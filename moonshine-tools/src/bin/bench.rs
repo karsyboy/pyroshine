@@ -8,7 +8,7 @@ use moonshine_core::config::ApplicationConfig;
 use moonshine_core::session::SessionContext;
 use moonshine_core::session::SessionKeyData;
 use moonshine_core::session::SessionKeys;
-use moonshine_core::session::compositor::{CaptureMode, CompositorConfig};
+use moonshine_core::session::compositor::{BenchPointer, CaptureMode, CompositorConfig};
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::session::stream::audio::AudioChannels;
 use moonshine_core::session::stream::audio::AudioConfig;
@@ -18,7 +18,7 @@ use moonshine_core::session::stream::control::ControlStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
 use moonshine_core::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
-use moonshine_core::session::stream::video::{FrameStats, PyroWaveQueueMode};
+use moonshine_core::session::stream::video::{ConversionQueueMode, FrameStats, PyroWaveQueueMode};
 use moonshine_core::session::{RemoteInputKey, RemoteInputKeyId};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -29,6 +29,13 @@ struct Args {
 	/// Force composition to measure the fallback independently of fullscreen eligibility.
 	#[arg(long)]
 	composited: bool,
+	/// Emulate client pointer use so the compositor cursor is visible: one
+	/// motion (`static`) or motion on every refresh tick (`moving`).
+	#[arg(long, value_parser = ["static", "moving"])]
+	cursor: Option<String>,
+	/// H.264/HEVC/AV1 conversion queue; auto prefers a dedicated compute family.
+	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
+	conversion_queue: String,
 	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
@@ -158,6 +165,13 @@ fn parse_bit_depth(value: &str) -> Result<u8, String> {
 		"10" => Ok(10),
 		_ => Err("bit depth must be 8 or 10".to_string()),
 	}
+}
+
+fn bench_pointer(args: &Args) -> Option<BenchPointer> {
+	args.cursor.as_deref().map(|mode| match mode {
+		"static" => BenchPointer::Static,
+		_ => BenchPointer::Moving,
+	})
 }
 
 fn parse_codec(s: &str) -> VideoCodec {
@@ -744,6 +758,7 @@ async fn run_benchmark(
 			} else {
 				CaptureMode::Auto
 			},
+			bench_pointer: bench_pointer(args),
 			..Default::default()
 		},
 		VideoStreamConfig {
@@ -752,6 +767,11 @@ async fn run_benchmark(
 				"off" => moonshine_core::session::stream::video::FecMode::Off,
 				"auto" => moonshine_core::session::stream::video::FecMode::Auto,
 				_ => moonshine_core::session::stream::video::FecMode::Fixed,
+			},
+			conversion_queue: match args.conversion_queue.as_str() {
+				"graphics" => ConversionQueueMode::Graphics,
+				"compute" => ConversionQueueMode::Compute,
+				_ => ConversionQueueMode::Auto,
 			},
 			pyrowave_queue: match args.pyrowave_queue.as_str() {
 				"graphics" => PyroWaveQueueMode::Graphics,

@@ -4,7 +4,7 @@ use super::frame::ExportedFrame;
 use smithay::reexports::calloop::ping::{Ping, PingSource, make_ping};
 use std::sync::{
 	Arc,
-	atomic::{AtomicU64, Ordering},
+	atomic::{AtomicU8, AtomicU64, Ordering},
 	mpsc,
 };
 use std::time::{Duration, Instant};
@@ -38,14 +38,43 @@ pub(crate) enum CaptureSendError {
 	Disconnected,
 }
 
+/// Late-composition layer kinds a capture consumer can draw.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OverlayCaps(u8);
+impl OverlayCaps {
+	pub(crate) const NONE: Self = Self(0);
+	/// CPU texels (`OverlayContent::Pixels`).
+	pub(crate) const PIXELS: Self = Self(1);
+	/// Client DMA-BUFs (`OverlayContent::Dmabuf`).
+	pub(crate) const DMABUF: Self = Self(2);
+	pub(crate) const fn union(self, other: Self) -> Self {
+		Self(self.0 | other.0)
+	}
+	pub(crate) fn contains(self, other: Self) -> bool {
+		other.0 != 0 && self.0 & other.0 == other.0
+	}
+	/// Whether every layer of `overlays` can be drawn.
+	pub(crate) fn draws(self, overlays: &super::frame::FrameOverlays) -> bool {
+		overlays.iter().flatten().all(|layer| {
+			self.contains(match layer.content {
+				super::frame::OverlayContent::Pixels(_) => Self::PIXELS,
+				super::frame::OverlayContent::Dmabuf { .. } => Self::DMABUF,
+			})
+		})
+	}
+}
+
 pub(crate) struct CaptureSender {
 	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
+	overlay_caps: Arc<AtomicU8>,
 	tx: mpsc::SyncSender<ExportedFrame>,
 	demand_source: Option<PingSource>,
 	state: Arc<AtomicU64>,
 }
 pub(crate) struct CaptureReceiver {
 	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
+	/// Whether the active consumer composites `ExportedFrame::overlay`.
+	overlay_caps: Arc<AtomicU8>,
 	rx: mpsc::Receiver<ExportedFrame>,
 	demand: Option<Ping>,
 	state: Arc<AtomicU64>,
@@ -55,6 +84,7 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	let (tx, rx) = mpsc::sync_channel(1);
 	let state = Arc::new(AtomicU64::new(IDLE));
 	let context = Arc::new(std::sync::OnceLock::new());
+	let overlay_caps = Arc::new(AtomicU8::new(0));
 	let (demand, demand_source) = match make_ping() {
 		Ok((ping, source)) => (Some(ping), Some(source)),
 		Err(error) => {
@@ -65,12 +95,14 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	(
 		CaptureSender {
 			context: context.clone(),
+			overlay_caps: overlay_caps.clone(),
 			tx,
 			demand_source,
 			state: state.clone(),
 		},
 		CaptureReceiver {
 			context,
+			overlay_caps,
 			rx,
 			state,
 			demand,
@@ -100,6 +132,12 @@ impl CaptureSender {
 			state: self.state.clone(),
 			ticket,
 		})
+	}
+	/// Which late-composition layer kinds frames may carry. A frame captured
+	/// before the consumer withdrew support is dropped by that consumer, never
+	/// encoded without its layers.
+	pub(crate) fn overlay_caps(&self) -> OverlayCaps {
+		OverlayCaps(self.overlay_caps.load(Ordering::Acquire))
 	}
 	pub(crate) fn requested(&self) -> bool {
 		self.state.load(Ordering::Acquire) & STATE_MASK == REQUESTED
@@ -134,6 +172,10 @@ impl CaptureReceiver {
 			.get()
 			.cloned()
 			.ok_or_else(|| "Capture GPU context not initialized; compositor must be ready before streaming".into())
+	}
+	/// Declare which frame overlay layers this consumer composites.
+	pub(crate) fn set_overlay_caps(&self, caps: OverlayCaps) {
+		self.overlay_caps.store(caps.0, Ordering::Release);
 	}
 	pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<ExportedFrame, mpsc::RecvTimeoutError> {
 		self.recv_timeout_if(timeout, true)
@@ -201,6 +243,7 @@ impl CaptureReceiver {
 }
 impl Drop for CaptureReceiver {
 	fn drop(&mut self) {
+		self.overlay_caps.store(0, Ordering::Release);
 		self.state.fetch_or(CLOSED, Ordering::AcqRel);
 		while let Ok(frame) = self.rx.try_recv() {
 			frame.consumed.store(true, Ordering::Release);
@@ -273,6 +316,50 @@ mod tests {
 		drop(credit);
 		assert!(!tx.occupied());
 	}
+	#[test]
+	fn overlay_support_is_declared_by_the_consumer_and_withdrawn_on_drop() {
+		let (tx, rx) = capture_channel();
+		assert_eq!(
+			tx.overlay_caps(),
+			OverlayCaps::NONE,
+			"no consumer composites overlays by default"
+		);
+		rx.set_overlay_caps(OverlayCaps::PIXELS.union(OverlayCaps::DMABUF));
+		assert!(tx.overlay_caps().contains(OverlayCaps::DMABUF));
+		rx.set_overlay_caps(OverlayCaps::PIXELS);
+		assert!(!tx.overlay_caps().contains(OverlayCaps::DMABUF));
+		assert!(tx.overlay_caps().contains(OverlayCaps::PIXELS));
+		drop(rx);
+		assert_eq!(
+			tx.overlay_caps(),
+			OverlayCaps::NONE,
+			"a dropped consumer cannot draw overlays"
+		);
+	}
+
+	#[test]
+	fn overlay_caps_require_every_layer_kind() {
+		use crate::session::compositor::frame::{FrameOverlay, OverlayContent, OverlayFormat, OverlayImage};
+		let pixels = FrameOverlay {
+			content: OverlayContent::Pixels(Arc::new(OverlayImage {
+				generation: 1,
+				width: 1,
+				height: 1,
+				format: OverlayFormat::Rgba8,
+				pixels: vec![0; 4].into_boxed_slice(),
+			})),
+			x: 0,
+			y: 0,
+			opacity: 1.0,
+		};
+		let none = Default::default();
+		assert!(OverlayCaps::NONE.draws(&none), "a frame without layers needs nothing");
+		let cursor_only = [None, Some(pixels.clone())];
+		assert!(OverlayCaps::PIXELS.draws(&cursor_only));
+		assert!(!OverlayCaps::NONE.draws(&cursor_only));
+		assert!(!OverlayCaps::DMABUF.draws(&cursor_only));
+	}
+
 	#[test]
 	fn reset_cannot_be_replenished_by_old_credit() {
 		let (tx, rx) = capture_channel();

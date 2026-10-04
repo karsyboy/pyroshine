@@ -115,6 +115,77 @@ impl HdrMetadata {
 	}
 }
 
+/// Byte order of an overlay image's 8-bit premultiplied-alpha texels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlayFormat {
+	/// R, G, B, A bytes (xcursor images).
+	Rgba8,
+	/// B, G, R, A bytes (little-endian `wl_shm` ARGB8888/XRGB8888).
+	Bgra8,
+}
+
+/// Immutable overlay pixels, shared by every frame until the content changes.
+#[derive(Debug)]
+pub(crate) struct OverlayImage {
+	/// Changes whenever the pixels change; encoders upload once per generation.
+	pub generation: u64,
+	pub width: u32,
+	pub height: u32,
+	pub format: OverlayFormat,
+	/// Tightly packed premultiplied texels; opaque formats carry alpha 255.
+	pub pixels: Box<[u8]>,
+}
+
+/// Texels of one late-composition layer.
+#[derive(Debug, Clone)]
+pub(crate) enum OverlayContent {
+	/// CPU texels shared until they change (cursors, `wl_shm` surfaces).
+	Pixels(Arc<OverlayImage>),
+	/// A single-plane 8-bit client DMA-BUF read in place by the encoder. The
+	/// frame's source hold keeps the client from reusing it until `consumed`.
+	Dmabuf {
+		dmabuf: Dmabuf,
+		/// Ignore the alpha channel (X formats).
+		opaque: bool,
+	},
+}
+
+/// A small element the encoder composites over a directly exported frame
+/// ("late composition"), instead of the compositor rendering the whole scene.
+///
+/// Encoded output must match what GLES composition would produce: texels are
+/// premultiplied, scaled by `opacity` (the GLES element alpha) and blended
+/// 1:1 source-over at `(x, y)` in output pixels, in the frame's own encoding,
+/// before any color conversion.
+#[derive(Debug, Clone)]
+pub(crate) struct FrameOverlay {
+	pub content: OverlayContent,
+	pub x: i32,
+	pub y: i32,
+	pub opacity: f32,
+}
+
+impl FrameOverlay {
+	pub(crate) fn width(&self) -> u32 {
+		match &self.content {
+			OverlayContent::Pixels(image) => image.width,
+			OverlayContent::Dmabuf { dmabuf, .. } => dmabuf.width(),
+		}
+	}
+	pub(crate) fn height(&self) -> u32 {
+		match &self.content {
+			OverlayContent::Pixels(image) => image.height,
+			OverlayContent::Dmabuf { dmabuf, .. } => dmabuf.height(),
+		}
+	}
+}
+
+/// Late-composition layers per frame: a Steam notification, then the cursor.
+pub(crate) const MAX_OVERLAYS: usize = 2;
+
+/// Layers bottom to top; `None` entries are skipped.
+pub(crate) type FrameOverlays = [Option<FrameOverlay>; MAX_OVERLAYS];
+
 /// Strong ownership of a frame's source DMA-BUF and its plane descriptors.
 #[derive(Clone, Debug)]
 pub(crate) struct SourceLease(
@@ -161,6 +232,9 @@ pub(crate) struct ExportedFrame {
 	pub color_space: FrameColorSpace,
 	/// Optional HDR metadata from the composited content.
 	pub hdr_metadata: Option<HdrMetadata>,
+	/// Layers to composite at encode time, bottom to top; all `None` when the
+	/// frame is complete.
+	pub overlays: FrameOverlays,
 }
 
 /// Layout of a single DMA-BUF plane; its descriptor is owned by the frame.
@@ -214,7 +288,17 @@ impl ExportedFrame {
 			consumed,
 			color_space,
 			hdr_metadata,
+			overlays: Default::default(),
 		}
+	}
+
+	/// Layers to composite, bottom to top.
+	pub(crate) fn overlays(&self) -> impl Iterator<Item = &FrameOverlay> + '_ {
+		self.overlays.iter().flatten()
+	}
+
+	pub(crate) fn has_overlays(&self) -> bool {
+		self.overlays.iter().any(Option::is_some)
 	}
 
 	/// The frame's planes, with descriptors borrowed from its source lease.
@@ -260,6 +344,7 @@ impl ExportedFrame {
 			consumed: Arc::new(AtomicBool::new(false)),
 			color_space: FrameColorSpace::Srgb,
 			hdr_metadata: None,
+			overlays: Default::default(),
 		}
 	}
 }

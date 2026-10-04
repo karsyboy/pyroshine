@@ -3,6 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod convert;
 pub(super) mod dmabuf;
 pub(super) mod failure;
 mod hdr_sei;
@@ -17,7 +18,10 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState};
+use crate::session::compositor::admission::OverlayCaps;
+use crate::session::compositor::frame::{
+	FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
+};
 use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 
@@ -33,6 +37,8 @@ use crate::session::stream::video::{
 	VideoCodec, VideoPacketMessage, VideoReconfigureCommand, VideoStreamConfig, VideoStreamContext,
 };
 
+pub use convert::ConversionQueueMode;
+use convert::InputConverter;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
@@ -54,6 +60,50 @@ use pixelforge::{
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
 /// GPU fed plus one slot of slack, bounding useful work to three frames even under network stalls.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
+/// Declares whether this consumer composites frame overlays (late cursor
+/// composition) and withdraws the declaration on every exit; the next
+/// consumer of the capture channel declares its own.
+struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
+impl<'a> OverlaySupport<'a> {
+	fn declare(rx: &'a crate::session::compositor::admission::CaptureReceiver, caps: OverlayCaps) -> Self {
+		rx.set_overlay_caps(caps);
+		Self(rx)
+	}
+}
+impl Drop for OverlaySupport<'_> {
+	fn drop(&mut self) {
+		self.0.set_overlay_caps(OverlayCaps::NONE);
+	}
+}
+
+/// Import a single-plane client DMA-BUF layer through the frame importer.
+fn import_overlay(
+	importer: &mut DmaBufImporter,
+	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+) -> Result<(Arc<CachedImport>, bool), String> {
+	use smithay::backend::allocator::Buffer;
+	use std::os::fd::AsFd;
+	let modifier: u64 = dmabuf.format().modifier.into();
+	let plane = dmabuf
+		.handles()
+		.zip(dmabuf.offsets())
+		.zip(dmabuf.strides())
+		.map(|((fd, offset), stride)| DmaBufPlane {
+			fd: fd.as_fd().as_raw_fd(),
+			offset,
+			stride,
+			modifier,
+		})
+		.next()
+		.ok_or("layer DMA-BUF has no planes")?;
+	let format = drm_fourcc_to_input(dmabuf.format().code as u32).1;
+	// The frame owns a strong reference to `dmabuf`, so the descriptor stays
+	// open for this call; the importer duplicates what it keeps.
+	importer
+		.import_or_reuse(plane.fd, dmabuf.width(), dmabuf.height(), format, &[plane])
+		.map_err(|e| e.to_string())
+}
 
 fn conventional_can_admit(in_flight: &AtomicUsize) -> bool {
 	in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT
@@ -915,6 +965,9 @@ impl VideoPipelineInner {
 			);
 		}
 
+		// PyroWave composites layers inside its 1:1 scaler input fetch.
+		let _overlay_support = OverlaySupport::declare(frame_rx, OverlayCaps::PIXELS.union(OverlayCaps::DMABUF));
+
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
@@ -973,6 +1026,13 @@ impl VideoPipelineInner {
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
 			let (encoded, created_at, pacing_origin, buffer_index, channel_wait) = if let Some(frame) = received {
+				if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
+					// Overlays are composited only into unscaled input. A capture
+					// that raced an extent change is dropped rather than encoded
+					// without its cursor; the next one is composited by GLES.
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				}
 				gpu_window_encodes += 1;
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
@@ -1242,6 +1302,53 @@ impl VideoPipelineInner {
 			(ChromaFormat::Yuv444, BitDepth::Eight) => OutputFormat::YUV444,
 			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
 		};
+
+		// Pyroshine's packed converter: no atomics, preferably on the dedicated
+		// compute family, and able to composite the cursor of a direct export.
+		// Pixelforge's converter remains the fallback for extents it cannot pack.
+		let mut input_converter = if convert::supports_extent(ctx.width, ctx.height) {
+			match InputConverter::new(
+				context.clone(),
+				self.config.conversion_queue,
+				ctx.width,
+				ctx.height,
+				output_format,
+				if ctx.format.hdr {
+					ColorSpace::Bt2020
+				} else {
+					ColorSpace::Bt709
+				},
+				ctx.format.range == ColorRange::Full,
+			) {
+				Ok(converter) => {
+					tracing::info!(
+						async_compute = converter.async_compute,
+						"Using packed RGB to YCbCr converter with late cursor composition"
+					);
+					Some(converter)
+				},
+				Err(e) => {
+					tracing::warn!("Packed converter unavailable ({e}); using Pixelforge's converter");
+					None
+				},
+			}
+		} else {
+			tracing::info!(
+				width = ctx.width,
+				height = ctx.height,
+				"Stream extent is not word aligned; using Pixelforge's converter without late composition"
+			);
+			None
+		};
+		let _overlay_support = OverlaySupport::declare(
+			frame_rx,
+			if input_converter.is_some() {
+				OverlayCaps::PIXELS.union(OverlayCaps::DMABUF)
+			} else {
+				OverlayCaps::NONE
+			},
+		);
+		let mut convert_window = convert::ConvertWindow::default();
 
 		// Converter per input format, plus the source import whose view it caches.
 		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
@@ -1530,44 +1637,11 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// Get (or build) a converter for this input format. Cached per
-				// format so switching render paths doesn't rebuild one each frame.
-				let (converter, cached_source) = match color_converters.entry(frame.format) {
-					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-					std::collections::hash_map::Entry::Vacant(e) => {
-						let color_space = if ctx.format.hdr {
-							ColorSpace::Bt2020
-						} else {
-							ColorSpace::Bt709
-						};
-						let full_range = ctx.format.range == ColorRange::Full;
-						let mut config =
-							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
-						config.color_space = color_space;
-						config.full_range = full_range;
-						match ColorConverter::new(context.clone(), config) {
-							Ok(conv) => {
-								tracing::debug!("Created color converter for input format {frame_input_format:?}");
-								e.insert((conv, None))
-							},
-							Err(e) => {
-								let failure = EncodeFailure::new(
-									EncodeStage::Setup,
-									Recovery::DropFrame,
-									SourceAccess::NotSubmitted,
-									format!("failed to create color converter: {e}"),
-								);
-								apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-								continue;
-							},
-						}
-					},
-				};
-
 				// In HDR mode, select per-frame color space and encoder VUI
 				// based on the frame's actual color space. SDR frames are
 				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
 				// dynamic VUI switching in the encoder.
+				let mut frame_color = None;
 				if ctx.format.hdr {
 					let frame_cs = frame.color_space;
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
@@ -1593,35 +1667,143 @@ impl VideoPipelineInner {
 						),
 					};
 
-					// Switch encoder VUI first. Only update the converter if
-					// the encoder switch succeeds, so that the converter's
-					// color space stays in sync with the encoder's VUI.
+					// Switch encoder VUI first. The converter's color space is
+					// updated below only after the encoder accepted the switch,
+					// so it stays in sync with the encoder's VUI.
 					if encoder_color_desc != Some(color_desc) {
 						tracing::debug!(
 							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
 						);
 						match encoder.set_color_description(color_desc) {
-							Ok(()) => {
-								encoder_color_desc = Some(color_desc);
-								converter.set_color_space(cs);
-								converter.set_full_range(full_range);
-								converter.set_sdr_reference_white_nits(sdr_white_nits);
-							},
+							Ok(()) => encoder_color_desc = Some(color_desc),
 							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
 						}
-					} else {
+					}
+					frame_color = Some((cs, full_range, sdr_white_nits));
+				}
+
+				let converted = if let Some(converter) = input_converter.as_mut() {
+					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
+						converter.set_color(cs, full_range, sdr_white_nits);
+					}
+					// DMA-BUF layers go through the same identity-checked import
+					// cache as the game source; the `Arc`s pin them for the call.
+					let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
+					let mut import_failed = None;
+					for (slot, layer) in frame.overlays.iter().enumerate() {
+						if let Some(FrameOverlay {
+							content: OverlayContent::Dmabuf { dmabuf, .. },
+							..
+						}) = layer
+						{
+							match import_overlay(importer, dmabuf) {
+								Ok(import) => layer_imports[slot] = Some(import),
+								Err(e) => import_failed = Some(e),
+							}
+						}
+					}
+					if let Some(e) = import_failed {
+						let failure = EncodeFailure::new(
+							EncodeStage::Import,
+							Recovery::DropFrame,
+							SourceAccess::NotSubmitted,
+							format!("failed to import overlay DMA-BUF: {e}"),
+						);
+						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+						continue;
+					}
+					let layers: convert::Layers<'_> = std::array::from_fn(|slot| {
+						let layer = frame.overlays[slot].as_ref()?;
+						let input = match &layer.content {
+							OverlayContent::Pixels(image) => convert::LayerInput::Pixels(image),
+							OverlayContent::Dmabuf { dmabuf, opaque } => {
+								let (import, first_use) = layer_imports[slot].as_ref()?;
+								convert::LayerInput::Imported {
+									import,
+									format: drm_fourcc_to_input(
+										smithay::backend::allocator::Buffer::format(dmabuf).code as u32,
+									)
+									.1,
+									first_use: *first_use,
+									opaque: *opaque,
+								}
+							},
+						};
+						Some(convert::Layer {
+							input,
+							x: layer.x,
+							y: layer.y,
+							width: layer.width(),
+							height: layer.height(),
+							opacity: layer.opacity,
+						})
+					});
+					converter
+						.convert(
+							&source_import,
+							import_vk_format,
+							needs_transition,
+							&layers,
+							encoder.input_image(),
+						)
+						.map(|outcome| {
+							convert_window.record(outcome.gpu_ns, frame.has_overlays());
+						})
+						.map_err(PixelForgeError::Vulkan)
+				} else if frame.has_overlays() {
+					// Captured while this consumer still advertised overlays (an
+					// epoch switch raced the capture). Never encode it without its
+					// cursor: drop it; the next capture is composited by GLES.
+					convert_window.overlay_drops += 1;
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				} else {
+					// Get (or build) a converter for this input format. Cached per
+					// format so switching render paths doesn't rebuild one each frame.
+					let (converter, cached_source) = match color_converters.entry(frame.format) {
+						std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+						std::collections::hash_map::Entry::Vacant(e) => {
+							let color_space = if ctx.format.hdr {
+								ColorSpace::Bt2020
+							} else {
+								ColorSpace::Bt709
+							};
+							let full_range = ctx.format.range == ColorRange::Full;
+							let mut config =
+								ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
+							config.color_space = color_space;
+							config.full_range = full_range;
+							match ColorConverter::new(context.clone(), config) {
+								Ok(conv) => {
+									tracing::debug!("Created color converter for input format {frame_input_format:?}");
+									e.insert((conv, None))
+								},
+								Err(e) => {
+									let failure = EncodeFailure::new(
+										EncodeStage::Setup,
+										Recovery::DropFrame,
+										SourceAccess::NotSubmitted,
+										format!("failed to create color converter: {e}"),
+									);
+									apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+									continue;
+								},
+							}
+						},
+					};
+					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
 						converter.set_color_space(cs);
 						converter.set_full_range(full_range);
 						converter.set_sdr_reference_white_nits(sdr_white_nits);
 					}
-				}
-
-				// Retain the source image; the converter caches a view of it.
-				*cached_source = Some(Arc::clone(&source_import));
+					// Retain the source image; the converter caches a view of it.
+					*cached_source = Some(Arc::clone(&source_import));
+					converter.convert(source_image, src_layout, encoder.input_image())
+				};
 
 				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					// pixelforge submits the conversion and waits for its fence; an
+				if let Err(e) = converted {
+					// Both converters submit the conversion and wait for its fence; an
 					// error may follow a submission whose reads are still pending.
 					// Establish completion before the compositor may reuse the source.
 					let failure = if is_device_lost(&e) {
@@ -1652,6 +1834,9 @@ impl VideoPipelineInner {
 					};
 					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 					continue;
+				}
+				if self.config.log_stats {
+					convert_window.maybe_log(input_converter.as_ref().map(|c| c.async_compute));
 				}
 
 				// The DMA-BUF content has been read into the encoder's input

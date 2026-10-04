@@ -81,6 +81,12 @@ pub(crate) struct GbmBufferSlot {
 	consumed: Arc<AtomicBool>,
 }
 
+/// A client buffer kept until the encoder's GPU reads finished.
+type HeldBuffer = (
+	smithay::reexports::wayland_server::backend::ObjectId,
+	smithay::backend::renderer::utils::Buffer,
+);
+
 // Combined render element type for compositing space + cursor elements.
 // We use GlesRenderer concretely (no generics) to avoid complex trait bound issues.
 pub(crate) enum OutputRenderElements {
@@ -270,6 +276,23 @@ pub(crate) struct MoonshineCompositor {
 	pub cursor_position: Point<f64, Logical>,
 	pub cursor: super::cursor::CursorState,
 	pub pointer_element: PointerElement,
+	/// The default cursor's texels for late composition.
+	default_cursor_overlay: Arc<super::frame::OverlayImage>,
+	/// Last client cursor buffer copied for late composition, keyed by its
+	/// surface and commit so unchanged cursors are not copied again.
+	client_cursor_overlay: Option<(
+		smithay::reexports::wayland_server::backend::ObjectId,
+		CommitCounter,
+		Arc<super::frame::OverlayImage>,
+	)>,
+	late_cursor_frames: u64,
+	/// Last `wl_shm` notification copied for late composition.
+	notification_pixels: Option<(
+		smithay::reexports::wayland_server::backend::ObjectId,
+		CommitCounter,
+		Arc<super::frame::OverlayImage>,
+	)>,
+	late_notification_frames: u64,
     pub capture_mode: super::CaptureMode,
     capture_path: Option<&'static str>,
 	last_resource_summary: std::time::Instant,
@@ -734,7 +757,7 @@ impl MoonshineCompositor {
 			dmabuf_state.create_global_with_default_feedback::<Self>(&display_handle, &default_feedback);
 
 		// Load the default xcursor and build a PointerElement with it.
-		let cursor_buffer = cursor::load_default_cursor();
+		let (cursor_buffer, default_cursor_overlay) = cursor::load_default_cursor();
 		let mut pointer_element = PointerElement::default();
 		pointer_element.set_buffer(cursor_buffer);
 
@@ -799,6 +822,11 @@ impl MoonshineCompositor {
 				cursor_position: initial_cursor_position,
 				cursor: Default::default(),
 				pointer_element,
+				default_cursor_overlay,
+				client_cursor_overlay: None,
+				late_cursor_frames: 0,
+				notification_pixels: None,
+				late_notification_frames: 0,
 				capture_mode,
 				capture_path: None,
 				last_resource_summary: std::time::Instant::now(),
@@ -1170,10 +1198,26 @@ impl MoonshineCompositor {
 
 	/// One buffer must reproduce the complete scene, independently of focus.
 	fn can_direct_scanout_scene(&self) -> Result<(), DirectReject> {
+		self.direct_scene_eligibility(self.cursor_visible(), self.notification_window.is_some())
+	}
+
+	/// The game window a direct export reads: the topmost visible window,
+	/// skipping a Steam notification the encoder composites itself.
+	fn direct_source_window(&self, skip_notification: bool) -> Option<&smithay::desktop::Window> {
+		let skipped = self.notification_window.as_ref().filter(|_| skip_notification);
+		self.space
+			.elements()
+			.rfind(|w| Some(*w) != skipped && self.window_metadata.get(*w).is_none_or(|m| m.opacity != 0))
+	}
+
+	/// Eligibility of everything except (optionally) the cursor and a Steam
+	/// notification. With either `false` the caller must reproduce that
+	/// element itself (late composition).
+	fn direct_scene_eligibility(&self, cursor: bool, notification: bool) -> Result<(), DirectReject> {
 		let extras = super::capture::SceneExtras {
-			cursor: self.cursor_visible(),
+			cursor,
 			steam_overlay: self.overlay_window.is_some(),
-			steam_notification: self.notification_window.is_some(),
+			steam_notification: notification && self.notification_window.is_some(),
 			external_overlay: self.external_overlay_window.is_some(),
 			dropdown: self.override_window.is_some(),
 			decoration: !self.decoration_windows.is_empty() || self.override_underlay_window.is_some(),
@@ -1190,11 +1234,7 @@ impl MoonshineCompositor {
 				_ => Err(DirectReject::NoSurface),
 			};
 		}
-		let Some(window) = self
-			.space
-			.elements()
-			.rfind(|w| self.window_metadata.get(*w).is_none_or(|m| m.opacity != 0))
-		else {
+		let Some(window) = self.direct_source_window(!notification) else {
 			return Err(DirectReject::NoSurface);
 		};
 		if self
@@ -1278,6 +1318,239 @@ impl MoonshineCompositor {
 		} else {
 			Ok(())
 		}
+	}
+
+	/// The visible cursor as a late-composition overlay, positioned exactly
+	/// where `render_and_export` would draw it. `None` when GLES composition
+	/// is needed to reproduce it (scaled, transformed, cropped, DMA-BUF or
+	/// multi-surface cursors). Callers have already excluded output scaling.
+	fn cursor_overlay(&mut self) -> Option<super::frame::FrameOverlay> {
+		if self.output.current_scale().fractional_scale() != 1.0 {
+			return None;
+		}
+		let (image, hotspot, offset) = match &self.cursor.image {
+			CursorImageStatus::Hidden => return None,
+			// The GLES path draws named cursors at the pointer, without a hotspot.
+			CursorImageStatus::Named(_) => (self.default_cursor_overlay.clone(), (0, 0).into(), (0, 0).into()),
+			CursorImageStatus::Surface(surface) => {
+				let surface = surface.clone();
+				if !surface.alive() {
+					return None;
+				}
+				let mut extra_content = false;
+				compositor::with_surface_tree_downward(
+					&surface,
+					(),
+					|_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+					|child, states, &()| {
+						if child != &surface
+							&& states
+								.data_map
+								.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+								.is_some_and(|state| state.lock().unwrap().buffer().is_some())
+						{
+							extra_content = true;
+						}
+					},
+					|_, _, &()| true,
+				);
+				if extra_content {
+					return None;
+				}
+				let hotspot = compositor::with_states(&surface, |states| {
+					states
+						.data_map
+						.get::<std::sync::Mutex<CursorImageAttributes>>()
+						.and_then(|m| m.lock().ok())
+						.map(|attrs| attrs.hotspot)
+						.unwrap_or_else(|| (0, 0).into())
+				});
+				let (buffer, commit, offset) = with_renderer_surface_state(&surface, |state| {
+					let view = state.view()?;
+					let buffer = state.buffer()?.clone();
+					let size = state.buffer_size()?;
+					// 1:1 texels only: a scaled, transformed or cropped cursor
+					// needs the GLES sampler to match composition.
+					if state.buffer_scale() != 1
+						|| state.buffer_transform() != smithay::utils::Transform::Normal
+						|| view.src.loc != (0.0, 0.0).into()
+						|| view.src.size != size.to_f64()
+						|| view.dst != size
+					{
+						return None;
+					}
+					Some((buffer, state.current_commit(), view.offset))
+				})
+				.flatten()?;
+				let id = surface.id();
+				let image = match &self.client_cursor_overlay {
+					Some((cached_id, cached_commit, image)) if *cached_id == id && *cached_commit == commit => {
+						image.clone()
+					},
+					_ => {
+						let (width, height, pixels) =
+							smithay::wayland::shm::with_buffer_contents(&buffer, |ptr, len, data| {
+								cursor::shm_overlay_pixels(ptr, len, &data)
+							})
+							.ok()
+							.flatten()?;
+						let image = Arc::new(super::frame::OverlayImage {
+							generation: cursor::next_overlay_generation(),
+							width,
+							height,
+							format: super::frame::OverlayFormat::Bgra8,
+							pixels,
+						});
+						self.client_cursor_overlay = Some((id, commit, image.clone()));
+						image
+					},
+				};
+				(image, hotspot, offset)
+			},
+		};
+		let location = (self.cursor_position - hotspot.to_f64())
+			.to_physical(1.0)
+			.to_i32_round::<i32>();
+		Some(super::frame::FrameOverlay {
+			content: super::frame::OverlayContent::Pixels(image),
+			x: location.x + offset.x,
+			y: location.y + offset.y,
+			opacity: 1.0,
+		})
+	}
+
+	/// The Steam notification as a late-composition layer, drawn where and
+	/// how `space_render_elements_with_override` would: at the window's
+	/// position, scaled by its window opacity. `Ok(None)` when GLES would draw
+	/// nothing; `Err` when only GLES can reproduce it (scaled, transformed,
+	/// cropped, multi-surface, multi-plane or unsupported formats). A DMA-BUF
+	/// layer also returns the client buffer to hold until the encoder read it.
+	fn notification_overlay(&mut self) -> Result<Option<(super::frame::FrameOverlay, Option<HeldBuffer>)>, ()> {
+		let Some(window) = self.notification_window.clone() else {
+			return Ok(None);
+		};
+		let opacity = self
+			.window_metadata
+			.get(&window)
+			.map(|m| m.opacity as f32 / 255.0)
+			.unwrap_or(1.0);
+		if opacity == 0.0 || !self.space.elements().any(|w| w == &window) {
+			return Ok(None);
+		}
+		let Some(output_geo) = self.space.output_geometry(&self.output) else {
+			return Err(());
+		};
+		let location: Point<i32, smithay::utils::Physical> =
+			(window.geometry().loc - output_geo.loc).to_physical_precise_round(1.0);
+		let Some(surface) = window.wl_surface().map(|s| s.into_owned()) else {
+			return Ok(None);
+		};
+		let mut extra_content = false;
+		compositor::with_surface_tree_downward(
+			&surface,
+			(),
+			|_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+			|child, states, &()| {
+				if child != &surface
+					&& states
+						.data_map
+						.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+						.is_some_and(|state| state.lock().unwrap().buffer().is_some())
+				{
+					extra_content = true;
+				}
+			},
+			|_, _, &()| true,
+		);
+		if extra_content {
+			return Err(());
+		}
+		let attached = with_renderer_surface_state(&surface, |state| {
+			let buffer = state.buffer()?.clone();
+			let view = state.view();
+			let size = state.buffer_size();
+			// 1:1 texels only, like the cursor.
+			let representable = view.zip(size).is_some_and(|(view, size)| {
+				state.buffer_scale() == 1
+					&& state.buffer_transform() == smithay::utils::Transform::Normal
+					&& view.src.loc == (0.0, 0.0).into()
+					&& view.src.size == size.to_f64()
+					&& view.dst == size
+			});
+			Some((buffer, state.current_commit(), view.map(|v| v.offset), representable))
+		})
+		.flatten();
+		let Some((buffer, commit, offset, representable)) = attached else {
+			// No committed buffer: GLES draws nothing either.
+			return Ok(None);
+		};
+		let offset = offset.filter(|_| representable).ok_or(())?;
+		let (x, y) = (location.x + offset.x, location.y + offset.y);
+		if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(&buffer) {
+			let opaque = match dmabuf.format().code {
+				Fourcc::Argb8888 | Fourcc::Abgr8888 => false,
+				Fourcc::Xrgb8888 | Fourcc::Xbgr8888 => true,
+				_ => return Err(()),
+			};
+			if dmabuf.num_planes() != 1 {
+				return Err(());
+			}
+			let layer = super::frame::FrameOverlay {
+				content: super::frame::OverlayContent::Dmabuf {
+					dmabuf: dmabuf.clone(),
+					opaque,
+				},
+				x,
+				y,
+				opacity,
+			};
+			return Ok(Some((layer, Some((buffer.id(), buffer)))));
+		}
+		let id = surface.id();
+		let image = match &self.notification_pixels {
+			Some((cached_id, cached_commit, image)) if *cached_id == id && *cached_commit == commit => image.clone(),
+			_ => {
+				let (width, height, pixels) = smithay::wayland::shm::with_buffer_contents(&buffer, |ptr, len, data| {
+					cursor::shm_overlay_pixels(ptr, len, &data)
+				})
+				.ok()
+				.flatten()
+				.ok_or(())?;
+				let image = Arc::new(super::frame::OverlayImage {
+					generation: cursor::next_overlay_generation(),
+					width,
+					height,
+					format: super::frame::OverlayFormat::Bgra8,
+					pixels,
+				});
+				self.notification_pixels = Some((id, commit, image.clone()));
+				image
+			},
+		};
+		let layer = super::frame::FrameOverlay {
+			content: super::frame::OverlayContent::Pixels(image),
+			x,
+			y,
+			opacity,
+		};
+		Ok(Some((layer, None)))
+	}
+
+	/// Layers the encoder must composite so the frame equals full composition,
+	/// bottom to top, plus a client buffer to hold. Requires the rest of the
+	/// scene to be directly exportable.
+	fn late_layers(&mut self) -> Result<(super::frame::FrameOverlays, Option<HeldBuffer>), DirectReject> {
+		self.direct_scene_eligibility(false, false)?;
+		let mut layers: super::frame::FrameOverlays = Default::default();
+		let mut hold = None;
+		if let Some((layer, held)) = self.notification_overlay().map_err(|()| DirectReject::Notification)? {
+			layers[0] = Some(layer);
+			hold = held;
+		}
+		if self.cursor_visible() {
+			layers[1] = Some(self.cursor_overlay().ok_or(DirectReject::Cursor)?);
+		}
+		Ok((layers, hold))
 	}
 
 	/// Service producer lifecycle on a refresh tick that publishes no capture.
@@ -1461,6 +1734,8 @@ impl MoonshineCompositor {
 				compositor_gpu_ms_per_second = (self.captured_frames != 0 && (self.composited_frames == 0 || self.gpu_timer.samples != 0)).then(|| self.gpu_timer.nanoseconds as f64 / self.last_resource_summary.elapsed().as_secs_f64() / 1e6),
 				captured_frames = self.captured_frames, pre_render_rejected = self.pre_render_rejected,
 				stale_after_render = self.stale_after_render, direct_export_frames = self.direct_frames,
+				late_cursor_frames = self.late_cursor_frames,
+				late_notification_frames = self.late_notification_frames,
 				composited_frames = self.composited_frames, capture_requested = self.frame_tx.requested(), capture_occupied = self.frame_tx.occupied(),
 				screen_dirty = self.screen_dirty,
 				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
@@ -1528,6 +1803,8 @@ impl MoonshineCompositor {
 			self.pre_render_rejected = 0;
 			self.stale_after_render = 0;
 			self.direct_frames = 0;
+			self.late_cursor_frames = 0;
+			self.late_notification_frames = 0;
 			self.composited_frames = 0;
 			self.direct_rejections = [0; DirectReject::COUNT];
 			self.last_resource_summary = std::time::Instant::now();
@@ -1570,20 +1847,63 @@ impl MoonshineCompositor {
 		//
 		// Direct scanout bypasses GLES, so skip it while an actually-drawn
 		// cursor (not client-hidden) needs compositing.
-		if let Err(reason) = self.can_direct_scanout_scene() {
-			if self.log_stats {
-				self.direct_rejections[reason as usize] += 1;
-			}
-		} else {
-			if self.is_override_active() {
-				if self.try_direct_scanout_override(&mut credit, send_callbacks) {
-					self.record_capture_path("direct_override");
+		//
+		// A visible cursor alone does not force composition when the consumer
+		// composites overlays itself (late composition): the scene without the
+		// cursor must still be directly exportable and the cursor image must be
+		// representable 1:1; otherwise GLES draws it as before.
+		// The same holds for a Steam notification (a small window above the
+		// game), composited as the layer below the cursor.
+		let direct = match self.can_direct_scanout_scene() {
+			Ok(()) => Ok((Default::default(), None)),
+			Err(DirectReject::Cursor | DirectReject::Notification)
+				if self.frame_tx.overlay_caps() != super::admission::OverlayCaps::NONE =>
+			{
+				let caps = self.frame_tx.overlay_caps();
+				self.late_layers().and_then(|(layers, hold)| {
+					if caps.draws(&layers) {
+						Ok((layers, hold))
+					} else if layers[0]
+						.as_ref()
+						.is_some_and(|l| !caps.draws(&[Some(l.clone()), None]))
+					{
+						Err(DirectReject::Notification)
+					} else {
+						Err(DirectReject::Cursor)
+					}
+				})
+			},
+			Err(reason) => Err(reason),
+		};
+		match direct {
+			Err(reason) => {
+				if self.log_stats {
+					self.direct_rejections[reason as usize] += 1;
+				}
+			},
+			Ok((layers, hold)) => {
+				let late_notification = layers[0].is_some();
+				let late_cursor = layers[1].is_some();
+				let override_active = self.is_override_active();
+				let exported = if override_active {
+					self.try_direct_scanout_override(&mut credit, send_callbacks, layers, hold)
+				} else {
+					self.try_direct_scanout(&mut credit, send_callbacks, layers, hold)
+				};
+				if exported {
+					self.record_capture_path(match (override_active, late_notification || late_cursor) {
+						(true, true) => "direct_override+late",
+						(true, false) => "direct_override",
+						(false, true) => "direct+late",
+						(false, false) => "direct",
+					});
+					if self.log_stats {
+						self.late_cursor_frames += u64::from(late_cursor);
+						self.late_notification_frames += u64::from(late_notification);
+					}
 					return;
 				}
-			} else if self.try_direct_scanout(&mut credit, send_callbacks) {
-				self.record_capture_path("direct");
-				return;
-			}
+			},
 		}
 
 		// Pick the next buffer from the pre-allocated pool.
@@ -1946,15 +2266,13 @@ impl MoonshineCompositor {
 		&mut self,
 		credit: &mut Option<super::admission::CaptureCredit>,
 		send_callbacks: bool,
+		overlays: super::frame::FrameOverlays,
+		overlay_hold: Option<HeldBuffer>,
 	) -> bool {
 		// Scene eligibility has proved that this opaque top window covers all
-		// other windows. Clone just the candidate, without a per-frame Vec.
-		let Some(window) = self
-			.space
-			.elements()
-			.rfind(|w| self.window_metadata.get(*w).is_none_or(|m| m.opacity != 0))
-			.cloned()
-		else {
+		// other windows, except a notification composited as a layer. Clone
+		// just the candidate, without a per-frame Vec.
+		let Some(window) = self.direct_source_window(true).cloned() else {
 			return false;
 		};
 		// Retain the origin safeguard inside the technical export path too.
@@ -2035,16 +2353,21 @@ impl MoonshineCompositor {
 
 		// The frame takes its own reference to the client's DMA-BUF; the held
 		// wl_buffer below only defers the client's content reuse.
-		let exported_frame = ExportedFrame::from_dmabuf(
+		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&client_dmabuf,
 			buffer_index,
 			consumed.clone(),
 			color_space,
 			hdr_metadata,
 		);
+		exported_frame.overlays = overlays;
 
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
+		// A DMA-BUF notification layer is read by the same GPU work.
+		if let Some((id, buffer)) = overlay_hold {
+			self.held_scanout_buffers.push((consumed.clone(), id, buffer));
+		}
 
 		match self
 			.frame_tx
@@ -2120,6 +2443,8 @@ impl MoonshineCompositor {
 		&mut self,
 		credit: &mut Option<super::admission::CaptureCredit>,
 		send_callbacks: bool,
+		overlays: super::frame::FrameOverlays,
+		overlay_hold: Option<HeldBuffer>,
 	) -> bool {
 		let override_surface = match self.override_surface.as_ref() {
 			Some((s, _)) if s.alive() => s.clone(),
@@ -2207,15 +2532,20 @@ impl MoonshineCompositor {
 
 		// The frame takes its own reference to the client's DMA-BUF; the held
 		// wl_buffer below only defers the client's content reuse.
-		let exported_frame = ExportedFrame::from_dmabuf(
+		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&client_dmabuf,
 			buffer_index,
 			consumed.clone(),
 			color_space,
 			hdr_metadata,
 		);
+		exported_frame.overlays = overlays;
 
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
+		// A DMA-BUF notification layer is read by the same GPU work.
+		if let Some((id, buffer)) = overlay_hold {
+			self.held_scanout_buffers.push((consumed.clone(), id, buffer));
+		}
 
 		match self
 			.frame_tx

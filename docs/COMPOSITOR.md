@@ -73,6 +73,54 @@ existing DMA-BUF checks still apply. Eligibility performs no X11 queries and
 allocates no window list. Current color management passes through pixel data and
 metadata; no new color conversion or SDR intermediate is introduced.
 
+### Late composition (cursor and Steam notifications)
+
+Two scene elements can be composited after capture instead of rendering the
+whole frame through GLES: a Steam notification and, above it, the cursor. The
+active consumer declares which layer kinds it draws
+(`CaptureReceiver::set_overlay_caps`: CPU texels and/or client DMA-BUFs; the
+conventional codecs' packed converter and PyroWave's 1:1 scaler since C API 0.9
+draw both). When the scene *without* those elements is directly exportable, the
+compositor exports the game's DMA-BUF with `ExportedFrame::overlays`, bottom to
+top, and the encoder blends each layer the way GLES would: texels premultiplied,
+scaled by the element alpha (the window's `_NET_WM_WINDOW_OPACITY` for a
+notification, one for the cursor), source-over in the frame's own encoding,
+before color conversion. The direct-export source lookup skips a notification
+it composites as a layer.
+
+* Cursor: drawn at the GLES position (named cursors at the pointer, client
+  cursors at pointer minus hotspot plus surface offset); the default xcursor or
+  a client `wl_shm` ARGB/XRGB8888 surface. Texels are copied only when the image
+  changes (surface + commit counter).
+* Notification: drawn at the window's position; a single-plane 8-bit
+  ARGB/ABGR/XRGB/XBGR DMA-BUF (XWayland normally delivers these) is read in
+  place and held with the game buffer until the encoder's reads finished; a
+  `wl_shm` buffer is copied like a cursor. X formats ignore the alpha byte.
+
+Every layer must be 1:1: one surface without subsurface content, buffer scale
+1, normal transform, no viewport crop or scale. Anything else (scaled output,
+fractional scale, interactive Steam overlays, dropdowns, decorations, cursor
+DMA-BUFs, multi-plane formats, extents the packed converter cannot represent)
+keeps GLES composition; counters report `direct_reject_cursor` or
+`direct_reject_notification`. A frame whose layers a consumer can no longer draw
+(a racing epoch switch) is dropped, never encoded without them. PyroWave blends
+layers in its scaler's unscaled input fetch; that specialization may round
+differently from the plain scaler at the level of relaxed-precision arithmetic
+(62-71 dB PSNR in the fork's overlay test), while full-opacity binary-alpha
+layers decode identically to pre-composited input under the same variant.
+`late_cursor_frames`/`late_notification_frames` in `Video capture resources`
+and `late_layer_frames` in `Video conversion summary` count them.
+
+### Buffer readiness
+
+A surface commit whose new DMA-BUF still has pending GPU writes is applied
+only when those implicit fences signal (a Smithay pre-commit blocker), so the
+compositor latches the newest completed frame and delivers that commit's frame
+callbacks afterwards. Without it, captures picked up buffers still queued
+behind a GPU-bound game and every consumer (GLES composition or encoder
+import) waited on them. `MOONSHINE_DISABLE_READY_LATCH=1` restores immediate
+latching for diagnosis.
+
 ### WSI and transparency
 
 Both swapchain protocols convey Vulkan composite-alpha intent. The
