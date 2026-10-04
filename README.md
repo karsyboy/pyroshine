@@ -74,9 +74,13 @@ Do not expose Pyroshine directly to the public internet.
 - [Installation, upgrades, and headless setup](docs/INSTALLATION.md)
 - [Complete config.toml reference](docs/CONFIGURATION.md)
 - [Tips and troubleshooting](docs/TIPS.md)
-- [All documentation](docs/README.md)
-- [Contributing, manual builds and installation, and releases](CONTRIBUTING.md)
+- [Pairing, revocation, and state recovery](docs/SECURITY_ADMINISTRATION.md)
 - [Changelog](docs/CHANGELOG.md)
+- [All documentation](docs/README.md)
+
+For development, start with the [architecture overview](docs/ARCHITECTURE.md)
+and the [contributor guide](CONTRIBUTING.md) (manual builds, validation, and
+releases).
 
 ## AI-assisted development
 
@@ -96,7 +100,10 @@ Pyroshine is an independent community fork of
 [Moonshine](https://github.com/hgaiser/moonshine), which builds on the Moonlight
 ecosystem and work pioneered by [Sunshine](https://github.com/LizardByte/Sunshine).
 It retains Moonshine's internal crate names, configuration paths, and protocol
-names to ease upstream synchronization.
+names to ease upstream synchronization. The client fork is
+[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave), and
+the codec is the pinned [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave)
+fork of [PyroWave](https://github.com/Themaister/pyrowave).
 
 Licensed under the [BSD 2-Clause License](LICENSE). Original copyright notices
 are preserved; dependencies retain their own licenses.

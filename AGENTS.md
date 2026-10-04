@@ -1,50 +1,73 @@
 # Working in Pyroshine
 
 Pyroshine is a Linux game-streaming server derived from Moonshine, serving
-Moonlight-compatible clients. This file is a repository map and engineering
-contract; read the deeper documents relevant to the change, not every guide.
+Moonlight-compatible clients and adding native PyroWave streaming. This file is
+a repository map and engineering contract for coding agents. It points to the
+authoritative documents; read the ones relevant to the change, not every guide.
+
+Related repositories:
+
+- [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave):
+  the client fork. Protocol, capability-bit and PyroWave wire changes must stay
+  compatible with it (and its `moonlight-common-c` submodule fork).
+- [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave): the pinned codec fork.
+
+## Working approach
+
+- Inspect the relevant code, tests and guide before editing. Treat the current
+  implementation as the source of truth; documents can be stale.
+- Prefer root-cause fixes over symptom workarounds, and explain the cause.
+- Keep changes focused. Avoid unrelated refactors, renames and formatting churn.
+- Preserve existing behavior, protocols and defaults unless the task explicitly
+  changes them. If you find an unrelated defect, report it instead of silently
+  redesigning behavior.
 
 ## Identity and compatibility
 
 - Native packages and portable installations expose the `pyroshine` command and
   service; the Rust server artifact remains `moonshine`.
 - Internal crate names, config/state paths, `MOONSHINE_*` environment variables,
-  and protocol identifiers intentionally retain `moonshine`. Do not casually
-  rename them: this preserves compatibility and eases upstream synchronization.
+  and protocol identifiers intentionally retain `moonshine`. Do not rename them:
+  this preserves compatibility and eases upstream synchronization.
 - Nix also retains the `moonshine` package/executable and `services.moonshine`
   module interface; follow `docs/NIXOS.md` for that integration.
-- Preserve public/protocol behavior unless the task intentionally changes it.
-  Avoid needless rewrites that complicate upstream comparison, while respecting
-  intentional Pyroshine divergence. Preserve license notices and attribution.
+- `dist/` holds `pyroshine-*` files (used by `nfpm.yaml` and the release
+  workflow) alongside upstream-named `moonshine-*` files, some of which Nix uses
+  (`nix/package.nix`). Check both when changing service, udev, Vulkan or policy
+  integration.
+- Preserve license notices and attribution.
 
 ## Repository map
 
 Paths are relative to the repository root; core rows use `moonshine-core/src/`
-unless explicitly marked as root.
+unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit together.
 
 | Area | Responsibility |
 | --- | --- |
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown |
-| `config.rs`, `healthcheck.rs` | Config loading/defaults and host/codec capability checks |
-| `app_scanner/`, `clients.rs`, `state.rs`, `tls.rs`, `discovery.rs` | Application discovery, pairing/client state, certificates, mDNS |
-| `webserver/`, `rtsp.rs`, `ingress.rs` | GameStream HTTP/HTTPS API and pairing; RTSP negotiation and stream orchestration; bounded connection supervision |
-| `session/mod.rs`, `session/manager.rs`, `session/application.rs`, `session/lifecycle.rs` | Session states, launch/resume/reconfiguration transitions, teardown ownership, worker start/completion registration, application lifetime |
-| `session/authorization.rs` | Launch/resume authorization generations binding RTSP, control and media discovery to the paired client |
-| `session/keys.rs`, `session/negotiation.rs` | Validated session keys, key-scoped AES-GCM nonce ownership; shared launch/resume/ANNOUNCE numeric domains |
-| `session/compositor/` | Embedded headless Smithay compositor, scene/focus/cursor/input, GBM/DMA-BUF capture |
-| `session/stream/audio/` | Embedded PulseAudio-compatible capture server, Opus encoding, audio packets/UDP |
-| `session/stream/control/` | Control protocol, input decoding/routing, Inputtino devices and feedback |
-| `session/stream/video/` | Negotiated formats, stream epochs, packetization/FEC, UDP GSO/pacing |
-| `session/stream/video/pipeline/` | Capture consumption, DMA-BUF import, Pixelforge/Vulkan Video encoding and PyroWave integration |
-| `session/stream/video/pyrowave.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership |
+| `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
+| `app_scanner/` | Steam, Lutris, Heroic and desktop-entry discovery |
+| `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
+| `webserver/` (`mod.rs`, `pairing.rs`, `bandwidth.rs`) | GameStream HTTP/HTTPS API, operator pairing, PyroWave bandwidth probe |
+| `rtsp.rs`, `ingress.rs`, `discovery.rs` | RTSP negotiation; bounded connection supervision; mDNS |
+| `session/manager.rs`, `session/mod.rs`, `session/lifecycle.rs` | Session states, transitions, teardown ownership, worker guards and start latches |
+| `session/application.rs`, `session/inhibit.rs` | Application systemd unit and environment; logind sleep inhibition |
+| `session/authorization.rs`, `session/keys.rs`, `session/negotiation.rs` | Authorization generations; validated keys and nonce ownership; shared numeric domains |
+| `session/compositor/` | Headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, color/swapchain protocols, capture admission and DMA-BUF export |
+| `session/stream/audio/` | Embedded PulseAudio-compatible server, Opus encoding, audio FEC/encryption, UDP |
+| `session/stream/control/` | ENet control protocol, peer authorization (`peers.rs`), input decoding/routing, Inputtino devices, ownership and feedback |
+| `session/stream/video/` | Negotiated formats, stream epochs, packetization, FEC, GSO/pacing, diagnostics |
+| `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), Pixelforge encoding, HDR metadata, failure classification |
+| `session/stream/video/pyrowave.rs`, `pyrowave_protocol.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership; dialect/profile negotiation |
 
 Other workspace and integration areas:
 
 - `moonshine-wsi/`: Vulkan implicit layer intercepting instance/device/surface/
   swapchain behavior and routing presentation to the compositor over Wayland.
-  Its `protocols/` bindings must agree with compositor-side protocol handling.
+  Its `protocols/` XML must agree with `session/compositor/protocols/`.
 - `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark.
-- `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration (`build-shaders.sh`) and changelog tooling/tests.
+- `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
+  (`build-shaders.sh`), changelog tooling/tests, measurement harnesses.
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
   installers, systemd, Vulkan manifests, device permissions and system policy.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
@@ -54,22 +77,19 @@ Other workspace and integration areas:
 
 | Change | Consult |
 | --- | --- |
-| Cross-layer ownership, startup or session lifecycle | `docs/ARCHITECTURE.md` |
+| Components, data flow, startup, session lifecycle, invariants | `docs/ARCHITECTURE.md` |
 | Build, install locally, contribute, release | `CONTRIBUTING.md`; CI commands in `.github/workflows/ci.yaml` |
 | Configuration fields, defaults or semantics | `docs/CONFIGURATION.md` and the owning Rust config/default implementations |
-| PyroWave, codec negotiation, GPU ownership, FEC or transport | `docs/PYROWAVE.md` |
+| PyroWave, codec negotiation, GPU ownership, FEC or transport | `docs/PYROWAVE.md`, `docs/PYROWAVE_COMPATIBILITY.md` |
 | Capture, cursor lifetime, focus, Steam surfaces/overlays or input | `docs/COMPOSITOR.md` |
-| Vulkan bypass, extension gates, swapchain image counts | `docs/VULKAN_IMAGE_COUNTS.md` |
+| Vulkan layer, bypass, extension gates, swapchain image counts | `docs/VULKAN_IMAGE_COUNTS.md` |
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
 | Performance measurements | `docs/BENCHMARKING.md`; lifetime/soak diagnostics in `docs/LONG_SESSION_PERFORMANCE.md` |
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
+| Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |
 | Packaging, service or host integration | `docs/INSTALLATION.md`, `CONTRIBUTING.md`; `docs/NIXOS.md` for Nix |
 | Release notes and inherited history | `docs/CHANGELOG.md`; `docs/UPSTREAM_CHANGELOG.md` is the upstream archive |
-
-`docs/README.md` indexes current guides; link new guides there when applicable.
-Dated results/rejected experiments belong in `docs/reports/`, not current design
-instructions. Treat archived validation as evidence for its recorded revision only.
 
 ## Architectural boundaries
 
@@ -101,13 +121,14 @@ instructions. Treat archived validation as evidence for its recorded revision on
 
 - Root `Cargo.toml` patches only `inputtino-sys` to the vendored native backend;
   the public Rust `inputtino` API stays on the pinned upstream Git dependency.
-  Do not casually replace/reorganize this arrangement. Follow `LOCAL_CHANGES.md`
+  Do not replace or reorganize this arrangement casually. Follow `LOCAL_CHANGES.md`
   when updating it, comparing the patch with upstream and coordinating Nix.
 - For PyroWave pins, C API assumptions or build changes, follow the pinned
   dependency process in `docs/PYROWAVE.md`. Keep Rust provenance/API requirements,
   `scripts/build-pyrowave.sh`, `nix/pyrowave.nix` and documented pins synchronized.
   Keep dependency patches under `nix/patches/` consistent across build paths;
-  do not silently substitute another PyroWave source or ABI.
+  never substitute another PyroWave source or ABI. Check that the client's
+  pinned decoder still accepts the bitstream family before changing pins.
 - Configuration additions/removals/renames/default or behavior changes must update
   owning Rust structures/defaults, examples and `docs/CONFIGURATION.md` together.
   Update healthcheck/capability behavior where affected. Keep user-facing settings
@@ -136,8 +157,9 @@ Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs the
 invocation in `CONTRIBUTING.md` or CI. Hardware-dependent tests are ignored by
 default so a run without hardware reports them as not executed, never as passed.
 
-- Documentation-only work needs diff/Markdown/path checks and `git diff --check`,
-  not a full native build. Select other checks according to the affected behavior.
+- Documentation-only work needs Markdown, relative-link and path checks and
+  `git diff --check`, not a full native build. Select other checks according to
+  the affected behavior.
 - Fix reproducible bugs with regression coverage when reasonably automatable.
   Test externally meaningful behavior or stable internal contracts, not incidental
   implementation details. For live-only behavior, cover lower-level contracts
@@ -149,9 +171,9 @@ default so a run without hardware reports them as not executed, never as passed.
 
 ## Change discipline and documentation
 
-- Keep work focused; avoid unrelated cleanup. Remove obsolete paths when a
-  replacement is intentionally complete; add compatibility shims only for an
-  actual compatibility requirement. Update relevant tests/docs with implementation.
+- Remove obsolete paths when a replacement is intentionally complete; add
+  compatibility shims only for an actual compatibility requirement. Update
+  relevant tests and docs with the implementation.
 - Record meaningful user-visible changes under `Unreleased` in `docs/CHANGELOG.md`
   using the contributor guide's categories. Do not add fork entries to the
   archived `docs/UPSTREAM_CHANGELOG.md`; follow `CONTRIBUTING.md` for release work.
@@ -159,5 +181,73 @@ default so a run without hardware reports them as not executed, never as passed.
   safety invariants and non-obvious performance decisions that could otherwise
   be incorrectly simplified. Avoid narrating code; document public/complicated
   interfaces where it materially helps humans and agents maintain them.
-- Update this file when architectural boundaries, canonical commands, document
-  locations or repository-wide invariants change; ordinary features need no edit.
+
+Documentation follows two audiences:
+
+- **User-facing** (`README.md`, `INSTALLATION.md`, `CONFIGURATION.md`, `TIPS.md`,
+  `SECURITY_ADMINISTRATION.md`, `NIXOS.md`): task-oriented, concise, with
+  prerequisites, copyable commands and links to deeper material. Keep
+  implementation detail out unless users act on it.
+- **Technical** (`ARCHITECTURE.md` and subsystem guides): current design,
+  responsibilities, contracts, invariants and acceptance checks. Describe the
+  resulting design, not how it evolved; history belongs in `docs/CHANGELOG.md`
+  and commit messages. Keep rationale only when it prevents an incorrect
+  simplification. Put design sections first and automated checks and hardware
+  acceptance procedures in a final validation section. Do not commit dated
+  investigation reports to `docs/`.
+
+Style: one `#` title, descriptive `##` headings, short paragraphs, tables for
+reference data, `sh`/`toml`-tagged code blocks, relative links between repository
+documents, and no marketing or unsupported claims. Link a new guide from
+`docs/README.md`; prefer one authoritative location plus links over duplicated
+explanations.
+
+Update this file when architectural boundaries, canonical commands, document
+locations or repository-wide invariants change; ordinary features need no edit.
+
+## Upstream synchronization
+
+Upstream is [Moonshine](https://github.com/hgaiser/moonshine), configured as
+the `upstream` remote (branch `main`); `origin` is the fork. Verify with
+`git remote -v` rather than assuming. Fork history begins after upstream
+v0.16.1 (see `docs/UPSTREAM_CHANGELOG.md`). Pinned third-party sources have
+their own upstreams: PyroWave (`karsyboy/pyrowave`, derived from
+`Themaister/pyrowave`; see `docs/PYROWAVE.md`), Inputtino
+(`games-on-whales/inputtino`; see `vendor/inputtino/LOCAL_CHANGES.md`), and the
+Git-pinned Smithay, Pixelforge and ash revisions in `Cargo.toml`.
+
+Staying reasonably compatible with upstream is an ongoing goal. Bug fixes,
+security fixes, performance, compatibility and maintenance improvements, useful
+features and architectural improvements are worth bringing in when they fit the
+fork and do not break, remove or undermine fork-specific functionality.
+
+Synchronization is never automatic:
+
+1. Identify the upstream repository and branch from the remote configuration
+   and these documents.
+2. Determine how the fork differs from upstream in the affected areas
+   (`git merge-base`, `git log`, `git diff`).
+3. Review the upstream changes being considered.
+4. Evaluate conflicts and regression risks.
+5. Decide whether the changes provide meaningful value to the fork.
+6. Identify fork-specific adaptations required.
+
+**Explicit approval is required before applying anything.** Agents may fetch,
+inspect and compare upstream and prepare a recommendation summarizing the
+relevant changes, why they are useful, affected areas, expected conflicts,
+fork behavior at risk and proposed validation. No agent may merge, cherry-pick,
+rebase onto, copy, port or otherwise apply upstream changes into this fork
+without explicit approval from the repository owner, even when the change is
+small, documentation-only, conflict-free or obviously beneficial.
+
+**Upstream repositories are read-only.** Never push to, commit to, open or
+update pull requests against, modify branches or settings of, merge into, or
+create releases in any upstream repository. All work stays in this fork unless
+the owner explicitly instructs otherwise.
+
+**Fork functionality takes priority.** Do not remove or weaken fork-specific
+behavior (PyroWave streaming, the authorization/teardown model, late
+composition, DualSense Edge support, packaging identity and others documented
+here) merely to reduce divergence. When upstream and fork requirements conflict,
+understand why the fork differs, preserve intentional behavior, adapt the
+upstream change cleanly where possible, and report unavoidable divergence.

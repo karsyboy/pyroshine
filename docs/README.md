@@ -4,20 +4,21 @@ Start with the [project README](../README.md) for requirements and a quick start
 
 ## Using Pyroshine
 
+User guides are task-oriented and avoid implementation detail.
+
 - [Installation and upgrades](INSTALLATION.md): native packages, portable builds, headless setup, and service diagnostics.
-- [Security administration](SECURITY_ADMINISTRATION.md): pairing approval, durable state recovery, TLS identity permissions and revocation.
 - [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults, and examples.
-- [DualSense Edge](DUALSENSE_EDGE.md): native controller mapping, dependency patch, and Steam acceptance checks.
 - [Tips and troubleshooting](TIPS.md): Steam, Flatpak, Gamescope, desktop sessions, and application logs.
+- [Security administration](SECURITY_ADMINISTRATION.md): pairing approval, durable state recovery, TLS identity permissions and revocation.
 - [NixOS](NIXOS.md): flake package, service module, and development shell.
 - [Changelog](CHANGELOG.md): Pyroshine fork releases and upcoming changes.
 - [Upstream changelog](UPSTREAM_CHANGELOG.md): archived Moonshine release history and attribution.
 
 ## Development and architecture
 
-Start with [Architecture overview](ARCHITECTURE.md) for component ownership,
-startup, session negotiation and resource lifetimes. Then choose the guide for
-the area being changed:
+Start with the [architecture overview](ARCHITECTURE.md) for components, data
+flow, session lifecycle and the invariants changes must preserve. Then choose
+the guide for the area being changed:
 
 | Area | Guide |
 | --- | --- |
@@ -26,13 +27,17 @@ the area being changed:
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |
 | Cross-fork framing and authenticated calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
-| Vulkan bypass, extension gates and swapchain counts | [Vulkan WSI](VULKAN_IMAGE_COUNTS.md) |
+| Vulkan layer, bypass safety and swapchain image counts | [Vulkan WSI](VULKAN_IMAGE_COUNTS.md) |
 | Native controller identity/report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
 | Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |
 | Mode changes, epochs and teardown | [Reconnect validation](reconnect-validation.md) |
+| Coding-agent rules and upstream policy | [AGENTS.md](../AGENTS.md) |
 
-[Historical reports](reports/README.md) preserve dated investigations and measured
-results. They may describe older designs or local artifacts; use current guides
-and code for engineering contracts, and repeat relevant hardware acceptance for
-new changes. Keep new evidence separate from current instructions.
+Guides describe the current design and its acceptance checks. Dated
+investigation reports and measurement logs are not kept in this repository;
+record new evidence (revision, hardware, workload and unperformed checks) with
+the change that needs it rather than in a guide.
+
+The streaming client is maintained separately in
+[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave).

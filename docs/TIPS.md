@@ -1,10 +1,10 @@
-# Tips & Tricks
+# Tips and troubleshooting
 
-Practical recipes for getting the most out of Pyroshine.
+Practical recipes for common Pyroshine setups and problems.
 Each tip shows a real-world use of `pre_command` / `post_command` (or other configuration) to solve a common problem.
 See the [configuration reference](CONFIGURATION.md) for the full schema of these fields.
 
-## Table of Contents
+## Contents
 
 - [Close a desktop Steam before streaming Steam](#close-a-desktop-steam-before-streaming-steam)
 - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)

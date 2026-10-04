@@ -1,21 +1,33 @@
-# Vulkan image counts and XWayland bypass
+# Vulkan WSI layer and XWayland bypass
 
-The XWayland bypass replaces XCB/Xlib surfaces with Wayland surfaces. Mesa can
-report a conservative legacy `minImageCount=4` while a FIFO mode query permits
-three images. Path of Exile's native Vulkan renderer checks the legacy range
-before creating its swapchain and can abort with `unsupported backbuffer image
-count`. Disabling bypass selects the original XCB WSI and avoids those Wayland
-limits. The previous `max(driver_minimum, 3)` policy could not reduce four and
-also unnecessarily excluded ordinary two-image configurations.
+`moonshine-wsi` is an implicit Vulkan layer (`VK_LAYER_MOONSHINE_wsi`) loaded
+into applications launched by Pyroshine, which set `ENABLE_MOONSHINE_WSI=1`.
+It connects to the session compositor through `MOONSHINE_WAYLAND_DISPLAY` and:
 
-The [GE-Proton reference](https://github.com/GloriousEggroll/proton-ge-custom/commit/d8522c3c2faa119f3adcfc2482c1a81d42c6c63e)
-uses mode-specific limits and declares the host swapchain mode to avoid Mesa's
-legacy allocation policy. Pyroshine applies that mechanism to bypass surfaces
-without executable-name or engine-name matching.
+- replaces safe XCB/Xlib surfaces with Wayland surfaces (the *XWayland bypass*),
+  keeping a real XCB fallback for each replacement;
+- reports swapchain color space, HDR metadata, present mode and actual image
+  counts over the private `moonshine_swapchain` protocol;
+- advertises HDR surface formats when the session sets `MOONSHINE_HDR=1`; and
+- applies the frame limiter and present-mode policy.
 
-Implementation is in `moonshine-wsi/src/{instance,device,surface,swapchain,image_count}.rs`;
-compositor feedback is in `moonshine-core/src/session/compositor/gamescope_swapchain.rs`.
-See [architecture](ARCHITECTURE.md) for presentation/capture ownership.
+The layer participates in presentation only; capture and encoding belong to the
+server. See [architecture](ARCHITECTURE.md#compositor-and-presentation) for
+ownership. Implementation is in `moonshine-wsi/src/`; compositor feedback is in
+`moonshine-core/src/session/compositor/gamescope_swapchain.rs`, and the
+protocol XML in `moonshine-wsi/protocols/` must match the compositor's copy.
+
+## Image-count compatibility
+
+Mesa can report a conservative legacy `minImageCount=4` for a Wayland surface
+while a FIFO mode query permits three images. Applications that validate the
+legacy range before creating a swapchain (for example Path of Exile's Vulkan
+renderer, which aborts with `unsupported backbuffer image count`) would fail on
+bypass surfaces. Following the
+[GE-Proton approach](https://github.com/GloriousEggroll/proton-ge-custom/commit/d8522c3c2faa119f3adcfc2482c1a81d42c6c63e),
+the layer uses mode-specific limits from `VK_EXT_surface_maintenance1` and
+declares the swapchain's present modes, without executable- or engine-name
+matching. Ordinary two-image configurations are unaffected.
 
 ## Negotiation
 
@@ -80,9 +92,9 @@ The EXT maintenance path requires driver support; KHR-only implementations keep
 their original image-count behavior.
 
 `MOONSHINE_WSI_MIN_IMAGE_COUNT` is deprecated and ignored with a warning.
-Advertised requirements now follow the driver rather than a buffering preference.
-No downstream code depended on this setting; the requested swapchain minimum is
-not increased. Actual image counts are obtained with `vkGetSwapchainImagesKHR`
+Advertised requirements follow the driver rather than a buffering preference,
+and the requested swapchain minimum is never increased. Actual image counts are
+obtained with `vkGetSwapchainImagesKHR`
 and used for diagnostics and swapchain feedback. No images are hidden and no
 acquired image indices are remapped.
 
@@ -135,7 +147,47 @@ DEBUG diagnostics log policy changes with reasons: `_WINE_ALLOW_FLIP=0`,
 `XWayland bypass active` means a replacement was allocated; verify swapchain
 `bypass=true/false` and `override_window_content` to identify actual presentation.
 
-## Proton fullscreen acceptance (Dave the Diver test case)
+## Presentation failures and temporary surface ownership
+
+Limiter and bypass recreation hints replace only ICD `SUCCESS` or `SUBOPTIMAL`.
+Negative aggregate results remain authoritative, and negative per-swapchain
+results are never overwritten. All eligible swapchains in a batch receive their
+hints; a mixed batch retains its driver failure even when other entries need
+recreation. `OUT_OF_DATE` takes precedence over synthetic `SUBOPTIMAL`.
+
+Bypass construction owns each temporary `wl_surface` with a rollback guard. Any
+failure, including missing instance/dispatch or an ICD constructor error, sends
+one protocol destructor and flushes. A successful Vulkan constructor transfers
+the proxy to live surface ownership; ordinary teardown destroys the Vulkan
+surface before destroying the protocol surface. XCB fallback remains available.
+The mock ICD and in-process Wayland server tests run without GPU hardware.
+
+## Validation
+
+Automated checks run without GPU hardware; game acceptance needs an actual GPU,
+streaming client and game installation.
+
+### Automated checks
+
+From the repository root:
+
+```sh
+cargo fmt --all -- --check
+cargo build --locked --release -p moonshine-wsi
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+```
+
+The WSI suite covers image-count policy cases, creation-mode consistency,
+compatible FIFO switching, limiter fallback, and mocked ICD tests checking
+extension/feature gates and the synchronous lifetime and structure types of
+capability query chains. Workspace loopback socket tests require permission to
+bind UDP sockets.
+
+### Proton fullscreen acceptance
+
+This procedure uses Dave the Diver as the test case for Proton fullscreen and
+borderless transitions and bypass safety.
 
 Install the rebuilt layer and restart the game process. Compare fullscreen and
 borderless at the same stream settings. Use Steam launch options:
@@ -183,29 +235,9 @@ DualSense/Edge and Nintendo emulation, active-mask hotplug and reconnect (indice
 buffering. These require an actual GPU, streaming client, and game installation;
 unit tests do not establish game acceptance or performance.
 
-## Build and automated checks
+### Path of Exile acceptance
 
-From the repository root:
-
-```sh
-cargo fmt --all -- --check
-cargo build --locked --release -p moonshine-wsi
-cargo test --locked --workspace --all-features
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-```
-
-The WSI suite covers image-count policy cases, creation-mode consistency,
-compatible FIFO switching, limiter fallback, and mocked ICD tests checking
-extension/feature gates and the synchronous lifetime and structure types of
-capability query chains. Workspace loopback socket tests require permission to
-bind UDP sockets.
-
-## Recorded validation
-
-Dated results are preserved in the [historical report](reports/VULKAN_IMAGE_COUNTS.md).
-They are evidence for those revisions, not a substitute for current acceptance.
-
-## Path of Exile acceptance
+This procedure exercises [image-count compatibility](#image-count-compatibility).
 
 1. Install the rebuilt `target/release/libmoonshine_wsi.so` using the existing
    package/portable workflow or the [manual installation guide](../CONTRIBUTING.md#manual-installation-and-upgrade).
@@ -251,18 +283,3 @@ A host/stream/game run must confirm it. Applications that reject conservative
 capabilities before creating any Vulkan device remain a limitation of the safe
 feature-enable gate. Explicit application mode lists are also not overridden to
 force a three-image configuration.
-
-## Presentation failures and temporary surface ownership
-
-Limiter and bypass recreation hints replace only ICD `SUCCESS` or `SUBOPTIMAL`.
-Negative aggregate results remain authoritative, and negative per-swapchain
-results are never overwritten. All eligible swapchains in a batch receive their
-hints; a mixed batch retains its driver failure even when other entries need
-recreation. `OUT_OF_DATE` takes precedence over synthetic `SUBOPTIMAL`.
-
-Bypass construction owns each temporary `wl_surface` with a rollback guard. Any
-failure, including missing instance/dispatch or an ICD constructor error, sends
-one protocol destructor and flushes. A successful Vulkan constructor transfers
-the proxy to live surface ownership; ordinary teardown destroys the Vulkan
-surface before destroying the protocol surface. XCB fallback remains available.
-The mock ICD and in-process Wayland server tests run without GPU hardware.

@@ -1,167 +1,267 @@
 # Architecture overview
 
-Pyroshine runs applications in isolated, headless Linux sessions and streams
-video, audio and input to Moonlight-compatible clients. Start here for ownership
-and lifecycle; use the linked guides for detailed contracts and acceptance tests.
-Build/install/CI/release procedures live in [CONTRIBUTING.md](../CONTRIBUTING.md).
+Pyroshine runs one application at a time in an isolated, headless Linux session
+and streams its video, audio and input to a Moonlight-compatible client. This
+document describes the current design: components, how they communicate, the
+lifecycle from startup to shutdown, and the invariants changes must preserve.
+Subsystem guides linked from each section hold the detailed contracts.
+
+Build, install, CI and release procedures live in [CONTRIBUTING.md](../CONTRIBUTING.md).
+User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
+
+## Workspace
+
+| Crate | Output | Role |
+| --- | --- | --- |
+| Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown |
+| `moonshine-core` | Library | Every server subsystem: protocol endpoints, pairing, sessions, compositor, encoders, transport, input |
+| `moonshine-wsi` | `libmoonshine_wsi.so` | Implicit Vulkan layer loaded into streamed applications |
+| `moonshine-tools` | `moonshine-bench` | Developer benchmark that drives the production session stack without a client |
+
+Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
+(Vulkan Video encoding), the optional PyroWave shared library (loaded at
+runtime), the vendored Inputtino native backend (virtual input devices), and
+systemd/logind over D-Bus. Internal crate names, paths, environment variables
+and protocol identifiers keep the upstream `moonshine` spelling.
+
+Core paths below are relative to `moonshine-core/src/`.
 
 ## Components and data flow
 
-```text
-CLI/startup (src/main.rs)
-  ├─ config, host capability probes, TLS/client state, mDNS
-  ├─ GameStream HTTP/HTTPS API ── launch/resume/cancel ── SessionManager
-  └─ RTSP ── negotiated stream contexts / PLAY ───────── SessionManager
-                                                         │
-                                       application + headless compositor
-                                                         │
-application Vulkan presentation ── moonshine-wsi ── Wayland scene
-                                                         │
-                                               GBM/DMA-BUF capture
-                                                         │
-                                     Pixelforge or PyroWave encoder
-                                                         │
-                                          packetization → FEC → optional encryption → UDP
+```mermaid
+flowchart LR
+  subgraph Client["Moonlight client"]
+    C[Client]
+  end
 
-application audio → embedded PulseAudio-compatible server → Opus → UDP
-client control/input → control stream → compositor input / Inputtino devices
-client ← control feedback (HDR, rumble, motion/trigger requests)
+  subgraph Server["pyroshine process"]
+    HTTP["webserver/<br/>HTTP + HTTPS API, pairing"]
+    RTSP["rtsp.rs<br/>stream negotiation"]
+    MGR["session/manager.rs<br/>SessionManager"]
+    subgraph Session["Session (one at a time)"]
+      COMP["session/compositor/<br/>headless Smithay + XWayland"]
+      VID["stream/video/<br/>pipeline, packetizer, FEC, UDP"]
+      AUD["stream/audio/<br/>Pulse server, Opus, UDP"]
+      CTL["stream/control/<br/>ENet control, input, feedback"]
+    end
+  end
+
+  APP["Application<br/>(systemd user unit)"]
+  WSI["moonshine-wsi<br/>Vulkan layer"]
+
+  C -- "pair / launch / resume / cancel" --> HTTP
+  C -- "DESCRIBE / ANNOUNCE / PLAY" --> RTSP
+  HTTP --> MGR
+  RTSP --> MGR
+  MGR --> Session
+  APP -- "Wayland / X11 surfaces" --> COMP
+  APP -- "Vulkan present" --> WSI -- "swapchain protocol" --> COMP
+  APP -- "PulseAudio protocol" --> AUD
+  COMP -- "DMA-BUF frames" --> VID -- "RTP video" --> C
+  AUD -- "RTP audio" --> C
+  C -- "input, StartB, IDR, FEC status" --> CTL
+  CTL -- "keyboard, pointer, touch, pen" --> COMP
+  CTL -- "rumble, LED, HDR, motion" --> C
 ```
 
-Core module paths below are relative to `moonshine-core/src/`; WSI code lives
-in `moonshine-wsi/src/`.
+| Component | Responsibility | Does not own |
+| --- | --- | --- |
+| `src/main.rs` | Load config, scan applications, wait for the user D-Bus session, run host checks, construct services, handle SIGTERM/SIGINT | Session state |
+| `config.rs`, `app_scanner/` | Deserialize `config.toml`; discover Steam, Lutris, Heroic and desktop-entry applications at startup | Runtime reconfiguration |
+| `healthcheck.rs`, `gpu.rs` | Probe GPU, Vulkan, DMA-BUF and encoder profiles; verify the capture and encode devices are the same GPU | Encoding |
+| `discovery.rs` | Advertise `_nvstream._tcp` over mDNS | — |
+| `tls.rs`, `clients.rs`, `state.rs`, `durable.rs` | Server identity, paired-client trust, durable `state.toml` | Session authorization |
+| `webserver/` | GameStream HTTP/HTTPS API: server info, app list, pairing, launch/resume/cancel, PyroWave bandwidth probe | Stream properties |
+| `rtsp.rs` | RTSP OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY; parse and validate negotiated stream contexts | Encoders or sockets |
+| `ingress.rs` | Bounded, cancellable tasks for accepted HTTP, HTTPS and RTSP connections | Protocol semantics |
+| `session/manager.rs` | The single session's lifecycle, transitions, authorization generations, keys and teardown | Resource creation details |
+| `session/mod.rs` (`SystemSession`) | Builds the compositor, application and streams for each transition | Lifecycle decisions |
+| `session/application.rs` | Run the application, pre/post commands and output routing as the `moonshine-session.service` systemd user unit | — |
+| `session/compositor/` | Wayland/XWayland server, scene, focus, cursor, Steam classification, output mode, capture and frame export | Codec negotiation, transport |
+| `session/stream/video/` | Import, convert and encode captured frames; packetize, protect, encrypt, pace and send | Scene composition |
+| `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
+| `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
+| `moonshine-wsi` | Intercept Vulkan surfaces and swapchains in applications; route presentation and swapchain metadata to the compositor | Capture, encoding |
 
-`moonshine-wsi` participates in Vulkan presentation; it is not the encoder or
-session manager. Scene visibility belongs to the compositor. Encoding and
-transport belong to `moonshine-core/src/session/stream/video/`. Control decoding
-and virtual devices belong to `session/stream/control/`; focus and Wayland input targets
-belong to `session/compositor/`. The audio server/encoder belong to `session/stream/audio/`.
-Developer tools reuse these session interfaces rather than owning another stack.
+Boundaries to preserve:
+
+- Scene visibility and input focus belong to the compositor. Encoding, packet
+  transport and FEC belong to `stream/video/`. Control decoding and virtual
+  devices belong to `stream/control/`.
+- The WSI layer participates in presentation only. A WSI change alone does not
+  establish correct capture or streaming behavior.
+- Developer tools reuse the production session interfaces through
+  `SessionManager`; they do not own a parallel stack.
+
+## Process and threading model
+
+The server is a multi-threaded Tokio process. Latency-sensitive or blocking work
+runs on dedicated threads that communicate through bounded channels:
+
+| Thread or task | Work |
+| --- | --- |
+| `compositor` thread | calloop event loop: Wayland dispatch, XWayland, input injection, refresh timer, scene capture |
+| `video-pipeline` thread | DMA-BUF import, conversion and encoding (Pixelforge or PyroWave) |
+| Video packet task | Packetization, FEC, encryption, pacing and UDP send |
+| `pulse-server` thread | PulseAudio protocol server for the application |
+| `audio-encode` thread and audio packet task | Opus encoding, audio FEC/encryption and UDP send |
+| Control task | ENet service loop, message decoding, input routing, feedback |
+| `gamepad-input` thread | Inputtino virtual controller state and native feedback callbacks |
+| Manager-owned tasks | Session transitions and teardown |
+
+Every session worker registers a `lifecycle::WorkerGuard` before it is spawned,
+so session completion means every worker has exited and released what it owns.
 
 ## Startup and capability advertisement
 
-`src/main.rs` loads config, scans applications, waits for the user D-Bus session,
-and checks the host before wiring services. `--no-health-check` still probes GPU
-capabilities; it does not bypass the DMA-BUF requirement. Advertised codec/HDR
-support comes from actual encoder/profile probes and configuration, not merely
-from finding a library or extension name.
+`src/main.rs` loads or creates the configuration, scans applications, waits for
+the user D-Bus session, then runs the health check. `pyroshine healthcheck`
+runs the same checks and exits. `--no-health-check` skips the report but still
+probes GPU capabilities, and the server refuses to start without DMA-BUF import.
 
-`gpu.rs` verifies the selected Vulkan context against the opened GBM/EGL DRM
-node using `VK_EXT_physical_device_drm`, with complete PCI identity as a fallback.
-The compositor publishes a verified, shared `VideoContext` through the capture
-channel before readiness. Conventional encoding, DMA-BUF import and PyroWave UUID
-matching clone that context throughout the session and reconnects. Healthcheck uses
-the same verification before profile probes, including with `--no-health-check`.
-Unresolvable configuration or unknown/mismatched device identity advertises no
-codec/HDR/DMA-BUF capability and prevents startup/session launch. No cross-device
-capture-to-encoder path is validated or enabled. This identity check does not prove
-that every application's client DMA-BUF format/modifier imports successfully;
-normal import validation and terminal failure handling still apply. Applications
-on a different GPU can use compositor composition if their EGL imports work;
-that client-to-compositor transfer is separate from capture-to-encoder selection.
+Advertised codecs and HDR come from encoder and profile probes, not from finding
+a library or extension name:
 
-A missing/incompatible optional PyroWave library leaves conventional codecs
-available. A negotiated PyroWave stream does not silently switch to another
-codec or software encoder. See [PyroWave](PYROWAVE.md#capability-and-negotiation-extension).
+- `gpu.rs` verifies the selected Vulkan device matches the GBM/EGL render node
+  used for capture (`VK_EXT_physical_device_drm`, with the complete PCI address
+  as a fallback). An unresolvable or mismatched identity advertises no codec,
+  HDR or DMA-BUF capability and prevents launch. No cross-device
+  capture-to-encode path exists.
+- The compositor publishes the verified, shared `VideoContext` before it reports
+  ready. Conventional encoding, DMA-BUF import and PyroWave device matching use
+  that context for the whole session, including reconnects.
+- A conventional codec bit is set only after creating its exact Pixelforge
+  profile. PyroWave bits are set only after loading the pinned C API, matching
+  the Vulkan device and creating each SDR/HDR encoder. A missing or incompatible
+  PyroWave library leaves the conventional codecs available.
+
+The server then constructs, in order, TLS identity, `SessionManager`,
+`ClientManager`, the RTSP server, the webserver and mDNS discovery, and waits
+for a shutdown signal.
+
+## Client lifecycle
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant H as HTTPS API
+  participant M as SessionManager
+  participant R as RTSP
+  participant K as Control stream
+  C->>H: /launch (paired certificate)
+  H->>M: initialize + launch (new authorization generation)
+  M-->>H: compositor and application running
+  C->>R: DESCRIBE, SETUP, ANNOUNCE
+  R->>M: validated pending video/audio contexts
+  C->>R: PLAY
+  R->>M: start streams (or commit reconnect)
+  C->>K: ENet connect, authenticated control
+  K->>M: StartB opens audio/video start latches
+  Note over C,K: streaming
+  C--xK: disconnect or ping timeout: pause media, release input
+  C->>H: /resume, then ANNOUNCE and PLAY again
+  C->>H: /cancel (or application exits): one teardown
+```
+
+1. **Discovery and pairing.** Clients find the host through mDNS or manually.
+   Pairing is approved by the host operator on the loopback-only `/pin` page;
+   trust is persisted in `state.toml` before it is published. See
+   [Security administration](SECURITY_ADMINISTRATION.md).
+2. **Launch.** An authenticated HTTPS `/launch` validates the request, creates an
+   authorization generation and session keys, then initializes and launches the
+   session: the compositor starts (with XWayland), and the application starts as
+   a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY`, `PULSE_SERVER` and the
+   WSI layer enabled.
+3. **Negotiation.** RTSP DESCRIBE advertises the probed formats. ANNOUNCE carries
+   the client's codec, chroma, dynamic range, resolution, FPS, bitrate, packet
+   size, encryption and audio layout; it is validated and stored as a *pending*
+   context. PLAY commits it by starting the stream workers.
+4. **Streaming.** The control stream admits the authenticated peer. Its `StartB`
+   opens the video and audio start latches, and media flows.
+5. **Disconnect and resume.** Losing the control peer (ENet disconnect or the
+   `[stream].timeout` ping deadline) pauses media delivery and releases its
+   input, but keeps the application running. `/resume` starts a new
+   authorization generation; the following ANNOUNCE and PLAY either fast-resume
+   unchanged settings or reconfigure.
+6. **Stop.** `/cancel`, application exit, a worker failure, a failed transition
+   or service shutdown starts exactly one teardown.
 
 ## Session lifecycle and negotiation
 
 `session/manager.rs` owns the single optional session; `session/mod.rs` builds
-its `Initialized`, `Launched` and `Active` states. Application/compositor lifetime
-and a client's stream epoch are different: a reconnect can retain the application
-while resetting or replacing the encoders and transport state. Ownership,
-cancellation and teardown follow [session ownership and shutdown](#session-ownership-and-shutdown).
+its `Initialized`, `Launched` and `Active` states. Application and compositor
+lifetime is separate from a client's *stream epoch*: a reconnect can keep the
+application while resetting or replacing encoders and transport state.
 
 | Step | Owner and contract |
 | --- | --- |
-| HTTP launch | Authenticated GameStream API initializes and launches the application/compositor |
-| RTSP ANNOUNCE | Validates negotiated formats and numeric domains; for an active session pauses the live epoch, then publishes pending video/audio contexts |
+| HTTP launch | Authenticated GameStream API initializes and launches the application and compositor |
+| RTSP ANNOUNCE | Validates negotiated formats and numeric domains; for an active session, pauses the live epoch, then publishes pending video/audio contexts |
 | RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition |
 | Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
 | HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
-| Unchanged reconnect | Pauses both streams, retains the video pipeline and Pulse sockets, resets client-visible media sequencing/encoder state, and acknowledges ordered transport activation before PLAY completes |
-| Changed reconnect | Pauses both epochs, updates compositor output when needed, and commits negotiated video/audio resources before activating delivery |
-| Cancel, application exit or session failure | One teardown stops the application unit and joins every worker; only then can the manager accept a later launch |
+| Unchanged reconnect | Pauses both streams, keeps the video pipeline and Pulse sockets, resets client-visible sequencing and encoder state (IDR), and activates transport before PLAY completes |
+| Changed reconnect | Pauses both epochs, reconfigures compositor output only for resolution, refresh rate or HDR changes, and commits new video/audio resources before activating delivery |
+| Cancel, application exit or failure | One teardown stops the application unit and joins every worker; only then can a new launch start |
 
-Audio uses the same Pause → producer reset → BeginEpoch barrier as video on
-all reconnects, including identical settings. PING discovers a destination but
-cannot activate delivery. PCM frames and audio packets carry the manager's
-existing authorization generation; the encoder freezes key material at the
-ordered boundary, recreates Opus state, and clears RTP/FEC state before transport
-activation. Pulse clears queued PCM and resampler history before acknowledging
-the sample boundary. Same-mode and duration-only resumes retain Pulse clients;
-layout changes rebuild their output converters while preserving negotiated source
-formats and sockets. Existing stereo sources remain stereo content when upmixed
-into a surround sink until the application chooses a surround source format.
+Negotiation invariants:
 
-The authenticated controlling peer owns input through the existing ControlPeers
-tracker. Disconnect or authorization-generation replacement closes its feedback
-receiver, orders compositor key/button releases and touch/pen/text cancellation,
-and waits until every virtual controller is neutralized (buttons, sticks,
-triggers, touchpad contacts, angular rate), its pending Home/Guide transition and
-activation pulse are cancelled, and its feedback route is revoked. Device
-lifetime is separate from ownership: the virtual controllers stay plugged in, so
-a retained game does not see an unplug (which also made Steam raise its overlay
-and force composited capture after every reconnect). Native callbacks hold an
-owner-switchable route (`control/input/ownership.rs`), never a peer's channel;
-feedback produced while unowned is dropped. The next peer's first input for a
-slot claims it, re-enables motion reports and replays the device's current LED
-and per-trigger effect state; rumble is never replayed. An arrival with a
-different virtual identity (family or Edge subtype), a controller missing from
-the client's active mask, or session teardown destroys the device. The slot
-mutex serializes Home/Guide timers. Only an active peer's disconnect performs
-cleanup; a delayed disconnect from a replaced generation cannot release new
-input or revoke the new owner.
+- **Pending is not active.** Keep pending and active contexts separate until
+  PLAY. Epoch barriers ensure old frames and packets never enter a new stream.
+- **Validate before changing anything.** Launch, resume and ANNOUNCE values are
+  checked against shared numeric domains (`session/negotiation.rs`,
+  `VideoStreamContext::validate`) before the manager pauses, rekeys or
+  reconfigures. A rejected request leaves the working stream unchanged. The
+  domains are consumer limits (representable extents, one-datagram shards,
+  32-bit rate control, implemented audio durations), not quality caps.
+- **No silent fallback.** An unsupported codec, chroma, bit depth or range fails
+  negotiation; the server never substitutes another format.
+- **Audio follows the same barrier.** Every reconnect, including unchanged
+  settings, runs Pause → producer reset → begin epoch for audio as for video.
+  Opus and RTP/FEC state are recreated and Pulse discards queued PCM before
+  activation. Pulse client connections survive; a layout change rebuilds output
+  converters without closing application sockets.
 
-RTSP access requires an existing session context established through the
-GameStream lifecycle. Do not move launch authentication into the streaming hot
-path or treat possession of an RTSP socket as pairing authorization.
+Use the [reconnect validation](reconnect-validation.md) matrix for changes here.
 
-Each authenticated `/launch` or `/resume` starts an authorization generation
-(`session/authorization.rs`) owned by the session manager: the paired client's
-normalized address plus fresh Sunshine session identifiers. RTSP accepts only
-that address, and ANNOUNCE/PLAY commit only within the generation that issued
-them. Media PINGs must come from that address and, for clients announcing
-Moonlight's `ML_FF_SESSION_ID_V1`, echo the generation's ping payload; source
-ports stay free for NAT. The control stream admits peers by address and connect
-data, but dispatches only the peer that authenticated with the HTTPS-delivered
-AES-GCM key, with a per-generation replay window. Without session-ID support,
-clients sharing one address are distinguished only by the control key; media
-endpoint discovery then relies on address alone.
+### Authorization and keys
 
-Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
-(`ingress.rs`) that hold a global shutdown delay token, with TLS handshake,
-request-header and RTSP framing deadlines. Pairing approval is a loopback-only
-operator action; first pairing cannot rely on a paired client certificate.
-Pairing trust changes serialize under the persistent state owner and publish only
-after atomic replacement and sync. Pending transactions have finite capacity and
-a deadline, with generation-scoped waiter cleanup. Revocation drains HTTPS
-launch/resume/cancel operations and tears down the active session; see
-[Security administration](SECURITY_ADMINISTRATION.md) for legacy associations and
-recovery policy.
+- Each authenticated `/launch` or `/resume` starts an **authorization
+  generation** (`session/authorization.rs`): the paired client's normalized
+  address plus fresh session identifiers. RTSP accepts only that address, and
+  ANNOUNCE/PLAY commit only within the generation that issued them. RTSP
+  possession alone never implies pairing authorization.
+- Media PINGs must come from that address and, for clients announcing
+  `ML_FF_SESSION_ID_V1`, echo the generation's ping payload; source ports may
+  differ for NAT. A PING discovers an endpoint but cannot activate a paused epoch.
+- The control stream (`stream/control/peers.rs`) admits candidates by address
+  and connect data, but dispatches only the peer that authenticates with the
+  HTTPS-delivered AES-GCM key. Only that active peer extends the stream timeout
+  and receives feedback.
+- Session keys (`session/keys.rs`) carry a server-owned generation; consumers
+  detect changes by generation, never by the client's `rikeyid`. AES-GCM nonce
+  counters for video and control belong to the key bytes through a
+  process-lifetime ledger, so recreation, reconnect or a later session reusing
+  the key continues the same counters. An encrypted video epoch encrypts every
+  shard or emits none; nonce exhaustion retires the key. Audio uses the
+  protocol's AES-CBC IV (`rikeyid` plus RTP sequence).
 
-Launch, resume and ANNOUNCE values are validated against shared numeric
-domains (`session/negotiation.rs`, `VideoStreamContext::validate`) before the
-manager pauses, rekeys or reconfigures anything; a rejected request leaves the
-working stream unchanged. The domains are consumer limits (nonzero timing,
-representable extents, one-datagram shards including the encryption prefix,
-32-bit Vulkan Video rate control, implemented audio durations), not quality caps.
+### Input ownership across reconnects
 
-Session keys (`session/keys.rs`) are validated at the HTTPS boundary and
-published as material with a server-owned generation; consumers detect key
-changes by generation, never by the client's `rikeyid`. AES-GCM nonce counters
-for video and host control messages belong to the key bytes through the
-manager's process-lifetime key ledger, so packetizer recreation, reconfigure,
-reconnect, key-ID-only changes or a later session reusing the key continue the
-same counters. A video epoch that negotiated encryption either encrypts every
-shard or emits none (nonce exhaustion retires the key instead of wrapping).
-Audio uses the protocol's fixed AES-CBC IV (`rikeyid` plus RTP sequence).
+The authenticated controlling peer owns input. When it disconnects or its
+generation is replaced, the control stream releases held keys and buttons,
+cancels touch, pen and text input, neutralizes every virtual controller,
+cancels pending Home/Guide timers and revokes the feedback route before the
+cleanup is acknowledged.
 
-A pending ANNOUNCE is not the active encoder configuration. Keep pending and
-active contexts separate until PLAY, and preserve epoch barriers so old packets
-or captured frames cannot enter the new stream. Changed audio layout/duration
-can require capture-server reconfiguration as well as a new encoder. Validate
-both directions of mode changes with [reconnect checks](reconnect-validation.md).
+Virtual controllers stay plugged in across ownership changes, so a retained game
+does not observe an unplug. Native Inputtino callbacks hold an owner-switchable
+route (`control/input/ownership.rs`), never a peer's channel; feedback produced
+while unowned is dropped. The next peer's first input for a slot claims it and
+replays LED and trigger-effect state (never rumble). A different controller
+identity, a controller missing from the client's active mask, or teardown
+destroys the device. A delayed disconnect from a replaced generation cannot
+release the new owner's input.
 
 ## Session ownership and shutdown
 
@@ -170,132 +270,249 @@ The manager's lifecycle is explicit; absence of state never means idle:
 | State | Meaning |
 | --- | --- |
 | `Idle` | No session and no owned resources. The only state that accepts `/launch`. |
-| `Live` | A session record (epoch, stop manager, authoritative context, live stream contexts, application unit, start latches) plus either the owned state or one in-flight transition that checked it out. HTTP/RTSP see the context in both cases. |
-| `Stopping` | One teardown task owns everything. The session is not reported, its keys, pending contexts and authorization are retired, and a replacement launch waits (bounded) for completion. |
+| `Live` | A session record (epoch, stop manager, authoritative context, live stream contexts, application unit, start latches) plus either the owned state or one in-flight transition that checked it out. HTTP and RTSP see the context in both cases. |
+| `Stopping` | One teardown task owns everything. The session is not reported; its keys, pending contexts and authorization are retired, and a replacement launch waits (bounded) for completion. |
 
 **Transitions** (initialize, launch, PLAY start/resume, active ANNOUNCE pause)
-validate every prerequisite under the manager mutex before moving anything,
-then run in a manager-owned task with the mutex released. The caller only
-awaits the result: an HTTP timeout or dropped RTSP connection does not drop the
-work. Each transition holds a completion token of its session and is wrapped
-in the session's cancellation, so a stop cancels it at any await and teardown
-waits until it has handed back what it checked out. A result commits only if
-the session epoch and transition id are still current and the session is not
-stopping; otherwise it goes to that epoch's teardown. A failed transition
-cannot leave half-applied state: it starts a deterministic full teardown.
-Duplicate, premature or stale requests (PLAY without a current-generation
-ANNOUNCE, a second PLAY or launch, ANNOUNCE/PLAY during another transition) are
+validate every prerequisite under the manager mutex, then run in a
+manager-owned task with the mutex released. An HTTP timeout or dropped RTSP
+connection does not drop the work. Each transition holds its session's
+completion token and runs under the session's cancellation, so a stop cancels
+it at any await and teardown waits until it hands back what it checked out. A
+result commits only if the session epoch and transition id are still current
+and the session is not stopping. A failed transition never leaves half-applied
+state: it starts a full teardown. Duplicate, premature or stale requests are
 rejected without touching the retained application or streams.
-
-The compositor owns the session's XWayland process. Smithay neither signals nor
-reaps it and calloop never frees a loop whose sources hold loop handles, so the
-compositor identifies the child it forked, holds a pidfd for it, and at teardown
-closes its Wayland client, waits (2 s, then `SIGKILL` via the pidfd, 1 s), lets
-the WM's X11 source observe the closed connection, and releases the display lock
-and sockets before its worker guard drops. A process that survives is reported
-and keeps the session `Stopping`, so the teardown deadline fails terminally
-instead of reporting `Idle`. A retained-session reconnect does not touch it.
 
 **Workers** (compositor, video pipeline thread and packet task, audio encoder
 and packet task, PulseAudio server, control stream, gamepad thread) register a
-`lifecycle::WorkerGuard` *before* they are spawned and drop it last, after
-their sockets, threads, GPU objects and frames. The session stop manager's
-completion therefore means every worker exited and released what it owned; a
-failed spawn drops the guard and stops the session. Stream workers wait for
-`StartB` through a persistent `lifecycle::StartLatch`: it may open before,
-during or after workers wait, duplicate opens are no-ops, and a stop before
-`StartB` cancels the wait and releases the worker's socket.
+`lifecycle::WorkerGuard` before they are spawned and drop it last, after their
+sockets, threads, GPU objects and frames. Stream workers wait for `StartB`
+through a persistent `lifecycle::StartLatch`: it may open before, during or
+after workers wait, duplicate opens are no-ops, and a stop before `StartB`
+cancels the wait and releases the worker's socket.
+
+**XWayland** is owned by the compositor (`compositor/xwayland_process.rs`),
+which holds a pidfd for the child it spawned. Teardown closes its Wayland
+client, waits (then `SIGKILL`s via the pidfd), and releases the display lock and
+sockets before the compositor's worker guard drops. A surviving process keeps
+the session `Stopping`. A retained-session reconnect does not touch XWayland.
 
 **Teardown** has a single owner per session, started by user cancel, a worker or
-application exit (via a per-session watchdog that only hands over, so nothing
-aborts the cleanup), a failed transition, or service shutdown. In order, it:
-stops the application unit while the compositor and audio still serve it
-(unless a transition was in flight, which is cancelled first); triggers the
-session stop; drops the owned state; waits for every worker and transition;
-drops state handed back by transitions; stops the unit if not already done;
-then reports `Idle`. The unit is recorded before a launch starts, so a launch
-cancelled after systemd accepted the unit is still stopped. `Application` drop
-never blocks; stopping the unit is an awaited, bounded D-Bus job.
+application exit (through a per-session watchdog that only hands over), a failed
+transition, or service shutdown. In order, it stops the application unit while
+the compositor and audio still serve it (if a transition is in flight, that is
+cancelled first and the unit is stopped after it hands back), triggers the
+session stop, drops the owned state, waits for every worker and transition,
+drops state handed back by transitions, then reports `Idle`. The
+unit name is recorded before a launch starts, so a launch cancelled after
+systemd accepted the unit is still stopped. `Application` drop never blocks;
+stopping the unit is an awaited, bounded D-Bus job.
 
-**Deadlines.** Application stop is bounded to 6 s and worker exit to the rest
-of a 16 s end-to-end teardown deadline (`SESSION_TEARDOWN_DEADLINE`). An
-unsuccessful unit stop is logged and does not wedge the manager (the next
-launch also replaces a leftover unit). Exceeding the deadline is terminal: the
+**Deadlines.** Application stop is bounded to 6 s and worker exit to the rest of
+a 16 s end-to-end deadline (`SESSION_TEARDOWN_DEADLINE`). A failed unit stop is
+logged without wedging the manager. Exceeding the deadline is terminal: the
 session stays `Stopping`, new sessions are refused, and the service shuts down
-for its supervisor to restart it. Service shutdown (SIGTERM/SIGINT) holds its
-completion until the session teardown, application included, has finished or
-failed within that same deadline.
+for its supervisor to restart it. Service shutdown (SIGTERM/SIGINT) completes
+only after session teardown finishes or fails within the same deadline.
 
 Tests: `session/manager/lifecycle_tests.rs` drives the manager through a fake
 backend with barriers and fault injection at every transition await; stream
 workers have socket-release tests in their modules.
 
-## Capture and native resource ownership
+## Compositor and presentation
 
-Two independent signals matter:
+`session/compositor/` embeds a headless Smithay compositor on its own calloop
+thread. It owns:
+
+- the Wayland display, XWayland, and the virtual output (mode, refresh rate,
+  scale, HDR state);
+- scene, stacking, focus and Steam window classification (`focus.rs`,
+  `x11_focus.rs`), following Gamescope's Steam focus model;
+- cursor state (`cursor.rs`) and output scaling (`scaling.rs`);
+- color metadata from `wp_color_management_v1` and the swapchain protocols
+  (`color_management.rs`, `gamescope_swapchain.rs`);
+- input injection into the Smithay seat (`input.rs`);
+- capture and frame export (`capture.rs`, `admission.rs`, `frame.rs`).
+
+The refresh timer is the only capture clock: each refresh deadline offers at
+most one capture, independent of encoder completion. Buffer releases, frame
+callbacks and input continue even while capture is blocked.
+
+**Presentation.** Applications present through ordinary Wayland or X11 surfaces.
+For Vulkan applications under XWayland, the `moonshine-wsi` layer (enabled by
+`ENABLE_MOONSHINE_WSI=1` in the application environment) can replace the
+XCB/Xlib surface with a Wayland surface ("bypass") and report swapchain color
+space, HDR metadata, present mode and image counts over the private
+`moonshine_swapchain` protocol. The compositor also implements
+`gamescope_swapchain` for DXVK. Bypass is rejected for unsafe X11 presentation
+topologies, which keep the real XCB surface. See
+[Vulkan WSI](VULKAN_IMAGE_COUNTS.md).
+
+**Capture.** Capture visibility and input focus are separate decisions:
+
+- *Direct export* hands the encoder the application's own DMA-BUF when it
+  represents the entire visible scene, optionally with a cursor and Steam
+  notification as late-composited layers.
+- *Composition* renders the scene through GLES into a compositor-owned DMA-BUF
+  pool and waits for completion before export.
+
+Commits are latched only once their DMA-BUF has finished rendering, and color
+format and metadata (sRGB, BT.2020/PQ, scRGB) pass through unchanged. See
+[Compositor](COMPOSITOR.md) for eligibility, cursor and Steam rules.
+
+## Video path
+
+```text
+compositor capture ─ExportedFrame─▶ video-pipeline thread ─encoded frame─▶ packet task ─UDP─▶ client
+   (admission credit)             import → convert/encode            packetize → FEC → encrypt → pace
+```
+
+**Admission.** `compositor/admission.rs` gives the consumer receiver-driven
+demand: one credit and one handoff slot. The compositor claims the credit before
+any export or rendering. Two signals are independent:
 
 - **Capture admission** says whether the pipeline can accept another scene.
-- **Buffer consumption** says whether the GPU has finished reading its source.
+- **Buffer consumption** (`consumed`) says whether the GPU has finished reading
+  the source.
 
-Releasing a source buffer must not create a second network admission credit.
-Conversely, paced sending must not retain a source buffer after GPU consumption.
-A third property, **descriptor ownership**, is independent of both: every
-`ExportedFrame` holds a `SourceLease` (a strong Smithay `Dmabuf` reference) to
-its pool slot or client buffer, and hands out plane fds only borrowed from
-itself. A frame that is queued, being imported or being read therefore keeps
-its descriptors open and unrecycled even after the compositor retires a pool or
-exits; imports take their own references (duplicated fds, imported memory)
-before the frame is dropped. `consumed` is set only when no GPU work can still
-read the source.
-Epoch invalidation must reject old completions without replenishing new demand.
-See [capture pipeline](PIPELINE_OPTIMIZATION.md) for the precise handoff contract.
+Releasing a source buffer never creates a second admission credit, and paced
+sending never retains a source buffer after GPU consumption. Every
+`ExportedFrame` also holds a `SourceLease` (a strong DMA-BUF reference) so its
+descriptors stay valid while queued, imported or read. Epoch changes reject old
+completions without replenishing demand. See
+[Capture pipeline](PIPELINE_OPTIMIZATION.md).
 
-Direct export is allowed only when the source represents the entire visible
-scene. Composition adds a GLES pass and completion wait before DMA-BUF export;
-that wait currently protects ownership. Preserve cursor/overlay visibility and
-input focus independently; [COMPOSITOR.md](COMPOSITOR.md) explains their interaction.
+**Encoders.** `stream/video/format.rs` treats codec, chroma, bit depth,
+transfer, primaries, matrix, range and HDR as independent negotiated properties.
 
-DMA-BUF caches validate open-file identity and the complete image layout, not
-just a numeric fd or buffer index. At the PyroWave C API boundary, duplicated fds
-transfer ownership to the native importer, and child handles must die before
-parent device/library resources. Conventional Vulkan import also needs cleanup
-for partial allocation failures. These assumptions are part of correctness,
-including shutdown and output-mode changes.
+| Backend | Formats | Path |
+| --- | --- | --- |
+| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
+| PyroWave (`pyrowave.rs`, `pyrowave_protocol.rs`) | Intra-only wavelet codec, 4:2:0/4:4:4, SDR/HDR10 | DMA-BUF import into a PyroWave-owned Vulkan device on the same GPU → GPU scale, color transform and encode → one frame at a time through send completion |
 
-## Transport and failure boundaries
+PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a
+conventional codec and has no CPU or alternate-codec fallback. `pyrowave.rs`
+owns the C API's unsafe boundary: exact ABI checks, handle ownership, and
+destroying child resources before the device and library. See
+[PyroWave](PYROWAVE.md).
 
-Video packetization preserves Moonlight framing, sequencing and representable
-FEC metadata. FEC covers plaintext shards; optional encryption follows per shard.
-PyroWave pacing uses capture time and rebases after backpressure instead of
-sending catch-up bursts. Raw UDP `WouldBlock` retries must participate in Tokio
-readiness clearing. See [PyroWave transport](PYROWAVE.md#transport-pacing-and-diagnostics)
-and [runtime diagnostics](LONG_SESSION_PERFORMANCE.md).
+**Transport.** `packetizer.rs` preserves Moonlight's RTP/NV framing and
+sequencing. Each frame's shards live in one contiguous `ShardBatch`
+(`shard_batch.rs`), which also carries network credits and transport outcomes.
+Reed-Solomon FEC (`fec.rs`) covers plaintext shards, then optional AES-GCM
+encryption is applied per shard. `fec_mode = "auto"` adjusts parity from the
+client's FEC status feedback. `gso_socket.rs` sends with UDP GSO and a
+per-datagram fallback; raw `WouldBlock` retries must go through Tokio readiness. PyroWave frames are paced across a
+bitrate-derived window anchored to capture time (`pacing_timer.rs`) and rebase
+after backpressure rather than bursting.
 
-Native/GPU failures must preserve cleanup and stop unsafe reuse; retrying a lost
-Vulkan device indefinitely cannot restore that device. Both encoder backends
-report frame failures through `pipeline/failure.rs`: the failed stage, a
-recovery (`DropFrame`, `RequestIdr` when the encoder may have referenced a frame
-the client never receives, or `Terminal`) and whether the source's GPU reads are
-not submitted, completed or unknown. Only the first two release the source for
-reuse; a conventional conversion failure first waits for the device to idle to
-establish completion. Device/API loss is terminal; a recoverable failure that
-repeats for 300 frames and 5 s without a success is escalated. A terminal
-failure ends the pipeline, which stops the session. Diagnostics report the first
-failure and at most one summary per 5 s. A successful compile,
-loader probe or loopback benchmark does not prove presentation, client decode,
-Steam behavior or physical-link performance.
+**Failures.** Both encoder backends report frame failures through
+`pipeline/failure.rs` with the failed stage, a recovery (`DropFrame`,
+`RequestIdr` or `Terminal`) and whether the source's GPU reads are not
+submitted, completed or unknown. Only the first two release the source for
+reuse. Device or API loss is terminal; a recoverable failure that repeats for
+300 frames and 5 s without success is escalated. A terminal failure ends the
+pipeline, which stops the session.
+
+**Diagnostics.** With `[stream.video] log_stats`, the pipeline emits five-second
+capture, cadence, pipeline, transport, import and process summaries
+(`stream/video/diagnostics.rs`). See
+[Streaming diagnostics](LONG_SESSION_PERFORMANCE.md).
+
+## Audio path
+
+```text
+application ─PulseAudio protocol─▶ pulse-server thread ─PCM─▶ audio-encode thread ─▶ audio packet task ─UDP─▶ client
+                                   (sink, resampling)        Opus → RS FEC → AES-CBC
+```
+
+`stream/audio/pulse_server/` is an embedded PulseAudio-compatible server whose
+socket is passed to the application as `PULSE_SERVER`. It mixes and converts
+application streams into the negotiated layout (stereo, 5.1 or 7.1). The
+encoder produces Opus packets of the negotiated duration (5 or 10 ms), adds
+GameStream audio FEC and optional AES-CBC encryption, and the packet task sends
+them over UDP. Opus bitrate is bounded by Moonlight's 1400-byte audio packet
+limit. Reconnects follow the epoch barrier described under negotiation.
+
+## Control and input path
+
+`stream/control/` runs the GameStream control protocol over ENet (UDP). After
+peer authorization it decrypts AES-GCM control messages and dispatches:
+
+| Message class | Destination |
+| --- | --- |
+| Keyboard, text, mouse, scroll, touch, pen | Compositor input channel, injected into the Smithay seat with the compositor's focus |
+| Controller arrival, state, touchpad, motion, battery | `control/input/gamepad.rs` → Inputtino virtual devices on the `gamepad-input` thread |
+| `StartB`, IDR requests, reference-frame invalidation, FEC status | Stream start latches and the video stream handle |
+| Ping | Active-peer liveness (`[stream].timeout`) |
+
+Feedback flows back over the same channel: rumble, trigger effects, LED and
+motion-enable requests from virtual controllers, and HDR mode and metadata from
+the video stream.
+
+Virtual controller family follows `[stream.control.gamepad] emulation`:
+Xbox, PlayStation (including the DualSense Edge subtype) or Nintendo. Steam
+Input routing on the host is separate from virtual-device delivery. See
+[Compositor](COMPOSITOR.md#steam-classification-and-input) and
+[DualSense Edge](DUALSENSE_EDGE.md).
+
+## Configuration and persistent state
+
+| Data | Location | Owner |
+| --- | --- | --- |
+| Server configuration | `config.toml` (`$XDG_CONFIG_HOME/moonshine/` by default), read once at startup | `config.rs` and the owning subsystem's config type |
+| TLS identity | `cert.pem`, `key.pem` (default `~/.config/moonshine/`) | `tls.rs` |
+| Server UUID and paired-client trust | `state.toml` in the data directory (default `~/.local/share/moonshine/`) | `state.rs`, `clients.rs`; atomic replacement through `durable.rs` |
+| Negotiated stream properties | RTSP ANNOUNCE, per stream epoch | `rtsp.rs`, session manager |
+| Diagnostic switches | `MOONSHINE_*` environment variables | Individual subsystems |
+
+Configuration is not reloaded at runtime. Each subsystem receives its own typed
+config section when the session manager or server is constructed. Client-chosen
+properties (resolution, FPS, bitrate, codec, chroma, HDR, audio layout) are
+negotiated per session, not configured. The application receives
+`MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and
+`MOONSHINE_CLIENT_FRAMERATE`. See [Configuration](CONFIGURATION.md) and
+[Security administration](SECURITY_ADMINISTRATION.md).
+
+Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
+(`ingress.rs`) that hold a global shutdown delay token and apply TLS-handshake,
+request-header and RTSP-framing deadlines. Pairing trust changes are serialized,
+written atomically and synced before they take effect; revocation drains
+in-flight launch/resume/cancel requests and stops the active session.
+
+## Architectural invariants
+
+Changes must preserve these properties unless a task explicitly redesigns them:
+
+- One session at a time, with one teardown owner and a bounded teardown
+  deadline. Absence of state never means idle.
+- Pending stream contexts are never the active configuration before PLAY; epoch
+  barriers keep old frames, packets, keys and input out of a new stream.
+- Negotiation either produces the requested format or fails; no silent codec,
+  chroma, depth, range or software fallback.
+- Capture admission, GPU buffer consumption and descriptor ownership are
+  independent signals; never merge them.
+- Capture and encode use the same verified GPU; no cross-device path.
+- FEC covers plaintext shards; encryption follows per shard.
+- Hot paths (capture, conversion, encoding, packetization, pacing, input) avoid
+  extra copies, blocking I/O, unbounded queues and per-frame logging. Existing
+  GPU completion waits are ownership requirements.
+- Native boundaries (Vulkan, DMA-BUF descriptors, PyroWave, Inputtino) keep
+  narrow `unsafe` scopes, explicit ownership and child-before-parent cleanup.
 
 ## Where to go next
 
-- [Compositor](COMPOSITOR.md): scene eligibility, cursor intent, Steam focus/input.
-- [Capture pipeline](PIPELINE_OPTIMIZATION.md): admission, completion and bounded work.
-- [PyroWave](PYROWAVE.md): dependency maintenance, wire formats, color, FEC and GPU matrix.
-- [Vulkan WSI](VULKAN_IMAGE_COUNTS.md): dispatch/extension gates and image-count negotiation.
-- [DualSense Edge](DUALSENSE_EDGE.md): native report mapping and hardware acceptance.
-- [Benchmarking](BENCHMARKING.md), [diagnostics](LONG_SESSION_PERFORMANCE.md) and
-  [reconnect validation](reconnect-validation.md): measurement and acceptance.
+| Topic | Guide |
+| --- | --- |
+| Scene eligibility, cursor, late composition, Steam focus and input | [Compositor](COMPOSITOR.md) |
+| Capture admission, encoder queues and transport accounting | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
+| PyroWave dependency, negotiation, color, FEC, pacing and GPU matrix | [PyroWave](PYROWAVE.md) |
+| PyroWave dialects and authenticated bandwidth calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
+| WSI extension gates, image counts and bypass safety | [Vulkan WSI](VULKAN_IMAGE_COUNTS.md) |
+| Native controller identity and report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
+| Measurements, diagnostics and reconnect acceptance | [Benchmarking](BENCHMARKING.md), [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md), [Reconnect validation](reconnect-validation.md) |
 
-Current guides describe implementation contracts. [Historical reports](reports/README.md)
-preserve dated evidence and rejected experiments; they are not current validation
-claims. Keep guides synchronized when those contracts change, and record new
-measurements with revision, hardware, workload and unperformed checks.
+A successful build, loader probe or loopback benchmark does not prove
+presentation, client decode, Steam behavior or physical-link performance.
+Record tested hardware, clients and unperformed checks with new validation.

@@ -216,7 +216,7 @@ format, offsets, and strides. File descriptors are duplicated because the C API
 takes ownership. The compositor buffer is released only after PyroWave's
 packetization call has waited for the GPU encode.
 
-Failures keep the same rule ([encoder failure contract](ARCHITECTURE.md#transport-and-failure-boundaries)).
+Failures keep the same rule ([encoder failure contract](ARCHITECTURE.md#video-path)).
 With the pinned C source, `encode_scaled` discards its command buffer without
 submitting on error, and `compute_num_packets`/`packetize` wait on the queued
 fence before any other failure, so every failed frame can release its source.

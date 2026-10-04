@@ -15,6 +15,8 @@ Old clients retain their previous behavior. Old hosts ignore the new capability
 and receive the same PS family and normal controller input. Packet types, lengths,
 and button-field encoding are unchanged. The extension adds one capability
 constant to moonlight-common-c; it does not add packets or a HID tunnel.
+The client side lives in [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave)
+and its moonlight-common-c submodule.
 
 ## Mapping
 
@@ -38,7 +40,7 @@ Client-side SDL/HIDAPI must expose the four normalized paddle slots. Custom
 controller mappings or disabling HIDAPI can omit them; the client warns when a
 slot is unavailable. Verify the actual SDL version and USB/Bluetooth report
 handling in the client build. Host tests cannot establish Windows/macOS client
-support. Historical dependency versions are in the [recorded report](reports/DUALSENSE_EDGE.md#client-dependency-snapshot).
+support.
 
 Pyroshine retains the pinned upstream Rust Inputtino API and patches only its
 native `inputtino-sys` backend. See [local patch maintenance](../vendor/inputtino/LOCAL_CHANGES.md)
@@ -149,8 +151,3 @@ Automated tests/builds cannot establish physical USB/Bluetooth delivery, Steam's
 identification, feedback or reconnect behavior. Perform the acceptance checks on
 a host with uinput/UHID/hidraw access and Steam. Build Nix packaging separately
 in a Nix environment. Record revisions, platforms and checks not performed.
-
-## Recorded validation
-
-Dated results are preserved in the [historical report](reports/DUALSENSE_EDGE.md).
-They are evidence for those revisions, not a substitute for current acceptance.

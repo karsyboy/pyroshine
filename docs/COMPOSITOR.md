@@ -14,9 +14,17 @@ is separately generation-tagged; see [capture admission](PIPELINE_OPTIMIZATION.m
 Service buffer releases and input even when capture is blocked or the scene is
 clean. [Architecture](ARCHITECTURE.md) explains session and stream ownership.
 
+The implementation is under `moonshine-core/src/session/`: event loop, state
+and protocol handlers in `compositor/{mod,state,handlers}.rs`, capture and
+eligibility in `compositor/{capture,admission,frame}.rs`, cursor in
+`compositor/cursor.rs`, focus and Steam classification in
+`compositor/{focus,x11_focus}.rs`, input injection in `compositor/input.rs`,
+swapchain and color protocols in `compositor/{gamescope_swapchain,color_management}.rs`,
+and controller emulation in `stream/control/input/{gamepad,mod}.rs`.
+
 ## Configuration
 
-Both additions are optional and preserve automatic defaults:
+Both settings are optional and default to automatic behavior (see the [configuration reference](CONFIGURATION.md)):
 
 ```toml
 [compositor]
@@ -116,15 +124,15 @@ and `late_layer_frames` in `Video conversion summary` count them.
 A surface commit whose new DMA-BUF still has pending GPU writes is applied
 only when those implicit fences signal (a Smithay pre-commit blocker), so the
 compositor latches the newest completed frame and delivers that commit's frame
-callbacks afterwards. Without it, captures picked up buffers still queued
-behind a GPU-bound game and every consumer (GLES composition or encoder
-import) waited on them. `MOONSHINE_DISABLE_READY_LATCH=1` restores immediate
-latching for diagnosis.
+callbacks afterwards. Latching earlier would hand captures buffers still
+queued behind a GPU-bound game, making every consumer (GLES composition or
+encoder import) wait on them. `MOONSHINE_DISABLE_READY_LATCH=1` restores
+immediate latching for diagnosis.
 
 ### WSI and transparency
 
 Both swapchain protocols convey Vulkan composite-alpha intent. The
-compositor now honors `VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR` for the declared root
+compositor honors `VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR` for the declared root
 image in direct eligibility and GLES blending, including alpha-capable HDR
 buffers. Child surfaces retain their own transparency. See the
 [Vulkan definition](https://github.khronos.org/Vulkan-Site/spec/latest/chapters/VK_KHR_surface/wsi.html).
@@ -140,12 +148,6 @@ surface itself may remain alive. A newer override on that surface survives old
 swapchain destruction. Capture eligibility, focus classification, and GPU export
 rules remain independent of this presentation decision. See
 [presentation topology and fullscreen diagnosis](VULKAN_IMAGE_COUNTS.md#presentation-topology-and-fallback).
-
-Controller Guide shortcuts are described in
-[configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
-Guide or the explicit Back+Start policy so games receive real Select holds.
-Activation rumble deadlines preserve every held button; disconnect drops all
-per-controller shortcut state.
 
 ### Steam classification and input
 
@@ -164,6 +166,12 @@ keyboard on the game; closing the overlay restores the game target and unified
 focused-app contract. These match the inspected
 [gamescope focus logic](https://github.com/ValveSoftware/gamescope/blob/master/src/steamcompmgr.cpp).
 
+Controller Guide shortcuts are described in
+[configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
+Guide or the explicit Back+Start policy so games receive real Select holds.
+Activation rumble deadlines preserve every held button; disconnect drops all
+per-controller shortcut state.
+
 DEBUG logs report classification, cursor, virtual-device creation, and capture
 path transitions (`direct`, `direct_override`, `composited`); rendering itself
 does not emit per-frame INFO messages.
@@ -181,33 +189,36 @@ the scene. See [PyroWave ownership](PYROWAVE.md#gpu-path-and-ownership) and
 
 ## Validation and runtime checks
 
+### Automated tests
+
 Unit tests cover cursor activation/idle/hide, real Wayland resource replacement
 and destruction, scene extras and automatic restoration, capture configuration,
 cropping/scaling/rotation, Steam classification transitions, notification focus
 and dropdown exclusion, unchanged focus-contract suppression, and controller
 kind/policy parsing. They do not prove Steam or game behavior on hardware.
 
-On a GPU host, use DEBUG logging to inspect a fullscreen workload.
-Confirm `direct` or `direct_override` with an explicitly
-hidden cursor and no extra content. Check GPU utilization and frame latency.
-Expose the cursor, leave the mouse idle for more than three seconds, and navigate
-Grim Dawn using only a controller. Confirm visible cursor composition persists,
-then explicit application hide immediately restores direct eligibility.
+### Hardware acceptance
 
-Hold controller input while a notification appears, updates, and disappears.
-Confirm the notification is captured and game input remains uninterrupted, with
-no focus-contract rewrites. Open/close Steam overlay and small interactive menus;
-confirm visibility, intended pointer/controller routing, mode-2 keyboard split,
-and immediate restoration. Repeat with Steam Input enabled and disabled to
-separate Steam routing from virtual-device delivery. Test arrival, duplicate
-arrival, update before arrival, active-mask removal, and reconnect at indices
-0 and 15, plus native PS motion/touch/rumble and forced policies.
+These checks need a GPU host with `/dev/dri`, a client and Steam. Run the server
+with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug`).
 
-Repeat with H.264, HEVC, AV1, PyroWave, HDR, YUV 4:4:4, output scaling, and a static
-screen. Confirm HDR render format/color metadata remain intact and no CPU capture,
-extra frame queue, or GPU-to-CPU transfer appears. These checks require a GPU
-host with `/dev/dri`; unit tests alone cannot validate the runtime paths.
-
-The implementation is in `compositor/{capture,cursor,focus,handlers,input,mod,
-state,x11_focus,gamescope_swapchain}.rs` and
-`stream/control/input/{gamepad,mod}.rs`, under `moonshine-core/src/session/`.
+1. **Direct export.** Run a fullscreen workload with an explicitly hidden cursor
+   and no extra content. Confirm the capture path is `direct` or
+   `direct_override`, and check GPU utilization and frame latency.
+2. **Cursor.** Expose the cursor, leave the mouse idle for more than three
+   seconds, and navigate a game (for example Grim Dawn) using only a controller.
+   Visible cursor composition must persist; an explicit application hide must
+   immediately restore direct eligibility.
+3. **Notifications.** Hold controller input while a Steam notification appears,
+   updates and disappears. The notification must be captured, game input must
+   continue uninterrupted, and no focus-contract rewrites may occur.
+4. **Overlay and menus.** Open and close the Steam overlay and small interactive
+   menus. Confirm visibility, pointer/controller routing, the mode-2 keyboard
+   split and immediate restoration. Repeat with Steam Input enabled and
+   disabled to separate Steam routing from virtual-device delivery.
+5. **Controllers.** Test arrival, duplicate arrival, update before arrival,
+   active-mask removal and reconnect at indices 0 and 15, plus native
+   PlayStation motion/touch/rumble and forced emulation policies.
+6. **Formats.** Repeat with H.264, HEVC, AV1, PyroWave, HDR, YUV 4:4:4, output
+   scaling and a static screen. HDR render format and color metadata must stay
+   intact, with no CPU capture, extra frame queue or GPU-to-CPU transfer.

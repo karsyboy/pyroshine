@@ -1,9 +1,7 @@
 # Capture and encode pipeline
 
 This guide describes current admission, ownership and performance constraints.
-For the system context see [ARCHITECTURE.md](ARCHITECTURE.md). The dated
-[optimization report](reports/PIPELINE_OPTIMIZATION.md) preserves measurements,
-tradeoffs and a rejected shader experiment.
+For the system context see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Capture admission and presentation
 
@@ -67,12 +65,13 @@ record the first blocking condition with fixed counters, avoiding per-frame stri
 Composition submits GLES, waits for its SyncPoint, then exports the image to the
 Vulkan consumer. PyroWave packet pacing starts before compositor preparation and
 rendering; the GLES fence wait and encoding consume the same frame budget rather
-than extending it. Completion-based pipeline latency remains measured separately. Failed rendering/completion stops capture rather than publishing
-or recycling a buffer with uncertain GPU ownership.
+than extending it. Completion-based pipeline latency is measured separately.
+Failed rendering/completion stops capture rather than publishing or recycling a
+buffer with uncertain GPU ownership.
 
-A visible cursor or Steam notification no longer forces composition: see
-[late cursor composition](COMPOSITOR.md#late-composition-cursor-and-steam-notifications). Commits are
-latched only once their DMA-BUF finished rendering
+A visible cursor or Steam notification does not by itself force composition;
+see [late composition](COMPOSITOR.md#late-composition-cursor-and-steam-notifications).
+Commits are latched only once their DMA-BUF finished rendering
 ([buffer readiness](COMPOSITOR.md#buffer-readiness)), so direct export never
 hands the encoder a frame still queued behind a game's GPU work.
 
@@ -89,9 +88,9 @@ then one buffer-to-image copy fills the encoder input slot. Its arithmetic
 mirrors Pixelforge's shader; the GPU fixture
 `packed_converter_matches_pixelforge_on_gpu` compares both converters' output
 for every format, color mode and range. It submits to the dedicated compute
-family by default (`conversion_queue`): with a GPU-bound game on an RX 9070
-XT, three interleaved runs each measured 0.90% game FPS loss on compute versus
-1.28% on graphics (1% lows 2.28% versus 3.10%). Pixelforge shares the input image
+family by default (`conversion_queue`), which measured lower game-FPS impact
+than the graphics queue alongside a GPU-bound game; `graphics` remains available
+for A/B comparison. Pixelforge shares the input image
 concurrently with that family. The conversion still ends with a CPU fence wait
 before `Encoder::encode`, whose API takes no wait semaphore, and releases the
 source only after that wait. Pixelforge's converter is the fallback for widths
@@ -130,14 +129,11 @@ AsyncFd for precise packet deadlines. A mutable send borrow enforces one wait
 per timer; cancellation and rearming cannot leak a prior frame's expiry. There
 is no spin loop or pacing thread. Timer initialization/wait failure falls back
 to Tokio's ordinary timer without failing startup. Unpaced conventional sends
-do not allocate or use this timer. GSO and per-datagram fallback share the same readiness retry and observed
-WouldBlock counters. An observed readiness wait or a chunk overrun moves the remaining pacing schedule forward;
-no overdue later chunks are released together. The maximum within-chunk burst
-remains the existing payload-capped GSO cadence (also used without GSO). FEC and
-rate-control budgets remain unchanged.
-
-See the [pacing follow-up](reports/PACING_CADENCE.md) for the correction to the
-initial composited 4K120 result.
+do not allocate or use this timer. GSO and per-datagram fallback share the same
+readiness retry and observed `WouldBlock` counters. An observed readiness wait
+or a chunk overrun moves the remaining pacing schedule forward; no overdue later
+chunks are released together. The maximum within-chunk burst is the
+payload-capped GSO cadence (also used without GSO).
 
 Both importers retain DMA-BUF open-file identity and full layout validation.
 A recycled numeric fd or reused compositor index is insufficient identity.
@@ -150,27 +146,6 @@ measurement. Optional selection failure retains a graphics fallback. The logged
 value is a preference, not proof of the native library's final queue choice.
 Normal queue priority and external-memory synchronization remain in place.
 Measure real-game contention before drawing conclusions from cube benchmarks.
-
-## Measurement and changes needing more proof
-
-[Benchmarking](BENCHMARKING.md) defines latency/GPU/throughput denominators;
-[runtime diagnostics](LONG_SESSION_PERFORMANCE.md) explains stall signatures.
-Server pipeline latency excludes game rendering, compositor CPU fence waits,
-client decode and display. GPU utilization alone does not measure codec cost.
-
-Deferred work needs specific evidence before implementation:
-
-| Candidate | Required evidence/contract |
-| --- | --- |
-| Explicit EGL-to-Vulkan fence transport | Driver support, fd ownership on import failure, semaphore/buffer lifetime, reconfiguration and both encoder paths |
-| Direct scaling | Matching crop, origin, borders, sampling and color output |
-| RGB conversion/DWT fusion | Equivalent rounding/dithering/HDR output and lower GPU cost across representative devices; the recorded candidate failed quality/performance checks |
-| Import-cache aliasing | Measured duplicate-fd churn plus preserved identity/layout checks |
-| Capture/send overlap | Tightly bounded work without stale scenes, extra admission credits or epoch leakage |
-
-Use [GPU validation](PYROWAVE.md#validation-matrix), compositor/Steam acceptance
-and [reconnect checks](reconnect-validation.md) after pipeline changes. Loopback
-runs cannot establish physical network capacity or end-to-end client behavior.
 
 ## Transport ownership and outcomes
 
@@ -190,8 +165,29 @@ Completion notifications never block resource release. Per-datagram failures
 are aggregated into batch counters and warnings are limited to once per second.
 
 Benchmark `FrameStats.enqueue` covers queue handoff/residence and `send` covers
-socket work; `total` now ends at transport completion for conventional codecs too.
+socket work; `total` ends at transport completion for every codec.
 `wire_bytes` is successfully submitted UDP payload (including FEC and encryption),
 not IP/link traffic or client delivery. The sender summary additionally estimates
 Ethernet load with IPv6/UDP and framing overhead. Pipeline enqueue summaries
 measure earlier handoff separately and do not report transmission throughput.
+
+## Measurement and changes needing more proof
+
+[Benchmarking](BENCHMARKING.md) defines latency/GPU/throughput denominators;
+[runtime diagnostics](LONG_SESSION_PERFORMANCE.md) explains stall signatures.
+Server pipeline latency excludes game rendering, compositor CPU fence waits,
+client decode and display. GPU utilization alone does not measure codec cost.
+
+Deferred work needs specific evidence before implementation:
+
+| Candidate | Required evidence/contract |
+| --- | --- |
+| Explicit EGL-to-Vulkan fence transport | Driver support, fd ownership on import failure, semaphore/buffer lifetime, reconfiguration and both encoder paths |
+| Direct scaling | Matching crop, origin, borders, sampling and color output |
+| RGB conversion/DWT fusion | Equivalent rounding/dithering/HDR output and lower GPU cost across representative devices; a previously measured candidate failed quality/performance checks |
+| Import-cache aliasing | Measured duplicate-fd churn plus preserved identity/layout checks |
+| Capture/send overlap | Tightly bounded work without stale scenes, extra admission credits or epoch leakage |
+
+Use [GPU validation](PYROWAVE.md#validation-matrix), compositor/Steam acceptance
+and [reconnect checks](reconnect-validation.md) after pipeline changes. Loopback
+runs cannot establish physical network capacity or end-to-end client behavior.

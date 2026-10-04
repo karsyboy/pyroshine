@@ -149,6 +149,3 @@ For a full stop, run several launch → stream → quit cycles and confirm
 `pgrep -P "$(pgrep -x pyroshine)" -x Xwayland` returns nothing and no new
 `/tmp/.X*-lock` remains after each `Session stopped; ready for a new session.`;
 a resume keeps the same XWayland PID and display.
-
-Automated coverage and remaining hardware checks for Batch 4 are recorded in
-[the remediation report](reports/RECONNECT_AUDIO_INPUT_2026-10-02.md).

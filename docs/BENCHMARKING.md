@@ -142,8 +142,8 @@ traffic are additional. Do not treat the UDP payload as physical wire bitrate.
 The benchmark's latency starts at direct export or composition completion;
 it does not include game rendering, client decode/display, or the compositor
 CPU fence wait. Measure those separately when evaluating end-to-end latency.
-See [the historical optimization report](reports/PIPELINE_OPTIMIZATION.md) for measured results,
-validation gaps, and changes deliberately deferred.
+Changes deliberately deferred pending evidence are listed in the
+[capture pipeline guide](PIPELINE_OPTIMIZATION.md#measurement-and-changes-needing-more-proof).
 
 ### Lifecycle cycles
 
@@ -186,13 +186,11 @@ activity. See its README for calibration and interpretation limits; repeat
 runs interleaved because a GPU's sustained clocks drift by about half a percent
 over a long session.
 
-## Packetizer and transport remediation evidence
+## Transport measurement scripts
 
-See [the 2026-10-02 transport report](reports/TRANSPORT_REMEDIATION_2026-10-02.md)
-for fixed-content CPU measurements, raw GPU/loopback runs, fault tests and remaining
-physical-LAN/client acceptance work. `scripts/transport_measurements.py` prepares
-an original-revision measurement harness and compares whole-batch fingerprints
-as well as per-trial allocations and timing. Run measurements without concurrent
+`scripts/transport_measurements.py` prepares a baseline-revision measurement
+harness for the packetizer and compares whole-batch fingerprints as well as
+per-trial allocations and timing. Run measurements without concurrent
 compilation, keep the governor and diagnostics unchanged, and retain outliers.
 The pipeline benchmark keeps a live UDP drain but does not decode video.
 

@@ -76,7 +76,7 @@ use its fingerprint. An unknown/already revoked target reports failure.
 A paired client can also send **GET /unpair over HTTPS** for self-revocation.
 The TLS certificate selects the credential: caller-supplied IDs/fingerprints
 cannot revoke another client. Unauthenticated remote HTTP deletion is rejected,
-and HTTP GET no longer reports fictitious success. Older clients that issue an
+and plain-HTTP GET `/unpair` returns 404. Older clients that issue an
 unauthenticated GET during pairing cleanup must retry pairing normally.
 
 Revocation clears pending approvals, drains in-flight launch/resume/cancel

@@ -1,9 +1,7 @@
 # Long-session streaming diagnostics
 
 Use this guide to distinguish capture, encoder, transport and runtime stalls.
-The [historical investigation](reports/LONG_SESSION_PERFORMANCE.md) preserves
-September 2026 fixes, version correlations and hardware smoke-test results.
-Current capture admission is described in [the pipeline guide](PIPELINE_OPTIMIZATION.md).
+Capture admission is described in [the pipeline guide](PIPELINE_OPTIMIZATION.md).
 
 ## Collect comparable evidence
 
