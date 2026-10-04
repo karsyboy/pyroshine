@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-11] - 2026-10-03
+
 ### Changed
 
 - Convert H.264/HEVC/AV1 input with a Pyroshine-owned compute shader instead of Pixelforge's converter. It produces the same encoder input (bit-identical in GPU fixture comparisons for NV12, P010 and 10-bit 4:4:4 from 8-bit, 10-bit and FP16 sources in every color mode), but writes whole words instead of per-byte global atomics and needs no buffer clear: 4K NV12 conversion measured 73 µs of GPU time against about 200 µs per synchronous Pixelforge conversion on an RX 9070 XT. It runs on the dedicated compute queue by default (`[stream.video] conversion_queue`). Pixelforge's converter remains the fallback for widths that are not a multiple of four or odd heights.
