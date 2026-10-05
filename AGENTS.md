@@ -59,6 +59,8 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `session/stream/video/` | Negotiated formats, stream epochs, packetization, FEC, GSO/pacing, diagnostics |
 | `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), Pixelforge encoding, HDR metadata, failure classification |
 | `session/stream/video/pyrowave.rs`, `pyrowave_protocol.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership; dialect/profile negotiation |
+| `session/status.rs` | Public session phase from manager status and control-stream peer ownership |
+| `management/` | Session-bus management interface for the desktop app: status, pairing, clients, config store (`config_store.rs`), editor schema (`schema.rs`), telemetry aggregation |
 
 Other workspace and integration areas:
 
@@ -66,6 +68,11 @@ Other workspace and integration areas:
   swapchain behavior and routing presentation to the compositor over Wayland.
   Its `protocols/` XML must agree with `session/compositor/protocols/`.
 - `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark.
+- `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
+  error names, proxies) shared by the daemon and the desktop app.
+- `pyroshine-ui/`: optional desktop app (Tauri 2, React/Material UI, `ksni` tray) in a
+  separate Cargo workspace and npm project, packaged by `nfpm-ui.yaml`. It is a client of
+  the management interface only; server crates must never depend on it.
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
   (`build-shaders.sh`), changelog tooling/tests, measurement harnesses.
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
@@ -88,6 +95,7 @@ Other workspace and integration areas:
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |
+| Management interface, desktop app | `docs/ARCHITECTURE.md` (Desktop management interface), `docs/DESKTOP.md`, `pyroshine-ui/README.md` |
 | Packaging, service or host integration | `docs/INSTALLATION.md`, `CONTRIBUTING.md`; `docs/NIXOS.md` for Nix |
 | Release notes and inherited history | `docs/CHANGELOG.md`; `docs/UPSTREAM_CHANGELOG.md` is the upstream archive |
 
@@ -130,7 +138,10 @@ Other workspace and integration areas:
   never substitute another PyroWave source or ABI. Check that the client's
   pinned decoder still accepts the bitstream family before changing pins.
 - Configuration additions/removals/renames/default or behavior changes must update
-  owning Rust structures/defaults, examples and `docs/CONFIGURATION.md` together.
+  owning Rust structures/defaults, examples and `docs/CONFIGURATION.md` together,
+  plus the editor schema in `management/schema.rs` (its tests fail otherwise) and
+  the UI fixture (`MOONSHINE_UPDATE_UI_FIXTURES=1 cargo test -p moonshine-core
+  ui_schema_fixture_is_current`).
   Update healthcheck/capability behavior where affected. Keep user-facing settings
   documented; code-only options must be intentionally internal/diagnostic.
 
@@ -157,6 +168,9 @@ Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs the
 invocation in `CONTRIBUTING.md` or CI. Hardware-dependent tests are ignored by
 default so a run without hardware reports them as not executed, never as passed.
 
+- Desktop app changes run the `pyroshine-ui` checks listed in `CONTRIBUTING.md`
+  (npm typecheck/test/build, and fmt/clippy/test with `--manifest-path
+  pyroshine-ui/src-tauri/Cargo.toml`). Management-interface tests need `dbus-daemon`.
 - Documentation-only work needs Markdown, relative-link and path checks and
   `git diff --check`, not a full native build. Select other checks according to
   the affected behavior.

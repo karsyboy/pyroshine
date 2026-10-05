@@ -19,12 +19,13 @@ build dependencies. On Debian/Ubuntu, the CI dependency set is:
 ```sh
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  build-essential clang cmake libc++-dev libc++abi-dev libclang-dev \
+  build-essential clang cmake dbus libc++-dev libc++abi-dev libclang-dev \
   libdrm-dev libevdev-dev libgbm-dev libopus-dev libwayland-dev \
   libxkbcommon-dev patchelf pkg-config
 ```
 
-Other distributions need the corresponding development packages. At runtime,
+`dbus` provides the `dbus-daemon` the management-interface tests start on a
+private bus. Other distributions need the corresponding development packages. At runtime,
 the host also needs systemd with a user D-Bus session, Xwayland, and working
 Vulkan/GPU drivers. Nix users can use `nix develop` for the build environment;
 see the [NixOS guide](docs/NIXOS.md).
@@ -55,6 +56,10 @@ For a local server healthcheck, explicitly select the built PyroWave library:
 MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.0 \
   ./target/release/moonshine healthcheck
 ```
+
+The optional desktop app is a separate workspace under `pyroshine-ui/` with its
+own Node.js and WebKitGTK prerequisites; see [pyroshine-ui/README.md](pyroshine-ui/README.md).
+Building the server never compiles it.
 
 A successful compile alone does not install the WSI manifest or device rules.
 Use the installation steps below before validating streaming. When the optional
@@ -150,6 +155,16 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 ```
 
+The desktop app has its own checks (CI runs them in the `Desktop app` job):
+
+```sh
+cd pyroshine-ui
+npm ci && npm run typecheck && npm test && npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+```
+
 Hardware-dependent tests are `#[ignore]`d, so an ordinary run reports them as
 ignored rather than passed. Select them explicitly; a selected check fails if
 its opt-in is missing. To verify the pinned PyroWave C API with the library you
@@ -238,6 +253,7 @@ It can also be run with `workflow_dispatch` for an existing tag. Check that the
 workflow succeeded and all assets are attached, then test installation and an
 upgrade from the previous release.
 
-Packaging is defined in [nfpm.yaml](nfpm.yaml) and [dist/](dist/). Keep the
+Packaging is defined in [nfpm.yaml](nfpm.yaml), [nfpm-ui.yaml](nfpm-ui.yaml)
+(the separate desktop app package) and [dist/](dist/). Keep the
 portable and native package integration files consistent when changing service,
 udev, Vulkan, or policy paths.

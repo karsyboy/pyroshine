@@ -58,13 +58,18 @@ title = "My game"
 command = ["/absolute/path/to/game"]
 ```
 
-Restart the service after editing, add the host in Moonlight, and enter the
-client's pairing PIN at `http://localhost:47989/pin` on the host (the page only
-accepts requests from the host itself; see [headless pairing](docs/CONFIGURATION.md#webserver)):
+Restart the service after editing:
 
 ```sh
 sudo systemctl restart "pyroshine@$USER"
 ```
+
+Add the host in Moonlight and enter the PIN it shows on the host. On a desktop,
+the optional `pyroshine-ui` package adds a system tray, pairing notifications,
+client management and a settings editor; see the [desktop app guide](docs/DESKTOP.md).
+Without it, use the host-local page linked in the service log
+(`http://localhost:47989/pin?uniqueid=…`); it only accepts requests from the host
+itself (see [headless pairing](docs/CONFIGURATION.md#webserver)).
 
 Use a trusted LAN or VPN and restrict the GameStream ports with a firewall.
 Do not expose Pyroshine directly to the public internet.
@@ -72,6 +77,7 @@ Do not expose Pyroshine directly to the public internet.
 ## Documentation
 
 - [Installation, upgrades, and headless setup](docs/INSTALLATION.md)
+- [Desktop app: tray, pairing, and settings](docs/DESKTOP.md)
 - [Complete config.toml reference](docs/CONFIGURATION.md)
 - [Tips and troubleshooting](docs/TIPS.md)
 - [Pairing, revocation, and state recovery](docs/SECURITY_ADMINISTRATION.md)

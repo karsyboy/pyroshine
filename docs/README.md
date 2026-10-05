@@ -7,6 +7,7 @@ Start with the [project README](../README.md) for requirements and a quick start
 User guides are task-oriented and avoid implementation detail.
 
 - [Installation and upgrades](INSTALLATION.md): native packages, portable builds, headless setup, and service diagnostics.
+- [Desktop app](DESKTOP.md): optional system tray, pairing notifications, client management, settings editor, and stream dashboard.
 - [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults, and examples.
 - [Tips and troubleshooting](TIPS.md): Steam, Flatpak, Gamescope, desktop sessions, and application logs.
 - [Security administration](SECURITY_ADMINISTRATION.md): pairing approval, durable state recovery, TLS identity permissions and revocation.
@@ -23,6 +24,7 @@ the guide for the area being changed:
 | Area | Guide |
 | --- | --- |
 | Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
+| Management interface and desktop app | [Architecture](ARCHITECTURE.md#desktop-management-interface), [pyroshine-ui](../pyroshine-ui/README.md) |
 | Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |

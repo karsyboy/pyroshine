@@ -78,3 +78,45 @@ jobs:
 
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}
+
+  desktop:
+    name: Desktop app
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pyroshine-ui
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: pyroshine-ui/package-lock.json
+
+      - name: Frontend
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Rustfmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml

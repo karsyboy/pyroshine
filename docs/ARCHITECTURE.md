@@ -17,6 +17,8 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 | `moonshine-core` | Library | Every server subsystem: protocol endpoints, pairing, sessions, compositor, encoders, transport, input |
 | `moonshine-wsi` | `libmoonshine_wsi.so` | Implicit Vulkan layer loaded into streamed applications |
 | `moonshine-tools` | `moonshine-bench` | Developer benchmark that drives the production session stack without a client |
+| `moonshine-management` | Library | Local management API contract: D-Bus names, JSON documents, error names and client proxies |
+| `pyroshine-ui/` (separate workspace) | `pyroshine-ui` | Optional desktop app: tray, notifications, pairing, settings and dashboard |
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
 (Vulkan Video encoding), the optional PyroWave shared library (loaded at
@@ -82,6 +84,8 @@ flowchart LR
 | `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
 | `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
 | `moonshine-wsi` | Intercept Vulkan surfaces and swapchains in applications; route presentation and swapchain metadata to the compositor | Capture, encoding |
+| `management/` | Session-bus management interface: status, pairing, clients, configuration store, telemetry aggregation | Session, pairing or trust decisions (it calls the owners) |
+| `session/status.rs` | Public session phase from manager status and control-stream ownership | Lifecycle transitions |
 
 Boundaries to preserve:
 
@@ -136,8 +140,10 @@ a library or extension name:
   PyroWave library leaves the conventional codecs available.
 
 The server then constructs, in order, TLS identity, `SessionManager`,
-`ClientManager`, the RTSP server, the webserver and mDNS discovery, and waits
-for a shutdown signal.
+`ClientManager`, the management service, the RTSP server, the webserver and
+mDNS discovery, and waits for a shutdown signal. The management service is
+optional: failing to connect to the session bus or to own its name is logged
+and the server runs unchanged.
 
 ## Client lifecycle
 
@@ -164,9 +170,9 @@ sequenceDiagram
 ```
 
 1. **Discovery and pairing.** Clients find the host through mDNS or manually.
-   Pairing is approved by the host operator on the loopback-only `/pin` page;
-   trust is persisted in `state.toml` before it is published. See
-   [Security administration](SECURITY_ADMINISTRATION.md).
+   Pairing is approved by the host operator in the desktop app or on the
+   loopback-only `/pin` page; trust is persisted in `state.toml` before it is
+   published. See [Security administration](SECURITY_ADMINISTRATION.md).
 2. **Launch.** An authenticated HTTPS `/launch` validates the request, creates an
    authorization generation and session keys, then initializes and launches the
    session: the compositor starts (with XWayland), and the application starts as
@@ -468,7 +474,9 @@ Input routing on the host is separate from virtual-device delivery. See
 | Diagnostic switches | `MOONSHINE_*` environment variables | Individual subsystems |
 
 Configuration is not reloaded at runtime. Each subsystem receives its own typed
-config section when the session manager or server is constructed. Client-chosen
+config section when the session manager or server is constructed. The desktop
+app edits the file through the management configuration store, which only
+reports that a restart is required. Client-chosen
 properties (resolution, FPS, bitrate, codec, chroma, HDR, audio layout) are
 negotiated per session, not configured. The application receives
 `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and
@@ -480,6 +488,94 @@ Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
 request-header and RTSP-framing deadlines. Pairing trust changes are serialized,
 written atomically and synced before they take effect; revocation drains
 in-flight launch/resume/cancel requests and stops the active session.
+
+## Desktop management interface
+
+`management/` exports `io.github.karsyboy.Pyroshine` (interface
+`…Pyroshine.Management1`) on the service user's D-Bus session bus. The
+optional desktop app (`pyroshine-ui/`) is its client; the contract (names,
+JSON documents, error names, proxies) lives in `moonshine-management` so both
+sides build against one definition.
+
+```text
+pyroshine-ui (desktop session)              pyroshine (service)
+  tray (ksni) · notifications · window        management/ ── SessionManager
+            │                                      │       ── ClientManager / state.toml
+            └──── session bus: methods, signals ───┘       ── config store (config.toml)
+                                                            ── frame stats broadcast
+```
+
+The interface is a control surface over the existing owners, never a parallel
+implementation:
+
+| Operation | Owner and path |
+| --- | --- |
+| End session | `SessionManager::stop_session`, the same teardown as `/cancel` (behind the authorization gate) |
+| Approve / reject pairing | `ClientManager` pending requests; the approval token (`request`) must match the shown request, as on `/pin` |
+| Revoke client | `ClientManager::revoke_and_stop_session`, shared with loopback `/unpair` |
+| Name a client | Optional, display-only metadata in `state.toml`, written through the state transaction |
+| Configuration | `config_store` (below) |
+
+**Access.** The session bus admits only the user running the service; every
+method additionally checks the caller's Unix user. The interface is not
+reachable from the GameStream listeners. Documents are sanitized views: no
+session keys, PINs, pairing secrets or private keys are exposed. The approval
+token and certificate fingerprints are operator identification, as on `/pin`.
+
+**Session status.** `SessionManager` publishes a `ManagerStatus` snapshot when
+its mutex is released after a change (the guard publishes, so no transition can
+forget), and the control stream publishes `ClientPresence` when the peer that
+authenticated the current generation attaches or leaves. `session/status.rs`
+derives the public phase:
+
+| Phase | Derived from |
+| --- | --- |
+| `idle` / `stopping` / `error` | `Idle`; `Stopping` or a triggered stop; teardown past its deadline |
+| `starting` | Initialize/launch/start transition, or the first generation's client not yet attached |
+| `streaming` | Streams committed and the current generation's authenticated control peer attached |
+| `client_disconnected` | That peer left (disconnect or ping timeout) and nobody resumed, or a waiting client exceeded `[stream].timeout` |
+| `reconnecting` | `/resume` rotated the generation, or a reconnect ANNOUNCE/PLAY is pending or in progress |
+
+A retained session without its client is therefore never reported as
+streaming, and a peer of a replaced generation cannot make it so.
+
+**Configuration store.** Pyroshine never rewrites `config.toml` on its own, so
+the file is user-authored. A save deserializes the submitted values into
+`Config`, runs `Config::validate` plus schema range checks on changed settings,
+and edits the user's TOML document with `toml_edit`: only settings whose typed
+value changed are touched, unchanged applications and scanners keep their
+original tables and comments, an emptied list is written as `[]` (an omitted
+one means the defaults), and a created `[webserver]` table is written complete.
+The edited document must parse back into exactly the submitted configuration
+or nothing is written. Saves are serialized, rejected when the file's content
+revision changed since it was read, and replaced atomically with the previous
+permission bits through `durable.rs`. Configuration is still read only at
+startup; a save reports `restart_required` when the file differs from the
+running configuration. The editor's schema (`management/schema.rs`) is tested
+to cover exactly the settings `Config` serializes, and its choice values are
+serialized from the Rust enums.
+
+**Telemetry.** Both encoders already publish one `FrameStats` per frame on the
+benchmark's `broadcast` channel. The management service subscribes only while
+the desktop UI owns its bus name and a client is streaming, drains the channel
+on a 250 ms timer (no per-frame wakeups) and publishes one-second summaries
+(`StatsUpdated`). `broadcast::send` never blocks: a receiver that falls behind
+loses the oldest samples, which are counted, and with no receiver it remains
+the no-op it is on a headless server.
+
+**Notifications.** While the UI owns `io.github.karsyboy.PyroshineUi` it
+receives `PairingRequested` and notifies the operator; the daemon's own
+notify-rust notification (coalesced to one per 30 s) is the fallback when no
+UI runs. The bus releases the UI's name when it exits or crashes.
+
+**Desktop app.** Tauri 2 (WebKitGTK) with a React/Material UI frontend, chosen
+for permissive licensing, a complete Material component set and a browser
+preview for UI development; the tray uses `ksni` (StatusNotifierItem) rather
+than Tauri's appindicator tray, for click activation and runtime icons. The app
+follows the daemon's bus name instead of polling, subscribes before reading
+snapshots, and creates its window on demand (closing destroys the webview), so
+the tray-only app holds no web content process. Its Cargo workspace is
+separate, so server builds never compile GTK or WebKitGTK.
 
 ## Architectural invariants
 
@@ -500,6 +596,9 @@ Changes must preserve these properties unless a task explicitly redesigns them:
   GPU completion waits are ownership requirements.
 - Native boundaries (Vulkan, DMA-BUF descriptors, PyroWave, Inputtino) keep
   narrow `unsafe` scopes, explicit ownership and child-before-parent cleanup.
+- The management interface observes and calls the owning components; it never
+  holds session, pairing or trust state of its own, and nothing on a media path
+  waits for it. The server runs unchanged without it or without a desktop UI.
 
 ## Where to go next
 

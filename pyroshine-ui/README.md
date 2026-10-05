@@ -64,3 +64,35 @@ MOONSHINE_UPDATE_UI_FIXTURES=1 cargo test -p moonshine-core ui_schema_fixture_is
 
 Icons derive from `assets/logo-no-text.png`; regenerate them with
 `python3 pyroshine-ui/scripts/generate-icons.py` (requires Pillow).
+
+## Acceptance checks
+
+Automated tests cover the management interface over a private bus, the
+session-phase derivation, pairing token binding, configuration editing and the
+frontend's draft logic. These checks need a desktop, a GPU and a Moonlight
+client; record the desktop environment, session type and client used.
+
+1. **Tray.** With the service running, log in to the desktop: the tray icon
+   appears (plain logo). Left-click opens the dashboard ("ready for connections").
+2. **Pairing.** Revoke a test client in **Clients** and confirm it can no longer
+   connect. Pair it again from Moonlight: a notification appears, clicking it
+   opens **Clients** at the request, entering the PIN pairs the client and it is
+   listed; a wrong PIN fails on both sides; **Reject** ends the request in
+   Moonlight. Restarting pairing in Moonlight replaces the shown request.
+3. **Headless fallback.** Quit the app and pair a client using the notification
+   or the logged `http://localhost:<port>/pin?uniqueid=…` link.
+4. **Streaming state.** Start a stream: the icon shows the green play badge and
+   the dashboard matches the application, resolution, refresh rate, codec, HDR
+   and chroma Moonlight negotiated, with statistics about once per second.
+   Disconnect Moonlight without quitting: the amber pause badge and "Client
+   disconnected" appear and the game keeps running. Resume: the state returns to
+   streaming. **End Session** (tray or dashboard) closes the application and
+   returns to idle through the normal teardown (service log "Stopping session").
+5. **Settings.** Edit a commented, non-trivial `config.toml` in the app and
+   save: only the edited settings change in the file, invalid values are
+   refused with the setting highlighted, editing the file externally before
+   saving reports a conflict, and the restart notice appears. Restart the
+   service and confirm the settings apply.
+6. **Isolation.** During a stream, `kill -9` the app: the stream continues.
+   Start the app again: it shows the live session. Restart the service with the
+   app open: it reports Pyroshine as unavailable, then reconnects.

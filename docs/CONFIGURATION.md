@@ -21,6 +21,12 @@ at startup; restart the server after edits. Invalid TOML or missing required
 fields prevents startup. Unknown fields are not rejected by the current parser,
 so check spelling carefully.
 
+The [desktop app](DESKTOP.md#settings) edits every setting below. It validates
+the whole configuration before saving, changes only the settings you edit
+(keeping comments, formatting and unrelated entries), refuses to overwrite a
+file changed since it was loaded, and replaces the file atomically. Saving does
+not reload the configuration; restart the server to apply it.
+
 The packaged systemd unit explicitly passes `/home/<user>/.config/moonshine/config.toml`.
 To use another location, run `sudo systemctl edit "pyroshine@$USER"` and add
 an override (replace the path with the streaming user's file):
