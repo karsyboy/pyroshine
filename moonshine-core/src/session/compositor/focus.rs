@@ -520,6 +520,104 @@ pub(crate) fn is_good_override_candidate(override_meta: &WindowMetadata, focus: 
 		&& (rect.loc.y + rect.size.h) > 0
 }
 
+/// Classified special windows. Gamescope: the overlay, notification, external
+/// overlay and input-focus picks of `DetermineAndApplyFocus()`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SpecialWindows<W> {
+	/// Interactive Steam overlay (highest opacity wins).
+	pub overlay: Option<W>,
+	/// Passive Steam notification (last in stacking order wins).
+	pub notification: Option<W>,
+	/// Non-Steam overlay (highest opacity wins).
+	pub external_overlay: Option<W>,
+	/// The last visible Steam overlay that requested input.
+	pub input_focus: Option<W>,
+}
+
+impl<W> Default for SpecialWindows<W> {
+	fn default() -> Self {
+		Self {
+			overlay: None,
+			notification: None,
+			external_overlay: None,
+			input_focus: None,
+		}
+	}
+}
+
+/// Pick the special windows from already classified metadata, bottom to top.
+///
+/// A transparent (opacity 0) Steam surface holds no role: Steam hides a closed
+/// overlay that way, so it can neither paint above the game nor keep input.
+pub(crate) fn pick_special_windows<'a, W: Clone + 'a>(
+	windows: impl IntoIterator<Item = (&'a W, &'a WindowMetadata)>,
+) -> SpecialWindows<W> {
+	let mut picked = SpecialWindows::default();
+	let mut max_overlay_opacity = 0u32;
+	let mut max_external_overlay_opacity = 0u32;
+	for (window, meta) in windows {
+		if meta.is_overlay && meta.opacity != 0 {
+			let interactive = meta.flags.contains(WindowFlags::OVERLAY);
+			if interactive && meta.opacity >= max_overlay_opacity {
+				picked.overlay = Some(window.clone());
+				max_overlay_opacity = meta.opacity;
+			} else if !interactive {
+				picked.notification = Some(window.clone());
+			}
+			if meta.input_focus_mode != 0 {
+				picked.input_focus = Some(window.clone());
+			}
+		}
+		if meta.flags.contains(WindowFlags::EXTERNAL_OVERLAY) && meta.opacity > max_external_overlay_opacity {
+			picked.external_overlay = Some(window.clone());
+			max_external_overlay_opacity = meta.opacity;
+		}
+	}
+	picked
+}
+
+/// Keyboard and pointer targets for a focus pass.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InputTargets<W> {
+	pub keyboard: W,
+	pub pointer: W,
+	/// `STEAM_INPUT_FOCUS` of the input focus window.
+	pub mode: u32,
+}
+
+/// Route input between the focus window and an overlay requesting input.
+///
+/// The input focus is the overlay when one asks for input, else the focus
+/// window; the pointer always follows it. Mode 2 keeps the keyboard on the
+/// focus window. Gamescope: `DetermineAndApplyFocus()` input routing.
+pub(crate) fn route_input<W: Clone>(focus: &W, focus_mode: u32, overlay: Option<(&W, u32)>) -> InputTargets<W> {
+	let (input_focus, mode) = overlay.unwrap_or((focus, focus_mode));
+	InputTargets {
+		keyboard: if mode == 2 { focus.clone() } else { input_focus.clone() },
+		pointer: input_focus.clone(),
+		mode,
+	}
+}
+
+/// Clear every role `window` holds in `roles` and `decorations`.
+///
+/// Unmap and destroy share this, so a window that disappears by either path
+/// (including destruction without a prior unmap) can neither keep painting
+/// above the game nor keep input. Idempotent; returns whether `window` held
+/// any role.
+pub(crate) fn forget_window<W: PartialEq>(window: &W, roles: &mut [&mut Option<W>], decorations: &mut Vec<W>) -> bool {
+	let mut held = false;
+	for role in roles.iter_mut() {
+		if role.as_ref() == Some(window) {
+			**role = None;
+			held = true;
+		}
+	}
+	let before = decorations.len();
+	decorations.retain(|w| w != window);
+	held || decorations.len() != before
+}
+
 /// Focus state for the compositor. Tracks whether focus needs reevaluation.
 #[derive(Debug, Default)]
 pub(crate) struct FocusState {
@@ -598,6 +696,182 @@ mod tests {
 		assert!(meta.flags.contains(WindowFlags::OVERLAY));
 		meta.classify_steam_surface(1920);
 		assert!(meta.flags.contains(WindowFlags::NOTIFICATION));
+	}
+
+	const GAME: u32 = 1;
+	const OVERLAY: u32 = 2;
+
+	fn game_meta() -> WindowMetadata {
+		WindowMetadata {
+			app_id: 12345,
+			opacity: 255,
+			x11_window_id: Some(GAME),
+			geometry: smithay::utils::Rectangle::from_size((1920, 1080).into()),
+			..Default::default()
+		}
+	}
+
+	/// Steam's interactive overlay as it sits mapped but hidden over a game.
+	fn hidden_overlay_meta() -> WindowMetadata {
+		let mut meta = WindowMetadata {
+			is_overlay: true,
+			opacity: 0,
+			x11_window_id: Some(OVERLAY),
+			geometry: smithay::utils::Rectangle::from_size((1920, 1080).into()),
+			..Default::default()
+		};
+		meta.classify_steam_surface(1920);
+		meta
+	}
+
+	/// One focus pass over `[game, overlay]` stacked bottom to top.
+	fn focus_pass(game: &WindowMetadata, overlay: Option<&WindowMetadata>) -> (SpecialWindows<u32>, InputTargets<u32>) {
+		let windows = [(&GAME, game)].into_iter().chain(overlay.map(|meta| (&OVERLAY, meta)));
+		let picked = pick_special_windows(windows);
+		let overlay_input = picked
+			.input_focus
+			.as_ref()
+			.map(|w| (w, overlay.map_or(0, |m| m.input_focus_mode)));
+		let targets = route_input(&GAME, game.input_focus_mode, overlay_input);
+		(picked, targets)
+	}
+
+	fn game_owns_input() -> InputTargets<u32> {
+		InputTargets {
+			keyboard: GAME,
+			pointer: GAME,
+			mode: 0,
+		}
+	}
+
+	#[test]
+	fn steam_overlay_open_and_close_returns_paint_and_input_to_the_game() {
+		let game = game_meta();
+		let mut overlay = hidden_overlay_meta();
+
+		// Mapped but transparent: no role, the game owns all input.
+		let (picked, targets) = focus_pass(&game, Some(&overlay));
+		assert_eq!(picked, SpecialWindows::default());
+		assert_eq!(targets, game_owns_input());
+
+		for _ in 0..10 {
+			// Open with STEAM_INPUT_FOCUS=2: painted above, pointer to the
+			// overlay, keyboard stays on the game.
+			overlay.opacity = 255;
+			overlay.input_focus_mode = 2;
+			overlay.classify_steam_surface(1920);
+			let (picked, targets) = focus_pass(&game, Some(&overlay));
+			assert_eq!(picked.overlay, Some(OVERLAY));
+			assert_eq!(picked.input_focus, Some(OVERLAY));
+			assert_eq!(
+				targets,
+				InputTargets {
+					keyboard: GAME,
+					pointer: OVERLAY,
+					mode: 2
+				}
+			);
+
+			// Mode 1 takes the keyboard too.
+			overlay.input_focus_mode = 1;
+			let (_, targets) = focus_pass(&game, Some(&overlay));
+			assert_eq!(targets.keyboard, OVERLAY);
+
+			// Back to mode 0: a full-width overlay still paints until hidden,
+			// but no longer holds input.
+			overlay.input_focus_mode = 0;
+			overlay.classify_steam_surface(1920);
+			let (picked, targets) = focus_pass(&game, Some(&overlay));
+			assert_eq!(picked.overlay, Some(OVERLAY));
+			assert_eq!(picked.input_focus, None);
+			assert_eq!(targets, game_owns_input());
+
+			// Closed (opacity 0): no paint, no input.
+			overlay.opacity = 0;
+			let (picked, targets) = focus_pass(&game, Some(&overlay));
+			assert_eq!(picked, SpecialWindows::default());
+			assert_eq!(targets, game_owns_input());
+		}
+	}
+
+	#[test]
+	fn overlay_that_disappears_without_hiding_releases_every_role() {
+		let game = game_meta();
+		let mut overlay = hidden_overlay_meta();
+		overlay.opacity = 255;
+		overlay.input_focus_mode = 1;
+		overlay.classify_steam_surface(1920);
+		let (picked, targets) = focus_pass(&game, Some(&overlay));
+
+		// Compositor roles as left by the open overlay.
+		let mut overlay_role = picked.overlay;
+		let mut notification_role = picked.notification;
+		let mut input_focus_role = picked.input_focus;
+		let mut pointer_focus = Some(targets.pointer);
+		let mut focused = Some(GAME);
+		let mut decorations = vec![OVERLAY, 7];
+
+		// Destroyed while still visible and holding input, with no unmap:
+		// every reference goes at once, and a repeat is a no-op.
+		for expected in [true, false] {
+			let held = forget_window(
+				&OVERLAY,
+				&mut [
+					&mut overlay_role,
+					&mut notification_role,
+					&mut input_focus_role,
+					&mut pointer_focus,
+					&mut focused,
+				],
+				&mut decorations,
+			);
+			assert_eq!(held, expected);
+		}
+		assert_eq!((overlay_role, input_focus_role, pointer_focus), (None, None, None));
+		assert_eq!(focused, Some(GAME), "unrelated roles are kept");
+		assert_eq!(decorations, vec![7]);
+
+		// The next focus pass, without the window, routes everything to the game.
+		let (picked, targets) = focus_pass(&game, None);
+		assert_eq!(picked, SpecialWindows::default());
+		assert_eq!(targets, game_owns_input());
+
+		// A recreated overlay is classified afresh.
+		let mut recreated = hidden_overlay_meta();
+		recreated.opacity = 255;
+		recreated.input_focus_mode = 2;
+		recreated.classify_steam_surface(1920);
+		let (picked, targets) = focus_pass(&game, Some(&recreated));
+		assert_eq!(picked.overlay, Some(OVERLAY));
+		assert_eq!(targets.keyboard, GAME);
+		assert_eq!(targets.pointer, OVERLAY);
+	}
+
+	#[test]
+	fn notification_and_external_overlay_hold_paint_roles_but_not_input() {
+		let game = game_meta();
+		let mut notification = WindowMetadata {
+			is_overlay: true,
+			opacity: 255,
+			geometry: smithay::utils::Rectangle::from_size((300, 100).into()),
+			..Default::default()
+		};
+		notification.classify_steam_surface(1920);
+		let external = WindowMetadata {
+			opacity: 128,
+			flags: WindowFlags::EXTERNAL_OVERLAY,
+			..Default::default()
+		};
+		let picked = pick_special_windows([(&GAME, &game), (&3, &notification), (&4, &external)]);
+		assert_eq!(picked.notification, Some(3));
+		assert_eq!(picked.external_overlay, Some(4));
+		assert_eq!(picked.overlay, None);
+		assert_eq!(picked.input_focus, None);
+		assert_eq!(route_input(&GAME, 0, None), game_owns_input());
+
+		notification.opacity = 0;
+		let picked = pick_special_windows([(&GAME, &game), (&3, &notification)]);
+		assert_eq!(picked.notification, None, "a hidden notification is not painted");
 	}
 
 	#[test]
