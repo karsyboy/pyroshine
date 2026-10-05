@@ -1143,3 +1143,108 @@ async fn service_shutdown_during_every_transition_completes() {
 		assert!(h.initialize().await.is_err(), "{op:?}");
 	}
 }
+
+mod status {
+	use super::*;
+	use crate::session::status::{ClientPresence, SessionPhase, derive_phase};
+
+	fn presence(generation: u64, attached: bool, was_attached: bool) -> ClientPresence {
+		ClientPresence {
+			generation,
+			attached,
+			was_attached,
+		}
+	}
+
+	fn phase(status: &watch::Receiver<ManagerStatus>, presence: ClientPresence) -> SessionPhase {
+		derive_phase(&status.borrow(), &presence, Instant::now(), Duration::from_secs(60))
+	}
+
+	/// The published status follows every lifecycle step, and only the
+	/// current generation's attached control peer makes a session streaming.
+	#[tokio::test]
+	async fn status_follows_launch_streaming_resume_and_canonical_stop() {
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		let none = ClientPresence::default();
+		assert_eq!(phase(&status, none), SessionPhase::Idle);
+
+		let launch = hold_at(&h, Op::Launch).await;
+		assert_eq!(phase(&status, none), SessionPhase::Starting);
+		h.release(Op::Launch);
+		launch.await.unwrap().unwrap();
+		assert_eq!(phase(&status, none), SessionPhase::Starting, "launched, awaiting PLAY");
+
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		let first = grant.generation();
+		assert_eq!(phase(&status, presence(first, false, false)), SessionPhase::Starting);
+		assert_eq!(phase(&status, presence(first, true, true)), SessionPhase::Streaming);
+		assert_eq!(
+			phase(&status, presence(first, false, true)),
+			SessionPhase::ClientDisconnected,
+			"client loss retains the session"
+		);
+
+		h.core
+			.resume_session(keys(), ResumeRequest::default(), h.client)
+			.await
+			.unwrap();
+		assert_eq!(phase(&status, presence(first, false, true)), SessionPhase::Reconnecting);
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		assert_eq!(phase(&status, presence(first, false, true)), SessionPhase::Reconnecting);
+		h.core.start_session(&grant).await.unwrap();
+		let second = grant.generation();
+		assert_eq!(
+			phase(&status, presence(second, false, false)),
+			SessionPhase::Reconnecting
+		);
+		assert_eq!(phase(&status, presence(second, true, true)), SessionPhase::Streaming);
+		// The replaced generation's peer can never report streaming.
+		assert_eq!(phase(&status, presence(first, true, true)), SessionPhase::Reconnecting);
+
+		// The canonical stop is visible while teardown stops the application.
+		h.hold(Op::StopApplication);
+		let core = h.core.clone();
+		let stop = tokio::spawn(async move { core.stop_session().await });
+		h.entered(Op::StopApplication, 1).await;
+		assert_eq!(phase(&status, presence(second, true, true)), SessionPhase::Stopping);
+		h.release(Op::StopApplication);
+		stop.await.unwrap().unwrap();
+		h.assert_released().await;
+		assert_eq!(phase(&status, presence(second, false, true)), SessionPhase::Idle);
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::UserStopped);
+		assert!(last.completed);
+	}
+
+	/// A worker failure ends the session through the same teardown and is
+	/// reported as an unexpected stop.
+	#[tokio::test]
+	async fn worker_failure_is_reported_as_the_last_stop() {
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.active().await;
+		let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+		stop.trigger_shutdown(SessionShutdownReason::CompositorStopped).unwrap();
+		h.wait_idle().await;
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::CompositorStopped);
+		assert_eq!(phase(&status, ClientPresence::default()), SessionPhase::Idle);
+	}
+
+	/// A teardown past its deadline is never reported idle.
+	#[tokio::test(start_paused = true)]
+	async fn teardown_failure_is_an_error_phase() {
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.active().await;
+		h.backend().worker_exit.send_replace(false);
+		assert!(h.core.stop_session().await.is_err());
+		assert_eq!(phase(&status, ClientPresence::default()), SessionPhase::Error);
+		assert!(!status.borrow().last_stop.clone().unwrap().completed);
+		h.backend().worker_exit.send_replace(true);
+	}
+}

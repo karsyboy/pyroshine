@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
@@ -18,6 +19,7 @@ use crate::session::compositor::{
 use crate::session::keys::ActiveKeys;
 use crate::session::lifecycle::WorkerGuard;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::status::ClientPresence;
 use crate::session::stream::audio::AudioStartHandle;
 use crate::session::stream::video::VideoStreamHandle;
 use crate::session::stream::video::fec::FrameFecStatus;
@@ -328,16 +330,41 @@ pub(crate) struct ControlStreamContext {
 	pub keys_rx: SessionKeysReceiver,
 	/// Authorized client and generation; peers are bound to it (see `peers`).
 	pub authorization_rx: AuthorizationReceiver,
+	/// Where active-peer ownership is reported for session status.
+	pub presence: Arc<watch::Sender<ClientPresence>>,
 }
 
 impl ControlStreamContext {
 	/// Create the control stream's key context. HDR state is delivered through
 	/// the live metadata watch so it can change between reconnect epochs.
-	pub fn new(ctx: &SessionContext, authorization_rx: AuthorizationReceiver) -> Self {
+	pub fn new(
+		ctx: &SessionContext,
+		authorization_rx: AuthorizationReceiver,
+		presence: Arc<watch::Sender<ClientPresence>>,
+	) -> Self {
 		Self {
 			keys_rx: ctx.keys.clone_rx().expect("session keys not initialized"),
 			authorization_rx,
+			presence,
 		}
+	}
+}
+
+/// Report active-peer ownership to session status. Only a change publishes;
+/// otherwise this is a few integer comparisons per service pass, and nothing
+/// waits on the receiver.
+fn publish_presence(tx: &watch::Sender<ClientPresence>, peers: &ControlPeers, last: &mut ClientPresence) {
+	let generation = peers.generation();
+	let attached = peers.active().is_some();
+	let was_attached = attached || (generation == last.generation && last.was_attached);
+	let next = ClientPresence {
+		generation,
+		attached,
+		was_attached,
+	};
+	if next != *last {
+		*last = next;
+		tx.send_replace(next);
 	}
 }
 
@@ -597,6 +624,11 @@ async fn run_control_loop(
 		authorization_rx.borrow_and_update().generation(),
 		Duration::from_secs(stream_timeout),
 	);
+	let mut presence = ClientPresence {
+		generation: peers.generation(),
+		..Default::default()
+	};
+	context.presence.send_replace(presence);
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		if adopt_current_generation(
@@ -612,6 +644,9 @@ async fn run_control_loop(
 		{
 			break;
 		}
+		// Reports the previous pass's outcome; every pass reaches this point,
+		// including those that ended in `continue`.
+		publish_presence(&context.presence, &peers, &mut presence);
 
 		// Check for feedback messages.
 		if let Ok(command) = feedback_rx.try_recv()
@@ -795,6 +830,7 @@ async fn run_control_loop(
 	}
 
 	tracing::debug!("Control stream stopped.");
+	context.presence.send_modify(|presence| presence.attached = false);
 
 	// Notify the client of graceful termination before closing the connection.
 	// NVST_DISCONN_SERVER_TERMINATED_CLOSED (0x80030023) is recognized by the
@@ -1146,6 +1182,7 @@ mod tests {
 			video_pauses: Arc<AtomicUsize>,
 			audio_pauses: Arc<AtomicUsize>,
 			idr: tokio::sync::broadcast::Receiver<()>,
+			presence: watch::Receiver<ClientPresence>,
 		}
 
 		impl Server {
@@ -1220,6 +1257,8 @@ mod tests {
 				}
 				let (audio_trigger, audio_pauses) = AudioStartHandle::for_test();
 				let (hdr_tx, hdr_rx) = watch::channel(HdrModeState::new(false));
+				let presence_tx = Arc::new(watch::channel(ClientPresence::default()).0);
+				let presence = presence_tx.subscribe();
 				ControlStream {
 					stop: stop.clone(),
 					input_handler,
@@ -1230,6 +1269,7 @@ mod tests {
 					ControlStreamContext {
 						keys_rx,
 						authorization_rx,
+						presence: presence_tx,
 					},
 					video_handle,
 					audio_trigger,
@@ -1247,7 +1287,13 @@ mod tests {
 					video_pauses,
 					audio_pauses,
 					idr: probe.idr_rx,
+					presence,
 				}
+			}
+
+			/// Control ownership as last reported to session status.
+			fn presence(&self) -> ClientPresence {
+				*self.presence.borrow()
 			}
 
 			fn connect_data(&self) -> u32 {
@@ -1436,6 +1482,73 @@ mod tests {
 			assert_eq!(server.resets().len(), 1);
 			server.assert_alive("resumed session");
 			server.cancel().await;
+		}
+
+		/// Session status reports media as flowing only while the peer that
+		/// authenticated the current generation owns the control stream: a
+		/// disconnect leaves a retained session, a resume awaits the new peer.
+		#[tokio::test]
+		async fn presence_reports_active_peer_ownership_per_generation() {
+			let mut server = Server::start(60);
+			let unattached = ClientPresence {
+				generation: 1,
+				attached: false,
+				was_attached: false,
+			};
+			let mut started = server.presence.clone();
+			tokio::time::timeout(
+				Duration::from_secs(5),
+				started.wait_for(|presence| presence.generation == 1),
+			)
+			.await
+			.expect("the control worker reports its generation")
+			.unwrap();
+			assert_eq!(server.presence(), unattached);
+
+			let mut client = server.connect().await;
+			client.pump(Duration::from_millis(50)).await;
+			assert_eq!(server.presence(), unattached, "an ENet connection is not an owner");
+			client.send(&KEY, &ping()).await;
+			assert!(server.presence().attached, "authentication attaches the client");
+
+			client.disconnect().await;
+			client.pump(Duration::from_millis(50)).await;
+			assert_eq!(
+				server.presence(),
+				ClientPresence {
+					generation: 1,
+					attached: false,
+					was_attached: true,
+				},
+				"a disconnect retains a detached session"
+			);
+
+			server.resume(2, NEW_KEY);
+			let mut resumed = server.connect().await;
+			resumed.pump(Duration::from_millis(50)).await;
+			assert_eq!(
+				server.presence(),
+				ClientPresence {
+					generation: 2,
+					attached: false,
+					was_attached: false,
+				},
+				"a resumed generation waits for its own client"
+			);
+			resumed.send(&NEW_KEY, &ping()).await;
+			resumed.pump(Duration::from_millis(50)).await;
+			assert_eq!(
+				server.presence(),
+				ClientPresence {
+					generation: 2,
+					attached: true,
+					was_attached: true,
+				}
+			);
+
+			let presence = server.presence.clone();
+			server.cancel().await;
+			assert!(!presence.borrow().attached, "a stopped control stream owns no client");
 		}
 
 		/// A client that vanishes without an ENet disconnect (crash, suspend,

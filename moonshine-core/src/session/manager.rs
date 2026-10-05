@@ -19,8 +19,9 @@
 
 use std::future::Future;
 use std::net::IpAddr;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use async_shutdown::{DelayShutdownToken, ShutdownManager};
 use tokio::sync::{Mutex, MutexGuard, broadcast, watch};
@@ -39,6 +40,9 @@ use crate::session::authorization::StreamAuthorization;
 use crate::session::compositor::CompositorConfig;
 use crate::session::keys::KeyLedger;
 use crate::session::lifecycle::StartLatch;
+use crate::session::status::{
+	ClientPresence, LifecycleStatus, LiveStatus, ManagerStatus, StopRecord, TransitionStatus,
+};
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
@@ -203,6 +207,18 @@ enum TransitionKind {
 	Resume,
 }
 
+impl From<TransitionKind> for TransitionStatus {
+	fn from(kind: TransitionKind) -> Self {
+		match kind {
+			TransitionKind::Initialize => Self::Initialize,
+			TransitionKind::Launch => Self::Launch,
+			TransitionKind::Start => Self::Start,
+			TransitionKind::Announce => Self::Announce,
+			TransitionKind::Resume => Self::Resume,
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Transition {
 	id: u64,
@@ -225,6 +241,11 @@ struct SessionRecord {
 	application_unit: Option<&'static str>,
 	/// Start latches of the live stream workers.
 	start_latches: Vec<StartLatch>,
+	/// When the launch was accepted, for status reporting.
+	started_at: SystemTime,
+	/// Authorization generation created by the launch; later generations
+	/// come from `/resume`.
+	first_generation: Option<u64>,
 }
 
 struct LiveSession<B: SessionBackend> {
@@ -278,6 +299,22 @@ struct PendingStreams {
 	generation: u64,
 }
 
+/// Read-only view of the live session for status reporting. It carries no
+/// key material: session keys stay inside the manager and stream workers.
+pub(crate) struct SessionView {
+	pub epoch: u64,
+	pub started_at: SystemTime,
+	pub application_title: String,
+	pub application_id: i32,
+	pub resolution: (u32, u32),
+	pub refresh_rate: u32,
+	pub hdr: bool,
+	pub audio_channels: crate::session::stream::audio::AudioChannels,
+	pub audio_channel_mask: u32,
+	pub client_ip: IpAddr,
+	pub streams: Option<(VideoStreamContext, AudioStreamContext)>,
+}
+
 struct SessionManagerInner<B: SessionBackend> {
 	lifecycle: Lifecycle<B>,
 
@@ -312,6 +349,16 @@ struct SessionManagerInner<B: SessionBackend> {
 	/// Next authorization generation. Never reset, so a stale grant from an
 	/// earlier session cannot match a later one.
 	next_generation: u64,
+
+	/// Last client-driven protocol progress (launch, resume, ANNOUNCE, PLAY);
+	/// status consumers bound how long a session waits for its client.
+	progress_at: Instant,
+
+	/// How the most recent session ended.
+	last_stop: Option<StopRecord>,
+
+	/// A teardown exceeded its deadline; the service is shutting down.
+	teardown_failed: bool,
 }
 
 impl<B: SessionBackend> SessionManagerInner<B> {
@@ -327,6 +374,35 @@ impl<B: SessionBackend> SessionManagerInner<B> {
 			resume_request: None,
 			authorization_tx: None,
 			next_generation: 1,
+			progress_at: Instant::now(),
+			last_stop: None,
+			teardown_failed: false,
+		}
+	}
+
+	/// Snapshot published to status consumers (see `session::status`).
+	fn status(&self) -> ManagerStatus {
+		let lifecycle = match &self.lifecycle {
+			Lifecycle::Idle => LifecycleStatus::Idle,
+			Lifecycle::Stopping(_) if self.teardown_failed => LifecycleStatus::Failed,
+			Lifecycle::Stopping(_) => LifecycleStatus::Stopping,
+			Lifecycle::Live(live) => {
+				let streaming = live.record.streams.is_some();
+				LifecycleStatus::Live(LiveStatus {
+					epoch: live.record.epoch,
+					transition: live.transition.map(|transition| transition.kind.into()),
+					streams_committed: streaming,
+					stopping: live.record.stop.is_shutdown_triggered(),
+					reconnect_pending: streaming && (self.pending.is_some() || self.resume_request.is_some()),
+					generation: self.authorization_tx.as_ref().map(|tx| tx.borrow().generation()),
+					first_generation: live.record.first_generation,
+					awaiting_since: self.progress_at,
+				})
+			},
+		};
+		ManagerStatus {
+			lifecycle,
+			last_stop: self.last_stop.clone(),
 		}
 	}
 
@@ -335,6 +411,7 @@ impl<B: SessionBackend> SessionManagerInner<B> {
 	fn rotate_authorization(&mut self, client_ip: IpAddr) -> Result<(), ()> {
 		let authorization = StreamAuthorization::new(self.next_generation, client_ip)?;
 		self.next_generation += 1;
+		self.progress_at = Instant::now();
 		match &self.authorization_tx {
 			Some(tx) => {
 				tx.send_replace(authorization);
@@ -436,6 +513,9 @@ pub(crate) struct SessionCore<B: SessionBackend> {
 	backend: Arc<B>,
 	/// Shutdown manager for the entire application.
 	shutdown: ShutdownManager<ShutdownReason>,
+	/// Latest [`ManagerStatus`], republished whenever the manager lock is
+	/// released after a change.
+	status: Arc<watch::Sender<ManagerStatus>>,
 }
 
 impl<B: SessionBackend> Clone for SessionCore<B> {
@@ -444,7 +524,43 @@ impl<B: SessionBackend> Clone for SessionCore<B> {
 			inner: self.inner.clone(),
 			backend: self.backend.clone(),
 			shutdown: self.shutdown.clone(),
+			status: self.status.clone(),
 		}
+	}
+}
+
+/// The manager mutex guard. Releasing it publishes the manager status if it
+/// changed, so every state change reaches status consumers without each
+/// transition having to remember to report it.
+struct InnerGuard<'a, B: SessionBackend> {
+	guard: MutexGuard<'a, SessionManagerInner<B>>,
+	status: &'a watch::Sender<ManagerStatus>,
+}
+
+impl<B: SessionBackend> Deref for InnerGuard<'_, B> {
+	type Target = SessionManagerInner<B>;
+
+	fn deref(&self) -> &Self::Target {
+		&self.guard
+	}
+}
+
+impl<B: SessionBackend> DerefMut for InnerGuard<'_, B> {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.guard
+	}
+}
+
+impl<B: SessionBackend> Drop for InnerGuard<'_, B> {
+	fn drop(&mut self) {
+		let status = self.guard.status();
+		self.status.send_if_modified(|current| {
+			let changed = *current != status;
+			if changed {
+				*current = status;
+			}
+			changed
+		});
 	}
 }
 
@@ -458,6 +574,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			inner: Arc::new(Mutex::new(SessionManagerInner::new())),
 			backend: Arc::new(backend),
 			shutdown,
+			status: Arc::new(watch::channel(ManagerStatus::default()).0),
 		};
 
 		// Global shutdown owner: tear the session down (application included)
@@ -478,8 +595,37 @@ impl<B: SessionBackend> SessionCore<B> {
 		Ok(core)
 	}
 
-	async fn lock(&self) -> MutexGuard<'_, SessionManagerInner<B>> {
-		self.inner.lock().await
+	async fn lock(&self) -> InnerGuard<'_, B> {
+		InnerGuard {
+			guard: self.inner.lock().await,
+			status: &self.status,
+		}
+	}
+
+	/// Follow the manager status (see `session::status`).
+	pub(crate) fn subscribe_status(&self) -> watch::Receiver<ManagerStatus> {
+		self.status.subscribe()
+	}
+
+	/// Read-only view of the live session for status reporting.
+	pub(crate) async fn session_view(&self) -> Option<SessionView> {
+		let mut guard = self.lock().await;
+		guard.live().map(|live| {
+			let context = &live.record.context;
+			SessionView {
+				epoch: live.record.epoch,
+				started_at: live.record.started_at,
+				application_title: context.application.title.clone(),
+				application_id: context.application_id,
+				resolution: context.resolution,
+				refresh_rate: context.refresh_rate,
+				hdr: context.hdr,
+				audio_channels: context.audio_channels,
+				audio_channel_mask: context.audio_channel_mask,
+				client_ip: context.client_ip,
+				streams: live.record.streams.clone(),
+			}
+		})
 	}
 
 	/// Authorize an RTSP peer for the current launch/resume generation.
@@ -586,6 +732,12 @@ impl<B: SessionBackend> SessionCore<B> {
 		.await;
 
 		let mut guard = self.lock().await;
+		guard.last_stop = Some(StopRecord {
+			epoch,
+			reason,
+			completed: result.is_ok(),
+			at: SystemTime::now(),
+		});
 		match result {
 			Ok(()) => {
 				guard.lifecycle = Lifecycle::Idle;
@@ -596,6 +748,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			Err(_) => {
 				// Workers may still own ports, the Pulse socket or GPU objects: never
 				// report idle. Restarting the service is the only safe recovery.
+				guard.teardown_failed = true;
 				drop(guard);
 				tracing::error!(
 					epoch,
@@ -740,6 +893,8 @@ impl<B: SessionBackend> SessionCore<B> {
 					streams: None,
 					application_unit: None,
 					start_latches: Vec::new(),
+					started_at: SystemTime::now(),
+					first_generation: None,
 				},
 				state: None,
 				transition: None,
@@ -769,7 +924,9 @@ impl<B: SessionBackend> SessionCore<B> {
 					} else {
 						// Set here so keys exist only for an initialized session.
 						guard.keys_tx = Some(keys_tx);
+						let generation = guard.authorization_tx.as_ref().map(|tx| tx.borrow().generation());
 						let live = guard.committable(&ticket).expect("checked above");
+						live.record.first_generation = generation;
 						live.state = Some(state);
 						live.transition = None;
 						tracing::info!(
@@ -834,6 +991,7 @@ impl<B: SessionBackend> SessionCore<B> {
 						Some(live) => {
 							live.state = Some(state);
 							live.transition = None;
+							guard.progress_at = Instant::now();
 							tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
 							Ok(())
 						},
@@ -1121,6 +1279,7 @@ impl<B: SessionBackend> SessionCore<B> {
 									live.record.start_latches = latches;
 									live.state = Some(state);
 									live.transition = None;
+									guard.progress_at = Instant::now();
 									Ok(())
 								},
 								None => {
@@ -1153,6 +1312,7 @@ impl<B: SessionBackend> SessionCore<B> {
 								live.record.streams = Some((video, audio));
 								live.state = Some(state);
 								live.transition = None;
+								guard.progress_at = Instant::now();
 								Ok(())
 							},
 							None => {
@@ -1229,6 +1389,7 @@ fn publish_pending<B: SessionBackend>(
 	session_id_v1: bool,
 ) {
 	guard.pending = Some(pending);
+	guard.progress_at = Instant::now();
 	if session_id_v1 && let Some(tx) = &guard.authorization_tx {
 		tx.send_modify(StreamAuthorization::require_session_id);
 	}
@@ -1239,6 +1400,8 @@ fn publish_pending<B: SessionBackend>(
 pub struct SessionManager {
 	core: SessionCore<SystemSession>,
 	stats_tx: broadcast::Sender<FrameStats>,
+	/// Control-stream ownership of the current generation (see `session::status`).
+	presence_tx: Arc<watch::Sender<ClientPresence>>,
 }
 
 impl SessionManager {
@@ -1254,6 +1417,7 @@ impl SessionManager {
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let stats_tx = broadcast::channel(256).0;
+		let presence_tx = Arc::new(watch::channel(ClientPresence::default()).0);
 		let backend = SystemSession {
 			compositor_config,
 			video_config,
@@ -1263,11 +1427,35 @@ impl SessionManager {
 			stream_timeout,
 			inhibit_sleep,
 			stats_tx: stats_tx.clone(),
+			presence_tx: presence_tx.clone(),
 		};
 		Ok(Self {
 			core: SessionCore::new(backend, shutdown)?,
 			stats_tx,
+			presence_tx,
 		})
+	}
+
+	/// Follow the manager lifecycle (see `session::status`).
+	pub(crate) fn subscribe_status(&self) -> watch::Receiver<ManagerStatus> {
+		self.core.subscribe_status()
+	}
+
+	/// Follow control-stream ownership of the current generation.
+	pub(crate) fn subscribe_presence(&self) -> watch::Receiver<ClientPresence> {
+		self.presence_tx.subscribe()
+	}
+
+	/// Receiver for per-frame statistics, for management telemetry. The
+	/// channel never blocks the pipeline: a receiver that falls behind loses
+	/// the oldest samples. Drop it when no consumer needs telemetry.
+	pub(crate) fn frame_stats_receiver(&self) -> broadcast::Receiver<FrameStats> {
+		self.stats_tx.subscribe()
+	}
+
+	/// Read-only view of the live session, if any.
+	pub(crate) async fn session_view(&self) -> Option<SessionView> {
+		self.core.session_view().await
 	}
 
 	/// Returns a receiver for per-frame encoding statistics.

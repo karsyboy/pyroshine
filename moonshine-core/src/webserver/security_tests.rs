@@ -802,8 +802,22 @@ async fn authorized_revocation_survives_restart_and_blocks_https() {
 	assert_eq!(restarted.get_uuid().unwrap(), uuid);
 	assert!(!restarted.has_paired_cert("cert-A".into()).unwrap());
 	assert!(restarted.has_paired_cert("cert-B".into()).unwrap());
-	assert!(server.verify_paired_client(&Some("cert-A".into())).is_some());
-	assert!(server.verify_paired_client(&Some("cert-B".into())).is_none());
+	assert!(
+		server
+			.verify_paired_client(
+				&Some("cert-A".into()),
+				REMOTE.parse::<std::net::SocketAddr>().unwrap().ip()
+			)
+			.is_some()
+	);
+	assert!(
+		server
+			.verify_paired_client(
+				&Some("cert-B".into()),
+				REMOTE.parse::<std::net::SocketAddr>().unwrap().ip()
+			)
+			.is_none()
+	);
 	let (status, _) = http(&server, LOCAL, post("/unpair?uniqueid=A", "localhost:47989", "", "")).await;
 	assert_eq!(status, 400, "absent credentials must not report revocation success");
 }

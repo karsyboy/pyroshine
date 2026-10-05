@@ -1,5 +1,8 @@
 [workspace]
-members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
+members = [".", "moonshine-core", "moonshine-management", "moonshine-tools", "moonshine-wsi"]
+# The optional desktop UI is a separate workspace so headless builds never
+# compile its GUI dependencies; see pyroshine-ui/README.md.
+exclude = ["pyroshine-ui"]
 resolver = "2"
 
 [workspace.package]

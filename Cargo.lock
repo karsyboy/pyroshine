@@ -2397,6 +2397,7 @@ dependencies = [
  "mdns-sd",
  "mio 1.2.2",
  "mio-timerfd",
+ "moonshine-management",
  "network-interface",
  "notify-rust",
  "opus",
@@ -2425,6 +2426,7 @@ dependencies = [
  "tokio-enet",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "tracing",
  "url",
  "uuid",
@@ -2435,6 +2437,15 @@ dependencies = [
  "xcursor",
  "zbus",
  "zvariant",
+]
+
+[[package]]
+name = "moonshine-management"
+version = "0.17.0-beta-11"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zbus",
 ]
 
 [[package]]
@@ -4070,6 +4081,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
