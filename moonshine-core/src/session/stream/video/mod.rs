@@ -1144,12 +1144,8 @@ mod tests {
 	/// and must release the port for the next session.
 	#[tokio::test]
 	async fn failed_pipeline_construction_releases_the_started_packet_handler() {
-		let port = tokio::net::UdpSocket::bind("127.0.0.1:0")
-			.await
-			.unwrap()
-			.local_addr()
-			.unwrap()
-			.port();
+		use crate::session::stream::test_support::{construct_on_fixed_port, fixed_udp_port, udp_port_open_here};
+		let port = fixed_udp_port();
 		let config = VideoStreamConfig {
 			port,
 			..Default::default()
@@ -1157,17 +1153,23 @@ mod tests {
 		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
 		for cycle in 0..100 {
 			let stop = ShutdownManager::new();
-			let (_capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
-			let stream = VideoStream::new(
-				config.clone(),
-				"127.0.0.1".into(),
-				capture_rx,
-				watch::channel(HdrModeState::new(false)).0,
-				stop.clone(),
-				broadcast::channel(1).0,
-			)
+			// Each attempt gets its own capture channel; keep the senders open.
+			let mut capture_senders = Vec::new();
+			let stream = construct_on_fixed_port(port, async || {
+				let (capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+				capture_senders.push(capture_tx);
+				VideoStream::new(
+					config.clone(),
+					"127.0.0.1".into(),
+					capture_rx,
+					watch::channel(HdrModeState::new(false)).0,
+					stop.clone(),
+					broadcast::channel(1).0,
+				)
+				.await
+			})
 			.await
-			.unwrap_or_else(|()| panic!("cycle {cycle}: previous session still owns the video port"));
+			.unwrap_or_else(|e| panic!("cycle {cycle}: {e}"));
 			let keys = watch::channel(crate::session::keys::KeyLedger::default().publish(
 				crate::session::SessionKeyData::new(
 					crate::session::RemoteInputKey::from_bytes([1; 16]),
@@ -1194,9 +1196,10 @@ mod tests {
 			tokio::time::timeout(std::time::Duration::from_secs(5), stop.wait_shutdown_complete())
 				.await
 				.unwrap_or_else(|_| panic!("cycle {cycle}: started packet handler was not joined"));
-			tokio::net::UdpSocket::bind(("127.0.0.1", port))
-				.await
-				.unwrap_or_else(|e| panic!("cycle {cycle}: completed stop must release the port: {e}"));
+			assert!(
+				!udp_port_open_here(port),
+				"cycle {cycle}: completed stop must release the port"
+			);
 		}
 	}
 

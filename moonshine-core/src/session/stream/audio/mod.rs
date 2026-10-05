@@ -701,23 +701,22 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn hundred_real_audio_sessions_release_a_fixed_port() {
 		let pulse_dir = tempfile::tempdir().unwrap();
-		let port = UdpSocket::bind("127.0.0.1:0")
-			.await
-			.unwrap()
-			.local_addr()
-			.unwrap()
-			.port();
+		use crate::session::stream::test_support::{construct_on_fixed_port, fixed_udp_port, udp_port_open_here};
+		let port = fixed_udp_port();
 		let mut ledger = crate::session::keys::KeyLedger::default();
 		for cycle in 0..100u32 {
 			let stop = ShutdownManager::new();
-			let audio = AudioStream::new_in(
-				AudioStreamConfig { port },
-				"127.0.0.1".into(),
-				stop.clone(),
-				pulse_dir.path(),
-			)
+			let audio = construct_on_fixed_port(port, async || {
+				AudioStream::new_in(
+					AudioStreamConfig { port },
+					"127.0.0.1".into(),
+					stop.clone(),
+					pulse_dir.path(),
+				)
+				.await
+			})
 			.await
-			.unwrap_or_else(|()| panic!("cycle {cycle}: previous session still owns the audio port"));
+			.unwrap_or_else(|e| panic!("cycle {cycle}: {e}"));
 			let (channels, mask) = [
 				(AudioChannels::Stereo, 0x3),
 				(AudioChannels::Surround51, 0x3f),
@@ -763,9 +762,10 @@ mod tests {
 			tokio::time::timeout(Duration::from_secs(5), stop.wait_shutdown_complete())
 				.await
 				.unwrap_or_else(|_| panic!("cycle {cycle}: audio owners did not complete"));
-			UdpSocket::bind(("127.0.0.1", port))
-				.await
-				.unwrap_or_else(|e| panic!("cycle {cycle}: completed stop must release the port: {e}"));
+			assert!(
+				!udp_port_open_here(port),
+				"cycle {cycle}: completed stop must release the port"
+			);
 			drop(handle);
 		}
 	}
