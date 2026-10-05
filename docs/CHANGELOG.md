@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta.14] - 2026-10-05
+
 ### Added
 
 - Show the compositor's current foreground application in the desktop dashboard and tray, including game launches from Steam and live window-title changes. Session details retain the original Moonlight application name and ID, and foreground reporting continues while the client is disconnected.
