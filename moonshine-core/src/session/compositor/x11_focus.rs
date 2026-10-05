@@ -853,6 +853,12 @@ impl X11Focus {
 		self.write_atom_prop(window_id as Window, self.atoms.wm_state, self.atoms.wm_state, &[1, 0]);
 	}
 
+	/// Set `WM_STATE` to `ICCCM_ICONIC_STATE` (3), acknowledging a client's
+	/// `WM_CHANGE_STATE` request. Gamescope: `handle_wm_change_state()`.
+	pub fn set_wm_state_iconic(&self, window_id: u32) {
+		self.write_atom_prop(window_id as Window, self.atoms.wm_state, self.atoms.wm_state, &[3, 0]);
+	}
+
 	/// Read all focus control data at once.
 	///
 	/// Returns `None` if the X11 display connection is broken or invalid.

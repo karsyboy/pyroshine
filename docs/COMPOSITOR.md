@@ -18,8 +18,9 @@ The implementation is under `moonshine-core/src/session/`: event loop, state
 and protocol handlers in `compositor/{mod,state,handlers}.rs`, capture and
 eligibility in `compositor/{capture,admission,frame}.rs`, cursor in
 `compositor/cursor.rs`, focus and Steam classification in
-`compositor/{focus,x11_focus}.rs`, input injection in `compositor/input.rs`,
-swapchain and color protocols in `compositor/{gamescope_swapchain,color_management}.rs`,
+`compositor/{focus,x11_focus}.rs`, input injection in `compositor/input.rs`
+(XTest emulation in `compositor/emulated_input.rs`), swapchain and color
+protocols in `compositor/{gamescope_swapchain,wsi_bindings,color_management}.rs`,
 and controller emulation in `stream/control/input/{gamepad,mod}.rs`.
 
 ## Configuration
@@ -50,6 +51,24 @@ There is no inactivity timer. An active visible cursor remains visible until
 client cursor state changes. Mouse/pen use can activate the initial fallback;
 controller events do not activate it and cannot change application cursor intent.
 Pointer activity cannot undo an explicit `Hidden` request.
+
+### Emulated pointer input (XTest)
+
+Steam Input turns a controller into mouse motion, clicks and keys with XTest
+requests on the session's X display. A rootless XWayland built with libei sends
+XTest to the EIS server named by `LIBEI_SOCKET` and otherwise moves only its own
+pointer sprite, behind the compositor's back (the next compositor pointer event
+snaps it back). The compositor listens on `$XDG_RUNTIME_DIR/<wayland-display>-ei`
+(`compositor/emulated_input.rs`, Smithay's libei backend) and passes the socket
+to XWayland only, as gamescope does. Its seat offers a keyboard, a relative
+pointer and an absolute pointer spanning all X11 root coordinates: XWayland
+emulates nothing until every capability it binds has a device.
+
+Emulated events take the Moonlight input paths in `compositor/input.rs`: relative
+motion honors an active pointer lock, coordinates are scene coordinates (XWayland
+is unscaled), and pointer events activate the cursor exactly like mouse use.
+Emulated keyboard events reach the seat keyboard without touching the cursor.
+Controller input that Steam does not convert never reaches this path.
 
 The pinned Smithay revision is
 [`0ff00983b6007257a7a161a4fe8b14a778e2ac8f`](https://github.com/Smithay/smithay/tree/0ff00983b6007257a7a161a4fe8b14a778e2ac8f).
@@ -137,16 +156,35 @@ image in direct eligibility and GLES blending, including alpha-capable HDR
 buffers. Child surfaces retain their own transparency. See the
 [Vulkan definition](https://github.khronos.org/Vulkan-Site/spec/latest/chapters/VK_KHR_surface/wsi.html).
 
+### WSI presentation bindings
+
+`override_window_content` binds a swapchain `wl_surface` to the X11 window it
+presents (`compositor/wsi_bindings.rs`), like gamescope's per-window override
+surface. Each window keeps its own binding, so simultaneously running games never
+replace each other's presentation; rendering, direct export, source size and
+focus readiness ask which surface presents a given window. The reported window
+(often a Wine/DXVK child) resolves to the rendered toplevel when it maps; a
+resolved binding issues no further X11 queries.
+
+A surface binds one window, and a newer surface for the same window replaces the
+older binding. A binding is removed when its owning swapchain object is
+destroyed (an older swapchain cannot remove a newer chain's binding of the same
+surface), when its surface dies, or when its X11 window is destroyed (X11 ids are
+reused). Unmap keeps it: Wine restores a minimized window by withdrawing and
+remapping it. Every live binding receives its window's frame callbacks on
+composited and idle refresh ticks, so a background game stays resumable; direct
+export services only the exported surface, as for any window. Presentation
+feedback reports a binding as displayed only when the frame composed it.
+
 ### Unsafe XWayland replacement cleanup
 
 Wine presentation safety is checked before accepting any top-level bypass.
 Unsafe windows present via the retained XCB surface without a replacement binding.
 When safety changes, the WSI layer destroys its protocol override before requesting
-swapchain recreation. The compositor clears only the owning swapchain's override,
+swapchain recreation. The compositor clears only the owning swapchain's binding,
 invalidates damage, and restores the XWayland scene even though the Vulkan/Wayland
-surface itself may remain alive. A newer override on that surface survives old
-swapchain destruction. Capture eligibility, focus classification, and GPU export
-rules remain independent of this presentation decision. See
+surface itself may remain alive. Capture eligibility, focus classification, and
+GPU export rules remain independent of this presentation decision. See
 [presentation topology and fullscreen diagnosis](VULKAN_IMAGE_COUNTS.md#presentation-topology-and-fallback).
 
 ### Steam classification and input
@@ -166,15 +204,32 @@ keyboard on the game; closing the overlay restores the game target and unified
 focused-app contract. These match the inspected
 [gamescope focus logic](https://github.com/ValveSoftware/gamescope/blob/master/src/steamcompmgr.cpp).
 
+Steam closes its overlay by making it transparent; a transparent Steam surface
+holds no role. A window that is unmapped or destroyed (with or without a prior
+unmap) is retired by one idempotent path: it leaves the space, its metadata and
+transient links, and every overlay, notification, external-overlay, dropdown,
+decoration, input-focus and pointer-focus reference, then focus is re-evaluated
+so input returns to the game.
+
+When the overlay takes keyboard focus, Wine deactivates a fullscreen game, which
+may minimize itself with `WM_CHANGE_STATE` and then waits for the window manager
+to update `WM_STATE` before any further state change, including its restore. The
+compositor acknowledges the iconic state without unmapping the window, and a
+window becoming the focus is set back to normal, as gamescope does
+(`handle_wm_change_state`, `DetermineAndApplyFocus`).
+
 Controller Guide shortcuts are described in
 [configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
 Guide or the explicit Back+Start policy so games receive real Select holds.
 Activation rumble deadlines preserve every held button; disconnect drops all
 per-controller shortcut state.
 
-DEBUG logs report classification, cursor, virtual-device creation, and capture
-path transitions (`direct`, `direct_override`, `composited`); rendering itself
-does not emit per-frame INFO messages.
+DEBUG logs report classification, cursor, virtual-device creation, WSI binding
+registration/resolution/release, X11 window retirement, iconic acknowledgements,
+EIS connections, and capture path transitions (`direct`, `direct_override`,
+`composited`); rendering itself does not emit per-frame INFO messages. Window,
+focus and overlay transitions use the `focus` target and need it enabled
+(for example `MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
 
 ## Color and output changes
 
@@ -195,12 +250,26 @@ Unit tests cover cursor activation/idle/hide, real Wayland resource replacement
 and destruction, scene extras and automatic restoration, capture configuration,
 cropping/scaling/rotation, Steam classification transitions, notification focus
 and dropdown exclusion, unchanged focus-contract suppression, and controller
-kind/policy parsing. They do not prove Steam or game behavior on hardware.
+kind/policy parsing. `wsi_bindings` tests cover two simultaneous games,
+swapchain recreation and old-owner release, deterministic fallback, late window
+resolution and window destruction; `focus` tests cover the overlay open/close
+cycle (modes 2, 1 and 0, opacity 0), input routing back to the game, and role
+cleanup for an overlay destroyed without being hidden or unmapped. They do not
+prove Steam or game behavior on hardware.
+
+The ignored `xtest_motion_moves_the_compositor_pointer` test starts the
+compositor and XWayland on a GPU host (no session or systemd units), sends XTest
+motion from an X11 client and checks that the next compositor pointer event
+continues from that position:
+
+```sh
+cargo test -p moonshine-core --all-features --lib -- --ignored xtest_motion_moves_the_compositor_pointer
+```
 
 ### Hardware acceptance
 
 These checks need a GPU host with `/dev/dri`, a client and Steam. Run the server
-with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug`).
+with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
 
 1. **Direct export.** Run a fullscreen workload with an explicitly hidden cursor
    and no extra content. Confirm the capture path is `direct` or
@@ -215,10 +284,28 @@ with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug`).
 4. **Overlay and menus.** Open and close the Steam overlay and small interactive
    menus. Confirm visibility, pointer/controller routing, the mode-2 keyboard
    split and immediate restoration. Repeat with Steam Input enabled and
-   disabled to separate Steam routing from virtual-device delivery.
-5. **Controllers.** Test arrival, duplicate arrival, update before arrival,
+   disabled to separate Steam routing from virtual-device delivery. Include a
+   fullscreen Proton game that minimizes on focus loss (for example Grim Dawn):
+   open and close the overlay at least ten times, in `capture_mode = "auto"` and
+   `"composited"`. The game must return immediately; the log shows
+   `WM_CHANGE_STATE iconic acknowledged` when it minimized.
+5. **Simultaneous games.** Launch a Vulkan game, then a second one without
+   closing the first, and switch between them through Steam at least ten times,
+   then close the second, continue the first and relaunch the second. The
+   selected game must always show its own picture, with no persistent black
+   frame, and `direct_override` must return when the scene is eligible. Check
+   `WSI binding registered`/`released` logs per game. Repeat without
+   `MOONSHINE_WSI_DISABLE_BYPASS`.
+6. **Controller cursor.** In a game with a visible cursor, move it continuously
+   with the mouse, then with Steam Input (controller as mouse), alternating
+   repeatedly. The cursor must not flash or jump, clicks must land at it, the
+   log shows `EIS client connected for XTest input emulation`, and
+   `$TMPDIR/moonshine/xwayland.log` must not contain `[xwayland ei] EI setup
+   failed`. An application-hidden cursor must stay hidden and plain controller
+   gameplay must not show one.
+7. **Controllers.** Test arrival, duplicate arrival, update before arrival,
    active-mask removal and reconnect at indices 0 and 15, plus native
    PlayStation motion/touch/rumble and forced emulation policies.
-6. **Formats.** Repeat with H.264, HEVC, AV1, PyroWave, HDR, YUV 4:4:4, output
+8. **Formats.** Repeat with H.264, HEVC, AV1, PyroWave, HDR, YUV 4:4:4, output
    scaling and a static screen. HDR render format and color metadata must stay
    intact, with no CPU capture, extra frame queue or GPU-to-CPU transfer.

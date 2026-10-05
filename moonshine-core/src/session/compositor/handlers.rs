@@ -421,7 +421,12 @@ impl CompositorHandler for MoonshineCompositor {
 		// Mark the screen as dirty so the next timer tick renders and sends a frame.
 		self.screen_dirty = true;
 		self.commit_generation = self.commit_generation.wrapping_add(1);
-		if self.override_surface.as_ref().is_some_and(|(s, _)| s == surface) {
+		if self
+			.focused_window
+			.as_ref()
+			.and_then(|window| self.wsi_surface(window))
+			.is_some_and(|s| s == surface)
+		{
 			self.note_source_commit();
 		}
 
@@ -456,7 +461,7 @@ impl CompositorHandler for MoonshineCompositor {
 				.space
 				.elements()
 				.any(|w| w.wl_surface().is_some_and(|s| &*s == surface))
-				|| self.override_surface.as_ref().is_some_and(|(s, _)| s == surface))
+				|| self.wsi.contains(surface))
 		{
 			self.reevaluate_focus();
 		}
@@ -591,6 +596,117 @@ impl MoonshineCompositor {
 			}
 		}
 		self.window_metadata.remove(window);
+	}
+
+	/// Remove an X11 window that left the scene from every compositor
+	/// structure: the space, metadata, the transient index, the dropdown slot
+	/// and every special-window, focus and decoration role.
+	///
+	/// Unmap and destroy both call this, so neither path can leave a stale
+	/// overlay painted above the game (a metadata-less window would render as
+	/// an opaque normal window) or holding pointer/keyboard routing. A role
+	/// that outlived its space element is found by id. Idempotent.
+	fn retire_x11_window(&mut self, window_id: u32) {
+		let is_window = |w: &Window| w.x11_surface().is_some_and(|x| x.window_id() == window_id);
+		let elem = self.space.elements().find(|w| is_window(w)).cloned();
+		let target = elem.clone().or_else(|| {
+			[
+				&self.overlay_window,
+				&self.notification_window,
+				&self.external_overlay_window,
+				&self.input_focus_window,
+				&self.pointer_focus_window,
+				&self.override_window,
+				&self.override_underlay_window,
+				&self.focused_window,
+			]
+			.into_iter()
+			.flatten()
+			.chain(&self.decoration_windows)
+			.find(|w| is_window(w))
+			.cloned()
+		});
+		let was_focused = Some(window_id) == self.focused_x11_window;
+		let Some(target) = target else {
+			if was_focused {
+				self.focused_x11_window = None;
+				self.reevaluate_focus();
+			}
+			return;
+		};
+
+		// Focus returns to the parent when its focused transient child goes.
+		let focused_is_transient_child = self.focused_x11_window.is_some_and(|fid| {
+			self.space
+				.elements()
+				.find(|e| e.x11_surface().is_some_and(|x| x.window_id() == fid))
+				.and_then(|e| self.window_metadata.get(e))
+				.is_some_and(|m| m.transient_for == Some(window_id))
+		});
+		// Special windows can be referenced by pointer focus and the focusable
+		// lists even when the focused window is unaffected.
+		let is_special = self.window_metadata.get(&target).is_some_and(|m| {
+			m.flags.intersects(
+				WindowFlags::OVERLAY
+					| WindowFlags::NOTIFICATION
+					| WindowFlags::EXTERNAL_OVERLAY
+					| WindowFlags::STREAMING_CLIENT
+					| WindowFlags::STREAMING_CLIENT_VIDEO
+					| WindowFlags::VR_OVERLAY_TARGET,
+			)
+		});
+
+		if self.override_window.as_ref() == Some(&target) {
+			self.clear_dropdowns();
+		}
+		self.unregister_window(&target);
+		if elem.is_some() {
+			self.space.unmap_elem(&target);
+			self.screen_dirty = true;
+		}
+		let held_role = super::focus::forget_window(
+			&target,
+			&mut [
+				&mut self.overlay_window,
+				&mut self.notification_window,
+				&mut self.external_overlay_window,
+				&mut self.input_focus_window,
+				&mut self.pointer_focus_window,
+				&mut self.override_window,
+				&mut self.override_underlay_window,
+				&mut self.focused_window,
+			],
+			&mut self.decoration_windows,
+		);
+		if held_role {
+			self.steam_overlay_input_active = self.input_focus_window.is_some();
+			self.overlay_dirty = true;
+			self.screen_dirty = true;
+		}
+		tracing::debug!(
+			target: "focus",
+			window_id,
+			in_scene = elem.is_some(),
+			was_focused,
+			is_special,
+			held_role,
+			"X11 window retired"
+		);
+
+		// Re-evaluate when the focus (or its transient child) went, when a
+		// Wayland window had focus (so Smithay keyboard focus is re-validated),
+		// or when the window held a special role: pointer focus, input routing
+		// and the GAMESCOPE focusable lists must return to the game.
+		if was_focused || focused_is_transient_child || self.focused_x11_window.is_none() || is_special || held_role {
+			if was_focused || focused_is_transient_child {
+				self.focused_x11_window = None;
+				if let Some(keyboard) = self.seat.get_keyboard() {
+					let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+					keyboard.set_focus(self, None, serial);
+				}
+			}
+			self.reevaluate_focus();
+		}
 	}
 
 	/// Check if an X11 window is transient-for (directly or transitively)
@@ -830,59 +946,44 @@ impl MoonshineCompositor {
 	/// Only the highest-opacity external overlay is kept. `input_focus_window`
 	/// is the last overlay that asked for input.
 	fn classify_special_windows(&mut self, windows: &[Window]) {
-		let mut best_overlay: Option<Window> = None;
-		let mut best_notification: Option<Window> = None;
-		let mut best_external_overlay: Option<Window> = None;
-		let mut input_focus: Option<Window> = None;
-		let mut max_overlay_opacity = 0u32;
-		let mut max_external_overlay_opacity = 0u32;
-
+		// Output resize/reconnection can change the full-width boundary, even
+		// when Steam's own window properties did not change.
 		let output_width = self.output_rect().size.w;
 		for window in windows {
-			let Some(meta) = self.window_metadata.get_mut(window) else {
-				continue;
-			};
-
-			// Output resize/reconnection can change the full-width boundary,
-			// even when Steam's own window properties did not change.
-			meta.classify_steam_surface(output_width);
-			if meta.is_overlay && meta.opacity != 0 {
-				let interactive = meta.flags.contains(WindowFlags::OVERLAY);
-				if interactive && meta.opacity >= max_overlay_opacity {
-					best_overlay = Some(window.clone());
-					max_overlay_opacity = meta.opacity;
-				} else if !interactive {
-					best_notification = Some(window.clone());
-				}
-
-				if meta.input_focus_mode != 0 {
-					input_focus = Some(window.clone());
-				}
-			}
-
-			if meta.flags.contains(WindowFlags::EXTERNAL_OVERLAY) && meta.opacity > max_external_overlay_opacity {
-				best_external_overlay = Some(window.clone());
-				max_external_overlay_opacity = meta.opacity;
+			if let Some(meta) = self.window_metadata.get_mut(window) {
+				meta.classify_steam_surface(output_width);
 			}
 		}
+		let picked = super::focus::pick_special_windows(
+			windows
+				.iter()
+				.filter_map(|window| self.window_metadata.get(window).map(|meta| (window, meta))),
+		);
 
-		let old_overlay = self.overlay_window.clone();
-		let old_notification = self.notification_window.clone();
-		let old_external_overlay = self.external_overlay_window.clone();
-		let old_input_focus = self.input_focus_window.clone();
-		self.overlay_window = best_overlay;
-		self.notification_window = best_notification;
-		self.external_overlay_window = best_external_overlay;
-		self.input_focus_window = input_focus;
+		let overlay_changed = self.overlay_window != picked.overlay
+			|| self.notification_window != picked.notification
+			|| self.external_overlay_window != picked.external_overlay;
+		let input_changed = self.input_focus_window != picked.input_focus;
+		if overlay_changed || input_changed {
+			tracing::debug!(
+				target: "focus",
+				overlay = ?picked.overlay.as_ref().and_then(|w| w.x11_surface().map(|x| x.window_id())),
+				notification = ?picked.notification.as_ref().and_then(|w| w.x11_surface().map(|x| x.window_id())),
+				external_overlay = ?picked.external_overlay.as_ref().and_then(|w| w.x11_surface().map(|x| x.window_id())),
+				input_focus = ?picked.input_focus.as_ref().and_then(|w| w.x11_surface().map(|x| x.window_id())),
+				"Special window classification changed"
+			);
+		}
+		self.overlay_window = picked.overlay;
+		self.notification_window = picked.notification;
+		self.external_overlay_window = picked.external_overlay;
+		self.input_focus_window = picked.input_focus;
 		self.steam_overlay_input_active = self.input_focus_window.is_some();
-		if old_overlay != self.overlay_window
-			|| old_notification != self.notification_window
-			|| old_external_overlay != self.external_overlay_window
-		{
+		if overlay_changed {
 			self.overlay_dirty = true;
 			self.screen_dirty = true;
 		}
-		if old_input_focus != self.input_focus_window {
+		if input_changed {
 			self.focus_state.mark_dirty();
 		}
 	}
@@ -896,10 +997,7 @@ impl MoonshineCompositor {
 		if window.wl_surface().is_some_and(|s| surface_has_buffer(&s)) {
 			return true;
 		}
-		let x11_id = window.x11_surface().map(|x| x.window_id());
-		self.override_surface
-			.as_ref()
-			.is_some_and(|(s, render_window)| Some(*render_window) == x11_id && s.is_alive() && surface_has_buffer(s))
+		self.wsi_surface(window).is_some_and(surface_has_buffer)
 	}
 
 	/// Defer to the Steam UI only while `requested` hasn't presented yet.
@@ -1408,20 +1506,20 @@ impl MoonshineCompositor {
 		// Input focus: the last overlay that asked for input, else the focus
 		// window. Mode 2 keeps keyboard on the game while the overlay takes
 		// pointer input. Gamescope: `DetermineAndApplyFocus()` input routing.
-		let input_focus = self.input_focus_window.clone().unwrap_or_else(|| best.clone());
-		let input_focus_mode = self
-			.window_metadata
-			.get(&input_focus)
-			.map(|m| m.input_focus_mode)
-			.unwrap_or(0);
-		let keyboard_target: Option<Window> = if input_focus_mode == 2 {
-			Some(best.clone())
-		} else {
-			Some(input_focus.clone())
-		};
+		let mode_of = |window: &Window| self.window_metadata.get(window).map_or(0, |m| m.input_focus_mode);
+		let targets = super::focus::route_input(
+			best,
+			mode_of(best),
+			self.input_focus_window
+				.as_ref()
+				.map(|overlay| (overlay, mode_of(overlay))),
+		);
+		let input_focus = targets.pointer.clone();
+		let input_focus_mode = targets.mode;
+		let keyboard_target: Option<Window> = Some(targets.keyboard);
 
 		// Pointer focus follows inputFocus — the overlay when it asks for input.
-		let pointer_target: Option<Window> = Some(input_focus.clone());
+		let pointer_target: Option<Window> = Some(targets.pointer);
 		if !focus_changed && self.pointer_focus_window == pointer_target && self.input_focus_mode == input_focus_mode {
 			self.focus_state.apply();
 			return;
@@ -1500,11 +1598,15 @@ impl MoonshineCompositor {
 			self.current_keyboard_focus_window = None;
 		}
 		self.input_focus_mode = input_focus_mode;
-		if let Some(prev) = old_focused_x11
+		// A window becoming the focus is taken out of an acknowledged iconic
+		// state (see `minimize_request`); Wine restores the game on that
+		// WM_STATE change. Never put a window back to iconic: some games
+		// misbehave. Gamescope: `DetermineAndApplyFocus()` `set_wm_state`.
+		if let Some(focused) = self.focused_x11_window
 			&& old_focused_x11 != self.focused_x11_window
 			&& let Some(ref x11_focus) = self.x11_focus
 		{
-			x11_focus.set_wm_state_normal(prev);
+			x11_focus.set_wm_state_normal(focused);
 		}
 
 		// Send initial pointer motion event to the pointer focus window to establish
@@ -2580,84 +2682,41 @@ impl XwmHandler for MoonshineCompositor {
 	}
 
 	fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
-		let unmapped_id = window.window_id();
-		let was_focused = Some(unmapped_id) == self.focused_x11_window;
-
-		// Check if the currently focused window is a transient child of
-		// this window. If so, focus should return to the parent.
-		let focused_id = self.focused_x11_window;
-		let focused_is_transient_child = focused_id.is_some_and(|fid| {
-			self.space
-				.elements()
-				.find(|e| e.x11_surface().is_some_and(|x| x.window_id() == fid))
-				.and_then(|e| self.window_metadata.get(e))
-				.is_some_and(|m| m.transient_for == Some(unmapped_id))
-		});
-
-		let maybe = self.find_window_by_x11_surface(&window);
-
-		// Check if this window is an overlay/notification/external-overlay
-		// that might be pointed to by pointer_focus_window or the special
-		// window trackers, regardless of whether it was the focused window.
-		let is_special = maybe.as_ref().is_some_and(|elem| {
-			self.window_metadata.get(elem).is_some_and(|m| {
-				m.flags.intersects(
-					WindowFlags::OVERLAY
-						| WindowFlags::NOTIFICATION
-						| WindowFlags::EXTERNAL_OVERLAY
-						| WindowFlags::STREAMING_CLIENT
-						| WindowFlags::STREAMING_CLIENT_VIDEO
-						| WindowFlags::VR_OVERLAY_TARGET,
-				)
-			})
-		});
-
-		if let Some(elem) = maybe {
-			self.unregister_window(&elem);
-			self.space.unmap_elem(&elem);
-
-			// Clear override window if it was the unmapped window.
-			if self.override_window.as_ref() == Some(&elem) {
-				self.clear_dropdowns();
-			}
-		}
+		tracing::debug!(
+			target: "focus",
+			window_id = window.window_id(),
+			override_redirect = window.is_override_redirect(),
+			"X11 window unmapped"
+		);
+		self.retire_x11_window(window.window_id());
 		if !window.is_override_redirect() {
 			let _ = window.set_mapped(false);
-		}
-
-		// If the focused window was unmapped, or a transient child of the
-		// focused window was unmapped, clear focus and re-evaluate.
-		// Also re-evaluate when focused_x11_window is None (a Wayland window
-		// had focus) to ensure Smithay keyboard focus is properly cleared.
-		// Additionally re-evaluate when a special (overlay/notification/etc.)
-		// window unmapped — pointer_focus_window and the GAMESCOPE focusable
-		// lists may be stale even if the focused window wasn't affected.
-		if was_focused || focused_is_transient_child || self.focused_x11_window.is_none() || is_special {
-			if was_focused || focused_is_transient_child {
-				self.focused_x11_window = None;
-				if let Some(keyboard) = self.seat.get_keyboard() {
-					let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-					keyboard.set_focus(self, None, serial);
-				}
-			}
-			self.reevaluate_focus();
 		}
 	}
 
 	fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
-		// Remove metadata for destroyed X11 windows.
-		let elem = self
-			.space
-			.elements()
-			.find(|e| {
-				e.x11_surface()
-					.map(|x| x.window_id() == window.window_id())
-					.unwrap_or(false)
-			})
-			.cloned();
+		tracing::debug!(target: "focus", window_id = window.window_id(), "X11 window destroyed");
+		// Usually already retired by its unmap; a window destroyed while still
+		// mapped (or whose unmap was not observed) is retired here the same way.
+		self.retire_x11_window(window.window_id());
+		// Unlike unmap (Wine withdraws and remaps a restored window), a
+		// destroyed window never presents its swapchain again.
+		self.release_window_bindings(window.window_id());
+	}
 
-		if let Some(elem) = elem {
-			self.unregister_window(&elem);
+	fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+		// Wine iconifies a fullscreen game that loses activation (for example
+		// when the Steam overlay takes keyboard focus) with WM_CHANGE_STATE and
+		// then waits for the WM to update WM_STATE before any further state
+		// change, including the restore. Left unanswered, the game stays
+		// minimized and stops presenting for good. Acknowledge the state like
+		// gamescope without unmapping: the window keeps its place in the scene
+		// and focus ranking, Wine restores it by remapping, and a focus change
+		// marks it Normal again (`apply_focus`).
+		tracing::debug!(target: "focus", window_id = window.window_id(), "WM_CHANGE_STATE iconic acknowledged");
+		if let Some(x11_focus) = &self.x11_focus {
+			x11_focus.set_wm_state_iconic(window.window_id());
+			x11_focus.flush();
 		}
 	}
 

@@ -28,7 +28,6 @@ use std::collections::HashMap;
 
 use smithay::backend::input::InputTime;
 use smithay::desktop::Space;
-use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
 use smithay::input::{Seat, SeatState};
@@ -396,6 +395,11 @@ pub(crate) struct MoonshineCompositor {
 	pub x11_focus_token: Option<RegistrationToken>,
 	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
 	pub wayland_display: String,
+	/// EIS socket through which XWayland forwards XTest input (Steam Input's
+	/// controller-as-mouse); see [`super::emulated_input`].
+	emulated_input: Option<super::emulated_input::EmulatedInputServer>,
+	/// Compositor keyboard layout, also advertised to the emulated keyboard.
+	keyboard_config: KeyboardConfig,
 
 	/// Whether HDR mode is active for this session.
 	pub hdr: bool,
@@ -409,16 +413,11 @@ pub(crate) struct MoonshineCompositor {
 	pub virtual_connector_strategy: super::VirtualConnectorStrategy,
 
 	// -- WSI layer --
-	/// WSI override surface `(surface, render_window)`, where `render_window` is
-	/// the resolved X11 toplevel of the window the swapchain was created on
-	/// (0 for native Wayland).  When set, this surface is rendered instead of
-	/// that window's X11 content.
-	pub override_surface: Option<(WlSurface, u32)>,
-
-	/// X11 window the WSI layer reported for the current override surface (the
-	/// swapchain window, often a child of the rendered toplevel). Kept so the
-	/// target can be re-resolved when its window maps later.
-	pub override_reported_window: u32,
+	/// WSI presentation bindings: the swapchain surface that presents each X11
+	/// window in place of its XWayland content. Every live game keeps its own
+	/// binding, so switching between simultaneously running games presents
+	/// each one's own swapchain.
+	pub(super) wsi: super::wsi_bindings::WsiBindings,
 
 	/// X11 window ID of the currently focused window (from Smithay's keyboard focus).
 	/// Used by the WSI layer to match override surfaces to focused windows.
@@ -665,29 +664,11 @@ impl MoonshineCompositor {
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
-		let mut xkb_config = XkbConfig::default();
-
-		if !keyboard_config.layout.is_empty() {
-			xkb_config.layout = &keyboard_config.layout;
-		}
-
-		if !keyboard_config.variant.is_empty() {
-			xkb_config.variant = &keyboard_config.variant;
-		}
-
-		if !keyboard_config.model.is_empty() {
-			xkb_config.model = &keyboard_config.model;
-		}
-
-		if let Some(options) = keyboard_config.options.clone().filter(|options| !options.is_empty()) {
-			xkb_config.options = Some(options);
-		}
-
 		let mut space = Space::default();
 
 		// Create the input devices exposed to streamed applications.
 		let mut seat = seat_state.new_wl_seat(&display_handle, "moonshine");
-		seat.add_keyboard(xkb_config, 200, 25)
+		seat.add_keyboard(keyboard_config.xkb_config(), 200, 25)
 			.expect("Failed to add keyboard to seat");
 		seat.add_pointer();
 		seat.add_touch();
@@ -875,12 +856,13 @@ impl MoonshineCompositor {
 				xdisplay_tx: Some(xdisplay_tx),
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
+				emulated_input: None,
+				keyboard_config,
 				hdr: hdr_active,
 				hdr_capable,
 				steam_mode,
 				virtual_connector_strategy,
-				override_surface: None,
-				override_reported_window: 0,
+				wsi: Default::default(),
 				focused_x11_window: None,
 				focused_window: None,
 				upscale_scaler: super::scaling::UpscaleScaler::from_env(),
@@ -913,17 +895,17 @@ impl MoonshineCompositor {
 		)
 	}
 
-	/// Space render elements, substituting the WSI override surface for the
-	/// content of the window with X11 ID `override.1`.
+	/// Space render elements, substituting each window's WSI binding for its
+	/// X11 content.
 	///
 	/// Mirrors gamescope's `steamcompmgr_win_t::current_surface()`: a window
-	/// presents the override surface whenever one is set, in place of its X11
+	/// presents its override surface whenever one is bound, in place of its X11
 	/// content, at the window's own geometry.
 	fn space_render_elements_with_override(
 		renderer: &mut GlesRenderer,
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
-		override_surface: Option<(&WlSurface, u32)>,
+		wsi: &super::wsi_bindings::WsiBindings,
 		layers: SceneLayers<'_>,
 		opacity: impl Fn(&smithay::desktop::Window) -> f32,
 	) -> Vec<OutputRenderElements> {
@@ -940,12 +922,7 @@ impl MoonshineCompositor {
 			}
 			let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
 
-			let overridden = override_surface.and_then(|(surface, xid)| {
-				window
-					.x11_surface()
-					.is_some_and(|x| x.window_id() == xid)
-					.then_some(surface)
-			});
+			let overridden = window.x11_surface().and_then(|x| wsi.surface_for_window(x.window_id()));
 
 			let root = overridden
 				.cloned()
@@ -1000,7 +977,7 @@ impl MoonshineCompositor {
 			render_window(&mut elements, window);
 		}
 
-		if let Some((surface, 0)) = override_surface {
+		if let Some(surface) = wsi.standalone() {
 			let opaque = super::gamescope_swapchain::surface_is_opaque(surface);
 			let root_id = Id::from_wayland_resource(surface);
 			elements.extend(
@@ -1120,15 +1097,10 @@ impl MoonshineCompositor {
 
 	/// Rendered logical size of the window's content, if any.
 	///
-	/// A window whose content is overridden by the WSI presents the override
-	/// surface, so its rendered size is the override's.
+	/// A window whose content is overridden by the WSI presents its binding,
+	/// so its rendered size is the binding's.
 	fn window_source_size(&self, window: &smithay::desktop::Window) -> Option<(i32, i32)> {
-		if let Some(x11_id) = window.x11_surface().map(|x| x.window_id())
-			&& let Some((surface, render_window)) = self.override_surface.as_ref()
-			&& *render_window == x11_id
-			&& surface.alive()
-			&& let Some(size) = Self::surface_source_size(surface)
-		{
+		if let Some(size) = self.wsi_surface(window).and_then(Self::surface_source_size) {
 			return Some(size);
 		}
 		window.wl_surface().as_deref().and_then(Self::surface_source_size)
@@ -1229,9 +1201,9 @@ impl MoonshineCompositor {
 		}
 		// A standalone native override has no X11 scene window.
 		if self.space.elements().next().is_none() {
-			return match self.override_surface.as_ref() {
-				Some((surface, 0)) if surface.alive() => self.surface_is_complete_output(surface),
-				_ => Err(DirectReject::NoSurface),
+			return match self.wsi.standalone() {
+				Some(surface) => self.surface_is_complete_output(surface),
+				None => Err(DirectReject::NoSurface),
 			};
 		}
 		let Some(window) = self.direct_source_window(!notification) else {
@@ -1247,13 +1219,8 @@ impl MoonshineCompositor {
 		if self.window_metadata.get(window).is_some_and(|m| m.opacity != 255) {
 			return Err(DirectReject::NotOpaque);
 		}
-		let source = if self.is_override_active() {
-			let Some((surface, xid)) = &self.override_surface else {
-				return Err(DirectReject::NoSurface);
-			};
-			if window.x11_surface().is_none_or(|x| x.window_id() != *xid) {
-				return Err(DirectReject::Other);
-			}
+		// The top window's own WSI binding, when it has one, is its content.
+		let source = if let Some(surface) = self.wsi_surface(window) {
 			surface.clone()
 		} else {
 			let Some(surface) = window.wl_surface() else {
@@ -1573,9 +1540,9 @@ impl MoonshineCompositor {
 				},
 			);
 		}
-		if let Some((surface, _)) = &self.override_surface
-			&& surface.alive()
-		{
+		// Every bound swapchain is serviced like its window, so a background
+		// game stays resumable when it is shown again.
+		for surface in self.wsi.live_surfaces() {
 			send_frames_surface_tree(
 				surface,
 				&self.output,
@@ -1683,6 +1650,13 @@ impl MoonshineCompositor {
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.
 		self.update_overlay_z_order();
+
+		// Drop bindings whose swapchain surface died with its client (no owner
+		// release); their windows present XWayland content again.
+		if self.wsi.prune_dead() {
+			tracing::debug!("Dead WSI binding cleared");
+			self.screen_dirty = true;
+		}
 
 		if self.cursor.reset_dead_surface() {
 			tracing::debug!(
@@ -1795,7 +1769,6 @@ impl MoonshineCompositor {
 				direct_reject_size = r[14],
 				direct_reject_no_surface = r[15],
 				direct_reject_not_dmabuf = r[16],
-				direct_reject_other = r[17],
 				"Video direct-export rejections"
 			);
 			self.gpu_timer.reset_window();
@@ -1884,9 +1857,10 @@ impl MoonshineCompositor {
 			Ok((layers, hold)) => {
 				let late_notification = layers[0].is_some();
 				let late_cursor = layers[1].is_some();
-				let override_active = self.is_override_active();
-				let exported = if override_active {
-					self.try_direct_scanout_override(&mut credit, send_callbacks, layers, hold)
+				let override_source = self.direct_override_source();
+				let override_active = override_source.is_some();
+				let exported = if let Some(surface) = override_source {
+					self.try_direct_scanout_override(surface, &mut credit, send_callbacks, layers, hold)
 				} else {
 					self.try_direct_scanout(&mut credit, send_callbacks, layers, hold)
 				};
@@ -2010,26 +1984,13 @@ impl MoonshineCompositor {
 		let mut elements: Vec<OutputRenderElements> = Vec::new();
 		elements.extend(cursor_elements);
 
-		// Drop a dead override surface.
-		if self.override_surface.as_ref().is_some_and(|(s, _)| !s.alive()) {
-			tracing::debug!("Override surface is dead, clearing.");
-			self.override_surface = None;
-			self.override_reported_window = 0;
-		}
-
-		// A window whose content is overridden by the WSI presents the override
-		// surface in place of its X11 content (gamescope `current_surface()`).
-		let override_target = self
-			.override_surface
-			.as_ref()
-			.filter(|(s, _)| s.alive())
-			.map(|(s, w)| (s.clone(), *w));
-
+		// A window whose content is overridden by the WSI presents its binding
+		// in place of its X11 content (gamescope `current_surface()`).
 		let space_elements = Self::space_render_elements_with_override(
 			&mut self.renderer,
 			&self.space,
 			&self.output,
-			override_target.as_ref().map(|(s, w)| (s, *w)),
+			&self.wsi,
 			SceneLayers {
 				decorations: &self.decoration_windows,
 				upper: [
@@ -2198,28 +2159,30 @@ impl MoonshineCompositor {
 			}
 		}
 
-		// Also send frame callbacks to the override surface if active,
-		// so the NVIDIA driver's Wayland WSI unblocks and presents the
-		// next frame.
-		if let Some((ref override_surface, _)) = self.override_surface
-			&& override_surface.alive()
-		{
+		// Bound swapchains receive their windows' frame callbacks, so the
+		// NVIDIA driver's Wayland WSI unblocks and presents the next frame; a
+		// background game stays resumable like any other space window.
+		// Presentation feedback is drained so WaitForPresentKHR can return; it
+		// reports a swapchain as displayed only when this frame composed it.
+		for surface in self.wsi.live_surfaces() {
 			if send_callbacks {
 				send_frames_surface_tree(
-					override_surface,
+					surface,
 					&self.output,
 					self.clock.now(),
 					Some(std::time::Duration::ZERO),
 					|_, _| Some(self.output.clone()),
 				);
 			}
-
-			// Drain and respond to wp_presentation_feedback callbacks
-			// so the NVIDIA driver's WaitForPresentKHR can return.
 			take_presentation_feedback_surface_tree(
-				override_surface,
+				surface,
 				&mut feedback,
-				|_, _| Some(self.output.clone()),
+				|surface, _| {
+					render_result
+						.as_ref()
+						.is_ok_and(|result| result.states.element_was_presented(surface))
+						.then(|| self.output.clone())
+				},
 				|_, _| {
 					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
 				},
@@ -2429,11 +2392,22 @@ impl MoonshineCompositor {
 		true
 	}
 
-	/// Direct DMA-BUF scanout for the gamescope/moonshine override surface.
+	/// The WSI binding a direct export reads: the top window's own binding, or
+	/// a standalone native swapchain when the scene has no windows.
+	fn direct_override_source(&self) -> Option<WlSurface> {
+		if self.space.elements().next().is_none() {
+			return self.wsi.standalone().cloned();
+		}
+		self.direct_source_window(true)
+			.and_then(|window| self.wsi_surface(window))
+			.cloned()
+	}
+
+	/// Direct DMA-BUF scanout for a gamescope/moonshine WSI binding.
 	///
-	/// When the WSI layer has installed an override surface (gamescope_swapchain
+	/// When the WSI layer has bound a swapchain surface (gamescope_swapchain
 	/// or moonshine_swapchain protocol), the game's frames are committed to
-	/// `self.override_surface` rather than to a space toplevel. Without this
+	/// that surface rather than to its space toplevel. Without this
 	/// path the compositor falls back to a GLES blit on the gfx queue, which
 	/// competes with the game's rendering at GPU saturation and inflates encode
 	/// latency. This sends the override surface's committed DMA-BUF straight
@@ -2441,15 +2415,15 @@ impl MoonshineCompositor {
 	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
 	fn try_direct_scanout_override(
 		&mut self,
+		override_surface: WlSurface,
 		credit: &mut Option<super::admission::CaptureCredit>,
 		send_callbacks: bool,
 		overlays: super::frame::FrameOverlays,
 		overlay_hold: Option<HeldBuffer>,
 	) -> bool {
-		let override_surface = match self.override_surface.as_ref() {
-			Some((s, _)) if s.alive() => s.clone(),
-			_ => return false,
-		};
+		if !override_surface.alive() {
+			return false;
+		}
 
 		let scanout_buffer = with_renderer_surface_state(&override_surface, |state| {
 			let buffer = state.buffer()?;
@@ -2609,103 +2583,101 @@ impl MoonshineCompositor {
 		true
 	}
 
-	/// Handle gamescope WSI layer's `override_window_content` request.
+	/// Handle the WSI layer's `override_window_content` request: bind the
+	/// swapchain surface to the X11 window it presents.
 	///
-	/// Stores the override surface so it gets rendered instead of the
-	/// original X11 window.
+	/// Other windows keep their own bindings. A different surface reporting the
+	/// same window replaces that window's binding; the displaced surface's HDR
+	/// state is evicted explicitly because `create_swapchain` only sees the new
+	/// surface. (When DXVK recreates its swapchain on a new X11 window, e.g. to
+	/// toggle HDR, the old binding instead goes with its owner's destroy.)
 	pub fn override_window_surface(&mut self, x11_window: u32, surface: WlSurface) {
-		// Clear stale HDR state from the previous override surface when the
-		// surface changes.  DXVK sometimes creates a new X11 window (and thus
-		// a new wl_surface) when toggling HDR mode, so the old surface's
-		// gamescope_current entry must be evicted explicitly — it won't be
-		// cleaned up by create_swapchain (which only sees the new surface).
-		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _)| s.clone())
-			&& old_surface != surface
-			&& let Some(cm) = &mut self.color_management
-		{
-			cm.clear_gamescope_current(&old_surface);
+		let displaced = self.wsi.bind(surface.clone(), x11_window);
+		for old_surface in &displaced {
+			if let Some(cm) = &mut self.color_management {
+				cm.clear_gamescope_current(old_surface);
+			}
 		}
-
-		self.override_reported_window = x11_window;
-		self.override_surface = Some((surface, x11_window));
+		tracing::debug!(
+			reported = x11_window,
+			surface = ?surface.id(),
+			displaced = ?displaced.iter().map(|s| s.id()).collect::<Vec<_>>(),
+			bindings = self.wsi.live_surfaces().count(),
+			"WSI binding registered"
+		);
 		self.resolve_override_window();
+		self.screen_dirty = true;
 	}
 
-	/// Resolve the override surface's target window from the WSI-reported xid.
+	/// Remove WSI bindings presenting a destroyed X11 window.
+	pub(super) fn release_window_bindings(&mut self, x11_window: u32) {
+		let removed = self.wsi.remove_window(x11_window);
+		if removed.is_empty() {
+			return;
+		}
+		for surface in &removed {
+			if let Some(cm) = &mut self.color_management {
+				cm.clear_gamescope_current(surface);
+			}
+		}
+		tracing::debug!(
+			x11_window,
+			removed = ?removed.iter().map(|s| s.id()).collect::<Vec<_>>(),
+			"WSI bindings released with their destroyed window"
+		);
+		self.invalidate_presentation();
+	}
+
+	/// The scene presents different content for an unchanged window set:
+	/// forget damage history so the next frame redraws everything.
+	pub(super) fn invalidate_presentation(&mut self) {
+		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
+		self.screen_dirty = true;
+	}
+
+	/// Resolve each binding's target window from the WSI-reported xid.
 	///
 	/// The WSI reports the window its Vulkan swapchain is created on, which for
-	/// Wine/DXVK is a child of the WM-visible toplevel. Key the override by the
+	/// Wine/DXVK is a child of the WM-visible toplevel. Key the binding by the
 	/// ancestor the compositor actually renders, independent of the current
-	/// focus (which can change after the override is stored).
+	/// focus (which can change after the binding is stored).
 	///
 	/// Smithay's XWM reparents clients into frame windows, so the root's child
 	/// is a frame that is never rendered; the managed client window is the
 	/// first ancestor present in the space. Re-run on window map because the
-	/// swapchain can be created before its window is mapped.
+	/// swapchain can be created before its window is mapped. Bindings that
+	/// already point at a rendered window issue no X11 query.
 	pub fn resolve_override_window(&mut self) {
-		let Some(alive) = self.override_surface.as_ref().map(|(s, _)| s.alive()) else {
-			return;
-		};
-		// A dead swapchain surface has no live window to resolve against; the
-		// render path clears it.
-		if !alive {
-			return;
-		}
-		let reported = self.override_reported_window;
-		if reported == 0 {
-			// Native Wayland surface: not tied to an X11 window.
-			if let Some((_, render)) = self.override_surface.as_mut() {
-				*render = 0;
-			}
-			return;
-		}
-
-		// Keep the current mapping if it already points at a rendered window.
-		let current = self.override_surface.as_ref().map(|(_, r)| *r);
-		if current.is_some_and(|c| {
-			self.space
+		let space = &self.space;
+		let is_rendered = |id: u32| {
+			space
 				.elements()
-				.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == c))
-		}) {
-			return;
+				.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == id))
+		};
+		let x11_focus = self.x11_focus.as_ref();
+		let changed = self.wsi.resolve(is_rendered, |reported| {
+			x11_focus.map(|xf| xf.get_ancestor_chain(reported)).unwrap_or_default()
+		});
+		for (reported, resolved) in changed {
+			tracing::debug!(reported, resolved, "Resolved WSI binding window");
 		}
-
-		let chain = self
-			.x11_focus
-			.as_ref()
-			.map(|xf| xf.get_ancestor_chain(reported))
-			.unwrap_or_default();
-		let resolved = chain
-			.iter()
-			.copied()
-			.find(|id| {
-				self.space
-					.elements()
-					.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == *id))
-			})
-			.unwrap_or(reported);
-		if let Some((_, render)) = self.override_surface.as_mut() {
-			*render = resolved;
-		}
-		tracing::debug!(
-			reported,
-			resolved,
-			chain = ?chain,
-			"Resolved override surface window"
-		);
 	}
 
-	/// Returns `true` when a live WSI override surface exists for a window in
-	/// the scene.  The override *is* that window's content, so it applies
-	/// whenever the window is shown, not only while it is focused.
+	/// The WSI binding presenting `window`'s content, if any.
+	pub(super) fn wsi_surface(&self, window: &smithay::desktop::Window) -> Option<&WlSurface> {
+		window
+			.x11_surface()
+			.and_then(|x| self.wsi.surface_for_window(x.window_id()))
+	}
+
+	/// Returns `true` when a live WSI binding presents a window in the scene
+	/// (or a standalone native swapchain). A binding *is* its window's content,
+	/// so it applies whenever the window is shown, not only while focused.
 	pub fn is_override_active(&self) -> bool {
-		self.override_surface.as_ref().is_some_and(|(s, render_window)| {
-			s.alive()
-				&& (*render_window == 0
-					|| self
-						.space
-						.elements()
-						.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == *render_window)))
+		self.wsi.any_presented(|id| {
+			self.space
+				.elements()
+				.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == id))
 		})
 	}
 
@@ -2838,15 +2810,26 @@ impl MoonshineCompositor {
 			"Spawning XWayland"
 		);
 
+		// XWayland forwards XTest input to the compositor only through EIS.
+		if self.emulated_input.is_none() {
+			self.emulated_input =
+				super::emulated_input::start(&self.handle, &self.wayland_display, &self.keyboard_config);
+		}
+		let mut envs: Vec<(&str, std::ffi::OsString)> = Vec::new();
+		if std::env::var_os("MOONSHINE_WAYLAND_DEBUG").is_some() {
+			envs.push(("WAYLAND_DEBUG", "1".into()));
+		}
+		if let Some(server) = &self.emulated_input {
+			envs.push(("LIBEI_SOCKET", server.socket.clone().into_os_string()));
+		}
+
 		// Smithay forks Xwayland from this thread; the before/after snapshot
 		// identifies exactly that child so teardown can own its lifetime.
 		let children_before = super::xwayland_process::thread_children();
 		let (xwayland, client) = match XWayland::spawn(
 			&self.display_handle,
 			None,
-			std::env::var("MOONSHINE_WAYLAND_DEBUG")
-				.ok()
-				.map(|_| ("WAYLAND_DEBUG", "1")),
+			envs,
 			// Emulate RandR so games can change resolution: without it Xwayland
 			// accepts the request but the mode never changes, leaving games
 			// stuck. Games launched through wlroots/gamescope get this flag.
@@ -2988,6 +2971,13 @@ impl MoonshineCompositor {
 		if let Some(token) = self.wayland_socket_token.take() {
 			self.handle.remove(token);
 			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
+		}
+
+		// Dropping the listener unlinks the EIS socket; XWayland's connection
+		// closes with the process.
+		if let Some(server) = self.emulated_input.take() {
+			self.handle.remove(server.token);
+			tracing::debug!(socket = %server.socket.display(), "Removed EIS listening socket source");
 		}
 
 		// Remove the root-window PropertyNotify source before the connection

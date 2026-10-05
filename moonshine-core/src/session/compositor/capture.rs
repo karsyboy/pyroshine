@@ -77,10 +77,9 @@ pub(super) enum DirectReject {
 	Size,
 	NoSurface,
 	NotDmabuf,
-	Other,
 }
 impl DirectReject {
-	pub const COUNT: usize = 18;
+	pub const COUNT: usize = 17;
 }
 
 impl SceneExtras {

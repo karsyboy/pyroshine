@@ -8,6 +8,7 @@ pub(crate) mod admission;
 mod capture;
 mod color_management;
 mod cursor;
+mod emulated_input;
 mod focus;
 pub(crate) mod frame;
 mod gamescope_swapchain;
@@ -17,6 +18,7 @@ pub(crate) mod input;
 mod protocols;
 mod scaling;
 mod state;
+mod wsi_bindings;
 mod x11_focus;
 mod xwayland_process;
 
@@ -60,6 +62,28 @@ impl Default for KeyboardConfig {
 			model: String::new(),
 			options: None,
 		}
+	}
+}
+
+impl KeyboardConfig {
+	/// The XKB configuration of the compositor keyboard (and the emulated
+	/// XTest keyboard, so both describe one keymap). Empty fields keep XKB's
+	/// defaults.
+	pub(crate) fn xkb_config(&self) -> smithay::input::keyboard::XkbConfig<'_> {
+		let mut xkb_config = smithay::input::keyboard::XkbConfig::default();
+		if !self.layout.is_empty() {
+			xkb_config.layout = &self.layout;
+		}
+		if !self.variant.is_empty() {
+			xkb_config.variant = &self.variant;
+		}
+		if !self.model.is_empty() {
+			xkb_config.model = &self.model;
+		}
+		if let Some(options) = self.options.clone().filter(|options| !options.is_empty()) {
+			xkb_config.options = Some(options);
+		}
+		xkb_config
 	}
 }
 
@@ -851,5 +875,127 @@ mod reconfigure_tests {
 		}
 		drop(compositor);
 		assert_eq!(responder.join().unwrap(), changes);
+	}
+}
+
+#[cfg(test)]
+mod xtest_tests {
+	use super::{Compositor, CompositorConfig, CompositorContext, CompositorInputEvent};
+	use crate::session::manager::SessionShutdownReason;
+	use x11rb::connection::Connection;
+	use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+	use x11rb::protocol::xtest::ConnectionExt as _;
+
+	const WIDTH: u16 = 1280;
+	const HEIGHT: u16 = 720;
+
+	/// Poll the X pointer until it reaches `expected` (root coordinates).
+	fn wait_for_pointer(conn: &impl Connection, root: u32, expected: (i16, i16)) -> (i16, i16) {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		loop {
+			let reply = conn.query_pointer(root).unwrap().reply().unwrap();
+			let position = (reply.root_x, reply.root_y);
+			if position == expected || std::time::Instant::now() > deadline {
+				return position;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+		}
+	}
+
+	/// Steam Input's controller-as-mouse is XTest motion from an X11 client.
+	/// It must move the compositor's pointer, not only XWayland's sprite:
+	/// otherwise the next compositor pointer event (Moonlight mouse, focus
+	/// change) snaps the X pointer back and the cursor alternates between
+	/// two positions.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland built with libei"]
+	fn xtest_motion_moves_the_compositor_pointer() {
+		let stop = async_shutdown::ShutdownManager::new();
+		let (compositor, handles) = Compositor::new(
+			CompositorConfig {
+				steam_mode: false,
+				..Default::default()
+			},
+			CompositorContext {
+				width: WIDTH.into(),
+				height: HEIGHT.into(),
+				refresh_rate: 60,
+				hdr: false,
+				output_scale: 1.0,
+				log_stats: false,
+			},
+			stop.clone(),
+		);
+		let launched = compositor.launch().expect("compositor launch");
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+
+		// A fullscreen game window that takes focus and pointer focus.
+		let window = conn.generate_id().unwrap();
+		conn.create_window(
+			x11rb::COPY_DEPTH_FROM_PARENT,
+			window,
+			root,
+			0,
+			0,
+			WIDTH,
+			HEIGHT,
+			0,
+			WindowClass::INPUT_OUTPUT,
+			x11rb::COPY_FROM_PARENT,
+			&CreateWindowAux::new().background_pixel(0),
+		)
+		.unwrap();
+		conn.map_window(window).unwrap();
+		conn.flush().unwrap();
+
+		// Moonlight mouse input positions the compositor pointer over the window.
+		let mut entered = (0, 0);
+		for _ in 0..50 {
+			handles
+				.input_tx
+				.send(CompositorInputEvent::MouseMoveAbsolute {
+					x: 640,
+					y: 360,
+					screen_width: WIDTH as i16,
+					screen_height: HEIGHT as i16,
+				})
+				.unwrap();
+			entered = wait_for_pointer(&conn, root, (640, 360));
+			if entered == (640, 360) {
+				break;
+			}
+		}
+		assert_eq!(entered, (640, 360), "the window never received pointer focus");
+
+		// Relative XTest motion, as Steam Input sends it.
+		const MOTION_NOTIFY: u8 = 6;
+		conn.xtest_fake_input(MOTION_NOTIFY, 1, x11rb::CURRENT_TIME, x11rb::NONE, 100, 50, 0)
+			.unwrap();
+		conn.flush().unwrap();
+		assert_eq!(wait_for_pointer(&conn, root, (740, 410)), (740, 410));
+
+		// Mouse use afterwards continues from the controller position.
+		handles
+			.input_tx
+			.send(CompositorInputEvent::MouseMoveRelative { dx: 1, dy: 1 })
+			.unwrap();
+		assert_eq!(
+			wait_for_pointer(&conn, root, (741, 411)),
+			(741, 411),
+			"XTest motion bypassed the compositor pointer"
+		);
+
+		drop(conn);
+		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
+		tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap()
+			.block_on(async {
+				tokio::time::timeout(std::time::Duration::from_secs(10), stop.wait_shutdown_complete())
+					.await
+					.expect("compositor teardown")
+			});
 	}
 }

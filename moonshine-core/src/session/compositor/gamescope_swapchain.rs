@@ -144,16 +144,17 @@ fn handle_override_window_content(
 	x11_window: u32,
 	owner: smithay::reexports::wayland_server::backend::ObjectId,
 ) {
+	tracing::debug!(x11_window, %owner, "override_window_content");
 	smithay::wayland::compositor::with_states(surface, |states| {
 		states.data_map.insert_if_missing(OverrideOwner::default);
 		states.data_map.get::<OverrideOwner>().unwrap().claim(owner);
 	});
-	tracing::debug!(x11_window, "override_window_content");
 	state.override_window_surface(x11_window, surface.clone());
 }
 
 /// A Vulkan surface survives swapchain recreation. Destroying the old protocol
-/// object must remove its override, but cannot remove a newer chain's mapping.
+/// object must remove its surface's binding, but cannot remove a newer chain's
+/// binding of that surface, nor any other game's binding.
 fn release_override(
 	state: &mut MoonshineCompositor,
 	surface: &WlSurface,
@@ -165,15 +166,12 @@ fn release_override(
 		};
 		stored.release(&owner)
 	});
-	if owns_override && state.override_surface.as_ref().is_some_and(|(s, _)| s == surface) {
-		tracing::debug!("swapchain override released; restoring XWayland scene");
-		state.override_surface = None;
-		state.override_reported_window = 0;
+	if owns_override && state.wsi.release(surface) {
+		tracing::debug!(surface = ?surface.id(), "WSI binding released; restoring XWayland content for its window");
 		if let Some(cm) = &mut state.color_management {
 			cm.clear_gamescope_current(surface);
 		}
-		state.damage_tracker = smithay::backend::renderer::damage::OutputDamageTracker::from_output(&state.output);
-		state.screen_dirty = true;
+		state.invalidate_presentation();
 	}
 }
 

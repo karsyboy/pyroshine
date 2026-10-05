@@ -14,6 +14,15 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta.13] - 2026-10-05
+
+### Fixed
+
+- Keep every running game's picture when several Vulkan games run at once. The compositor kept a single WSI presentation surface, so launching a second game replaced the first game's surface: switching back showed a black window, and the first game's swapchain no longer received frame callbacks. Each game window now keeps its own swapchain binding, released only by its owning swapchain, its surface or the window's destruction.
+- Restore Proton games after the Steam overlay. A fullscreen game that minimizes itself when the overlay takes focus asks the window manager to make it iconic and then waits for the acknowledgement before any further state change, including its restore; that request was ignored, leaving the game minimized and black until it was killed. The compositor now acknowledges it as gamescope does, and marks a window becoming the focus as normal again (previously it marked the window losing focus).
+- Remove an X11 window from the scene and from every overlay, notification, decoration and input-focus role when it is destroyed without a prior unmap, so a vanished Steam overlay can no longer stay painted above the game or keep its input.
+- Keep the cursor steady when Steam Input moves it with a controller. Steam sends controller-as-mouse input through XTest; XWayland moved its own pointer without telling the compositor, and the next compositor pointer event snapped it back. XWayland now forwards XTest motion, clicks and keys to the compositor over EIS (libei), where they follow the same path as mouse input. Controller input that Steam does not turn into pointer events still never shows the cursor, and an application-hidden cursor stays hidden.
+
 ## [v0.17.0-beta.12] - 2026-10-05
 
 ### Added
