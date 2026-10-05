@@ -791,11 +791,18 @@ impl BypassWatch {
 	unsafe fn refresh(&mut self) {
 		unsafe {
 			let previous = self.decision;
-			self.decision = if self.subscribe_tree().is_some() {
+			let queried = if self.subscribe_tree().is_some() {
 				crate::swapchain::query_bypass_policy(self.connection, self.window)
 			} else {
 				Err(crate::swapchain::BypassReject::Unavailable)
 			};
+			if queried == Err(crate::swapchain::BypassReject::Minimized) {
+				crate::log_debug!(
+					"XWayland bypass: minimized client area keeps the current decision (window={})",
+					self.window
+				);
+			}
+			self.decision = crate::swapchain::next_bypass_decision(self.initialized, previous, queried);
 			if !self.initialized || self.decision != previous {
 				self.initialized = true;
 				match self.decision {

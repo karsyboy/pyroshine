@@ -109,7 +109,12 @@ The rule uses presentation topology, never game/executable names. Ordinary safe
 fullscreen windows retain bypass and automatic direct DMA-BUF export eligibility.
 
 Size tolerance (2 pixels), position tolerance (1 pixel), and obscuring child
-checks remain enforced. Child offsets accumulate in top-level coordinates;
+checks remain enforced. One geometry state is not a mismatch: a client window
+at most 1×1 is a minimized Wine window (Wine shrinks the client area before it
+iconifies the toplevel). It keeps the current decision instead of retiring the
+bypass, so minimize/restore cycles (for example around the Steam overlay) do not
+destroy and recreate the swapchain; it never enables a bypass that was rejected
+or not yet decided, and the Wine and obscuring checks still apply first. Child offsets accumulate in top-level coordinates;
 XCB geometry is parent-relative. The rendering branch itself is excluded from
 obstructions, while other visible children along the ancestry (and children of
 the rendering window itself) are checked. Obscuring checks also apply to top-level windows. XCB

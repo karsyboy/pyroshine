@@ -18,9 +18,9 @@ The implementation is under `moonshine-core/src/session/`: event loop, state
 and protocol handlers in `compositor/{mod,state,handlers}.rs`, capture and
 eligibility in `compositor/{capture,admission,frame}.rs`, cursor in
 `compositor/cursor.rs`, focus and Steam classification in
-`compositor/{focus,x11_focus}.rs`, input injection in `compositor/input.rs`
-(XTest emulation in `compositor/emulated_input.rs`), swapchain and color
-protocols in `compositor/{gamescope_swapchain,wsi_bindings,color_management}.rs`,
+`compositor/{focus,x11_focus}.rs`, input injection in `compositor/input.rs`,
+swapchain and color protocols in
+`compositor/{gamescope_swapchain,wsi_bindings,color_management}.rs`,
 and controller emulation in `stream/control/input/{gamepad,mod}.rs`.
 
 ## Configuration
@@ -52,23 +52,23 @@ client cursor state changes. Mouse/pen use can activate the initial fallback;
 controller events do not activate it and cannot change application cursor intent.
 Pointer activity cannot undo an explicit `Hidden` request.
 
-### Emulated pointer input (XTest)
+### Game-driven cursor warps and transient hides
 
-Steam Input turns a controller into mouse motion, clicks and keys with XTest
-requests on the session's X display. A rootless XWayland built with libei sends
-XTest to the EIS server named by `LIBEI_SOCKET` and otherwise moves only its own
-pointer sprite, behind the compositor's back (the next compositor pointer event
-snaps it back). The compositor listens on `$XDG_RUNTIME_DIR/<wayland-display>-ei`
-(`compositor/emulated_input.rs`, Smithay's libei backend) and passes the socket
-to XWayland only, as gamescope does. Its seat offers a keyboard, a relative
-pointer and an absolute pointer spanning all X11 root coordinates: XWayland
-emulates nothing until every capability it binds has a device.
+Games with native controller support move the cursor themselves with
+`SetCursorPos`, which Wine turns into `XWarpPointer`. Rootless XWayland reports a
+warp to the compositor (as a pointer-lock position hint) only while the X cursor
+is hidden, so Proton brackets each warp with `XFixesHideCursor` and
+`XFixesShowCursor`. XWayland forwards the hide immediately but delays the re-show
+until the next motion or 5 ms, so the compositor receives a hide/show pair for
+every warp; an unmodified cursor would be missing from the frames captured in
+between. Gamescope never shows these hides, because it reads the cursor image
+through XFixes.
 
-Emulated events take the Moonlight input paths in `compositor/input.rs`: relative
-motion honors an active pointer lock, coordinates are scene coordinates (XWayland
-is unscaled), and pointer events activate the cursor exactly like mouse use.
-Emulated keyboard events reach the seat keyboard without touching the cursor.
-Controller input that Steam does not convert never reaches this path.
+`CursorState` therefore keeps presenting the previous image for one output
+refresh interval after a hide request. A hide that is reverted within that
+interval is never presented; a hide that lasts longer is presented at the next
+refresh, so an application hide still takes effect within one frame. The
+request itself is recorded immediately: pointer use still cannot undo it.
 
 The pinned Smithay revision is
 [`0ff00983b6007257a7a161a4fe8b14a778e2ac8f`](https://github.com/Smithay/smithay/tree/0ff00983b6007257a7a161a4fe8b14a778e2ac8f).
@@ -214,9 +214,31 @@ so input returns to the game.
 When the overlay takes keyboard focus, Wine deactivates a fullscreen game, which
 may minimize itself with `WM_CHANGE_STATE` and then waits for the window manager
 to update `WM_STATE` before any further state change, including its restore. The
-compositor acknowledges the iconic state without unmapping the window, and a
-window becoming the focus is set back to normal, as gamescope does
-(`handle_wm_change_state`, `DetermineAndApplyFocus`).
+compositor acknowledges the iconic state without unmapping the window
+(gamescope's `handle_wm_change_state`), and a window becoming the focus is set
+back to normal (`DetermineAndApplyFocus`). Steam's overlay moves only keyboard
+focus and leaves the focus window unchanged, so an acknowledged iconic window is
+also set back to normal when it regains keyboard focus; Wine then restores the
+game and it recreates its swapchain.
+
+X keyboard focus is owned by the compositor. Its chosen keyboard window is
+watched for `FocusOut` on the compositor's own X11 connection (event-driven, no
+polling); when a client moves focus to another toplevel or drops it to `None`,
+focus and `_NET_ACTIVE_WINDOW` are restored, as gamescope does. Focus moving to a
+window inside the chosen one (a Wine or Steam CEF child) is kept. Steam's CEF
+windows otherwise take focus right after the overlay closes, and because
+Smithay's XWM publishes every focused window as `_NET_ACTIVE_WINDOW`, Wine would
+deactivate the game again.
+
+That Xlib connection installs a process-wide, non-fatal error handler when it
+opens. Its requests target client windows that can disappear at any moment, and
+X reports the resulting errors asynchronously; Xlib's default handler would exit
+the server.
+
+Steam hides overlays and notifications by clearing `STEAM_OVERLAY` and
+`STEAM_INPUT_FOCUS` or by setting `_NET_WM_WINDOW_OPACITY` to zero. Smithay reports
+the opacity change as its own property kind rather than as a raw atom; both
+refresh the cached classification.
 
 Controller Guide shortcuts are described in
 [configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
@@ -225,8 +247,8 @@ Activation rumble deadlines preserve every held button; disconnect drops all
 per-controller shortcut state.
 
 DEBUG logs report classification, cursor, virtual-device creation, WSI binding
-registration/resolution/release, X11 window retirement, iconic acknowledgements,
-EIS connections, and capture path transitions (`direct`, `direct_override`,
+registration/resolution/release, X11 window retirement, iconic acknowledgements
+and restores, and capture path transitions (`direct`, `direct_override`,
 `composited`); rendering itself does not emit per-frame INFO messages. Window,
 focus and overlay transitions use the `focus` target and need it enabled
 (for example `MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
@@ -254,16 +276,22 @@ kind/policy parsing. `wsi_bindings` tests cover two simultaneous games,
 swapchain recreation and old-owner release, deterministic fallback, late window
 resolution and window destruction; `focus` tests cover the overlay open/close
 cycle (modes 2, 1 and 0, opacity 0), input routing back to the game, and role
-cleanup for an overlay destroyed without being hidden or unmapped. They do not
+cleanup for an overlay destroyed without being hidden or unmapped; `cursor` tests
+cover the hide hold (reverted hides never presented, sustained hides presented
+after one frame, no exposure of an inactive or destroyed cursor). They do not
 prove Steam or game behavior on hardware.
 
-The ignored `xtest_motion_moves_the_compositor_pointer` test starts the
-compositor and XWayland on a GPU host (no session or systemd units), sends XTest
-motion from an X11 client and checks that the next compositor pointer event
-continues from that position:
+The ignored `xwayland_tests` start the compositor and XWayland on a GPU host (no
+session or systemd units). The `game_restored_when_steam_*` tests replay the
+Steam overlay sequence observed with Grim Dawn (overlay takes keyboard focus,
+game requests iconic, overlay hidden by property or opacity) and require the game
+to return to `NormalState`; `keyboard_focus_taken_by_steam_is_reclaimed` moves X
+focus to a Steam window and to `None` and requires the game to get it back, and
+`x11_errors_on_destroyed_focus_windows_are_not_fatal` requires asynchronous X
+errors from vanished windows to leave the process running:
 
 ```sh
-cargo test -p moonshine-core --all-features --lib -- --ignored xtest_motion_moves_the_compositor_pointer
+cargo test -p moonshine-core --all-features --lib -- --ignored xwayland_tests
 ```
 
 ### Hardware acceptance
@@ -296,13 +324,13 @@ with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
    frame, and `direct_override` must return when the scene is eligible. Check
    `WSI binding registered`/`released` logs per game. Repeat without
    `MOONSHINE_WSI_DISABLE_BYPASS`.
-6. **Controller cursor.** In a game with a visible cursor, move it continuously
-   with the mouse, then with Steam Input (controller as mouse), alternating
-   repeatedly. The cursor must not flash or jump, clicks must land at it, the
-   log shows `EIS client connected for XTest input emulation`, and
-   `$TMPDIR/moonshine/xwayland.log` must not contain `[xwayland ei] EI setup
-   failed`. An application-hidden cursor must stay hidden and plain controller
-   gameplay must not show one.
+6. **Controller cursor.** In a game whose own controller support moves a
+   visible cursor (for example Grim Dawn under Proton), move it continuously
+   with the controller, then with the mouse, alternating repeatedly. The cursor
+   must not flash or jump and clicks must land at it, although DEBUG logs still
+   show rapid `Cursor state changed` hide/show requests. An application-hidden
+   cursor must disappear within a frame and plain controller gameplay must not
+   show one.
 7. **Controllers.** Test arrival, duplicate arrival, update before arrival,
    active-mask removal and reconnect at indices 0 and 15, plus native
    PlayStation motion/touch/rumble and forced emulation policies.

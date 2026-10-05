@@ -2,14 +2,11 @@
 //!
 //! Input events from the Moonlight control stream are sent to the compositor
 //! via a `calloop::channel`. The compositor injects them directly into the
-//! Smithay `Seat`. Input X11 clients synthesize with XTest arrives from
-//! XWayland over EIS and is injected through the same seat paths.
+//! Smithay `Seat` — no libei or EIS socket needed.
 
 use smithay::backend::input::{
-	AbsolutePositionEvent, Axis, ButtonState, InputEvent, InputTime, KeyState, KeyboardKeyEvent, PointerAxisEvent,
-	PointerButtonEvent, PointerMotionEvent, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
+	Axis, ButtonState, InputTime, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
 };
-use smithay::backend::libei::EiInput;
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
@@ -19,7 +16,7 @@ use smithay::input::tablet::tool::{
 	MotionEvent as TabletMotionEvent, ProximityInEvent, ProximityOutEvent, TabletToolHandle, UpEvent as TabletUpEvent,
 };
 use smithay::input::touch::{DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
-use smithay::utils::{Logical, Point, SERIAL_COUNTER, Serial};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 use smithay::wayland::seat::WaylandFocus;
 
@@ -110,7 +107,8 @@ pub(crate) enum CompositorInputEvent {
 /// Process an input event received from the Moonlight control stream.
 ///
 /// Called on the compositor's calloop thread when the channel source fires.
-/// Events are injected directly into the Smithay Seat.
+/// Events are injected directly into the Smithay Seat — no libei needed
+/// since we *are* the compositor.
 pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
 	let serial = SERIAL_COUNTER.next_serial();
 	let time = InputTime::from_millis(state.clock.now().as_millis());
@@ -201,22 +199,103 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			};
 
 			// Input is in output coordinates; the scene may be scaled.
-			let location = state.output_to_scene(Point::from((new_x, new_y)));
-			move_pointer_to(state, location, serial, time);
+			state.cursor_position = state.output_to_scene(Point::from((new_x, new_y)));
+			clamp_cursor(state);
+
+			let under = find_surface_under(state);
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
+			pointer.motion(
+				state,
+				under,
+				&MotionEvent {
+					location: state.cursor_position,
+					serial,
+					time,
+				},
+			);
+			pointer.frame(state);
 		},
 		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
 			tracing::trace!(target: "input", "Mouse relative: ({dx}, {dy})");
 
 			let (rx, ry) = state.scene_input_ratio();
-			move_pointer_relative(state, Point::from((dx as f64 * rx, dy as f64 * ry)), serial, time);
+			let delta = Point::from((dx as f64 * rx, dy as f64 * ry));
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
+
+			// Check for pointer constraints (lock/confine).
+			let mut pointer_locked = false;
+			let under = find_surface_under(state);
+
+			if let Some((ref surface, ref _surface_loc)) = under {
+				with_pointer_constraint(surface, &pointer, |constraint| match constraint {
+					Some(constraint) if constraint.is_active() => match &*constraint {
+						PointerConstraint::Locked(_) => {
+							pointer_locked = true;
+						},
+						PointerConstraint::Confined(_) => {},
+					},
+					_ => {},
+				});
+			}
+
+			pointer.relative_motion(
+				state,
+				under.clone(),
+				&RelativeMotionEvent {
+					delta,
+					delta_unaccel: delta,
+					time,
+				},
+			);
+
+			state.cursor_position += delta;
+			clamp_cursor(state);
+
+			if pointer_locked {
+				pointer.frame(state);
+				return;
+			}
+
+			pointer.motion(
+				state,
+				under,
+				&MotionEvent {
+					location: state.cursor_position,
+					serial,
+					time,
+				},
+			);
+			pointer.frame(state);
 		},
 		CompositorInputEvent::MouseButtonDown { button } => {
 			tracing::trace!(target: "input", "Mouse button down: {button:#x}");
-			pointer_button(state, button, ButtonState::Pressed, serial, time);
+
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
+			pointer.button(
+				state,
+				&ButtonEvent {
+					serial,
+					time,
+					button,
+					state: ButtonState::Pressed,
+				},
+			);
+			pointer.frame(state);
 		},
 		CompositorInputEvent::MouseButtonUp { button } => {
 			tracing::trace!(target: "input", "Mouse button up: {button:#x}");
-			pointer_button(state, button, ButtonState::Released, serial, time);
+
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
+			pointer.button(
+				state,
+				&ButtonEvent {
+					serial,
+					time,
+					button,
+					state: ButtonState::Released,
+				},
+			);
+			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollVertical { amount } => {
 			tracing::trace!(target: "input", "Scroll vertical: {amount}");
@@ -317,179 +396,6 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			serial,
 			time,
 		),
-	}
-}
-
-/// Move the pointer to `location` in scene coordinates.
-fn move_pointer_to(state: &mut MoonshineCompositor, location: Point<f64, Logical>, serial: Serial, time: InputTime) {
-	state.cursor_position = location;
-	clamp_cursor(state);
-
-	let under = find_surface_under(state);
-	let pointer = state.seat.get_pointer().expect("pointer should exist");
-	pointer.motion(
-		state,
-		under,
-		&MotionEvent {
-			location: state.cursor_position,
-			serial,
-			time,
-		},
-	);
-	pointer.frame(state);
-}
-
-/// Move the pointer by `delta` in scene coordinates, honoring an active
-/// pointer lock: a locked pointer reports relative motion only.
-fn move_pointer_relative(state: &mut MoonshineCompositor, delta: Point<f64, Logical>, serial: Serial, time: InputTime) {
-	let pointer = state.seat.get_pointer().expect("pointer should exist");
-
-	// Check for pointer constraints (lock/confine).
-	let mut pointer_locked = false;
-	let under = find_surface_under(state);
-
-	if let Some((ref surface, ref _surface_loc)) = under {
-		with_pointer_constraint(surface, &pointer, |constraint| match constraint {
-			Some(constraint) if constraint.is_active() => match &*constraint {
-				PointerConstraint::Locked(_) => {
-					pointer_locked = true;
-				},
-				PointerConstraint::Confined(_) => {},
-			},
-			_ => {},
-		});
-	}
-
-	pointer.relative_motion(
-		state,
-		under.clone(),
-		&RelativeMotionEvent {
-			delta,
-			delta_unaccel: delta,
-			time,
-		},
-	);
-
-	state.cursor_position += delta;
-	clamp_cursor(state);
-
-	if pointer_locked {
-		pointer.frame(state);
-		return;
-	}
-
-	pointer.motion(
-		state,
-		under,
-		&MotionEvent {
-			location: state.cursor_position,
-			serial,
-			time,
-		},
-	);
-	pointer.frame(state);
-}
-
-fn pointer_button(
-	state: &mut MoonshineCompositor,
-	button: u32,
-	button_state: ButtonState,
-	serial: Serial,
-	time: InputTime,
-) {
-	let pointer = state.seat.get_pointer().expect("pointer should exist");
-	pointer.button(
-		state,
-		&ButtonEvent {
-			serial,
-			time,
-			button,
-			state: button_state,
-		},
-	);
-	pointer.frame(state);
-}
-
-/// Whether an emulated event is pointer use. Pointer use activates the
-/// fallback cursor exactly like client mouse input; keyboard use does not.
-fn emulated_event_is_pointer(event: &InputEvent<EiInput>) -> bool {
-	matches!(
-		event,
-		InputEvent::PointerMotion { .. }
-			| InputEvent::PointerMotionAbsolute { .. }
-			| InputEvent::PointerButton { .. }
-			| InputEvent::PointerAxis { .. }
-	)
-}
-
-/// Process input that X11 clients synthesized with XTest, which XWayland
-/// forwards over EIS (see [`super::emulated_input`]).
-///
-/// Steam Input turns controller sticks and buttons into XTest pointer motion,
-/// clicks and keys when a game or Steam UI uses the controller as a mouse.
-/// These are genuine pointer events from the client's point of view, so they
-/// take the same seat paths as Moonlight mouse input: the compositor cursor,
-/// Smithay's pointer focus and constraints and XWayland's own sprite stay one
-/// state instead of diverging. Coordinates are X11 root coordinates, which
-/// equal scene coordinates (XWayland runs unscaled), so no output-scaling
-/// inversion applies. Controller input that Steam does not turn into pointer
-/// events never reaches this path.
-pub(crate) fn process_emulated_input(event: InputEvent<EiInput>, state: &mut MoonshineCompositor) {
-	let serial = SERIAL_COUNTER.next_serial();
-	let time = InputTime::from_millis(state.clock.now().as_millis());
-
-	if emulated_event_is_pointer(&event) {
-		state.cursor.activate_pointer();
-		state.screen_dirty = true;
-	}
-
-	match event {
-		InputEvent::PointerMotion { event } => {
-			let delta = Point::from((event.delta_x(), event.delta_y()));
-			tracing::trace!(target: "input", ?delta, "Emulated pointer motion");
-			move_pointer_relative(state, delta, serial, time);
-		},
-		InputEvent::PointerMotionAbsolute { event } => {
-			let location = Point::from((event.x(), event.y()));
-			tracing::trace!(target: "input", ?location, "Emulated absolute pointer motion");
-			move_pointer_to(state, location, serial, time);
-		},
-		InputEvent::PointerButton { event } => {
-			tracing::trace!(target: "input", button = event.button_code(), state = ?event.state(), "Emulated pointer button");
-			pointer_button(state, event.button_code(), event.state(), serial, time);
-		},
-		InputEvent::PointerAxis { event } => {
-			let mut frame = AxisFrame::new(time).source(event.source());
-			for axis in [Axis::Horizontal, Axis::Vertical] {
-				if let Some(amount) = event.amount(axis) {
-					frame = frame.value(axis, amount);
-				}
-				if let Some(v120) = event.amount_v120(axis) {
-					// Discrete steps without a continuous amount scroll like a
-					// Moonlight wheel event of the same size.
-					if event.amount(axis).is_none() {
-						frame = frame.value(axis, v120 / 120.0 * 15.0);
-					}
-					frame = frame.v120(axis, v120 as i32);
-				}
-			}
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(state, frame);
-			pointer.frame(state);
-		},
-		InputEvent::Keyboard { event } => {
-			tracing::trace!(target: "input", key = ?event.key_code(), state = ?event.state(), "Emulated key");
-			if let Some(keyboard) = state.seat.get_keyboard() {
-				keyboard.input::<(), _>(state, event.key_code(), event.state(), serial, time, |_, _, _| {
-					FilterResult::Forward
-				});
-			}
-		},
-		InputEvent::DeviceAdded { device } | InputEvent::DeviceRemoved { device } => {
-			tracing::debug!(target: "input", device = ?device.name(), "Emulated input device changed");
-		},
-		// XWayland binds no touch device; other kinds are not produced by EIS.
-		_ => {},
 	}
 }
 

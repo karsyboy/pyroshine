@@ -8,7 +8,6 @@ pub(crate) mod admission;
 mod capture;
 mod color_management;
 mod cursor;
-mod emulated_input;
 mod focus;
 pub(crate) mod frame;
 mod gamescope_swapchain;
@@ -62,28 +61,6 @@ impl Default for KeyboardConfig {
 			model: String::new(),
 			options: None,
 		}
-	}
-}
-
-impl KeyboardConfig {
-	/// The XKB configuration of the compositor keyboard (and the emulated
-	/// XTest keyboard, so both describe one keymap). Empty fields keep XKB's
-	/// defaults.
-	pub(crate) fn xkb_config(&self) -> smithay::input::keyboard::XkbConfig<'_> {
-		let mut xkb_config = smithay::input::keyboard::XkbConfig::default();
-		if !self.layout.is_empty() {
-			xkb_config.layout = &self.layout;
-		}
-		if !self.variant.is_empty() {
-			xkb_config.variant = &self.variant;
-		}
-		if !self.model.is_empty() {
-			xkb_config.model = &self.model;
-		}
-		if let Some(options) = self.options.clone().filter(|options| !options.is_empty()) {
-			xkb_config.options = Some(options);
-		}
-		xkb_config
 	}
 }
 
@@ -879,41 +856,28 @@ mod reconfigure_tests {
 }
 
 #[cfg(test)]
-mod xtest_tests {
-	use super::{Compositor, CompositorConfig, CompositorContext, CompositorInputEvent};
+mod xwayland_tests {
+	use super::{Compositor, CompositorConfig, CompositorContext};
 	use crate::session::manager::SessionShutdownReason;
 	use x11rb::connection::Connection;
-	use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
-	use x11rb::protocol::xtest::ConnectionExt as _;
+	use x11rb::protocol::xproto::{
+		AtomEnum, ClientMessageEvent, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, WindowClass,
+	};
+	use x11rb::wrapper::ConnectionExt as _;
 
 	const WIDTH: u16 = 1280;
 	const HEIGHT: u16 = 720;
 
-	/// Poll the X pointer until it reaches `expected` (root coordinates).
-	fn wait_for_pointer(conn: &impl Connection, root: u32, expected: (i16, i16)) -> (i16, i16) {
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-		loop {
-			let reply = conn.query_pointer(root).unwrap().reply().unwrap();
-			let position = (reply.root_x, reply.root_y);
-			if position == expected || std::time::Instant::now() > deadline {
-				return position;
-			}
-			std::thread::sleep(std::time::Duration::from_millis(20));
-		}
-	}
-
-	/// Steam Input's controller-as-mouse is XTest motion from an X11 client.
-	/// It must move the compositor's pointer, not only XWayland's sprite:
-	/// otherwise the next compositor pointer event (Moonlight mouse, focus
-	/// change) snaps the X pointer back and the cursor alternates between
-	/// two positions.
-	#[test]
-	#[ignore = "needs a GPU render node and Xwayland built with libei"]
-	fn xtest_motion_moves_the_compositor_pointer() {
+	/// The compositor in Steam mode, as the service runs it.
+	fn launch() -> (
+		async_shutdown::ShutdownManager<SessionShutdownReason>,
+		super::CompositorHandles,
+		super::LaunchedCompositor,
+	) {
 		let stop = async_shutdown::ShutdownManager::new();
 		let (compositor, handles) = Compositor::new(
 			CompositorConfig {
-				steam_mode: false,
+				steam_mode: true,
 				..Default::default()
 			},
 			CompositorContext {
@@ -927,10 +891,51 @@ mod xtest_tests {
 			stop.clone(),
 		);
 		let launched = compositor.launch().expect("compositor launch");
-		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
-		let root = conn.setup().roots[screen_num].root;
+		(stop, handles, launched)
+	}
 
-		// A fullscreen game window that takes focus and pointer focus.
+	fn shut_down(stop: async_shutdown::ShutdownManager<SessionShutdownReason>) {
+		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
+		tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap()
+			.block_on(async {
+				tokio::time::timeout(std::time::Duration::from_secs(10), stop.wait_shutdown_complete())
+					.await
+					.expect("compositor teardown")
+			});
+	}
+
+	fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while std::time::Instant::now() < deadline {
+			if condition() {
+				return true;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+		}
+		false
+	}
+
+	fn cardinal(conn: &impl Connection, window: u32, name: &[u8]) -> Option<u32> {
+		let atom = conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+		let reply = conn
+			.get_property(false, window, atom, AtomEnum::ANY, 0, 1)
+			.unwrap()
+			.reply()
+			.ok()?;
+		reply.value32().and_then(|mut values| values.next())
+	}
+
+	fn set_cardinal(conn: &impl Connection, window: u32, name: &[u8], value: u32) {
+		let atom = conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+		conn.change_property32(PropMode::REPLACE, window, atom, AtomEnum::CARDINAL, &[value])
+			.unwrap();
+		conn.flush().unwrap();
+	}
+
+	fn map_fullscreen(conn: &impl Connection, root: u32, properties: &[(&[u8], u32)]) -> u32 {
 		let window = conn.generate_id().unwrap();
 		conn.create_window(
 			x11rb::COPY_DEPTH_FROM_PARENT,
@@ -946,56 +951,203 @@ mod xtest_tests {
 			&CreateWindowAux::new().background_pixel(0),
 		)
 		.unwrap();
+		for (name, value) in properties {
+			set_cardinal(conn, window, name, *value);
+		}
 		conn.map_window(window).unwrap();
 		conn.flush().unwrap();
+		window
+	}
 
-		// Moonlight mouse input positions the compositor pointer over the window.
-		let mut entered = (0, 0);
-		for _ in 0..50 {
-			handles
-				.input_tx
-				.send(CompositorInputEvent::MouseMoveAbsolute {
-					x: 640,
-					y: 360,
-					screen_width: WIDTH as i16,
-					screen_height: HEIGHT as i16,
-				})
-				.unwrap();
-			entered = wait_for_pointer(&conn, root, (640, 360));
-			if entered == (640, 360) {
-				break;
-			}
-		}
-		assert_eq!(entered, (640, 360), "the window never received pointer focus");
+	/// The Grim Dawn sequence observed on hardware: the Steam overlay takes
+	/// keyboard focus (`STEAM_INPUT_FOCUS=1`), the deactivated Wine game asks
+	/// to be iconic, and Steam hides the overlay again without changing the
+	/// focus window. The game must be made normal again when it regains
+	/// keyboard focus, or Wine never restores it.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn game_restored_when_steam_clears_its_overlay_properties() {
+		// What Steam did on hardware when Grim Dawn's overlay closed.
+		overlay_close_restores_minimized_game(|conn, overlay| {
+			set_cardinal(conn, overlay, b"STEAM_INPUT_FOCUS", 0);
+			set_cardinal(conn, overlay, b"STEAM_OVERLAY", 0);
+		});
+	}
 
-		// Relative XTest motion, as Steam Input sends it.
-		const MOTION_NOTIFY: u8 = 6;
-		conn.xtest_fake_input(MOTION_NOTIFY, 1, x11rb::CURRENT_TIME, x11rb::NONE, 100, 50, 0)
-			.unwrap();
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn game_restored_when_steam_hides_its_overlay_by_opacity() {
+		overlay_close_restores_minimized_game(|conn, overlay| {
+			set_cardinal(conn, overlay, b"_NET_WM_WINDOW_OPACITY", 0);
+		});
+	}
+
+	fn overlay_close_restores_minimized_game(close: impl Fn(&x11rb::rust_connection::RustConnection, u32)) {
+		const GAME_APP: u32 = 219990;
+		const STEAM_APP: u32 = 769;
+		let (stop, _handles, launched) = launch();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let active = |conn: &x11rb::rust_connection::RustConnection| cardinal(conn, root, b"_NET_ACTIVE_WINDOW");
+
+		// Steam's focus contract names the game first, as in the live session.
+		let baselayer = conn
+			.intern_atom(false, b"GAMESCOPECTRL_BASELAYER_APPID")
+			.unwrap()
+			.reply()
+			.unwrap()
+			.atom;
+		conn.change_property32(
+			PropMode::REPLACE,
+			root,
+			baselayer,
+			AtomEnum::CARDINAL,
+			&[GAME_APP, STEAM_APP],
+		)
+		.unwrap();
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", GAME_APP)]);
+		assert!(
+			wait_until(|| active(&conn) == Some(game)),
+			"the game never became active"
+		);
+
+		let overlay = map_fullscreen(
+			&conn,
+			root,
+			&[
+				(b"STEAM_GAME", STEAM_APP),
+				(b"STEAM_OVERLAY", 1),
+				(b"STEAM_INPUT_FOCUS", 1),
+			],
+		);
+		let input_focus =
+			|conn: &x11rb::rust_connection::RustConnection| conn.get_input_focus().unwrap().reply().unwrap().focus;
+		assert!(
+			wait_until(|| input_focus(&conn) == overlay),
+			"the overlay never took keyboard focus"
+		);
+
+		// XIconifyWindow: WM_CHANGE_STATE IconicState to the root window.
+		let change_state = conn
+			.intern_atom(false, b"WM_CHANGE_STATE")
+			.unwrap()
+			.reply()
+			.unwrap()
+			.atom;
+		conn.send_event(
+			false,
+			root,
+			EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+			ClientMessageEvent::new(32, game, change_state, [3u32, 0, 0, 0, 0]),
+		)
+		.unwrap();
 		conn.flush().unwrap();
-		assert_eq!(wait_for_pointer(&conn, root, (740, 410)), (740, 410));
+		assert!(
+			wait_until(|| cardinal(&conn, game, b"WM_STATE") == Some(3)),
+			"the iconic request was not acknowledged"
+		);
 
-		// Mouse use afterwards continues from the controller position.
-		handles
-			.input_tx
-			.send(CompositorInputEvent::MouseMoveRelative { dx: 1, dy: 1 })
-			.unwrap();
-		assert_eq!(
-			wait_for_pointer(&conn, root, (741, 411)),
-			(741, 411),
-			"XTest motion bypassed the compositor pointer"
+		close(&conn, overlay);
+		let returned = wait_until(|| input_focus(&conn) == game);
+		assert!(
+			returned,
+			"keyboard focus did not return: active={:?} game={game:#x} overlay={overlay:#x} opacity={:?}",
+			active(&conn),
+			cardinal(&conn, overlay, b"_NET_WM_WINDOW_OPACITY")
+		);
+		assert!(
+			wait_until(|| cardinal(&conn, game, b"WM_STATE") == Some(1)),
+			"the game stayed iconic after the overlay closed"
 		);
 
 		drop(conn);
-		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
-		tokio::runtime::Builder::new_current_thread()
-			.enable_time()
-			.build()
+		shut_down(stop);
+	}
+
+	/// Seen on hardware after the Steam overlay closed: Steam's CEF window
+	/// focuses itself while the game is the compositor's keyboard focus. The
+	/// compositor must take focus back (as gamescope does), or the game is
+	/// deactivated and a fullscreen Wine game minimizes again.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn keyboard_focus_taken_by_steam_is_reclaimed() {
+		const GAME_APP: u32 = 219990;
+		const STEAM_APP: u32 = 769;
+		let (stop, _handles, launched) = launch();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let baselayer = conn
+			.intern_atom(false, b"GAMESCOPECTRL_BASELAYER_APPID")
 			.unwrap()
-			.block_on(async {
-				tokio::time::timeout(std::time::Duration::from_secs(10), stop.wait_shutdown_complete())
-					.await
-					.expect("compositor teardown")
-			});
+			.reply()
+			.unwrap()
+			.atom;
+		conn.change_property32(
+			PropMode::REPLACE,
+			root,
+			baselayer,
+			AtomEnum::CARDINAL,
+			&[GAME_APP, STEAM_APP],
+		)
+		.unwrap();
+		let steam = map_fullscreen(&conn, root, &[(b"STEAM_GAME", STEAM_APP)]);
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", GAME_APP)]);
+		let input_focus =
+			|conn: &x11rb::rust_connection::RustConnection| conn.get_input_focus().unwrap().reply().unwrap().focus;
+		assert!(
+			wait_until(|| input_focus(&conn) == game),
+			"the game never received focus"
+		);
+
+		for _ in 0..3 {
+			conn.set_input_focus(x11rb::protocol::xproto::InputFocus::NONE, steam, x11rb::CURRENT_TIME)
+				.unwrap();
+			conn.flush().unwrap();
+			assert!(
+				wait_until(|| input_focus(&conn) == game),
+				"focus stayed on the window that took it: {:#x}",
+				input_focus(&conn)
+			);
+			assert_eq!(cardinal(&conn, root, b"_NET_ACTIVE_WINDOW"), Some(game));
+		}
+
+		// Focus dropped to None is taken back too.
+		conn.set_input_focus(
+			x11rb::protocol::xproto::InputFocus::NONE,
+			x11rb::NONE,
+			x11rb::CURRENT_TIME,
+		)
+		.unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(|| input_focus(&conn) == game), "focus stayed on None");
+
+		drop(conn);
+		shut_down(stop);
+	}
+
+	/// A focus target destroyed while the compositor selects its events yields
+	/// an asynchronous BadWindow. It must be ignored: Xlib's default handler
+	/// exits the process, which took the whole server down on hardware.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn x11_errors_on_destroyed_focus_windows_are_not_fatal() {
+		let (stop, _handles, launched) = launch();
+		let display = launched.ready().xdisplay;
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{display}"))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let focus = super::x11_focus::X11Focus::open(display).expect("X11 focus connection");
+		for _ in 0..5 {
+			let window = map_fullscreen(&conn, root, &[]);
+			conn.destroy_window(window).unwrap();
+			conn.sync().unwrap();
+			// Selecting events on, then reading through, a destroyed window.
+			focus.watch_keyboard_focus(window);
+			focus.flush();
+			let _ = focus.get_input_focus();
+			let _ = focus.drain_events();
+		}
+		drop(focus);
+		drop(conn);
+		shut_down(stop);
 	}
 }

@@ -674,6 +674,9 @@ pub(crate) enum BypassReject {
 	Position,
 	Obscuring,
 	Unavailable,
+	/// The client area is degenerate (at most 1×1): Wine minimized the window.
+	/// Not a verdict of its own; see [`next_bypass_decision`].
+	Minimized,
 }
 
 impl BypassReject {
@@ -685,6 +688,7 @@ impl BypassReject {
 			Self::Position => "geometry position mismatch",
 			Self::Obscuring => "obscuring child",
 			Self::Unavailable => "X11 topology/event monitoring unavailable",
+			Self::Minimized => "minimized client area",
 		}
 	}
 }
@@ -711,6 +715,9 @@ fn bypass_policy(
 	}
 	if is_toplevel {
 		return Ok(());
+	}
+	if child.2 <= 1 && child.3 <= 1 {
+		return Err(BypassReject::Minimized);
 	}
 	if child.2.abs_diff(top.2) > 2 || child.3.abs_diff(top.3) > 2 {
 		return Err(BypassReject::Size);
@@ -774,6 +781,28 @@ pub(crate) unsafe fn query_bypass_policy(connection: *mut libc::c_void, window: 
 			(0, 0, top_width, top_height),
 			false,
 		)
+	}
+}
+
+/// Fold a fresh policy query into the watched decision.
+///
+/// Minimizing a Wine window shrinks its client (swapchain) window to 1×1
+/// before the toplevel is iconified, and restoring grows it back. Treating that
+/// as a geometry mismatch retires the bypass swapchain on every minimize and
+/// forces a destroy/recreate pair on every restore (twice per Steam overlay
+/// use), with nothing gained: a minimized window presents nothing visible
+/// through either path. A minimized child therefore keeps the existing
+/// decision; it never enables a bypass that was not already allowed, and every
+/// other rejection still applies.
+pub(crate) fn next_bypass_decision(
+	initialized: bool,
+	previous: Result<(), BypassReject>,
+	queried: Result<(), BypassReject>,
+) -> Result<(), BypassReject> {
+	match queried {
+		Err(BypassReject::Minimized) if initialized => previous,
+		Err(BypassReject::Minimized) => Err(BypassReject::Size),
+		other => other,
 	}
 }
 
@@ -1060,6 +1089,47 @@ mod tests {
 		assert_eq!(
 			bypass_policy(None, false, false, top, top, true),
 			Err(BypassReject::Obscuring)
+		);
+	}
+
+	#[test]
+	fn minimized_wine_child_keeps_the_existing_decision() {
+		let top = (0, 0, 2880, 1920);
+		let minimized = (0, 0, 1, 1);
+		// Safety rejections still win over a minimized client area.
+		assert_eq!(
+			bypass_policy(Some(0), false, false, minimized, top, false),
+			Err(BypassReject::WineNoFlip)
+		);
+		assert_eq!(
+			bypass_policy(None, false, false, minimized, top, true),
+			Err(BypassReject::Obscuring)
+		);
+		let queried = bypass_policy(None, false, false, minimized, top, false);
+		assert_eq!(queried, Err(BypassReject::Minimized));
+
+		// Minimize and restore keep an allowed bypass: no retire, no recreation.
+		let mut decision = Ok(());
+		for _ in 0..10 {
+			decision = next_bypass_decision(true, decision, queried);
+			assert_eq!(decision, Ok(()));
+			decision = next_bypass_decision(true, decision, bypass_policy(None, false, false, top, top, false));
+			assert_eq!(decision, Ok(()));
+		}
+		// It never enables a rejected bypass, nor one not yet decided.
+		assert_eq!(
+			next_bypass_decision(true, Err(BypassReject::Size), queried),
+			Err(BypassReject::Size)
+		);
+		assert_eq!(next_bypass_decision(false, Ok(()), queried), Err(BypassReject::Size));
+		// A real mismatch still rejects.
+		assert_eq!(
+			next_bypass_decision(
+				true,
+				Ok(()),
+				bypass_policy(None, false, false, (0, 0, 640, 480), top, false)
+			),
+			Err(BypassReject::Size)
 		);
 	}
 

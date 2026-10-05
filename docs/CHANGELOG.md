@@ -14,6 +14,19 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore a game that minimized itself while the Steam overlay held keyboard focus (for example Grim Dawn, which went black after the overlay closed). Steam returns keyboard focus without changing the focus window, so the game stayed iconic; the compositor now sets a window it acknowledged as iconic back to normal when it regains keyboard focus, and Wine restores it.
+- Notice Steam overlay and notification opacity changes. Smithay reports `_NET_WM_WINDOW_OPACITY` separately from other window properties, so an overlay Steam hid by making it transparent kept its cached opacity: it could stay painted above the game and keep keyboard and pointer input.
+- Keep a game focused when Steam's windows take X keyboard focus, as Steam does right after its overlay closes. Wine treated that as losing the foreground, so Grim Dawn minimized again about 50 ms after it was restored and stayed black. The compositor now takes focus back from another window, as gamescope does.
+- Never let an X11 error from a window that disappeared exit the server. The compositor's auxiliary X11 connection only silenced errors while a call was in progress, but X reports errors asynchronously, so Xlib's default handler could terminate the whole service and stream.
+- Stop Grim Dawn crashing after repeated Steam overlay use. Each minimize retired the Vulkan WSI bypass because Wine shrinks a minimized game's client window to 1×1, and each restore destroyed and recreated the swapchain. The crashes (heap corruption detected during or after that swapchain teardown) occurred only during this churn and only with the bypass enabled; its exact source in the game process was not identified. A minimized client window now keeps the existing bypass decision, so minimize and restore no longer recreate the swapchain.
+- Stop the cursor flashing while a game moves it with a controller (for example Grim Dawn's own controller support). Proton hides the X cursor around every warp so XWayland can report the new position, and XWayland delays the re-show, so captured frames regularly missed the cursor. A cursor hide is now presented only once it outlasts one refresh interval; application hides still take effect within a frame.
+
+### Removed
+
+- Remove the EIS (libei) socket that v0.17.0-beta.13 offered XWayland for XTest input. It was added for a controller cursor problem whose actual cause was the transient cursor hides fixed above, and no tested game sent XTest through it.
+
 ## [v0.17.0-beta.13] - 2026-10-05
 
 ### Fixed

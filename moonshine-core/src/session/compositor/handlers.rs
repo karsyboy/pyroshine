@@ -607,6 +607,8 @@ impl MoonshineCompositor {
 	/// an opaque normal window) or holding pointer/keyboard routing. A role
 	/// that outlived its space element is found by id. Idempotent.
 	fn retire_x11_window(&mut self, window_id: u32) {
+		// Withdrawn (or destroyed): mapping again writes a fresh WM_STATE.
+		self.iconic_windows.remove(&window_id);
 		let is_window = |w: &Window| w.x11_surface().is_some_and(|x| x.window_id() == window_id);
 		let elem = self.space.elements().find(|w| is_window(w)).cloned();
 		let target = elem.clone().or_else(|| {
@@ -707,6 +709,57 @@ impl MoonshineCompositor {
 			}
 			self.reevaluate_focus();
 		}
+	}
+
+	/// Take X keyboard focus back when a client moved it away from the
+	/// compositor's chosen window to another toplevel, or dropped it to `None`.
+	///
+	/// Steam's CEF windows focus themselves (for example right after its
+	/// overlay closes). Smithay's XWM then publishes them as
+	/// `_NET_ACTIVE_WINDOW`, which Wine treats as losing the foreground: the
+	/// game deactivates and a fullscreen one minimizes again. Focus moving to a
+	/// window inside the chosen one (a Wine or CEF child) is kept. Gamescope:
+	/// the `FocusOut` handling in `steamcompmgr`'s X event loop.
+	pub(super) fn reclaim_keyboard_focus(&mut self) {
+		let Some(desired) = self.current_keyboard_focus_window else {
+			return;
+		};
+		let Some(x11_focus) = self.x11_focus.as_ref() else {
+			return;
+		};
+		// A window that left the scene is handled by its unmap/destroy.
+		if !self
+			.space
+			.elements()
+			.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == desired))
+		{
+			return;
+		}
+		let Some(actual) = x11_focus.get_input_focus() else {
+			return;
+		};
+		if actual == desired {
+			return;
+		}
+		let escaped = if super::x11_focus::X11Focus::is_no_window(actual) {
+			true
+		} else {
+			let chain = x11_focus.get_ancestor_chain(actual);
+			// Inside the chosen window: a Wine/CEF child keeps focus.
+			!chain.contains(&desired)
+				&& chain.iter().any(|id| {
+					self.space
+						.elements()
+						.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == *id))
+				})
+		};
+		if !escaped {
+			return;
+		}
+		tracing::debug!(target: "focus", desired, actual, "Keyboard focus taken by another window; reclaiming");
+		x11_focus.set_input_focus_revert(desired, 0);
+		x11_focus.set_net_active_window(desired);
+		x11_focus.flush();
 	}
 
 	/// Check if an X11 window is transient-for (directly or transitively)
@@ -1590,9 +1643,21 @@ impl MoonshineCompositor {
 			&& let Some(kid) = keyboard_focus_id
 		{
 			if input_changed {
+				// Watch before moving focus so this change is never mistaken
+				// for a client taking focus (see `reclaim_keyboard_focus`).
+				x11_focus.watch_keyboard_focus(kid);
 				x11_focus.set_input_focus_revert(kid, 0);
 				x11_focus.set_net_active_window(kid);
 				self.current_keyboard_focus_window = Some(kid);
+				// A window that minimized itself when it lost keyboard focus
+				// (Wine deactivating a fullscreen game while the Steam overlay
+				// holds the keyboard) is restored as focus returns. Steam keeps
+				// the focus window unchanged, so the focus-change restore below
+				// never runs, and Wine waits for WM_STATE before restoring.
+				if self.iconic_windows.remove(&kid) {
+					tracing::debug!(target: "focus", window_id = kid, "Keyboard focus returned; restoring iconic window");
+					x11_focus.set_wm_state_normal(kid);
+				}
 			}
 		} else if keyboard_focus_id.is_none() {
 			self.current_keyboard_focus_window = None;
@@ -1607,6 +1672,7 @@ impl MoonshineCompositor {
 			&& let Some(ref x11_focus) = self.x11_focus
 		{
 			x11_focus.set_wm_state_normal(focused);
+			self.iconic_windows.remove(&focused);
 		}
 
 		// Send initial pointer motion event to the pointer focus window to establish
@@ -2360,11 +2426,21 @@ impl XwmHandler for MoonshineCompositor {
 			self.reevaluate_focus();
 			return;
 		}
-		// STEAM_OVERLAY (forwarded as Other) drives overlay z-order: mark it
+		// Steam overlay properties drive classification and z-order: mark them
 		// dirty so update_overlay_z_order runs this frame instead of polling.
-		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
-			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_overlay_property(atom))
-		{
+		// Smithay forwards STEAM_* atoms as `Other` but reports
+		// `_NET_WM_WINDOW_OPACITY` as `Opacity`; Steam hides overlays and
+		// notifications through either, so both refresh the cached state.
+		let overlay_atom = match property {
+			smithay::xwayland::xwm::WmWindowProperty::Other(atom)
+				if self.x11_focus.as_ref().is_some_and(|xf| xf.is_overlay_property(atom)) =>
+			{
+				Some(Some(atom))
+			},
+			smithay::xwayland::xwm::WmWindowProperty::Opacity => Some(None),
+			_ => None,
+		};
+		if let Some(atom) = overlay_atom {
 			// Steam sets these after map; refresh just this window so focus
 			// doesn't have to re-read every window.
 			if let Some(elem) = self.find_window_by_x11_surface(&window) {
@@ -2379,7 +2455,7 @@ impl XwmHandler for MoonshineCompositor {
 				let external = self
 					.x11_focus
 					.as_ref()
-					.filter(|xf| xf.is_external_overlay_property(atom))
+					.filter(|xf| atom.is_some_and(|atom| xf.is_external_overlay_property(atom)))
 					.map(|xf| xf.is_gamescope_external_overlay(window_id));
 				let restored_app_id = external
 					.filter(|enabled| !enabled)
@@ -2711,12 +2787,13 @@ impl XwmHandler for MoonshineCompositor {
 		// change, including the restore. Left unanswered, the game stays
 		// minimized and stops presenting for good. Acknowledge the state like
 		// gamescope without unmapping: the window keeps its place in the scene
-		// and focus ranking, Wine restores it by remapping, and a focus change
-		// marks it Normal again (`apply_focus`).
+		// and focus ranking. `apply_focus` marks it Normal again when it
+		// becomes the focus or regains keyboard focus, and Wine restores it.
 		tracing::debug!(target: "focus", window_id = window.window_id(), "WM_CHANGE_STATE iconic acknowledged");
 		if let Some(x11_focus) = &self.x11_focus {
 			x11_focus.set_wm_state_iconic(window.window_id());
 			x11_focus.flush();
+			self.iconic_windows.insert(window.window_id());
 		}
 	}
 

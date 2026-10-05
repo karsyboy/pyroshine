@@ -55,7 +55,6 @@ smithay = { git = "https://github.com/Smithay/smithay", rev = "0ff00983b6007257a
     "backend_drm",
     "backend_gbm",
     "backend_egl",
-    "backend_libei",
     "renderer_gl",
     "wayland_frontend",
     "desktop",
@@ -85,7 +84,7 @@ zvariant = "5.12.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-# XTest client for the ignored XWayland input-emulation test (same version as Smithay's).
-x11rb = { version = "0.13.2", features = ["xtest"] }
+# X11 client for the ignored compositor/XWayland tests (same version as Smithay's).
+x11rb = "0.13.2"
 # Paused virtual time for deterministic teardown-deadline tests.
 tokio = { version = "1.52.3", features = ["test-util"] }

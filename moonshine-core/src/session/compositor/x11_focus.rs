@@ -50,11 +50,43 @@ const PROPERTY_CHANGE_MASK: libc_c_long = 1 << 22;
 /// `PropertyNotify` event type from `X11/X.h`.
 const PROPERTY_NOTIFY: c_int = 28;
 
+/// `FocusChangeMask` from `X11/X.h` — `1L << 21`.
+const FOCUS_CHANGE_MASK: libc_c_long = 1 << 21;
+
+/// `FocusOut` event type from `X11/X.h`.
+const FOCUS_OUT: c_int = 10;
+
+/// `PointerRoot` focus value from `X11/X.h`.
+const POINTER_ROOT: Window = 1;
+
 /// `XEvent` is a union over every event struct; Xlib guarantees it is at most
 /// 24 native `long`s. Only the `XPropertyEvent` member is ever read, but the
 /// buffer handed to `XNextEvent` must be the full union size or the server
 /// will write past it.
 const X_EVENT_LONGS: usize = 24;
+
+/// `XFocusChangeEvent` from `X11/Xlib.h`; only `window` is read.
+#[repr(C)]
+#[allow(dead_code)]
+struct XFocusChangeEvent {
+	type_: c_int,
+	serial: libc_c_ulong,
+	send_event: c_int,
+	display: *mut XDisplay,
+	window: Window,
+	mode: c_int,
+	detail: c_int,
+}
+
+/// What a drain of this connection's queued X11 events found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct X11Events {
+	/// Steam changed `GAMESCOPECTRL_BASELAYER_*` on the root window.
+	pub focus_control_changed: bool,
+	/// The watched keyboard focus window received `FocusOut`: focus moved
+	/// away from it or from a window inside it.
+	pub keyboard_focus_lost: bool,
+}
 
 /// `XPropertyEvent` from `X11/Xlib.h`.
 ///
@@ -123,6 +155,7 @@ type FnXSelectInput = unsafe extern "C" fn(*mut XDisplay, Window, libc_c_long) -
 type FnXPending = unsafe extern "C" fn(*mut XDisplay) -> c_int;
 type FnXNextEvent = unsafe extern "C" fn(*mut XDisplay, *mut c_void) -> c_int;
 type FnXConnectionNumber = unsafe extern "C" fn(*mut XDisplay) -> c_int;
+type FnXGetInputFocus = unsafe extern "C" fn(*mut XDisplay, *mut Window, *mut c_int) -> c_int;
 
 // ---------------------------------------------------------------------------
 // XRes FFI types (libXRes.so.1)
@@ -197,6 +230,7 @@ struct LoadedXlib {
 	xpending: Option<FnXPending>,
 	xnextevent: Option<FnXNextEvent>,
 	xconnectionnumber: Option<FnXConnectionNumber>,
+	xgetinputfocus: Option<FnXGetInputFocus>,
 }
 
 static LOADED_XLIB: OnceLock<LoadedXlib> = OnceLock::new();
@@ -300,6 +334,43 @@ extern "C" fn silent_x11_error(_dpy: *mut XDisplay, _err: *mut c_void) -> c_int 
 	0
 }
 
+/// `XErrorEvent` from `X11/Xlib.h`.
+#[repr(C)]
+#[allow(dead_code)]
+struct XErrorEvent {
+	type_: c_int,
+	display: *mut XDisplay,
+	resourceid: libc_c_ulong,
+	serial: libc_c_ulong,
+	error_code: u8,
+	request_code: u8,
+	minor_code: u8,
+}
+
+/// Process-wide Xlib error handler, installed when the connection opens.
+///
+/// X errors are reported asynchronously, often after the call that caused
+/// them returned and its scoped [`silent_x11_error`] was removed. Xlib's default
+/// handler then exits the process. Every request on this auxiliary connection
+/// targets client windows that may disappear at any moment (a focus target or
+/// property owner destroyed in flight), so an error is expected, never fatal:
+/// it is logged and dropped. Smithay's XWM uses x11rb, not Xlib, and is not
+/// affected.
+extern "C" fn nonfatal_x11_error(_dpy: *mut XDisplay, err: *mut c_void) -> c_int {
+	if !err.is_null() {
+		// SAFETY: Xlib passes a valid `XErrorEvent` for the duration of the call.
+		let err = unsafe { &*(err as *const XErrorEvent) };
+		tracing::debug!(
+			target: "focus",
+			error_code = err.error_code,
+			request_code = err.request_code,
+			resource = err.resourceid,
+			"Ignoring asynchronous X11 error on the focus connection"
+		);
+	}
+	0
+}
+
 fn load_xlib() {
 	LOADED_XLIB.get_or_init(|| unsafe {
 		libc::dlerror();
@@ -331,6 +402,7 @@ fn load_xlib() {
 				xpending: None,
 				xnextevent: None,
 				xconnectionnumber: None,
+				xgetinputfocus: None,
 			};
 		}
 
@@ -365,6 +437,8 @@ fn load_xlib() {
 		let xnextevent_ptr = dlsym(lib_ptr, c"XNextEvent".as_ptr());
 		libc::dlerror();
 		let xconnectionnumber_ptr = dlsym(lib_ptr, c"XConnectionNumber".as_ptr());
+		libc::dlerror();
+		let xgetinputfocus_ptr = dlsym(lib_ptr, c"XGetInputFocus".as_ptr());
 
 		LoadedXlib {
 			lib: lib_ptr as isize,
@@ -384,6 +458,7 @@ fn load_xlib() {
 			xpending: sym!(xpending_ptr, FnXPending),
 			xnextevent: sym!(xnextevent_ptr, FnXNextEvent),
 			xconnectionnumber: sym!(xconnectionnumber_ptr, FnXConnectionNumber),
+			xgetinputfocus: sym!(xgetinputfocus_ptr, FnXGetInputFocus),
 		}
 	});
 }
@@ -440,6 +515,9 @@ pub(crate) struct X11Focus {
 	/// Pre-interned atom IDs — cached once at construction time to avoid
 	/// repeated `XInternAtom` calls on every property read.
 	atoms: CachedAtoms,
+	/// Window whose `FocusOut` events this connection selects: the
+	/// compositor's chosen X keyboard focus (0 when none).
+	watched_keyboard_focus: std::cell::Cell<Window>,
 }
 
 /// Cached X11 atom IDs — interned once at construction time.
@@ -539,6 +617,13 @@ impl X11Focus {
 			tracing::warn!(target: "focus", "XOpenDisplay(:{}) failed", display_number);
 			return None;
 		}
+		// Before any request: asynchronous errors must never reach Xlib's
+		// default handler, which exits the process.
+		with_xlib(|loaded| {
+			let seterr = loaded.xseterrorhandler?;
+			unsafe { seterr(Some(nonfatal_x11_error)) };
+			Some(())
+		});
 		let atoms = CachedAtoms::intern_all(dpy)?;
 
 		// Get the root window — needed for root property reads.
@@ -554,6 +639,7 @@ impl X11Focus {
 			root,
 			atoms,
 			display_name: format!(":{}", display_number),
+			watched_keyboard_focus: std::cell::Cell::new(0),
 		};
 
 		// Initialize GAMESCOPE_XWAYLAND_SERVER_ID on the root window so that
@@ -630,46 +716,101 @@ impl X11Focus {
 		.is_some()
 	}
 
-	/// Drain queued X11 events, reporting whether Steam's focus control changed.
+	/// Drain queued X11 events, reporting Steam focus-control changes and loss
+	/// of the watched keyboard focus.
 	///
-	/// Returns `true` when a `PropertyNotify` for
-	/// `GAMESCOPECTRL_BASELAYER_APPID` or `GAMESCOPECTRL_BASELAYER_WINDOW`
-	/// arrived, meaning the caller should re-run focus selection. The queue is
-	/// always drained fully, even once a match is found, so nothing is left
-	/// behind to wake the event loop again.
-	pub fn drain_focus_control_change(&self) -> bool {
+	/// The queue is always drained fully, even once a match is found, so
+	/// nothing is left behind to wake the event loop again.
+	pub fn drain_events(&self) -> X11Events {
 		if self.dpy.is_null() {
-			return false;
+			return X11Events::default();
 		}
 		with_xlib(|loaded| {
 			let pending = loaded.xpending?;
 			let next = loaded.xnextevent?;
-			let mut changed = false;
+			let mut events = X11Events::default();
 			let mut event = [0 as libc_c_long; X_EVENT_LONGS];
 			unsafe {
 				while pending(self.dpy) > 0 {
 					next(self.dpy, event.as_mut_ptr() as *mut c_void);
 					// Every XEvent variant starts with the event type.
-					if *(event.as_ptr() as *const c_int) != PROPERTY_NOTIFY {
-						continue;
-					}
-					let property = &*(event.as_ptr() as *const XPropertyEvent);
-					if property.window == self.root
-						&& (property.atom == self.atoms.gamescopectrl_baselayer_appid
-							|| property.atom == self.atoms.gamescopectrl_baselayer_window)
-					{
-						tracing::debug!(
-							target: "focus",
-							atom = property.atom,
-							"Steam focus control changed on root window"
-						);
-						changed = true;
+					match *(event.as_ptr() as *const c_int) {
+						PROPERTY_NOTIFY => {
+							let property = &*(event.as_ptr() as *const XPropertyEvent);
+							if property.window == self.root
+								&& (property.atom == self.atoms.gamescopectrl_baselayer_appid
+									|| property.atom == self.atoms.gamescopectrl_baselayer_window)
+							{
+								tracing::debug!(
+									target: "focus",
+									atom = property.atom,
+									"Steam focus control changed on root window"
+								);
+								events.focus_control_changed = true;
+							}
+						},
+						FOCUS_OUT => {
+							let focus = &*(event.as_ptr() as *const XFocusChangeEvent);
+							// Events still queued for a previously watched window
+							// describe focus changes the compositor made itself.
+							if focus.window != 0 && focus.window == self.watched_keyboard_focus.get() {
+								events.keyboard_focus_lost = true;
+							}
+						},
+						_ => {},
 					}
 				}
 			}
-			Some(changed)
+			Some(events)
 		})
-		.unwrap_or(false)
+		.unwrap_or_default()
+	}
+
+	/// Select `FocusOut` on `window`, the compositor's chosen keyboard focus,
+	/// and stop watching the previous one. Call before moving X focus there so
+	/// the compositor's own focus change is never reported as an escape.
+	pub fn watch_keyboard_focus(&self, window: u32) {
+		let window = window as Window;
+		let previous = self.watched_keyboard_focus.replace(window);
+		if self.dpy.is_null() || previous == window {
+			return;
+		}
+		with_xlib(|loaded| {
+			let seterr = loaded.xseterrorhandler?;
+			let select = loaded.xselectinput?;
+			unsafe {
+				// The previous window may be gone; BadWindow is expected then.
+				let prev = seterr(Some(silent_x11_error));
+				if previous != 0 {
+					select(self.dpy, previous, 0);
+				}
+				if window != 0 {
+					select(self.dpy, window, FOCUS_CHANGE_MASK);
+				}
+				seterr(prev);
+			}
+			Some(())
+		});
+	}
+
+	/// The X server's current input focus: `Some(0)` for `None` and
+	/// `Some(1)` for `PointerRoot` (see [`Self::is_no_window`]).
+	pub fn get_input_focus(&self) -> Option<u32> {
+		if self.dpy.is_null() {
+			return None;
+		}
+		with_xlib(|loaded| {
+			let get_focus = loaded.xgetinputfocus?;
+			let mut focus: Window = 0;
+			let mut revert: c_int = 0;
+			unsafe { get_focus(self.dpy, &mut focus, &mut revert) };
+			Some(focus as u32)
+		})
+	}
+
+	/// Whether an input focus value is X's `None` or `PointerRoot`.
+	pub fn is_no_window(window: u32) -> bool {
+		window == 0 || window as Window == POINTER_ROOT
 	}
 
 	/// Read a single CARDINAL (format-32) window property by pre-interned atom.

@@ -253,9 +253,20 @@ where
 /// Smithay's default Named callbacks are fallback resets on focus leave or
 /// replacement. This compositor does not advertise wp_cursor_shape_manager;
 /// client wl_pointer.set_cursor requests arrive as Surface or Hidden.
+///
+/// `image` is the client's latest request. Presentation holds the previous
+/// visible image for one refresh interval after a hide: Proton hides the X
+/// cursor around each `SetCursorPos` warp so XWayland reports the warp, and
+/// XWayland forwards that hide at once but delays the re-show (5 ms or the next
+/// motion). Such a hide and show within one frame is never displayed on Windows
+/// or by gamescope, which reads the cursor through XFixes; presenting it would
+/// make a controller-driven cursor flash. A hide that lasts a whole refresh
+/// interval is presented.
 pub(crate) struct CursorState {
 	pub image: CursorImageStatus,
 	active: bool,
+	/// Image still presented after a hide request, until the deadline.
+	held: Option<(CursorImageStatus, std::time::Instant)>,
 }
 
 impl Default for CursorState {
@@ -263,11 +274,47 @@ impl Default for CursorState {
 		Self {
 			image: CursorImageStatus::default_named(),
 			active: false,
+			held: None,
 		}
 	}
 }
 
 impl CursorState {
+	/// Apply a client request at `now`; a hide of a visible cursor keeps it
+	/// presented for `hold` (one refresh interval).
+	pub fn request_image(&mut self, image: CursorImageStatus, now: std::time::Instant, hold: std::time::Duration) {
+		if matches!(image, CursorImageStatus::Hidden) && self.held.is_none() && self.visible() {
+			self.held = Some((self.image.clone(), now + hold));
+		}
+		self.set_image(image);
+	}
+
+	/// The image to present at `now`, if the cursor is shown.
+	pub fn presented(&self, now: std::time::Instant) -> Option<&CursorImageStatus> {
+		use smithay::reexports::wayland_server::Resource;
+		if !self.active {
+			return None;
+		}
+		match (&self.image, &self.held) {
+			(CursorImageStatus::Hidden, Some((held, deadline))) if now < *deadline => match held {
+				CursorImageStatus::Surface(surface) if !surface.is_alive() => None,
+				held => Some(held),
+			},
+			(CursorImageStatus::Hidden, _) => None,
+			(image, _) => Some(image),
+		}
+	}
+
+	/// End an expired hold. Returns `true` once, when the presented cursor
+	/// disappears and the scene must be redrawn.
+	pub fn settle(&mut self, now: std::time::Instant) -> bool {
+		if self.held.as_ref().is_some_and(|(_, deadline)| now >= *deadline) {
+			self.held = None;
+			return true;
+		}
+		false
+	}
+
 	pub fn activate_pointer(&mut self) {
 		let was_visible = self.visible();
 		self.active = true;
@@ -276,6 +323,9 @@ impl CursorState {
 		}
 	}
 	pub fn set_image(&mut self, image: CursorImageStatus) {
+		if !matches!(image, CursorImageStatus::Hidden) {
+			self.held = None;
+		}
 		if !matches!(&image, CursorImageStatus::Named(icon) if *icon == smithay::input::pointer::CursorIcon::Default) {
 			self.active = true;
 		}
@@ -432,6 +482,82 @@ mod visibility_tests {
 		cursor.activate_pointer();
 		assert!(!cursor.visible(), "mouse motion must not undo an app hide");
 	}
+	const FRAME: std::time::Duration = std::time::Duration::from_micros(8_333);
+
+	#[test]
+	fn hide_and_show_within_one_frame_is_never_presented() {
+		// Proton brackets each SetCursorPos warp with XFixes hide/show; XWayland
+		// forwards the hide immediately and the show up to 5 ms later.
+		let named = CursorImageStatus::Named(smithay::input::pointer::CursorIcon::Crosshair);
+		let mut cursor = CursorState::default();
+		let t0 = std::time::Instant::now();
+		cursor.request_image(named.clone(), t0, FRAME);
+		for warp in 0..100u32 {
+			let at = t0 + FRAME * warp;
+			cursor.request_image(CursorImageStatus::Hidden, at, FRAME);
+			assert!(!cursor.visible(), "the client's request is recorded as is");
+			assert_eq!(
+				cursor.presented(at + FRAME / 2),
+				Some(&named),
+				"no frame drops the cursor"
+			);
+			cursor.request_image(named.clone(), at + std::time::Duration::from_millis(5), FRAME);
+			assert!(!cursor.settle(at + FRAME * 2), "a reverted hide needs no redraw");
+		}
+	}
+
+	#[test]
+	fn sustained_application_hide_is_presented_after_one_frame() {
+		let named = CursorImageStatus::Named(smithay::input::pointer::CursorIcon::Crosshair);
+		let mut cursor = CursorState::default();
+		let t0 = std::time::Instant::now();
+		cursor.request_image(named.clone(), t0, FRAME);
+		cursor.request_image(CursorImageStatus::Hidden, t0, FRAME);
+		// Repeated hides cannot extend the hold.
+		cursor.request_image(CursorImageStatus::Hidden, t0 + FRAME / 2, FRAME);
+		assert!(cursor.presented(t0 + FRAME / 2).is_some());
+		assert_eq!(cursor.presented(t0 + FRAME), None);
+		assert!(
+			cursor.settle(t0 + FRAME),
+			"the scene is redrawn once without the cursor"
+		);
+		assert!(!cursor.settle(t0 + FRAME * 2));
+		cursor.activate_pointer();
+		assert_eq!(
+			cursor.presented(t0 + FRAME * 3),
+			None,
+			"pointer use cannot undo the hide"
+		);
+	}
+
+	#[test]
+	fn hold_never_exposes_an_inactive_or_destroyed_cursor() {
+		let t0 = std::time::Instant::now();
+		// Controller-only startup: nothing was ever shown, so nothing is held.
+		let mut cursor = CursorState::default();
+		cursor.request_image(CursorImageStatus::default_named(), t0, FRAME);
+		cursor.request_image(CursorImageStatus::Hidden, t0, FRAME);
+		assert_eq!(cursor.presented(t0), None);
+
+		// A held client surface that dies is not drawn.
+		let display = Display::<TestState>::new().unwrap();
+		let mut handle = display.handle();
+		let (server, _peer) = UnixStream::pair().unwrap();
+		let client = handle.insert_client(server, std::sync::Arc::new(())).unwrap();
+		let surface = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 6, ())
+			.unwrap();
+		let mut cursor = CursorState::default();
+		cursor.request_image(CursorImageStatus::Surface(surface.clone()), t0, FRAME);
+		cursor.request_image(CursorImageStatus::Hidden, t0, FRAME);
+		assert!(cursor.presented(t0).is_some());
+		handle
+			.backend_handle()
+			.destroy_object::<TestState>(&surface.id())
+			.unwrap();
+		assert_eq!(cursor.presented(t0), None);
+	}
+
 	#[test]
 	fn image_replacement_and_active_surface_fallback_preserve_visibility() {
 		let mut cursor = CursorState::default();

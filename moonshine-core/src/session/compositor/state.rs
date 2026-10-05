@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use smithay::backend::input::InputTime;
 use smithay::desktop::Space;
+use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
 use smithay::input::{Seat, SeatState};
@@ -395,11 +396,6 @@ pub(crate) struct MoonshineCompositor {
 	pub x11_focus_token: Option<RegistrationToken>,
 	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
 	pub wayland_display: String,
-	/// EIS socket through which XWayland forwards XTest input (Steam Input's
-	/// controller-as-mouse); see [`super::emulated_input`].
-	emulated_input: Option<super::emulated_input::EmulatedInputServer>,
-	/// Compositor keyboard layout, also advertised to the emulated keyboard.
-	keyboard_config: KeyboardConfig,
 
 	/// Whether HDR mode is active for this session.
 	pub hdr: bool,
@@ -474,6 +470,10 @@ pub(crate) struct MoonshineCompositor {
 	/// X11 window ID last focused by the X server (gamescope's
 	/// `currentKeyboardFocusWindow`).
 	pub current_keyboard_focus_window: Option<u32>,
+
+	/// X11 windows whose `WM_CHANGE_STATE` iconic request was acknowledged
+	/// and that are still iconic; see `XwmHandler::minimize_request`.
+	pub(super) iconic_windows: std::collections::HashSet<u32>,
 
 	/// `STEAM_INPUT_FOCUS` of the input focus window last applied.
 	pub input_focus_mode: u32,
@@ -664,11 +664,29 @@ impl MoonshineCompositor {
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
+		let mut xkb_config = XkbConfig::default();
+
+		if !keyboard_config.layout.is_empty() {
+			xkb_config.layout = &keyboard_config.layout;
+		}
+
+		if !keyboard_config.variant.is_empty() {
+			xkb_config.variant = &keyboard_config.variant;
+		}
+
+		if !keyboard_config.model.is_empty() {
+			xkb_config.model = &keyboard_config.model;
+		}
+
+		if let Some(options) = keyboard_config.options.clone().filter(|options| !options.is_empty()) {
+			xkb_config.options = Some(options);
+		}
+
 		let mut space = Space::default();
 
 		// Create the input devices exposed to streamed applications.
 		let mut seat = seat_state.new_wl_seat(&display_handle, "moonshine");
-		seat.add_keyboard(keyboard_config.xkb_config(), 200, 25)
+		seat.add_keyboard(xkb_config, 200, 25)
 			.expect("Failed to add keyboard to seat");
 		seat.add_pointer();
 		seat.add_touch();
@@ -856,8 +874,6 @@ impl MoonshineCompositor {
 				xdisplay_tx: Some(xdisplay_tx),
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
-				emulated_input: None,
-				keyboard_config,
 				hdr: hdr_active,
 				hdr_capable,
 				steam_mode,
@@ -877,6 +893,7 @@ impl MoonshineCompositor {
 				pointer_focus_window: None,
 				input_focus_window: None,
 				current_keyboard_focus_window: None,
+				iconic_windows: Default::default(),
 				input_focus_mode: 0,
 				damage_sequence_counter: 0,
 				map_sequence_counter: 0,
@@ -1150,15 +1167,25 @@ impl MoonshineCompositor {
 	pub(crate) fn set_cursor_image(&mut self, image: CursorImageStatus) {
 		let changed = self.cursor.image != image;
 		let was_visible = self.cursor.visible();
-		self.cursor.set_image(image);
+		self.cursor
+			.request_image(image, std::time::Instant::now(), self.refresh_interval());
 		if changed || was_visible != self.cursor.visible() {
 			tracing::debug!(image = ?self.cursor.image, was_visible, visible = self.cursor.visible(), "Cursor state changed");
 		}
 		self.screen_dirty = true;
 	}
 
+	/// One refresh interval of the virtual output.
+	fn refresh_interval(&self) -> std::time::Duration {
+		std::time::Duration::from_nanos(
+			1_000_000_000_000 / self.output.current_mode().map_or(60_000, |mode| mode.refresh.max(1)) as u64,
+		)
+	}
+
+	/// Whether a cursor is presented in the captured scene now (see
+	/// [`super::cursor::CursorState`] for the hide hold).
 	fn cursor_visible(&self) -> bool {
-		self.cursor.visible()
+		self.cursor.presented(std::time::Instant::now()).is_some()
 	}
 
 	fn record_capture_path(&mut self, path: &'static str) {
@@ -1295,7 +1322,7 @@ impl MoonshineCompositor {
 		if self.output.current_scale().fractional_scale() != 1.0 {
 			return None;
 		}
-		let (image, hotspot, offset) = match &self.cursor.image {
+		let (image, hotspot, offset) = match self.cursor.presented(std::time::Instant::now())? {
 			CursorImageStatus::Hidden => return None,
 			// The GLES path draws named cursors at the pointer, without a hotspot.
 			CursorImageStatus::Named(_) => (self.default_cursor_overlay.clone(), (0, 0).into(), (0, 0).into()),
@@ -1658,6 +1685,12 @@ impl MoonshineCompositor {
 			self.screen_dirty = true;
 		}
 
+		// A held cursor whose hide outlasted the hold disappears now.
+		if self.cursor.settle(std::time::Instant::now()) {
+			tracing::debug!("Cursor hidden");
+			self.screen_dirty = true;
+		}
+
 		if self.cursor.reset_dead_surface() {
 			tracing::debug!(
 				visible = self.cursor.visible(),
@@ -1934,11 +1967,11 @@ impl MoonshineCompositor {
 		}
 
 		// Cursor lifetime is handled before scanout/static-screen decisions.
-		let cursor_status = if self.cursor_visible() {
-			self.cursor.image.clone()
-		} else {
-			CursorImageStatus::Hidden
-		};
+		let cursor_status = self
+			.cursor
+			.presented(std::time::Instant::now())
+			.cloned()
+			.unwrap_or(CursorImageStatus::Hidden);
 
 		if self.log_stats {
 			self.gpu_timer.begin(&mut self.renderer);
@@ -2810,26 +2843,15 @@ impl MoonshineCompositor {
 			"Spawning XWayland"
 		);
 
-		// XWayland forwards XTest input to the compositor only through EIS.
-		if self.emulated_input.is_none() {
-			self.emulated_input =
-				super::emulated_input::start(&self.handle, &self.wayland_display, &self.keyboard_config);
-		}
-		let mut envs: Vec<(&str, std::ffi::OsString)> = Vec::new();
-		if std::env::var_os("MOONSHINE_WAYLAND_DEBUG").is_some() {
-			envs.push(("WAYLAND_DEBUG", "1".into()));
-		}
-		if let Some(server) = &self.emulated_input {
-			envs.push(("LIBEI_SOCKET", server.socket.clone().into_os_string()));
-		}
-
 		// Smithay forks Xwayland from this thread; the before/after snapshot
 		// identifies exactly that child so teardown can own its lifetime.
 		let children_before = super::xwayland_process::thread_children();
 		let (xwayland, client) = match XWayland::spawn(
 			&self.display_handle,
 			None,
-			envs,
+			std::env::var("MOONSHINE_WAYLAND_DEBUG")
+				.ok()
+				.map(|_| ("WAYLAND_DEBUG", "1")),
 			// Emulate RandR so games can change resolution: without it Xwayland
 			// accepts the request but the mode never changes, leaving games
 			// stuck. Games launched through wlroots/gamescope get this flag.
@@ -2941,12 +2963,16 @@ impl MoonshineCompositor {
 		let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
 		let source = calloop::generic::Generic::new(borrowed, calloop::Interest::READ, calloop::Mode::Level);
 		match self.handle.insert_source(source, |_, _, state: &mut Self| {
-			if state
+			let events = state
 				.x11_focus
 				.as_ref()
-				.is_some_and(|x11_focus| x11_focus.drain_focus_control_change())
-			{
+				.map(|x11_focus| x11_focus.drain_events())
+				.unwrap_or_default();
+			if events.focus_control_changed {
 				state.reevaluate_focus();
+			}
+			if events.keyboard_focus_lost {
+				state.reclaim_keyboard_focus();
 			}
 			Ok(calloop::PostAction::Continue)
 		}) {
@@ -2971,13 +2997,6 @@ impl MoonshineCompositor {
 		if let Some(token) = self.wayland_socket_token.take() {
 			self.handle.remove(token);
 			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
-		}
-
-		// Dropping the listener unlinks the EIS socket; XWayland's connection
-		// closes with the process.
-		if let Some(server) = self.emulated_input.take() {
-			self.handle.remove(server.token);
-			tracing::debug!(socket = %server.socket.display(), "Removed EIS listening socket source");
 		}
 
 		// Remove the root-window PropertyNotify source before the connection
