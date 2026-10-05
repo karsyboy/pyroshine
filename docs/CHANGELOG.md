@@ -14,14 +14,6 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-### Removed
-
-- Delete the custom Vulkan implicit layer, private presentation protocols and XWayland content replacement. Applications use their actual compositor surfaces; legacy XWayland HDR requiring interception is intentionally unsupported.
-
-### Changed
-
-- Native Wayland color management owns HDR declarations and mastering metadata. Add parametric scRGB support, transactional surface color state, version-correct readiness and output feedback, and color conversion within scene composition. Clean real surfaces retain direct DMA-BUF export.
-
 ## [v0.17.0-beta.14] - 2026-10-05
 
 ### Added
@@ -36,10 +28,13 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Never let an X11 error from a window that disappeared exit the server. The compositor's auxiliary X11 connection only silenced errors while a call was in progress, but X reports errors asynchronously, so Xlib's default handler could terminate the whole service and stream.
 - Stop Grim Dawn crashing after repeated Steam overlay use. Each minimize retired the Vulkan WSI bypass because Wine shrinks a minimized game's client window to 1×1, and each restore destroyed and recreated the swapchain. The crashes (heap corruption detected during or after that swapchain teardown) occurred only during this churn and only with the bypass enabled; its exact source in the game process was not identified. A minimized client window now keeps the existing bypass decision, so minimize and restore no longer recreate the swapchain.
 - Stop the cursor flashing while a game moves it with a controller (for example Grim Dawn's own controller support). Proton hides the X cursor around every warp so XWayland can report the new position, and XWayland delays the re-show, so captured frames regularly missed the cursor. A cursor hide is now presented only once it outlasts one refresh interval; application hides still take effect within a frame.
+- Native Wayland color management owns HDR declarations and mastering metadata. Add parametric scRGB support, transactional surface color state, version-correct readiness and output feedback, and color conversion within scene composition. Clean real surfaces retain direct DMA-BUF export.
 
 ### Removed
 
 - Remove the EIS (libei) socket that v0.17.0-beta.13 offered XWayland for XTest input. It was added for a controller cursor problem whose actual cause was the transient cursor hides fixed above, and no tested game sent XTest through it.
+-  Delete the custom Vulkan implicit layer, private presentation protocols and XWayland content replacement. Applications use their actual compositor surfaces; legacy XWayland HDR requiring interception is intentionally unsupported.
+
 
 ## [v0.17.0-beta.13] - 2026-10-05
 
