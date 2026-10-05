@@ -927,4 +927,27 @@ mod tests {
 			}
 		}
 	}
+
+	/// The desktop app renders forms from this schema. Its tests and browser
+	/// preview read a committed copy, which must match the daemon's schema.
+	/// Regenerate it with `MOONSHINE_UPDATE_UI_FIXTURES=1 cargo test -p
+	/// moonshine-core ui_schema_fixture_is_current`.
+	#[test]
+	fn ui_schema_fixture_is_current() {
+		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../pyroshine-ui/src/api/schema.fixture.json");
+		let fixture = serde_json::to_string_pretty(&json!({
+			"schema": config_schema(),
+			"defaults": Config::default(),
+		}))
+		.unwrap() + "\n";
+		if std::env::var_os("MOONSHINE_UPDATE_UI_FIXTURES").is_some() {
+			std::fs::write(&path, &fixture).unwrap();
+		}
+		let committed = std::fs::read_to_string(&path).unwrap_or_default();
+		assert!(
+			committed == fixture,
+			"{} is out of date; regenerate it with MOONSHINE_UPDATE_UI_FIXTURES=1 and check the desktop app renders the change",
+			path.display()
+		);
+	}
 }

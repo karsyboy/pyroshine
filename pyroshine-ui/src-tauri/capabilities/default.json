@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: application commands and event delivery only.",
+  "windows": ["main"],
+  "permissions": ["core:event:default", "core:window:allow-close"]
+}

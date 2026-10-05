@@ -1,0 +1,1456 @@
+{
+  "defaults": {
+    "address": "0.0.0.0",
+    "application": [
+      {
+        "boxart": null,
+        "command": [
+          "/usr/bin/steam",
+          "steam://open/bigpicture"
+        ],
+        "launch_timeout_secs": 2,
+        "title": "Steam"
+      }
+    ],
+    "application_scanner": [
+      {
+        "command": [
+          "/usr/bin/steam",
+          "-bigpicture",
+          "steam://rungameid/{game_id}"
+        ],
+        "launch_timeout_secs": 2,
+        "library": "$HOME/.local/share/Steam",
+        "type": "steam"
+      }
+    ],
+    "compositor": {
+      "capture_mode": "auto",
+      "gpu": null,
+      "hdr": true,
+      "keyboard": {
+        "layout": "us",
+        "model": "",
+        "options": null,
+        "variant": ""
+      },
+      "steam_mode": true,
+      "virtual_connector_strategy": "single_application"
+    },
+    "inhibit_sleep": true,
+    "name": "Pyroshine",
+    "stream": {
+      "audio": {
+        "port": 48000
+      },
+      "control": {
+        "gamepad": {
+          "emulation": "auto",
+          "home_button": {
+            "hold_ms": 0,
+            "rumble_duration_ms": 50,
+            "rumble_intensity": 0.5,
+            "suppress_home": false
+          }
+        },
+        "port": 47999
+      },
+      "port": 48010,
+      "timeout": 60,
+      "video": {
+        "conversion_queue": "auto",
+        "encrypt": false,
+        "fec_max_percentage": 25,
+        "fec_min_percentage": 0,
+        "fec_mode": "fixed",
+        "fec_percentage": 20,
+        "log_frame_spikes": false,
+        "log_stats": true,
+        "max_packet_size": 0,
+        "port": 47998,
+        "pyrowave_queue": "auto"
+      }
+    },
+    "webserver": {
+      "certificate": "$HOME/.config/moonshine/cert.pem",
+      "enable_pairing": true,
+      "port": 47989,
+      "port_https": 47984,
+      "private_key": "$HOME/.config/moonshine/key.pem"
+    }
+  },
+  "schema": {
+    "fields": [
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Name shown to clients and advertised on the network.",
+        "kind": {
+          "optional": false,
+          "placeholder": "Pyroshine",
+          "suggestions": [],
+          "type": "text"
+        },
+        "label": "Host name",
+        "path": "name",
+        "required": false,
+        "section": "general"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Ask logind to block suspend during a session. Needs the shipped polkit rule and pyroshine group access.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Prevent sleep while streaming",
+        "path": "inhibit_sleep",
+        "required": false,
+        "section": "general"
+      },
+      {
+        "advanced": false,
+        "caution": "Clients must be able to reach this address.",
+        "help": "IP address for the web and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
+        "kind": {
+          "optional": false,
+          "placeholder": "0.0.0.0",
+          "suggestions": [
+            "0.0.0.0",
+            "::"
+          ],
+          "type": "text"
+        },
+        "label": "Bind address",
+        "path": "address",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": "Clients and firewalls expect the default ports unless reconfigured.",
+        "help": "GameStream HTTP API and host-local pairing page (TCP).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "HTTP port",
+        "path": "webserver.port",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": "Clients and firewalls expect the default ports unless reconfigured.",
+        "help": "GameStream HTTPS API (TCP).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "HTTPS port",
+        "path": "webserver.port_https",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Stream negotiation (TCP).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "RTSP port",
+        "path": "stream.port",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Video stream (UDP).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "Video port",
+        "path": "stream.video.port",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Audio stream (UDP).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "Audio port",
+        "path": "stream.audio.port",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Input and control stream (UDP).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "Control port",
+        "path": "stream.control.port",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Seconds a streaming client may go without a ping before it is treated as disconnected. The session and application keep running for a resume.",
+        "kind": {
+          "max": 86400.0,
+          "min": 1.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "s"
+        },
+        "label": "Client timeout",
+        "path": "stream.timeout",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Allow new clients to pair. Disable after pairing your devices.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Allow new pairings",
+        "path": "webserver.enable_pairing",
+        "required": false,
+        "section": "security"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Encrypt the video stream with AES-128-GCM when the client supports it.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Encrypt video",
+        "path": "stream.video.encrypt",
+        "required": false,
+        "section": "security"
+      },
+      {
+        "advanced": true,
+        "caution": "Changing the server identity requires pairing every client again.",
+        "help": "Server certificate, created if missing. ~ and environment variables are expanded.",
+        "kind": {
+          "directory": false,
+          "expands": true,
+          "optional": false,
+          "type": "path"
+        },
+        "label": "TLS certificate",
+        "path": "webserver.certificate",
+        "required": false,
+        "section": "security"
+      },
+      {
+        "advanced": true,
+        "caution": "Changing the server identity requires pairing every client again.",
+        "help": "Private key of the server certificate, created if missing. Keep it private.",
+        "kind": {
+          "directory": false,
+          "expands": true,
+          "optional": false,
+          "type": "path"
+        },
+        "label": "TLS private key",
+        "path": "webserver.private_key",
+        "required": false,
+        "section": "security"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "How video parity (forward error correction) is chosen.",
+        "kind": {
+          "options": [
+            {
+              "description": "Never send parity, even when the client requests a minimum.",
+              "label": "Off",
+              "value": "off"
+            },
+            {
+              "description": "Always use the configured percentage.",
+              "label": "Fixed",
+              "value": "fixed"
+            },
+            {
+              "description": "Adjust between the minimum and maximum from the client's FEC feedback.",
+              "label": "Automatic",
+              "value": "auto"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Error correction",
+        "path": "stream.video.fec_mode",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Parity as a percentage of data packets in fixed mode; the starting value in automatic mode.",
+        "kind": {
+          "max": 255.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "%"
+        },
+        "label": "Parity",
+        "path": "stream.video.fec_percentage",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Lower bound for automatic error correction.",
+        "kind": {
+          "max": 255.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "%"
+        },
+        "label": "Automatic minimum",
+        "path": "stream.video.fec_min_percentage",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Upper bound for automatic error correction; keep it at least the minimum.",
+        "kind": {
+          "max": 255.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "%"
+        },
+        "label": "Automatic maximum",
+        "path": "stream.video.fec_max_percentage",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Upper bound for the client's video packet size in bytes; 0 disables the cap and values below 200 are ignored. Lower it for VPNs and tunnels with a small MTU.",
+        "kind": {
+          "max": 65000.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "bytes"
+        },
+        "label": "Packet size cap",
+        "path": "stream.video.max_packet_size",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "GPU queue preference for PyroWave encoding.",
+        "kind": {
+          "options": [
+            {
+              "description": "Graphics queue (recommended).",
+              "label": "Automatic",
+              "value": "auto"
+            },
+            {
+              "description": "Graphics queue.",
+              "label": "Graphics",
+              "value": "graphics"
+            },
+            {
+              "description": "Request a compute queue; the library falls back to graphics.",
+              "label": "Compute",
+              "value": "compute"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "PyroWave GPU queue",
+        "path": "stream.video.pyrowave_queue",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "GPU queue for H.264/HEVC/AV1 color conversion.",
+        "kind": {
+          "options": [
+            {
+              "description": "Dedicated compute family when the GPU has one, otherwise graphics.",
+              "label": "Automatic",
+              "value": "auto"
+            },
+            {
+              "description": "The graphics-capable queue family.",
+              "label": "Graphics",
+              "value": "graphics"
+            },
+            {
+              "description": "The dedicated compute family; graphics when the GPU has none.",
+              "label": "Compute",
+              "value": "compute"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Color conversion queue",
+        "path": "stream.video.conversion_queue",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Virtual controller family presented to games.",
+        "kind": {
+          "options": [
+            {
+              "description": "Keep the client's controller family; Xbox for Steam and unknown controllers.",
+              "label": "Automatic",
+              "value": "auto"
+            },
+            {
+              "description": "Always emulate Xbox controllers.",
+              "label": "Xbox",
+              "value": "xbox"
+            },
+            {
+              "description": "Always emulate PlayStation controllers (motion and touchpad).",
+              "label": "PlayStation",
+              "value": "playstation"
+            },
+            {
+              "description": "Always emulate Nintendo controllers.",
+              "label": "Nintendo",
+              "value": "nintendo"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Controller type",
+        "path": "stream.control.gamepad.emulation",
+        "required": false,
+        "section": "input"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Button combination that sends Home/Guide. Unset keeps older configurations working: a nonzero hold time selects Hold Back.",
+        "kind": {
+          "options": [
+            {
+              "description": "No synthetic Home button.",
+              "label": "Disabled",
+              "value": "disabled"
+            },
+            {
+              "description": "Holding Back sends Home; a short press sends a 100 ms Back tap.",
+              "label": "Hold Back (legacy)",
+              "value": "hold_back"
+            },
+            {
+              "description": "Holding both buttons sends Home; single presses pass through.",
+              "label": "Hold Back + Start (recommended)",
+              "value": "back_start"
+            }
+          ],
+          "type": "choice",
+          "unset_label": "Legacy (from hold time)"
+        },
+        "label": "Home shortcut",
+        "path": "stream.control.gamepad.home_button.trigger",
+        "required": false,
+        "section": "input"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "How long the shortcut must be held. 0 disables the shortcut for every trigger.",
+        "kind": {
+          "max": 10000.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "ms"
+        },
+        "label": "Hold time",
+        "path": "stream.control.gamepad.home_button.hold_ms",
+        "required": false,
+        "section": "input"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Length of the rumble pulse when the shortcut fires; 0 disables it.",
+        "kind": {
+          "max": 5000.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "ms"
+        },
+        "label": "Activation rumble",
+        "path": "stream.control.gamepad.home_button.rumble_duration_ms",
+        "required": false,
+        "section": "input"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Strength of the activation pulse.",
+        "kind": {
+          "max": 1.0,
+          "min": 0.0,
+          "optional": false,
+          "step": 0.05,
+          "type": "number",
+          "unit": null
+        },
+        "label": "Rumble strength",
+        "path": "stream.control.gamepad.home_button.rumble_intensity",
+        "required": false,
+        "section": "input"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Drop the client's physical Home/Guide button. The shortcut still works.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Ignore the physical Home button",
+        "path": "stream.control.gamepad.home_button.suppress_home",
+        "required": false,
+        "section": "input"
+      },
+      {
+        "advanced": false,
+        "caution": "The capture GPU must be the GPU Vulkan encodes on, or startup fails.",
+        "help": "Render node path (/dev/dri/renderD128), node name, or part of the device's uevent (such as a PCI ID). Unset selects automatically.",
+        "kind": {
+          "optional": true,
+          "placeholder": "Automatic",
+          "suggestions": [
+            "/dev/dri/renderD128",
+            "/dev/dri/renderD129"
+          ],
+          "type": "text"
+        },
+        "label": "GPU",
+        "path": "compositor.gpu",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Allow HDR when the GPU and client support it. Disabling it stops advertising HDR.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "HDR",
+        "path": "compositor.hdr",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Steam window filtering and Steam-controlled focus, like Gamescope's -e.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Steam mode",
+        "path": "compositor.steam_mode",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Focus policy when Steam mode is off.",
+        "kind": {
+          "options": [
+            {
+              "description": "One focus across the output; the highest-priority window wins.",
+              "label": "Single application",
+              "value": "single_application"
+            },
+            {
+              "description": "Steam chooses the focused windows.",
+              "label": "Steam controlled",
+              "value": "steam_controlled"
+            },
+            {
+              "description": "Separate focus per application ID.",
+              "label": "Per app ID",
+              "value": "per_app_id"
+            },
+            {
+              "description": "Separate focus per window.",
+              "label": "Per window",
+              "value": "per_window"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Window focus",
+        "path": "compositor.virtual_connector_strategy",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": true,
+        "caution": "Always compositing costs GPU time; use it to diagnose capture problems.",
+        "help": "How frames are captured.",
+        "kind": {
+          "options": [
+            {
+              "description": "Export the application's buffer directly when it is the whole scene.",
+              "label": "Automatic",
+              "value": "auto"
+            },
+            {
+              "description": "Render every frame through the compositor. For diagnosing capture problems.",
+              "label": "Always composite",
+              "value": "composited"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Capture",
+        "path": "compositor.capture_mode",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "XKB layout, for example us or de.",
+        "kind": {
+          "optional": false,
+          "placeholder": "us",
+          "suggestions": [
+            "us",
+            "gb",
+            "de",
+            "fr",
+            "es",
+            "it",
+            "jp"
+          ],
+          "type": "text"
+        },
+        "label": "Layout",
+        "path": "compositor.keyboard.layout",
+        "required": false,
+        "section": "keyboard"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "XKB layout variant; empty uses the layout's default.",
+        "kind": {
+          "optional": false,
+          "placeholder": null,
+          "suggestions": [],
+          "type": "text"
+        },
+        "label": "Variant",
+        "path": "compositor.keyboard.variant",
+        "required": false,
+        "section": "keyboard"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "XKB keyboard model; empty uses XKB's default.",
+        "kind": {
+          "optional": false,
+          "placeholder": null,
+          "suggestions": [],
+          "type": "text"
+        },
+        "label": "Model",
+        "path": "compositor.keyboard.model",
+        "required": false,
+        "section": "keyboard"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "XKB options such as caps:escape. Unset uses none.",
+        "kind": {
+          "optional": true,
+          "placeholder": null,
+          "suggestions": [
+            "caps:escape",
+            "compose:ralt"
+          ],
+          "type": "text"
+        },
+        "label": "Options",
+        "path": "compositor.keyboard.options",
+        "required": false,
+        "section": "keyboard"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Static applications. Discovered applications are added to this list when Pyroshine starts.",
+        "kind": {
+          "item": [
+            {
+              "advanced": false,
+              "caution": null,
+              "help": "Name shown to clients. It also derives the application ID, so keep titles distinct and stable.",
+              "kind": {
+                "optional": false,
+                "placeholder": "Steam",
+                "suggestions": [],
+                "type": "text"
+              },
+              "label": "Title",
+              "path": "title",
+              "required": true,
+              "section": "applications"
+            },
+            {
+              "advanced": false,
+              "caution": null,
+              "help": "Executable followed by its arguments. Commands are argument lists, not shell scripts; run a shell explicitly for shell syntax.",
+              "kind": {
+                "placeholders": [],
+                "type": "command"
+              },
+              "label": "Command",
+              "path": "command",
+              "required": true,
+              "section": "applications"
+            },
+            {
+              "advanced": false,
+              "caution": null,
+              "help": "Local image shown by clients. Missing art is resolved automatically when possible.",
+              "kind": {
+                "directory": false,
+                "expands": false,
+                "optional": true,
+                "type": "path"
+              },
+              "label": "Cover image",
+              "path": "boxart",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": false,
+              "caution": null,
+              "help": "Wayland output scale for this application. The stream keeps the client's physical resolution.",
+              "kind": {
+                "max": 8.0,
+                "min": 0.25,
+                "optional": true,
+                "step": 0.25,
+                "type": "number",
+                "unit": null
+              },
+              "label": "Output scale",
+              "path": "output_scale",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "Commands run in order before launching the application (systemd ExecStartPre). A failing command can prevent launch.",
+              "kind": {
+                "type": "command_list"
+              },
+              "label": "Before launch",
+              "path": "pre_command",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "Commands run after the application stops (systemd ExecStopPost). Useful for cleanup.",
+              "kind": {
+                "type": "command_list"
+              },
+              "label": "After session",
+              "path": "post_command",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "systemd StandardOutput destination. Unset discards output (\"null\").",
+              "kind": {
+                "optional": true,
+                "placeholder": "null",
+                "suggestions": [
+                  "null",
+                  "journal",
+                  "inherit",
+                  "file:/path/to/log",
+                  "append:/path/to/log"
+                ],
+                "type": "text"
+              },
+              "label": "Standard output",
+              "path": "stdout",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "systemd StandardError destination. Use \"journal\" to capture errors.",
+              "kind": {
+                "optional": true,
+                "placeholder": "null",
+                "suggestions": [
+                  "null",
+                  "journal",
+                  "inherit",
+                  "file:/path/to/log",
+                  "append:/path/to/log"
+                ],
+                "type": "text"
+              },
+              "label": "Standard error",
+              "path": "stderr",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
+              "kind": {
+                "max": 3600.0,
+                "min": 0.0,
+                "optional": false,
+                "type": "integer",
+                "unit": "s"
+              },
+              "label": "Launch timeout",
+              "path": "launch_timeout_secs",
+              "required": false,
+              "section": "applications"
+            }
+          ],
+          "type": "applications"
+        },
+        "label": "Applications",
+        "path": "application",
+        "required": false,
+        "section": "applications"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Scanners run at startup; restart Pyroshine after installing games.",
+        "kind": {
+          "type": "scanners",
+          "variants": [
+            {
+              "description": "Installed games in the Steam installation and its libraries.",
+              "fields": [
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Path to the Steam installation, for example $HOME/.local/share/Steam.",
+                  "kind": {
+                    "directory": true,
+                    "expands": true,
+                    "optional": false,
+                    "type": "path"
+                  },
+                  "label": "Steam directory",
+                  "path": "library",
+                  "required": true,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Command used for each discovered application; placeholders are replaced in every argument.",
+                  "kind": {
+                    "placeholders": [
+                      "{game_id}"
+                    ],
+                    "type": "command"
+                  },
+                  "label": "Launch command",
+                  "path": "command",
+                  "required": true,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run in order before launching each discovered application (systemd ExecStartPre). A failing command can prevent launch.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "Before launch",
+                  "path": "pre_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run after each discovered application stops (systemd ExecStopPost). Useful for cleanup.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "After session",
+                  "path": "post_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardOutput destination. Unset discards output (\"null\").",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard output",
+                  "path": "stdout",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardError destination. Use \"journal\" to capture errors.",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard error",
+                  "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
+                  "kind": {
+                    "max": 3600.0,
+                    "min": 0.0,
+                    "optional": false,
+                    "type": "integer",
+                    "unit": "s"
+                  },
+                  "label": "Launch timeout",
+                  "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                }
+              ],
+              "id": "steam",
+              "label": "Steam"
+            },
+            {
+              "description": "Installed entries from the Lutris database.",
+              "fields": [
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Path to pga.db. Defaults to the user's data directory (usually ~/.local/share/lutris/pga.db).",
+                  "kind": {
+                    "directory": false,
+                    "expands": true,
+                    "optional": false,
+                    "type": "path"
+                  },
+                  "label": "Lutris database",
+                  "path": "pga_db",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Command used for each discovered application; placeholders are replaced in every argument.",
+                  "kind": {
+                    "placeholders": [
+                      "{slug}"
+                    ],
+                    "type": "command"
+                  },
+                  "label": "Launch command",
+                  "path": "command",
+                  "required": true,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run in order before launching each discovered application (systemd ExecStartPre). A failing command can prevent launch.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "Before launch",
+                  "path": "pre_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run after each discovered application stops (systemd ExecStopPost). Useful for cleanup.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "After session",
+                  "path": "post_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardOutput destination. Unset discards output (\"null\").",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard output",
+                  "path": "stdout",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardError destination. Use \"journal\" to capture errors.",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard error",
+                  "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
+                  "kind": {
+                    "max": 3600.0,
+                    "min": 0.0,
+                    "optional": false,
+                    "type": "integer",
+                    "unit": "s"
+                  },
+                  "label": "Launch timeout",
+                  "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                }
+              ],
+              "id": "lutris",
+              "label": "Lutris"
+            },
+            {
+              "description": "Installed games across Heroic stores and sideloaded apps, excluding DLC.",
+              "fields": [
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Heroic's configuration directory. Defaults to the native config when present, otherwise the Flatpak config.",
+                  "kind": {
+                    "directory": true,
+                    "expands": true,
+                    "optional": false,
+                    "type": "path"
+                  },
+                  "label": "Heroic configuration",
+                  "path": "config_dir",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Command used for each discovered application; placeholders are replaced in every argument.",
+                  "kind": {
+                    "placeholders": [
+                      "{app_name}",
+                      "{runner}"
+                    ],
+                    "type": "command"
+                  },
+                  "label": "Launch command",
+                  "path": "command",
+                  "required": true,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run in order before launching each discovered application (systemd ExecStartPre). A failing command can prevent launch.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "Before launch",
+                  "path": "pre_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run after each discovered application stops (systemd ExecStopPost). Useful for cleanup.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "After session",
+                  "path": "post_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardOutput destination. Unset discards output (\"null\").",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard output",
+                  "path": "stdout",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardError destination. Use \"journal\" to capture errors.",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard error",
+                  "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
+                  "kind": {
+                    "max": 3600.0,
+                    "min": 0.0,
+                    "optional": false,
+                    "type": "integer",
+                    "unit": "s"
+                  },
+                  "label": "Launch timeout",
+                  "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                }
+              ],
+              "id": "heroic",
+              "label": "Heroic Games Launcher"
+            },
+            {
+              "description": "Recursively scan .desktop launchers; each entry's Exec line is its command.",
+              "fields": [
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Directories scanned recursively for .desktop files.",
+                  "kind": {
+                    "expands": true,
+                    "type": "path_list"
+                  },
+                  "label": "Directories",
+                  "path": "directories",
+                  "required": true,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Include entries marked Terminal=true.",
+                  "kind": {
+                    "type": "bool"
+                  },
+                  "label": "Include terminal applications",
+                  "path": "include_terminal",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Resolve desktop entry icons into cover images.",
+                  "kind": {
+                    "type": "bool"
+                  },
+                  "label": "Resolve icons",
+                  "path": "resolve_icons",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run in order before launching each discovered application (systemd ExecStartPre). A failing command can prevent launch.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "Before launch",
+                  "path": "pre_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run after each discovered application stops (systemd ExecStopPost). Useful for cleanup.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "After session",
+                  "path": "post_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardOutput destination. Unset discards output (\"null\").",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard output",
+                  "path": "stdout",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardError destination. Use \"journal\" to capture errors.",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard error",
+                  "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
+                  "kind": {
+                    "max": 3600.0,
+                    "min": 0.0,
+                    "optional": false,
+                    "type": "integer",
+                    "unit": "s"
+                  },
+                  "label": "Launch timeout",
+                  "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                }
+              ],
+              "id": "desktop",
+              "label": "Desktop entries"
+            }
+          ]
+        },
+        "label": "Scanners",
+        "path": "application_scanner",
+        "required": false,
+        "section": "scanners"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Log five-second capture, pipeline, transport and runtime summaries. Disabling also skips their collection.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Periodic statistics",
+        "path": "stream.video.log_stats",
+        "required": false,
+        "section": "diagnostics"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Warn when one frame's encoding and packetization exceeds the frame budget.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Frame spike warnings",
+        "path": "stream.video.log_frame_spikes",
+        "required": false,
+        "section": "diagnostics"
+      }
+    ],
+    "sections": [
+      {
+        "description": "Host identity and power management.",
+        "id": "general",
+        "title": "General"
+      },
+      {
+        "description": "Listener address, ports and client timeout.",
+        "id": "network",
+        "title": "Network"
+      },
+      {
+        "description": "Client pairing, TLS identity and stream encryption.",
+        "id": "security",
+        "title": "Pairing & security"
+      },
+      {
+        "description": "Forward error correction, packet size and GPU queues.",
+        "id": "video",
+        "title": "Video"
+      },
+      {
+        "description": "Virtual controllers and the Home button shortcut.",
+        "id": "input",
+        "title": "Input & controllers"
+      },
+      {
+        "description": "GPU selection, capture, HDR and window focus.",
+        "id": "display",
+        "title": "Compositor & display"
+      },
+      {
+        "description": "XKB layout of the streaming session.",
+        "id": "keyboard",
+        "title": "Keyboard"
+      },
+      {
+        "description": "Applications offered to clients.",
+        "id": "applications",
+        "title": "Applications"
+      },
+      {
+        "description": "Scanners that add installed games when Pyroshine starts.",
+        "id": "scanners",
+        "title": "Application discovery"
+      },
+      {
+        "description": "Logging for performance investigation.",
+        "id": "diagnostics",
+        "title": "Diagnostics"
+      }
+    ]
+  }
+}
