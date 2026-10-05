@@ -150,7 +150,7 @@ const overview = (): Overview => ({
       ? null
       : {
           api_version: 1,
-          version: "0.17.0-beta-11",
+          version: "test",
           name: "Living-room PC",
           pid: 4242,
           started_at_ms: now - 5 * 3_600_000,
