@@ -42,4 +42,4 @@ record new evidence (revision, hardware, workload and unperformed checks) with
 the change that needs it rather than in a guide.
 
 The streaming client is maintained separately in
-[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave).
+[Pyrolight](https://github.com/karsyboy/pyrolight).

@@ -1,7 +1,7 @@
 # PyroWave compatibility and bandwidth calibration
 
 Pyroshine accepts two PyroWave transport dialects: *native wire-v1*, used by
-[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave), and
+[Pyrolight](https://github.com/karsyboy/pyrolight), and
 *record-framed*, used by Nonary-derived clients. Both use the same encoder and
 block format. This guide also covers the authenticated bandwidth probe that
 clients use for calibration.
@@ -32,7 +32,7 @@ Native ANNOUNCE declares version `1`, optionally the explicit `native-wire-v1`
 dialect and matching bitstream ID. Older native clients remain compatible.
 Record ANNOUNCE declares feature bit `pyrowaveFeatures:1`, or the documented
 `pyrowaveAdaptiveFec:0/1` capability, without claiming native version 1.
-Moonlight Qt PyroWave, when it selects record framing for a record-only host,
+Pyrolight, when it selects record framing for a record-only host,
 also sends `x-ss-pyrowave.dialect:record-framed` and the bitstream ID. Nonary release/6.1.0-vrr18 predates those explicit echoes and is
 recognized by its record capability markers. User-agent strings are irrelevant.
 

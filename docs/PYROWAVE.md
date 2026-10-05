@@ -112,7 +112,7 @@ down to a 32-bit word exactly as wire-v1 clients do. Valid budgets range from
 1 KiB to just under 3 MiB. The value is logged when the encoder starts. There
 is no separate low bitrate cap for 4:4:4 or HDR.
 
-Client default-bitrate heuristics are owned by Moonlight Qt PyroWave, not a host
+Client default-bitrate heuristics are owned by Pyrolight, not a host
 congestion controller. The negotiated manual bitrate remains authoritative;
 FEC feedback adjusts parity, not PyroWave codec bitrate. Live bitrate adaptation
 would need an end-to-end capacity estimator.

@@ -15,7 +15,7 @@ Old clients retain their previous behavior. Old hosts ignore the new capability
 and receive the same PS family and normal controller input. Packet types, lengths,
 and button-field encoding are unchanged. The extension adds one capability
 constant to moonlight-common-c; it does not add packets or a HID tunnel.
-The client side lives in [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave)
+The client side lives in [Pyrolight](https://github.com/karsyboy/pyrolight)
 and its moonlight-common-c submodule.
 
 ## Mapping

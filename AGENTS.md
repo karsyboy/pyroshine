@@ -7,7 +7,7 @@ authoritative documents; read the ones relevant to the change, not every guide.
 
 Related repositories:
 
-- [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave):
+- [Pyrolight](https://github.com/karsyboy/pyrolight):
   the client fork. Protocol, capability-bit and PyroWave wire changes must stay
   compatible with it (and its `moonlight-common-c` submodule fork).
 - [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave): the pinned codec fork.

@@ -20,7 +20,7 @@ headless sessions and streams them to Moonlight-compatible clients.
 - Optional desktop app with a system tray, pairing notifications, client management,
   a settings editor, and a live stream dashboard. The server runs headless without it.
 
-Use [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave)
+Use [Pyrolight](https://github.com/karsyboy/pyrolight)
 for PyroWave streaming. Standard Moonlight clients can use the conventional codecs.
 
 ## Requirements
@@ -138,7 +138,7 @@ Pyroshine is an independent community fork of
 ecosystem and work pioneered by [Sunshine](https://github.com/LizardByte/Sunshine).
 It retains Moonshine's internal crate names, configuration paths, and protocol
 names to ease upstream synchronization. The client fork is
-[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave), and
+[Pyrolight](https://github.com/karsyboy/pyrolight), and
 the codec is the pinned [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave)
 fork of [PyroWave](https://github.com/Themaister/pyrowave).
 

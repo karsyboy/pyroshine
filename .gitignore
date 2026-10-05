@@ -5,3 +5,6 @@ __pycache__/
 *.bak
 docs/reports/PRODUCTION_READINESS_REVIEW_2026-10-01.md
 docs/reports/production-readiness-2026-10-01
+pyroshine-ui/node_modules
+pyroshine-ui/dist
+pyroshine-ui/src-tauri/target
