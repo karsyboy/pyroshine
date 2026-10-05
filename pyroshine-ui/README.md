@@ -93,6 +93,11 @@ client; record the desktop environment, session type and client used.
    refused with the setting highlighted, editing the file externally before
    saving reports a conflict, and the restart notice appears. Restart the
    service and confirm the settings apply.
-6. **Isolation.** During a stream, `kill -9` the app: the stream continues.
+6. **Window activation (Wayland).** With another window in front, click the
+   pairing notification, the tray icon, and the app's menu entry while the app
+   runs: each brings the Pyroshine window to the front with focus instead of
+   only highlighting it in the taskbar. `WAYLAND_DEBUG=client pyroshine-ui`
+   shows `xdg_activation_v1.activate` with the compositor's token.
+7. **Isolation.** During a stream, `kill -9` the app: the stream continues.
    Start the app again: it shows the live session. Restart the service with the
    app open: it reports Pyroshine as unavailable, then reconnects.

@@ -74,4 +74,7 @@ pub trait Ui {
 	/// Show the main window at `page` (for example `dashboard` or
 	/// `clients?request=<token>`).
 	fn show(&self, page: &str) -> zbus::Result<()>;
+	/// [`Self::show`], activating the window with the XDG activation token
+	/// the caller received for the user's action (Wayland focus requires one).
+	fn activate(&self, page: &str, activation_token: &str) -> zbus::Result<()>;
 }

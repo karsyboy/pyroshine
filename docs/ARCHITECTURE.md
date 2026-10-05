@@ -574,7 +574,12 @@ preview for UI development; the tray uses `ksni` (StatusNotifierItem) rather
 than Tauri's appindicator tray, for click activation and runtime icons. The app
 follows the daemon's bus name instead of polling, subscribes before reading
 snapshots, and creates its window on demand (closing destroys the webview), so
-the tray-only app holds no web content process. Its Cargo workspace is
+the tray-only app holds no web content process. On Wayland it raises the window
+with the XDG activation token of the user's click (notification
+`ActivationToken`, tray `ProvideXdgActivationToken`, launcher
+`XDG_ACTIVATION_TOKEN`, forwarded by `Activate` to a running instance) through
+`gtk_window_set_startup_id`; GTK's own token request would be refused because
+the click did not happen in the app. Its Cargo workspace is
 separate, so server builds never compile GTK or WebKitGTK.
 
 ## Architectural invariants

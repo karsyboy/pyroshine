@@ -97,6 +97,14 @@ pub struct PyroTray {
 	notifier: Notifier,
 	view: View,
 	icons: HashMap<Badge, Vec<Icon>>,
+	/// Token the tray host provided for the click being handled.
+	activation_token: Option<String>,
+}
+
+impl PyroTray {
+	fn open(&mut self, page: &str) {
+		window::show(&self.app, page, self.activation_token.take());
+	}
 }
 
 impl Tray for PyroTray {
@@ -140,13 +148,19 @@ impl Tray for PyroTray {
 		}
 	}
 
+	/// Plasma passes the activation token for a click on the item just
+	/// before activating it.
+	fn provide_xdg_activation_token(&mut self, token: String) {
+		self.activation_token = window::activation_token(&token);
+	}
+
 	/// Left click opens the window (at a waiting pairing request first).
 	fn activate(&mut self, _x: i32, _y: i32) {
 		let page = match self.view.requests.last() {
 			Some(request) => format!("clients?request={request}"),
 			None => "dashboard".into(),
 		};
-		window::show(&self.app, &page);
+		self.open(&page);
 	}
 
 	fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -165,7 +179,7 @@ impl Tray for PyroTray {
 			StandardItem {
 				label: "_Open Pyroshine".into(),
 				icon_name: "window-new".into(),
-				activate: Box::new(|tray: &mut Self| window::show(&tray.app, "dashboard")),
+				activate: Box::new(|tray: &mut Self| tray.open("dashboard")),
 				..Default::default()
 			}
 			.into(),
@@ -176,14 +190,14 @@ impl Tray for PyroTray {
 				StandardItem {
 					label: format!("{}…", pairing_label(self.view.requests.len())),
 					icon_name: "dialog-password".into(),
-					activate: Box::new(move |tray: &mut Self| window::show(&tray.app, &page)),
+					activate: Box::new(move |tray: &mut Self| tray.open(&page)),
 					..Default::default()
 				}
 			},
 			None => StandardItem {
 				label: "_Pair a Client…".into(),
 				icon_name: "list-add".into(),
-				activate: Box::new(|tray: &mut Self| window::show(&tray.app, "clients")),
+				activate: Box::new(|tray: &mut Self| tray.open("clients")),
 				..Default::default()
 			},
 		};
@@ -318,6 +332,7 @@ pub fn spawn(app: AppHandle, daemon: Arc<Daemon>, notifier: Notifier) -> TrayHan
 		notifier,
 		view: View::default(),
 		icons,
+		activation_token: None,
 	};
 	// The panel may start after the app (autostart), so a missing
 	// StatusNotifierWatcher is not fatal: the icon appears once one does.

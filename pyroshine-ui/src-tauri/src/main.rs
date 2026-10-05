@@ -64,12 +64,13 @@ fn main() {
 		.with_env_filter(EnvFilter::try_from_env("PYROSHINE_UI_LOG").unwrap_or_else(|_| EnvFilter::new("warn")))
 		.init();
 	window::apply_webkit_workarounds();
+	let launch_activation = window::take_launch_activation_token();
 
 	// One instance per user: a second launch (desktop entry, notification,
 	// autostart) asks the running instance to show the requested page.
 	// A background launch (autostart) leaves a running instance as it is.
 	let forward = (!options.background).then_some(options.page.as_str());
-	let instance = tauri::async_runtime::block_on(instance::acquire(forward));
+	let instance = tauri::async_runtime::block_on(instance::acquire(forward, launch_activation.as_deref()));
 	let (connection, show_requests) = match instance {
 		instance::Instance::Primary { connection, requests } => (Some(connection), Some(requests)),
 		instance::Instance::Forwarded => return,
@@ -100,8 +101,8 @@ fn main() {
 			if let Some(mut requests) = show_requests {
 				let handle = handle.clone();
 				tauri::async_runtime::spawn(async move {
-					while let Some(page) = requests.recv().await {
-						window::show(&handle, &page);
+					while let Some((page, activation)) = requests.recv().await {
+						window::show(&handle, &page, activation);
 					}
 				});
 			}
@@ -109,7 +110,7 @@ fn main() {
 			let tray = tray::spawn(handle.clone(), daemon.clone(), notifier.clone());
 			daemon.start(handle.clone(), tray, notifier);
 			if !options.background {
-				window::show(&handle, &options.page);
+				window::show(&handle, &options.page, launch_activation);
 			}
 			Ok(())
 		})

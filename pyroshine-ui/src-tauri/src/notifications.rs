@@ -39,9 +39,6 @@ trait Notifications {
 	) -> zbus::Result<u32>;
 
 	fn close_notification(&self, id: u32) -> zbus::Result<()>;
-
-	#[zbus(signal)]
-	fn action_invoked(&self, id: u32, action_key: String) -> zbus::Result<()>;
 }
 
 const ERROR_INTERVAL: Duration = Duration::from_secs(60);
@@ -62,6 +59,70 @@ struct Inner {
 	app: AppHandle,
 	proxy: NotificationsProxy<'static>,
 	state: Mutex<State>,
+}
+
+impl Inner {
+	/// Open the page of a clicked notification. The server sends the click's
+	/// activation token (`ActivationToken`, notification spec 1.2) right
+	/// before `ActionInvoked`; one ordered stream of both keeps them paired.
+	async fn follow_clicks(&self, connection: zbus::Connection) {
+		// The bus matches the sender against the server owning the name, so
+		// other clients cannot fake clicks.
+		let rule = zbus::MatchRule::builder()
+			.msg_type(zbus::message::Type::Signal)
+			.sender("org.freedesktop.Notifications")
+			.and_then(|rule| rule.interface("org.freedesktop.Notifications"))
+			.and_then(|rule| rule.path("/org/freedesktop/Notifications"))
+			.map(|rule| rule.build());
+		let stream = match rule {
+			Ok(rule) => zbus::MessageStream::for_match_rule(rule, &connection, Some(32)).await,
+			Err(error) => Err(error),
+		};
+		let mut stream = match stream {
+			Ok(stream) => stream,
+			Err(error) => {
+				tracing::warn!("Cannot follow notification clicks: {error}");
+				return;
+			},
+		};
+		let mut tokens: HashMap<u32, String> = HashMap::new();
+		while let Some(message) = stream.next().await {
+			let Ok(message) = message else { continue };
+			let header = message.header();
+			let Some(member) = header.member() else { continue };
+			let Ok((id, text)) = message.body().deserialize::<(u32, String)>() else {
+				// NotificationClosed carries (id, reason).
+				if member.as_str() == "NotificationClosed"
+					&& let Ok((id, _)) = message.body().deserialize::<(u32, u32)>()
+				{
+					tokens.remove(&id);
+				}
+				continue;
+			};
+			let state = self.state.lock().await;
+			let page = if Some(id) == state.pairing {
+				match &state.latest {
+					Some(request) => format!("clients?request={request}"),
+					None => "clients".into(),
+				}
+			} else if Some(id) == state.error {
+				"dashboard".into()
+			} else {
+				continue;
+			};
+			drop(state);
+			match member.as_str() {
+				"ActivationToken" => {
+					tokens.insert(id, text);
+				},
+				"ActionInvoked" => {
+					let token = tokens.remove(&id).and_then(|token| window::activation_token(&token));
+					window::show(&self.app, &page, token);
+				},
+				_ => {},
+			}
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -85,27 +146,7 @@ impl Notifier {
 			state: Mutex::default(),
 		});
 		let listener = inner.clone();
-		tauri::async_runtime::spawn(async move {
-			let Ok(mut actions) = listener.proxy.receive_action_invoked().await else {
-				return;
-			};
-			while let Some(signal) = actions.next().await {
-				let Ok(args) = signal.args() else { continue };
-				let state = listener.state.lock().await;
-				let page = if Some(*args.id()) == state.pairing {
-					match &state.latest {
-						Some(request) => format!("clients?request={request}"),
-						None => "clients".into(),
-					}
-				} else if Some(*args.id()) == state.error {
-					"dashboard".into()
-				} else {
-					continue;
-				};
-				drop(state);
-				window::show(&listener.app, &page);
-			}
-		});
+		tauri::async_runtime::spawn(async move { listener.follow_clicks(connection).await });
 		Self(Some(inner))
 	}
 

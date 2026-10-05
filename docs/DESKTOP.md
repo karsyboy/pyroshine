@@ -133,8 +133,11 @@ support, listening ports and the startup health check.
 Without a tray, closing the window keeps the app running for notifications;
 open it again from the application menu.
 
-Wayland compositors may decline to raise an existing window when a
-notification is clicked (focus-stealing prevention); the window is still shown.
+On Wayland a window may only take focus with an activation token from the
+compositor. The app uses the token that comes with the click on a
+notification, the tray icon or the application menu entry, so the window comes
+to the front. Desktops that do not pass a token (some notification servers and
+tray extensions) only highlight the window in the taskbar instead.
 On NVIDIA systems the app disables WebKitGTK's DMA-BUF renderer, which can show
 blank windows there; set `WEBKIT_DISABLE_DMABUF_RENDERER=0` to override.
 

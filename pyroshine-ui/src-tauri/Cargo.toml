@@ -19,8 +19,11 @@ tauri-build = { version = "2.7.1", features = [] }
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+gtk = "0.18"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-ksni = "0.3.6"
+# Unreleased upstream API: `Tray::provide_xdg_activation_token` (Plasma's
+# ProvideXdgActivationToken). Return to a crates.io release after 0.3.6.
+ksni = { git = "https://github.com/iovxw/ksni", rev = "547cc42b9e24ed58c20e7643644184bc2264c9b0" }
 moonshine-management = { path = "../../moonshine-management" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

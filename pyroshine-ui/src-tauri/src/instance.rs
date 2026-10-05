@@ -10,11 +10,15 @@ use moonshine_management::{UI_BUS_NAME, UI_OBJECT_PATH, UiProxy};
 use tokio::sync::mpsc;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
+/// A page another process asked for, with the activation token of the user
+/// action that asked (see `window`).
+pub type ShowRequest = (String, Option<String>);
+
 pub enum Instance {
 	/// This process is the UI; `requests` receives pages other launches ask for.
 	Primary {
 		connection: zbus::Connection,
-		requests: mpsc::UnboundedReceiver<String>,
+		requests: mpsc::UnboundedReceiver<ShowRequest>,
 	},
 	/// Another instance runs (and was asked to show the page, if any).
 	Forwarded,
@@ -22,17 +26,25 @@ pub enum Instance {
 }
 
 struct UiObject {
-	requests: mpsc::UnboundedSender<String>,
+	requests: mpsc::UnboundedSender<ShowRequest>,
 }
 
 #[zbus::interface(name = "io.github.karsyboy.PyroshineUi1")]
 impl UiObject {
 	fn show(&self, page: &str) {
-		let _ = self.requests.send(page.to_string());
+		let _ = self.requests.send((page.to_string(), None));
+	}
+
+	fn activate(&self, page: &str, activation_token: &str) {
+		let _ = self
+			.requests
+			.send((page.to_string(), crate::window::activation_token(activation_token)));
 	}
 }
 
-pub async fn acquire(page: Option<&str>) -> Instance {
+/// Become the UI instance, or forward `page` (with `activation`, this
+/// launch's token) to the running one.
+pub async fn acquire(page: Option<&str>, activation: Option<&str>) -> Instance {
 	let (sender, requests) = mpsc::unbounded_channel();
 	let connection = match zbus::connection::Builder::session()
 		.map(|builder| builder.method_timeout(Duration::from_secs(30)))
@@ -58,7 +70,15 @@ pub async fn acquire(page: Option<&str>) -> Instance {
 			};
 			match UiProxy::new(&connection).await {
 				Ok(proxy) => {
-					if let Err(error) = proxy.show(page).await {
+					let shown = match activation {
+						Some(token) => match proxy.activate(page, token).await {
+							// An instance from before Activate existed.
+							Err(zbus::Error::MethodError(..)) => proxy.show(page).await,
+							result => result,
+						},
+						None => proxy.show(page).await,
+					};
+					if let Err(error) = shown {
 						eprintln!("Pyroshine is already open but did not respond: {error}");
 					}
 				},
