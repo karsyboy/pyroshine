@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta.12] - 2026-10-05
+
 ### Added
 
 - Add the optional `pyroshine-ui` desktop app and package: a system tray whose icon shows whether a client is streaming (green play), the session is retained without a client (amber pause), or a client waits to pair; pairing notifications that open the request; PIN approval and rejection; paired-client naming and revocation; a settings editor for every `config.toml` setting, including applications and scanners; a stream dashboard with one-second performance statistics; and diagnostics. It starts in the tray at desktop login and manages, but never starts or stops, the service. See [Desktop app](DESKTOP.md).
