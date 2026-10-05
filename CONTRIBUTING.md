@@ -205,9 +205,13 @@ use `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` sections
 The [upstream history](docs/UPSTREAM_CHANGELOG.md) is an archive and should not
 receive new fork release entries.
 
-Before releasing, update `[workspace.package].version` in `Cargo.toml` and refresh
-workspace versions in `Cargo.lock`. Then prepare the changelog using Python 3.11
-or newer (no additional packages are needed):
+Before releasing, update `[workspace.package].version` in `Cargo.toml`. It is the
+only version to edit: `prepare` (below) writes it to every other copy — both
+`Cargo.lock` files, the desktop app's `src-tauri/Cargo.toml`, `package.json` and
+`package-lock.json` — and `check` fails while any copy differs. To synchronize
+without preparing a release, run `python3 scripts/changelog.py sync-versions`.
+Then prepare the changelog using Python 3.11 or newer (no additional packages
+are needed):
 
 ```sh
 # Replace the date with the intended release date.
@@ -217,17 +221,19 @@ python3 -m unittest discover -s scripts -p 'test_changelog.py'
 ```
 
 `prepare` moves the `Unreleased` notes into a dated entry for the workspace
-version and leaves an empty `Unreleased` section for future changes. It refuses
-empty notes or an already documented version. Review the result and commit the
-changelog together with the version bump. To inspect the exact release body:
+version, leaves an empty `Unreleased` section for future changes, and
+synchronizes the version copies. It refuses empty notes or an already
+documented version. Review the result and commit the changelog and synchronized
+version files together with the version bump. To inspect the exact release body:
 
 ```sh
 python3 scripts/changelog.py notes --tag vX.Y.Z
 ```
 
-`check` and CI only validate entries; they do not create or commit them. If a
-release tag was pushed before preparation, rerunning that tag still checks the
-old commit. The release tag must point to a commit containing the prepared entry.
+`check` and CI only validate entries and versions; they do not create or commit
+them. If a release tag was pushed before preparation, rerunning that tag still
+checks the old commit. The release tag must point to a commit containing the
+prepared entry.
 
 Run the workspace checks above and verify the packaged service and PyroWave
 library before tagging that commit. Use the same semantic version as the

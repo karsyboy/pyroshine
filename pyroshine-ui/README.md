@@ -33,6 +33,12 @@ cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 The binary is `src-tauri/target/release/pyroshine-ui`. `npm run build` must run
 first: the Rust build embeds `dist/`.
 
+The app is versioned with the server. Do not edit the versions in
+`package.json`, `package-lock.json` or `src-tauri/Cargo.toml`/`Cargo.lock` by
+hand: `python3 scripts/changelog.py sync-versions` (also run by the release's
+`prepare`) copies the workspace version into them, and CI's changelog check fails
+while they differ.
+
 ## Develop
 
 ```sh
