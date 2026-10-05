@@ -31,7 +31,10 @@ cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 ```
 
 The binary is `src-tauri/target/release/pyroshine-ui`. `npm run build` must run
-first: the Rust build embeds `dist/`.
+first: the Rust build embeds `dist/`. The crate's default `custom-protocol`
+feature makes every `cargo build` a production build; building with
+`--no-default-features` produces a development binary that loads the Vite dev
+server and only works under `npm run tauri:dev`.
 
 The app is versioned with the server. Do not edit the versions in
 `package.json`, `package-lock.json` or `src-tauri/Cargo.toml`/`Cargo.lock` by
@@ -43,7 +46,7 @@ while they differ.
 
 ```sh
 npm run dev            # browser preview at http://localhost:1420 with a mock backend
-npx tauri dev          # the real app against a running Pyroshine
+npm run tauri:dev      # the real app against a running Pyroshine, with live reload
 ```
 
 The browser preview simulates a daemon (`src/api/mock.ts`); add `?mock=idle`,

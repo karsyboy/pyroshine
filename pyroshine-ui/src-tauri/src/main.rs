@@ -6,6 +6,11 @@
 //! leaves the server and any stream untouched. All state comes from the
 //! daemon over the session bus (see `moonshine_management`).
 
+// A development-mode build loads the Vite dev server (`devUrl`) instead of the
+// embedded frontend; never let one ship. See the crate's `custom-protocol` feature.
+#[cfg(all(dev, not(debug_assertions)))]
+compile_error!("release builds must enable the default `custom-protocol` feature");
+
 mod commands;
 mod daemon;
 mod icons;
@@ -123,4 +128,19 @@ fn main() {
 			api.prevent_exit();
 		}
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	/// A development-mode binary loads the Vite dev server (`devUrl`) and shows
+	/// "Could not connect to localhost" when installed. Every build that runs
+	/// tests must be a production build.
+	#[test]
+	#[allow(clippy::assertions_on_constants)]
+	fn builds_embed_the_frontend() {
+		assert!(
+			!cfg!(dev),
+			"built without the custom-protocol feature; the window would load the dev server"
+		);
+	}
 }
