@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Show the compositor's current foreground application in the desktop dashboard and tray, including game launches from Steam and live window-title changes. Session details retain the original Moonlight application name and ID, and foreground reporting continues while the client is disconnected.
+
 ### Fixed
 
 - Restore a game that minimized itself while the Steam overlay held keyboard focus (for example Grim Dawn, which went black after the overlay closed). Steam returns keyboard focus without changing the focus window, so the game stayed iconic; the compositor now sets a window it acknowledged as iconic back to normal when it regains keyboard focus, and Wine restores it.

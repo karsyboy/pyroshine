@@ -18,6 +18,7 @@ export interface SessionSnapshot {
 export interface SessionDetails {
   epoch: number;
   application: { id: number; title: string };
+  foreground_application?: { title: string } | null;
   client_address: string;
   started_at_ms: number;
   requested: {

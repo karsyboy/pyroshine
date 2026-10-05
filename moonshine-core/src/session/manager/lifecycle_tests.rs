@@ -91,6 +91,7 @@ struct FakeBackend {
 	stop_on_launch_return: AtomicBool,
 	/// The most recent session's stop, so tests can play a failing worker.
 	session_stop: std::sync::Mutex<Option<ShutdownManager<SessionShutdownReason>>>,
+	foreground_tx: std::sync::Mutex<Option<watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>>>,
 	/// Every committed reconnect plan: whether video was recreated, and audio.
 	plans: std::sync::Mutex<Vec<(bool, AudioStreamContext)>>,
 }
@@ -108,6 +109,7 @@ impl FakeBackend {
 			worker_exit: watch::channel(true).0,
 			stop_on_launch_return: AtomicBool::new(false),
 			session_stop: std::sync::Mutex::new(None),
+			foreground_tx: std::sync::Mutex::new(None),
 			plans: std::sync::Mutex::new(Vec::new()),
 		}
 	}
@@ -166,11 +168,13 @@ impl SessionBackend for FakeBackend {
 		&self,
 		_context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> Result<FakeSession, ()> {
 		if self.counters.resources.load(Ordering::SeqCst) != 0 || self.counters.unit_created.load(Ordering::SeqCst) {
 			self.counters.overlapped.store(true, Ordering::SeqCst);
 		}
 		*self.session_stop.lock().unwrap() = Some(stop.clone());
+		*self.foreground_tx.lock().unwrap() = Some(foreground_tx);
 		// Like the gamepad thread: a worker that exists from initialization.
 		self.spawn_worker(&stop, None)?;
 		let session = self.session(&stop, 1);
@@ -396,6 +400,70 @@ fn context() -> SessionContext {
 		hdr: false,
 		client_ip: "127.0.0.1".parse().unwrap(),
 	}
+}
+
+#[tokio::test]
+async fn foreground_changes_are_session_scoped_and_survive_reconnect() {
+	use moonshine_management::dto::ForegroundApplication;
+	let h = Harness::new();
+	let mut context = context();
+	context.application.title = "Steam".into();
+	h.core.initialize_session(context).await.unwrap();
+	h.core.launch_session().await.unwrap();
+	let grant = h.grant().await;
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	let mut changes = h.core.subscribe_foreground().await.unwrap();
+	let sender = h.backend().foreground_tx.lock().unwrap().as_ref().unwrap().clone();
+	let epoch = h.core.session_view().await.unwrap().epoch;
+	for title in ["Steam", "Grim Dawn", "Grim Dawn - Running", "Steam"] {
+		sender.send_replace(Some(ForegroundApplication { title: title.into() }));
+		changes.changed().await.unwrap();
+		changes.borrow_and_update();
+		let view = h.core.session_view().await.unwrap();
+		assert_eq!(view.epoch, epoch);
+		assert_eq!(view.foreground_application.unwrap().title, title);
+		assert_eq!(view.application_title, "Steam");
+		assert_eq!(view.application_id, 1);
+	}
+
+	// A disconnected stream retains the same session; a resume rotates only
+	// its client authorization. Neither operation replaces compositor state.
+	sender.send_replace(Some(ForegroundApplication {
+		title: "Grim Dawn".into(),
+	}));
+	h.core
+		.resume_session(keys(), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	assert_eq!(
+		h.core
+			.session_view()
+			.await
+			.unwrap()
+			.foreground_application
+			.unwrap()
+			.title,
+		"Grim Dawn"
+	);
+	let grant = h.grant().await;
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.core.session_view().await.unwrap().epoch, epoch);
+	sender.send_replace(None);
+	assert!(h.core.session_view().await.unwrap().foreground_application.is_none());
+
+	h.core.stop(SessionShutdownReason::UserStopped).await.unwrap();
+	h.wait_idle().await;
+	assert!(h.core.subscribe_foreground().await.is_none());
+	h.initialize().await.unwrap();
+	// An old compositor's sender cannot update a replacement session.
+	sender.send_replace(Some(ForegroundApplication {
+		title: "Old game".into(),
+	}));
+	assert!(h.core.session_view().await.unwrap().foreground_application.is_none());
+	h.core.stop(SessionShutdownReason::UserStopped).await.unwrap();
+	h.wait_idle().await;
 }
 
 fn video() -> VideoStreamContext {

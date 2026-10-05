@@ -148,6 +148,7 @@ impl SessionBackend for SystemSession {
 		&self,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> Result<InitializedSession, ()> {
 		InitializedSession::new(
 			self.compositor_config.clone(),
@@ -158,6 +159,7 @@ impl SessionBackend for SystemSession {
 			context,
 			stop,
 			self.stats_tx.clone(),
+			foreground_tx,
 		)
 		.await
 	}
@@ -246,6 +248,7 @@ impl InitializedSession {
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> Result<Self, ()> {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
@@ -255,6 +258,7 @@ impl InitializedSession {
 			compositor_config,
 			compositor::CompositorContext::from_session(&context, video_config.log_stats),
 			stop.clone(),
+			foreground_tx,
 		);
 		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
 		let video_stream = VideoStream::new(

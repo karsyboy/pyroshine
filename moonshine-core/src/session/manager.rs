@@ -154,6 +154,7 @@ pub(crate) trait SessionBackend: Send + Sync + 'static {
 		&self,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> impl Future<Output = Result<Self::Initialized, ()>> + Send;
 
 	fn launch(&self, session: Self::Initialized) -> impl Future<Output = Result<Self::Launched, ()>> + Send;
@@ -234,6 +235,8 @@ struct SessionRecord {
 	stop: ShutdownManager<SessionShutdownReason>,
 	/// Authoritative context reported to HTTP/RTSP.
 	context: SessionContext,
+	/// Compositor state belongs to this session lifetime, not a client generation.
+	foreground: watch::Receiver<Option<moonshine_management::dto::ForegroundApplication>>,
 	/// Contexts used by the live encoders, once streaming.
 	streams: Option<(VideoStreamContext, AudioStreamContext)>,
 	/// Application unit this session may own. Recorded before the launch is
@@ -306,6 +309,7 @@ pub(crate) struct SessionView {
 	pub started_at: SystemTime,
 	pub application_title: String,
 	pub application_id: i32,
+	pub foreground_application: Option<moonshine_management::dto::ForegroundApplication>,
 	pub resolution: (u32, u32),
 	pub refresh_rate: u32,
 	pub hdr: bool,
@@ -607,6 +611,13 @@ impl<B: SessionBackend> SessionCore<B> {
 		self.status.subscribe()
 	}
 
+	/// Subscribe before reading the snapshot so focus-only changes cannot be lost.
+	pub(crate) async fn subscribe_foreground(
+		&self,
+	) -> Option<watch::Receiver<Option<moonshine_management::dto::ForegroundApplication>>> {
+		self.lock().await.live().map(|live| live.record.foreground.clone())
+	}
+
 	/// Read-only view of the live session for status reporting.
 	pub(crate) async fn session_view(&self) -> Option<SessionView> {
 		let mut guard = self.lock().await;
@@ -617,6 +628,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				started_at: live.record.started_at,
 				application_title: context.application.title.clone(),
 				application_id: context.application_id,
+				foreground_application: live.record.foreground.borrow().clone(),
 				resolution: context.resolution,
 				refresh_rate: context.refresh_rate,
 				hdr: context.hdr,
@@ -844,7 +856,7 @@ impl<B: SessionBackend> SessionCore<B> {
 	/// The session is not launched until `launch_session` is called. A
 	/// previous session that is still stopping is awaited first.
 	pub(crate) async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
-		let (ticket, keys_tx) = loop {
+		let (ticket, keys_tx, foreground_tx) = loop {
 			let mut guard = self.lock().await;
 			if self.shutdown.is_shutdown_triggered() {
 				tracing::warn!("Service is shutting down; rejecting InitializeSession command.");
@@ -885,11 +897,13 @@ impl<B: SessionBackend> SessionCore<B> {
 			let epoch = guard.next_epoch;
 			guard.next_epoch += 1;
 			let stop = ShutdownManager::new();
+			let (foreground_tx, foreground) = watch::channel(None);
 			guard.lifecycle = Lifecycle::Live(Box::new(LiveSession {
 				record: SessionRecord {
 					epoch,
 					stop: stop.clone(),
 					context: context.clone(),
+					foreground,
 					streams: None,
 					application_unit: None,
 					start_latches: Vec::new(),
@@ -901,7 +915,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			}));
 			let ticket = guard.begin_transition(TransitionKind::Initialize)?;
 			self.spawn_watchdog(epoch, stop);
-			break (ticket, tx);
+			break (ticket, tx, foreground_tx);
 		};
 
 		let client_ip = context.client_ip;
@@ -909,7 +923,7 @@ impl<B: SessionBackend> SessionCore<B> {
 		let task = tokio::spawn(async move {
 			let result = ticket
 				.stop
-				.wrap_cancel(core.backend.initialize(context, ticket.stop.clone()))
+				.wrap_cancel(core.backend.initialize(context, ticket.stop.clone(), foreground_tx))
 				.await;
 			let mut guard = core.lock().await;
 			let outcome = match result {
@@ -1453,6 +1467,12 @@ impl SessionManager {
 		self.stats_tx.subscribe()
 	}
 
+	pub(crate) async fn subscribe_foreground(
+		&self,
+	) -> Option<watch::Receiver<Option<moonshine_management::dto::ForegroundApplication>>> {
+		self.core.subscribe_foreground().await
+	}
+
 	/// Read-only view of the live session, if any.
 	pub(crate) async fn session_view(&self) -> Option<SessionView> {
 		self.core.session_view().await
@@ -1567,6 +1587,34 @@ impl SessionManager {
 			shutdown,
 		)
 		.unwrap()
+	}
+
+	/// Seed reporting state without opening the production compositor or audio
+	/// sockets. D-Bus tests exercise subscriptions/snapshots over this record;
+	/// backend lifetime behavior is covered by the lifecycle harness.
+	pub(crate) async fn reporting_session_for_test(
+		&self,
+		context: SessionContext,
+	) -> watch::Sender<Option<moonshine_management::dto::ForegroundApplication>> {
+		let (sender, foreground) = watch::channel(None);
+		let mut guard = self.core.lock().await;
+		assert!(matches!(guard.lifecycle, Lifecycle::Idle));
+		guard.lifecycle = Lifecycle::Live(Box::new(LiveSession {
+			record: SessionRecord {
+				epoch: 1,
+				stop: ShutdownManager::new(),
+				context,
+				foreground,
+				streams: None,
+				application_unit: None,
+				start_latches: Vec::new(),
+				started_at: SystemTime::now(),
+				first_generation: None,
+			},
+			state: None,
+			transition: None,
+		}));
+		sender
 	}
 
 	/// Start an authorization generation without launching a session, as an

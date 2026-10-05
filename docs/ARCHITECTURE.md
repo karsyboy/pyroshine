@@ -539,6 +539,18 @@ derives the public phase:
 A retained session without its client is therefore never reported as
 streaming, and a peer of a replaced generation cannot make it so.
 
+**Foreground application.** Each session record owns a watch receiver for its
+compositor's primary application metadata. The compositor publishes only
+changed values on primary-focus selection and title/class/app-ID events.
+Management subscribes before reading session details and also waits on that
+receiver, so focus-only changes produce `SessionChanged` without a lifecycle
+transition. The existing Tauri signal bridge updates React state and the tray.
+`SessionDetails.application` remains the configured Moonlight entry and ID;
+the additive, optional `foreground_application` contains only a display title.
+The channel belongs to the session lifetime, surviving disconnect/resume and
+being replaced on a new session. Neither reporting nor signal delivery runs in
+the frame path or waits for a UI consumer.
+
 **Configuration store.** Pyroshine never rewrites `config.toml` on its own, so
 the file is user-authored. A save deserializes the submitted values into
 `Config`, runs `Config::validate` plus schema range checks on changed settings,

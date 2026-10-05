@@ -419,11 +419,13 @@ pub(crate) struct MoonshineCompositor {
 	/// Used by the WSI layer to match override surfaces to focused windows.
 	pub focused_x11_window: Option<u32>,
 
-	/// The actual Window that currently has keyboard focus (X11 or Wayland).
+	/// Primary application window selected by compositor focus (X11 or Wayland).
+	/// Keyboard/pointer targets may separately follow an interactive overlay.
 	/// Used to properly deactivate the old window when focus changes,
 	/// especially for Wayland→Wayland transitions where focused_x11_window
 	/// would be None for both old and new.
 	pub focused_window: Option<smithay::desktop::Window>,
+	pub(super) foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	/// Scaling mode used to fit the focused window to the output.
 	pub upscale_scaler: super::scaling::UpscaleScaler,
 	/// Texture filter used when scaling.
@@ -632,6 +634,7 @@ impl MoonshineCompositor {
 		mut allocator: GbmAllocator<std::fs::File>,
 		renderer: GlesRenderer,
 		frame_tx: super::admission::CaptureSender,
+		foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 		width: u32,
 		height: u32,
 		render_fourcc: Fourcc,
@@ -881,6 +884,7 @@ impl MoonshineCompositor {
 				wsi: Default::default(),
 				focused_x11_window: None,
 				focused_window: None,
+				foreground_tx,
 				upscale_scaler: super::scaling::UpscaleScaler::from_env(),
 				upscale_filter: smithay::backend::renderer::TextureFilter::Linear,
 				global_scale: 1.0,

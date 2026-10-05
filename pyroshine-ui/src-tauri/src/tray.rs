@@ -71,7 +71,14 @@ impl View {
 		let Some(session) = &self.session else {
 			return Vec::new();
 		};
-		let mut lines = vec![session.application.title.clone()];
+		let mut lines = vec![
+			session
+				.foreground_application
+				.as_ref()
+				.map(|app| &app.title)
+				.unwrap_or(&session.application.title)
+				.clone(),
+		];
 		match &session.video {
 			Some(video) => lines.push(format!(
 				"{}×{} @ {} Hz · {}{}",
@@ -342,5 +349,29 @@ pub fn spawn(app: AppHandle, daemon: Arc<Daemon>, notifier: Notifier) -> TrayHan
 			tracing::warn!("System tray unavailable: {error}");
 			TrayHandle(None)
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn retained_session_lines_prefer_foreground_and_fall_back_to_launch_entry() {
+		let snapshot: SessionSnapshot =
+			serde_json::from_str(include_str!("../../src/api/session.fixture.json")).unwrap();
+		let mut view = View {
+			connected: true,
+			phase: snapshot.phase,
+			session: snapshot.session,
+			..Default::default()
+		};
+		assert_eq!(view.session_lines()[0], "Grim Dawn");
+		assert_eq!(view.badge(), Badge::Retained);
+		let session = view.session.as_mut().unwrap();
+		assert_eq!(session.application.title, "Steam");
+		assert_eq!(session.application.id, 42);
+		session.foreground_application = None;
+		assert_eq!(view.session_lines()[0], "Steam");
 	}
 }

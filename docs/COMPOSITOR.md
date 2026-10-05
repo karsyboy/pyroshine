@@ -264,9 +264,42 @@ resolution/refresh/HDR changes with the session epoch rather than resizing only
 the scene. See [PyroWave ownership](PYROWAVE.md#gpu-path-and-ownership) and
 [reconnect validation](reconnect-validation.md).
 
+## Foreground application reporting
+
+`focused_window` is the primary application selected by
+`pick_primary_focus_and_override` and installed by `apply_focus`. Reporting uses
+that window, independently of `input_focus_window`, `pointer_focus_window`,
+overlay, notification and dropdown/override roles. The existing classification,
+Steam focus contract, candidate filtering and ranking remain authoritative.
+XDG popups are tracked separately from primary toplevel windows.
+
+`foreground.rs` resolves nonempty, trimmed display metadata. XWayland uses
+Smithay's cached title (`_NET_WM_NAME`, then `WM_NAME`), then window class and
+instance. Native Wayland uses XDG role attributes: title, then app ID. No Steam
+manifest, process scan or numeric focus ID is used for reporting. Applications
+may expose captions or technical classes/app IDs rather than a friendly game
+name; absent metadata produces `None` and the UI falls back to the launch entry.
+
+Focus selection and no-candidate paths publish through a session-scoped Tokio
+watch sender, suppressing identical values. XWM `Title`/`Class` notifications
+and XDG `title_changed` refresh only the selected window, without dirtying
+rendering or recalculating focus. Existing XDG `app_id_changed` handling also
+refreshes the fallback name. Window retirement/destruction reuses normal focus
+selection. A client disconnect does not clear the channel; only compositor
+focus/lifetime events change its contents.
+
 ## Validation and runtime checks
 
 ### Automated tests
+
+Foreground tests cover metadata fallbacks, deduplicated publication, missing
+metadata, session lifetime/reconnect isolation, DTO compatibility, private
+D-Bus `GetSession`/`SessionChanged` updates without lifecycle changes, dashboard
+rendering and tray fallback. The ignored
+`foreground_follows_primary_focus_titles_and_window_lifetime` XWayland test
+checks game/launcher transitions, title updates, notification/overlay input
+separation and destruction. Run it with the other `xwayland_tests` below on a
+GPU host; it is not exercised by ordinary unit tests.
 
 Unit tests cover cursor activation/idle/hide, real Wayland resource replacement
 and destruction, scene extras and automatic restoration, capture configuration,
@@ -295,6 +328,27 @@ cargo test -p moonshine-core --all-features --lib -- --ignored xwayland_tests
 ```
 
 ### Hardware acceptance
+
+For foreground reporting, run these checks with the desktop app open. They
+require a GPU host, Moonlight, Steam and a game; automated metadata tests do not
+establish real game behavior:
+
+1. Launch the **Steam** Moonlight entry. Confirm the dashboard/tray report Steam
+   and Session details retain its Moonlight name and application ID.
+2. Launch a Proton/XWayland game such as Grim Dawn. Confirm the prominent name
+   changes to the game while the Moonlight name/ID remain unchanged. Exit the
+   game and confirm the name returns to Steam.
+3. While the game runs, trigger a Steam notification, open/close the Steam
+   overlay, and exercise dropdowns/tooltips. Confirm the reported name follows
+   primary focus and stays on the game while only overlay/input roles change.
+4. Launch a native Wayland application inside the session. Confirm its XDG
+   title (or app ID fallback) is shown, including a live title change. Close it
+   and confirm the next primary application is reported. Also test an XWayland
+   caption change and a window without a title when practical.
+5. Disconnect Moonlight without ending the session. Confirm the foreground name
+   remains available; reconnect and confirm title/focus updates continue. End
+   the session and confirm its foreground details disappear. Start another
+   session and confirm no previous game's name carries over.
 
 These checks need a GPU host with `/dev/dri`, a client and Steam. Run the server
 with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).

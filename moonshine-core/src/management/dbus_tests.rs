@@ -101,6 +101,7 @@ const CONFIG: &str = "# Comment kept by saves.\nname = \"Test host\"\n";
 
 struct Harness {
 	bus: PrivateBus,
+	sessions: SessionManager,
 	clients: ClientManager,
 	proxy: ManagementProxy<'static>,
 	config_path: std::path::PathBuf,
@@ -141,7 +142,7 @@ impl Harness {
 			.0,
 			stats: watch::channel(None).0,
 			runtime: tokio::runtime::Handle::current(),
-			sessions,
+			sessions: sessions.clone(),
 			clients: clients.clone(),
 		});
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
@@ -156,6 +157,7 @@ impl Harness {
 		}
 		Self {
 			bus,
+			sessions,
 			clients,
 			proxy,
 			config_path,
@@ -225,6 +227,72 @@ async fn server_session_and_capabilities_are_reported() {
 	// Ending a session that does not exist is a no-op, not an error.
 	harness.proxy.end_session().await.unwrap();
 	assert_eq!(harness.proxy.get_stats().await.unwrap(), "null");
+}
+
+#[tokio::test]
+async fn foreground_only_changes_emit_session_snapshots_without_lifecycle_changes() {
+	use crate::session::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+	use crate::session::stream::audio::AudioChannels;
+	use crate::session::{SessionContext, SessionKeys};
+	use moonshine_management::dto::ForegroundApplication;
+
+	let harness = Harness::start().await;
+	let mut signals = harness
+		.proxy
+		.receive_session_changed()
+		.await
+		.unwrap()
+		.map(|signal| signal.args().unwrap().snapshot().clone());
+	let sender = harness
+		.sessions
+		.reporting_session_for_test(SessionContext {
+			application: crate::session::application::ApplicationConfig {
+				title: "Steam".into(),
+				..Default::default()
+			},
+			application_id: 42,
+			resolution: (1920, 1080),
+			refresh_rate: 60,
+			hdr: false,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: "127.0.0.1".parse().unwrap(),
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				RemoteInputKey::from_bytes([7; 16]),
+				RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let mut epoch = None;
+	for title in [
+		Some("Steam"),
+		Some("Grim Dawn"),
+		Some("Grim Dawn - Running"),
+		None,
+		Some("Steam"),
+	] {
+		sender.send_replace(title.map(|title| ForegroundApplication { title: title.into() }));
+		let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let snapshot: SessionSnapshot = next(&mut signals).await;
+				if snapshot.session.as_ref().is_some_and(|session| {
+					session.foreground_application.as_ref().map(|app| app.title.as_str()) == title
+				}) {
+					break snapshot;
+				}
+			}
+		})
+		.await
+		.expect("focus-only change emits SessionChanged");
+		let session = snapshot.session.as_ref().unwrap();
+		assert_eq!(snapshot.phase, SessionPhase::Starting);
+		assert_eq!(*epoch.get_or_insert(session.epoch), session.epoch);
+		assert_eq!(session.application.title, "Steam");
+		assert_eq!(session.application.id, 42);
+		let fetched: SessionSnapshot = serde_json::from_str(&harness.proxy.get_session().await.unwrap()).unwrap();
+		assert_eq!(fetched, snapshot);
+	}
+	harness.sessions.stop_session().await.unwrap();
 }
 
 #[tokio::test]

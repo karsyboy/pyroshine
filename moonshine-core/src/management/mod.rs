@@ -207,8 +207,8 @@ async fn follow_ui(connection: &zbus::Connection, management: &Management, prese
 	}
 }
 
-/// Recompute the public session state whenever the manager or the control
-/// stream reports a change, or when a waiting session runs out of patience.
+/// Recompute the public session state on lifecycle, client ownership or
+/// compositor foreground changes, or when a waiting session runs out of patience.
 async fn follow_sessions(management: &Management, emitter: &zbus::object_server::SignalEmitter<'static>) {
 	let mut status = management.sessions.subscribe_status();
 	let mut presence = management.sessions.subscribe_presence();
@@ -216,6 +216,10 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 	loop {
 		let manager = status.borrow_and_update().clone();
 		let client = *presence.borrow_and_update();
+		let mut foreground = management.sessions.subscribe_foreground().await;
+		if let Some(receiver) = foreground.as_mut() {
+			receiver.borrow_and_update();
+		}
 		let snapshot = management.session_snapshot(&manager, &client).await;
 		let changed = management.session.send_if_modified(|current| {
 			let changed = *current != snapshot;
@@ -248,6 +252,16 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 			}
 		}
 
+		// A closed producer is a stopped compositor. Wait for lifecycle teardown
+		// instead of repeatedly waking on the closed channel.
+		let wait_foreground = async {
+			if let Some(receiver) = foreground.as_mut()
+				&& receiver.changed().await.is_ok()
+			{
+				return;
+			}
+			std::future::pending::<()>().await;
+		};
 		let deadline = status::patience_deadline(&manager, &client, management.client_patience);
 		let wait_patience = async {
 			match deadline {
@@ -261,6 +275,7 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 			changed = status.changed() => if changed.is_err() { return },
 			changed = presence.changed() => if changed.is_err() { return },
 			() = wait_patience => {},
+			() = wait_foreground => {},
 		}
 	}
 }
@@ -451,6 +466,7 @@ fn session_details(view: SessionView) -> SessionDetails {
 			id: view.application_id,
 			title: view.application_title,
 		},
+		foreground_application: view.foreground_application,
 		client_address: display_address(view.client_ip),
 		started_at_ms: unix_millis(view.started_at),
 		requested: RequestedMode {

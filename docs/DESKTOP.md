@@ -54,6 +54,15 @@ active, check the service log for "Desktop management interface unavailable".
 Left-click opens the window. The menu shows the current application, mode and
 client, and offers **Pair a Client**, **End Session** and **Quit Pyroshine UI**.
 
+The dashboard and tray show the primary application selected by Pyroshine's
+compositor. Launching a game from Steam changes that name to the game's window
+title; exiting it returns to the launcher. Session details show both the
+foreground application and the original **Moonlight application**, whose
+**Application ID** stays unchanged. If a window supplies no name, the main
+display falls back to the Moonlight application. Reporting continues while a
+disconnected session is retained. Overlays and notifications follow the
+compositor's existing primary-focus policy.
+
 **End Session** ends the session exactly like quitting from Moonlight: it
 closes the streamed application (unsaved progress may be lost) and disconnects
 the client. **Quit Pyroshine UI** only closes the app; the server and any stream

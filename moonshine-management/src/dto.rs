@@ -56,7 +56,11 @@ pub struct SessionSnapshot {
 pub struct SessionDetails {
 	/// Session lifetime number (unrelated to client identity).
 	pub epoch: u64,
+	/// Configured Moonlight launch entry; its identity never follows focus.
 	pub application: ApplicationSummary,
+	/// Primary application presented by the embedded compositor, if named.
+	#[serde(default)]
+	pub foreground_application: Option<ForegroundApplication>,
 	/// Address of the paired client authorized for the session.
 	pub client_address: String,
 	pub started_at_ms: u64,
@@ -72,6 +76,12 @@ pub struct SessionDetails {
 pub struct ApplicationSummary {
 	/// Application ID as reported to clients.
 	pub id: i32,
+	pub title: String,
+}
+
+/// Display metadata only: compositor app IDs are not Moonlight entry IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundApplication {
 	pub title: String,
 }
 
@@ -487,6 +497,32 @@ pub struct ScannerVariant {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn session_fixture_preserves_launch_identity_and_round_trips() {
+		let fixture: serde_json::Value =
+			serde_json::from_str(include_str!("../../pyroshine-ui/src/api/session.fixture.json")).unwrap();
+		let snapshot: SessionSnapshot = serde_json::from_value(fixture.clone()).unwrap();
+		let session = snapshot.session.as_ref().unwrap();
+		assert_eq!(
+			session.application,
+			ApplicationSummary {
+				id: 42,
+				title: "Steam".into()
+			}
+		);
+		assert_eq!(session.foreground_application.as_ref().unwrap().title, "Grim Dawn");
+		assert_eq!(serde_json::to_value(snapshot).unwrap(), fixture);
+
+		// Older daemons omit the additive field. New consumers still accept them.
+		let mut legacy = fixture;
+		legacy["session"]
+			.as_object_mut()
+			.unwrap()
+			.remove("foreground_application");
+		let snapshot: SessionSnapshot = serde_json::from_value(legacy).unwrap();
+		assert_eq!(snapshot.session.unwrap().foreground_application, None);
+	}
 
 	#[test]
 	fn phases_use_stable_snake_case_names() {

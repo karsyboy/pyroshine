@@ -9,6 +9,7 @@ mod capture;
 mod color_management;
 mod cursor;
 mod focus;
+mod foreground;
 pub(crate) mod frame;
 mod gamescope_swapchain;
 mod gpu_timing;
@@ -192,12 +193,20 @@ pub(crate) struct CompositorHandles {
 	pub input_tx: calloop::channel::Sender<CompositorInputEvent>,
 }
 
+/// Producer endpoints handed to the compositor thread at launch.
+struct CompositorOutputs {
+	frame_tx: CaptureSender,
+	ready_tx: mpsc::SyncSender<CompositorReady>,
+	foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
+}
+
 /// Unlaunched compositor — holds channel endpoints, can only be launched.
 pub(crate) struct Compositor {
 	config: CompositorConfig,
 	context: CompositorContext,
 	stop: ShutdownManager<SessionShutdownReason>,
 	frame_tx: CaptureSender,
+	foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	ready_tx: std::sync::mpsc::SyncSender<CompositorReady>,
 	ready_rx: std::sync::mpsc::Receiver<CompositorReady>,
@@ -245,6 +254,7 @@ impl Compositor {
 		config: CompositorConfig,
 		context: CompositorContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> (Self, CompositorHandles) {
 		let (frame_tx, frame_rx) = capture_channel();
 		let (input_tx, input_rx) = calloop::channel::channel();
@@ -257,6 +267,7 @@ impl Compositor {
 				context,
 				stop,
 				frame_tx,
+				foreground_tx,
 				input_rx,
 				ready_tx,
 				ready_rx,
@@ -273,6 +284,7 @@ impl Compositor {
 			context,
 			stop,
 			frame_tx,
+			foreground_tx,
 			input_rx,
 			ready_tx,
 			ready_rx,
@@ -289,11 +301,16 @@ impl Compositor {
 		// Registered before the thread exists: session completion then implies
 		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
 		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)?;
+		let outputs = CompositorOutputs {
+			frame_tx,
+			ready_tx,
+			foreground_tx,
+		};
 		std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
 				let _worker = worker;
-				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, reconfigure_rx, ready_tx, stop) {
+				if let Err(e) = run_compositor(config, context, outputs, input_rx, reconfigure_rx, stop) {
 					tracing::error!("Compositor failed: {e}");
 				}
 			})
@@ -349,12 +366,16 @@ impl LaunchedCompositor {
 fn run_compositor(
 	config: CompositorConfig,
 	context: CompositorContext,
-	mut frame_tx: CaptureSender,
+	outputs: CompositorOutputs,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
-	ready_tx: mpsc::SyncSender<CompositorReady>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
+	let CompositorOutputs {
+		mut frame_tx,
+		ready_tx,
+		foreground_tx,
+	} = outputs;
 	let capture_demand = frame_tx.take_demand_source();
 
 	// Open a render node (no DRM master required for headless operation).
@@ -529,6 +550,7 @@ fn run_compositor(
 		gbm_allocator,
 		renderer,
 		frame_tx,
+		foreground_tx,
 		context.width,
 		context.height,
 		render_fourcc,
@@ -874,7 +896,18 @@ mod xwayland_tests {
 		super::CompositorHandles,
 		super::LaunchedCompositor,
 	) {
+		let (stop, handles, launched, _) = launch_with_foreground();
+		(stop, handles, launched)
+	}
+
+	fn launch_with_foreground() -> (
+		async_shutdown::ShutdownManager<SessionShutdownReason>,
+		super::CompositorHandles,
+		super::LaunchedCompositor,
+		tokio::sync::watch::Receiver<Option<moonshine_management::dto::ForegroundApplication>>,
+	) {
 		let stop = async_shutdown::ShutdownManager::new();
+		let (foreground_tx, foreground) = tokio::sync::watch::channel(None);
 		let (compositor, handles) = Compositor::new(
 			CompositorConfig {
 				steam_mode: true,
@@ -889,9 +922,63 @@ mod xwayland_tests {
 				log_stats: false,
 			},
 			stop.clone(),
+			foreground_tx,
 		);
 		let launched = compositor.launch().expect("compositor launch");
-		(stop, handles, launched)
+		(stop, handles, launched, foreground)
+	}
+
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn foreground_follows_primary_focus_titles_and_window_lifetime() {
+		let (stop, _handles, launched, mut foreground) = launch_with_foreground();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let set_title = |window, title: &str| {
+			conn.change_property8(
+				PropMode::REPLACE,
+				window,
+				AtomEnum::WM_NAME,
+				AtomEnum::STRING,
+				title.as_bytes(),
+			)
+			.unwrap();
+			conn.flush().unwrap();
+		};
+		let observed = foreground.clone();
+		let title_is = |title: &str| observed.borrow().as_ref().is_some_and(|app| app.title == title);
+		let steam = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 769)]);
+		set_title(steam, "Steam");
+		assert!(wait_until(|| title_is("Steam")));
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 219990)]);
+		set_title(game, "Grim Dawn");
+		assert!(wait_until(|| title_is("Grim Dawn")));
+		set_title(game, "Grim Dawn - Running");
+		assert!(wait_until(|| title_is("Grim Dawn - Running")));
+		// Small Steam overlay = passive notification; full-width = interactive.
+		let overlay = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 769), (b"STEAM_OVERLAY", 1)]);
+		set_title(overlay, "Steam helper");
+		conn.configure_window(overlay, &x11rb::protocol::xproto::ConfigureWindowAux::new().width(200))
+			.unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(|| cardinal(&conn, root, b"_NET_ACTIVE_WINDOW") == Some(game)));
+		assert!(title_is("Grim Dawn - Running"));
+		foreground.borrow_and_update();
+		set_cardinal(&conn, overlay, b"STEAM_INPUT_FOCUS", 1);
+		assert!(wait_until(
+			|| conn.get_input_focus().unwrap().reply().unwrap().focus == overlay
+		));
+		assert!(title_is("Grim Dawn - Running"));
+		assert!(!foreground.has_changed().unwrap());
+		conn.destroy_window(overlay).unwrap();
+		conn.destroy_window(game).unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(|| title_is("Steam")));
+		conn.destroy_window(steam).unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(|| foreground.borrow().is_none()));
+		drop(conn);
+		shut_down(stop);
 	}
 
 	fn shut_down(stop: async_shutdown::ShutdownManager<SessionShutdownReason>) {

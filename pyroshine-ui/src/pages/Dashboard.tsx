@@ -85,7 +85,7 @@ function Hero({ onEnd, navigate }: { onEnd: () => void; navigate: (to: string) =
           <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: 3, justifyContent: "space-between" }}>
             <Box sx={{ minWidth: 0 }}>
               <Typography variant="h4" sx={{ mb: 0.5, overflowWrap: "anywhere" }}>
-                {session.application.title}
+                {session.foreground_application?.title ?? session.application.title}
               </Typography>
               {mode && (
                 <Typography variant="h6" color="text.secondary" sx={{ fontWeight: 400 }}>
@@ -279,7 +279,8 @@ function StreamDetails({ session }: { session: SessionDetails }) {
           </Typography>
           <Facts
             rows={[
-              ["Application", `${session.application.title}`],
+              ["Foreground application", session.foreground_application?.title ?? "—"],
+              ["Moonlight application", session.application.title],
               ["Application ID", String(session.application.id)],
               ["Client", session.client_address],
               ["Requested mode", `${session.requested.width} × ${session.requested.height} @ ${session.requested.refresh_rate} Hz${session.requested.hdr ? " · HDR" : ""}`],

@@ -1552,6 +1552,10 @@ impl MoonshineCompositor {
 		// Focus changed if either the X11 window ID or the actual window changed.
 		let focus_changed = old_focused_x11 != self.focused_x11_window
 			|| old_focused_window.as_ref().and_then(|w| w.wl_surface()) != best.wl_surface();
+		let foreground_missing = self.foreground_tx.borrow().is_none();
+		if focus_changed || foreground_missing {
+			self.refresh_foreground_application();
+		}
 		if focus_changed {
 			self.clear_dropdowns();
 		}
@@ -1831,6 +1835,7 @@ impl MoonshineCompositor {
 
 		// Handle no candidates — clear old focus.
 		if candidates.is_empty() {
+			super::foreground::publish(&self.foreground_tx, None);
 			tracing::debug!(
 				target: "focus",
 				space_windows = windows.len(),
@@ -1912,6 +1917,7 @@ impl MoonshineCompositor {
 		);
 
 		let Some(best) = focus else {
+			super::foreground::publish(&self.foreground_tx, None);
 			self.focus_state.apply();
 			return;
 		};
@@ -2089,7 +2095,15 @@ impl XdgShellHandler for MoonshineCompositor {
 		self.reevaluate_focus();
 	}
 
+	fn title_changed(&mut self, surface: ToplevelSurface) {
+		if self.focused_window.as_ref().and_then(Window::toplevel) == Some(&surface) {
+			self.refresh_foreground_application();
+		}
+	}
+
 	fn app_id_changed(&mut self, surface: ToplevelSurface) {
+		// Also refresh a title-less window whose display fallback is its app ID.
+		self.title_changed(surface.clone());
 		// Update app_id when the Wayland client changes its app_id.
 		let target = surface.wl_surface();
 		if let Some(window) = self.find_window_by_surface(target)
@@ -2412,6 +2426,15 @@ impl XwmHandler for MoonshineCompositor {
 	}
 
 	fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: smithay::xwayland::xwm::WmWindowProperty) {
+		if matches!(
+			property,
+			smithay::xwayland::xwm::WmWindowProperty::Title | smithay::xwayland::xwm::WmWindowProperty::Class
+		) {
+			if self.focused_window.as_ref().and_then(Window::x11_surface) == Some(&window) {
+				self.refresh_foreground_application();
+			}
+			return;
+		}
 		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
 			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_app_id_property(atom))
 		{

@@ -1,0 +1,26 @@
+{
+  "phase": "client_disconnected",
+  "session": {
+    "epoch": 7,
+    "application": {
+      "id": 42,
+      "title": "Steam"
+    },
+    "foreground_application": {
+      "title": "Grim Dawn"
+    },
+    "client_address": "127.0.0.1",
+    "started_at_ms": 1000,
+    "requested": {
+      "width": 3840,
+      "height": 2160,
+      "refresh_rate": 120,
+      "hdr": true,
+      "audio_channels": 2,
+      "audio_channel_mask": 3
+    },
+    "video": null,
+    "audio": null
+  },
+  "last_stop": null
+}
