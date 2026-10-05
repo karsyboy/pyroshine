@@ -15,14 +15,12 @@ use smithay::backend::allocator::gbm::GbmAllocator;
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement, RescaleRenderElement};
-use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
+use smithay::backend::renderer::element::{AsRenderElements, Element, Id, RenderElement};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions, with_renderer_surface_state};
 use smithay::backend::renderer::{Bind, BufferType, ImportDma, Renderer};
 use smithay::desktop::space::SpaceRenderElements;
-use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::utils::{OutputPresentationFeedback, take_presentation_feedback_surface_tree};
 use std::collections::HashMap;
 
@@ -90,52 +88,53 @@ type HeldBuffer = (
 // Combined render element type for compositing space + cursor elements.
 // We use GlesRenderer concretely (no generics) to avoid complex trait bound issues.
 pub(crate) enum OutputRenderElements {
-	Space(SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>),
-	/// A root swapchain that explicitly declared VK_COMPOSITE_ALPHA_OPAQUE.
-	OpaqueSpace(SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>),
-	Pointer(PointerRenderElement<GlesRenderer>),
+	Space(
+		SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+		Option<GlesTexProgram>,
+	),
+	Pointer(PointerRenderElement<GlesRenderer>, Option<GlesTexProgram>),
 }
 
 impl Element for OutputRenderElements {
 	fn id(&self) -> &Id {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.id(),
-			Self::Pointer(e) => e.id(),
+			Self::Space(e, _) => e.id(),
+			Self::Pointer(e, _) => e.id(),
 		}
 	}
 
 	fn current_commit(&self) -> CommitCounter {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.current_commit(),
-			Self::Pointer(e) => e.current_commit(),
+			Self::Space(e, _) => e.current_commit(),
+			Self::Pointer(e, _) => e.current_commit(),
 		}
 	}
 
 	fn geometry(&self, scale: smithay::utils::Scale<f64>) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.geometry(scale),
-			Self::Pointer(e) => e.geometry(scale),
+			Self::Space(e, _) => e.geometry(scale),
+			Self::Pointer(e, _) => e.geometry(scale),
 		}
 	}
 
 	fn src(&self) -> smithay::utils::Rectangle<f64, smithay::utils::Buffer> {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.src(),
-			Self::Pointer(e) => e.src(),
+			Self::Space(e, _) => e.src(),
+			Self::Pointer(e, _) => e.src(),
 		}
 	}
 
 	fn location(&self, scale: smithay::utils::Scale<f64>) -> smithay::utils::Point<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.location(scale),
-			Self::Pointer(e) => e.location(scale),
+			Self::Space(e, _) => e.location(scale),
+			Self::Pointer(e, _) => e.location(scale),
 		}
 	}
 
 	fn transform(&self) -> smithay::utils::Transform {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.transform(),
-			Self::Pointer(e) => e.transform(),
+			Self::Space(e, _) => e.transform(),
+			Self::Pointer(e, _) => e.transform(),
 		}
 	}
 
@@ -145,32 +144,29 @@ impl Element for OutputRenderElements {
 		commit: Option<CommitCounter>,
 	) -> DamageSet<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.damage_since(scale, commit),
-			Self::Pointer(e) => e.damage_since(scale, commit),
+			Self::Space(e, _) => e.damage_since(scale, commit),
+			Self::Pointer(e, _) => e.damage_since(scale, commit),
 		}
 	}
 
 	fn opaque_regions(&self, scale: smithay::utils::Scale<f64>) -> OpaqueRegions<i32, smithay::utils::Physical> {
 		match self {
-			Self::OpaqueSpace(e) if e.alpha() == 1.0 => {
-				std::iter::once(smithay::utils::Rectangle::from_size(e.geometry(scale).size)).collect()
-			},
-			Self::Space(e) | Self::OpaqueSpace(e) => e.opaque_regions(scale),
-			Self::Pointer(e) => e.opaque_regions(scale),
+			Self::Space(e, _) => e.opaque_regions(scale),
+			Self::Pointer(e, _) => e.opaque_regions(scale),
 		}
 	}
 
 	fn alpha(&self) -> f32 {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.alpha(),
-			Self::Pointer(e) => e.alpha(),
+			Self::Space(e, _) => e.alpha(),
+			Self::Pointer(e, _) => e.alpha(),
 		}
 	}
 
 	fn kind(&self) -> smithay::backend::renderer::element::Kind {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.kind(),
-			Self::Pointer(e) => e.kind(),
+			Self::Space(e, _) => e.kind(),
+			Self::Pointer(e, _) => e.kind(),
 		}
 	}
 }
@@ -185,10 +181,18 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
 		cache: Option<&smithay::utils::user_data::UserDataMap>,
 	) -> Result<(), GlesError> {
-		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
-			Self::Pointer(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
+		let program = match self {
+			Self::Space(_, p) | Self::Pointer(_, p) => p,
+		};
+		if let Some(program) = program {
+			frame.override_default_tex_program(program.clone(), Vec::new());
 		}
+		let result = match self {
+			Self::Space(e, _) => e.draw(frame, src, dst, damage, opaque_regions, cache),
+			Self::Pointer(e, _) => e.draw(frame, src, dst, damage, opaque_regions, cache),
+		};
+		frame.clear_tex_program_override();
+		result
 	}
 
 	fn underlying_storage(
@@ -196,21 +200,21 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		renderer: &mut GlesRenderer,
 	) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
 		match self {
-			Self::Space(e) | Self::OpaqueSpace(e) => e.underlying_storage(renderer),
-			Self::Pointer(e) => e.underlying_storage(renderer),
+			Self::Space(e, _) => e.underlying_storage(renderer),
+			Self::Pointer(e, _) => e.underlying_storage(renderer),
 		}
 	}
 }
 
 impl From<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> for OutputRenderElements {
 	fn from(e: SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>) -> Self {
-		Self::Space(e)
+		Self::Space(e, None)
 	}
 }
 
 impl From<PointerRenderElement<GlesRenderer>> for OutputRenderElements {
 	fn from(e: PointerRenderElement<GlesRenderer>) -> Self {
-		Self::Pointer(e)
+		Self::Pointer(e, None)
 	}
 }
 
@@ -243,6 +247,7 @@ pub(crate) struct MoonshineCompositor {
 	pub damage_tracker: OutputDamageTracker,
 	pub allocator: GbmAllocator<std::fs::File>,
 	pub renderer: GlesRenderer,
+	color_shaders: super::color_render::ColorShaders,
 
 	// -- DMA-BUF --
 	pub dmabuf_state: DmabufState,
@@ -262,7 +267,7 @@ pub(crate) struct MoonshineCompositor {
 	/// completed while it is unchanged, i.e. before any client answers the
 	/// slot's frame callbacks with newer content.
 	pub(super) commit_generation: u64,
-	/// Commits of the WSI override surface (the presented game), for cadence
+	/// Commits of the focused application surface, for cadence
 	/// diagnostics only.
 	pub(super) source_commit_generation: u64,
 
@@ -408,15 +413,7 @@ pub(crate) struct MoonshineCompositor {
 	/// Focus split strategy (gamescope's `backend_virtual_connector_strategy`).
 	pub virtual_connector_strategy: super::VirtualConnectorStrategy,
 
-	// -- WSI layer --
-	/// WSI presentation bindings: the swapchain surface that presents each X11
-	/// window in place of its XWayland content. Every live game keeps its own
-	/// binding, so switching between simultaneously running games presents
-	/// each one's own swapchain.
-	pub(super) wsi: super::wsi_bindings::WsiBindings,
-
 	/// X11 window ID of the currently focused window (from Smithay's keyboard focus).
-	/// Used by the WSI layer to match override surfaces to focused windows.
 	pub focused_x11_window: Option<u32>,
 
 	/// Primary application window selected by compositor focus (X11 or Wayland).
@@ -525,7 +522,7 @@ pub(crate) struct MoonshineCompositor {
 	)>,
 	/// Maps wl_buffer ObjectIds to stable buffer indices for pixelforge's
 	/// dmabuf import cache. Keying by ObjectId is robust against protocols
-	/// that re-duplicate fds per commit (e.g. gamescope_swapchain via
+	/// that re-duplicate fds per commit (e.g. a Wayland client via
 	/// vkd3d-proton); fd-keying produces fresh indices each frame and
 	/// effectively bypasses the cache. Indices start at `BUFFER_POOL_SIZE`
 	/// to avoid collisions with the GBM pool.
@@ -608,15 +605,16 @@ impl MoonshineCompositor {
 		}
 
 		self.hdr = hdr;
-		if let Some(color_management) = self.color_management.as_mut() {
-			color_management.hdr = hdr;
-		}
 		let mode = Mode {
 			size: (width as i32, height as i32).into(),
 			refresh: (refresh_rate * 1000) as i32,
 		};
 		self.output.change_current_state(Some(mode), None, None, None);
 		self.output.set_preferred(mode);
+		if let Some(color_management) = self.color_management.as_mut() {
+			color_management.reconfigure(hdr);
+		}
+
 		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
 		self.screen_dirty = true;
 		tracing::info!(width, height, refresh_rate, hdr, "Reconfigured live compositor output");
@@ -625,7 +623,7 @@ impl MoonshineCompositor {
 
 	/// Create a new compositor state.
 	#[allow(clippy::too_many_arguments)]
-	pub fn new(
+	pub(super) fn new(
 		display: Display<Self>,
 		display_handle: DisplayHandle,
 		handle: LoopHandle<'static, Self>,
@@ -633,6 +631,7 @@ impl MoonshineCompositor {
 		damage_tracker: OutputDamageTracker,
 		mut allocator: GbmAllocator<std::fs::File>,
 		renderer: GlesRenderer,
+		color_shaders: super::color_render::ColorShaders,
 		frame_tx: super::admission::CaptureSender,
 		foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 		width: u32,
@@ -779,20 +778,8 @@ impl MoonshineCompositor {
 		}
 		tracing::debug!("Pre-allocated {BUFFER_POOL_SIZE} GBM buffers for frame pool.");
 
-		// Initialize color management protocol when HDR is active.
-		let color_management = if hdr_capable {
-			Some(super::color_management::ColorManagementState::new(&display_handle, hdr))
-		} else {
-			None
-		};
-
-		// Register swapchain protocol globals for WSI layer support.
-		// Moonshine globals are always needed (for XWayland bypass, refresh_cycle, retire handling).
-		// Gamescope globals are gated on HDR to avoid advertising HDR capability on SDR sessions.
-		super::gamescope_swapchain::register_moonshine_globals(&display_handle);
-		if hdr_capable {
-			super::gamescope_swapchain::register_gamescope_globals(&display_handle);
-		}
+		// Native color descriptions remain available for SDR sessions too.
+		let color_management = Some(super::color_management::ColorManagementState::new(&display_handle, hdr));
 
 		(
 			Self {
@@ -809,6 +796,7 @@ impl MoonshineCompositor {
 				damage_tracker,
 				allocator,
 				renderer,
+				color_shaders,
 				dmabuf_state,
 				dmabuf_global,
 				frame_tx,
@@ -881,7 +869,6 @@ impl MoonshineCompositor {
 				hdr_capable,
 				steam_mode,
 				virtual_connector_strategy,
-				wsi: Default::default(),
 				focused_x11_window: None,
 				focused_window: None,
 				foreground_tx,
@@ -916,17 +903,11 @@ impl MoonshineCompositor {
 		)
 	}
 
-	/// Space render elements, substituting each window's WSI binding for its
-	/// X11 content.
-	///
-	/// Mirrors gamescope's `steamcompmgr_win_t::current_surface()`: a window
-	/// presents its override surface whenever one is bound, in place of its X11
-	/// content, at the window's own geometry.
-	fn space_render_elements_with_override(
+	/// Render the actual compositor scene in classified stacking order.
+	fn scene_render_elements(
 		renderer: &mut GlesRenderer,
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
-		wsi: &super::wsi_bindings::WsiBindings,
 		layers: SceneLayers<'_>,
 		opacity: impl Fn(&smithay::desktop::Window) -> f32,
 	) -> Vec<OutputRenderElements> {
@@ -943,41 +924,14 @@ impl MoonshineCompositor {
 			}
 			let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
 
-			let overridden = window.x11_surface().and_then(|x| wsi.surface_for_window(x.window_id()));
-
-			let root = overridden
-				.cloned()
-				.or_else(|| window.wl_surface().map(|s| s.into_owned()));
-			let opaque_id = root
-				.as_ref()
-				.filter(|surface| super::gamescope_swapchain::surface_is_opaque(surface))
-				.map(Id::from_wayland_resource);
-			let wrap = |element: SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>| {
-				if opaque_id.as_ref() == Some(element.id()) {
-					OutputRenderElements::OpaqueSpace(element)
-				} else {
-					OutputRenderElements::Space(element)
-				}
-			};
-			if let Some(surface) = overridden {
-				elements.extend(
-					render_elements_from_surface_tree::<
-						_,
-						SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-					>(renderer, surface, location, scale, alpha, Kind::Unspecified)
+			elements.extend(
+				window
+					.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
+						renderer, location, scale, alpha,
+					)
 					.into_iter()
-					.map(wrap),
-				);
-			} else {
-				elements.extend(
-					window
-						.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
-							renderer, location, scale, alpha,
-						)
-						.into_iter()
-						.map(wrap),
-				);
-			}
+					.map(|e| OutputRenderElements::Space(e, None)),
+			);
 		};
 
 		// Preserve space order for ordinary windows, then paint classified
@@ -996,25 +950,6 @@ impl MoonshineCompositor {
 		let mut elements = Vec::new();
 		for window in paint_order.into_iter().rev() {
 			render_window(&mut elements, window);
-		}
-
-		if let Some(surface) = wsi.standalone() {
-			let opaque = super::gamescope_swapchain::surface_is_opaque(surface);
-			let root_id = Id::from_wayland_resource(surface);
-			elements.extend(
-				render_elements_from_surface_tree::<
-					_,
-					SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-				>(renderer, surface, (0, 0), scale, 1.0, Kind::Unspecified)
-				.into_iter()
-				.map(|element| {
-					if opaque && element.id() == &root_id {
-						OutputRenderElements::OpaqueSpace(element)
-					} else {
-						OutputRenderElements::Space(element)
-					}
-				}),
-			);
 		}
 
 		elements
@@ -1118,12 +1053,7 @@ impl MoonshineCompositor {
 
 	/// Rendered logical size of the window's content, if any.
 	///
-	/// A window whose content is overridden by the WSI presents its binding,
-	/// so its rendered size is the binding's.
 	fn window_source_size(&self, window: &smithay::desktop::Window) -> Option<(i32, i32)> {
-		if let Some(size) = self.wsi_surface(window).and_then(Self::surface_source_size) {
-			return Some(size);
-		}
 		window.wl_surface().as_deref().and_then(Self::surface_source_size)
 	}
 
@@ -1230,13 +1160,6 @@ impl MoonshineCompositor {
 		if let Some(reason) = extras.rejection(self.capture_mode) {
 			return Err(reason);
 		}
-		// A standalone native override has no X11 scene window.
-		if self.space.elements().next().is_none() {
-			return match self.wsi.standalone() {
-				Some(surface) => self.surface_is_complete_output(surface),
-				None => Err(DirectReject::NoSurface),
-			};
-		}
 		let Some(window) = self.direct_source_window(!notification) else {
 			return Err(DirectReject::NoSurface);
 		};
@@ -1250,14 +1173,8 @@ impl MoonshineCompositor {
 		if self.window_metadata.get(window).is_some_and(|m| m.opacity != 255) {
 			return Err(DirectReject::NotOpaque);
 		}
-		// The top window's own WSI binding, when it has one, is its content.
-		let source = if let Some(surface) = self.wsi_surface(window) {
-			surface.clone()
-		} else {
-			let Some(surface) = window.wl_surface() else {
-				return Err(DirectReject::NoSurface);
-			};
-			surface.into_owned()
+		let Some(source) = window.wl_surface() else {
+			return Err(DirectReject::NoSurface);
 		};
 		if smithay::desktop::PopupManager::popups_for_surface(&source)
 			.next()
@@ -1265,13 +1182,20 @@ impl MoonshineCompositor {
 		{
 			return Err(DirectReject::SurfaceTree);
 		}
+		if !self.hdr
+			&& self
+				.color_management
+				.as_ref()
+				.is_some_and(|cm| cm.surface_color_space(&source) != FrameColorSpace::Srgb)
+		{
+			return Err(DirectReject::ForcedComposition);
+		}
 		self.surface_is_complete_output(&source)
 	}
 
 	/// A transformed/cropped tree cannot be represented by its root DMA-BUF.
 	fn surface_is_complete_output(&self, surface: &WlSurface) -> Result<(), DirectReject> {
 		let output = self.output_rect();
-		let declared_opaque = super::gamescope_swapchain::surface_is_opaque(surface);
 		with_renderer_surface_state(surface, |state| {
 			let view = state.view().ok_or(DirectReject::NoSurface)?;
 			if let Some(reason) = super::capture::surface_view_rejection(
@@ -1282,10 +1206,9 @@ impl MoonshineCompositor {
 			) {
 				return Err(reason);
 			}
-			if !declared_opaque
-				&& !state
-					.opaque_regions()
-					.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(output)))
+			if !state
+				.opaque_regions()
+				.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(output)))
 			{
 				return Err(DirectReject::NotOpaque);
 			}
@@ -1418,7 +1341,7 @@ impl MoonshineCompositor {
 	}
 
 	/// The Steam notification as a late-composition layer, drawn where and
-	/// how `space_render_elements_with_override` would: at the window's
+	/// how `scene_render_elements` would: at the window's
 	/// position, scaled by its window opacity. `Ok(None)` when GLES would draw
 	/// nothing; `Err` when only GLES can reproduce it (scaled, transformed,
 	/// cropped, multi-surface, multi-plane or unsupported formats). A DMA-BUF
@@ -1443,6 +1366,15 @@ impl MoonshineCompositor {
 		let Some(surface) = window.wl_surface().map(|s| s.into_owned()) else {
 			return Ok(None);
 		};
+		if self
+			.color_management
+			.as_ref()
+			.is_some_and(|cm| cm.surface_color_space(&surface) != FrameColorSpace::Srgb)
+		{
+			// Late overlay APIs describe SDR layers only; use the compositor's
+			// color-aware texture draw for an HDR-declared notification.
+			return Err(());
+		}
 		let mut extra_content = false;
 		compositor::with_surface_tree_downward(
 			&surface,
@@ -1539,6 +1471,20 @@ impl MoonshineCompositor {
 	/// scene to be directly exportable.
 	fn late_layers(&mut self) -> Result<(super::frame::FrameOverlays, Option<HeldBuffer>), DirectReject> {
 		self.direct_scene_eligibility(false, false)?;
+		if self
+			.direct_source_window(true)
+			.and_then(|w| w.wl_surface())
+			.is_some_and(|s| {
+				self.color_management
+					.as_ref()
+					.is_some_and(|cm| cm.surface_color_space(&s) != FrameColorSpace::Srgb)
+			}) {
+			return Err(if self.cursor_visible() {
+				DirectReject::Cursor
+			} else {
+				DirectReject::Notification
+			});
+		}
 		let mut layers: super::frame::FrameOverlays = Default::default();
 		let mut hold = None;
 		if let Some((layer, held)) = self.notification_overlay().map_err(|()| DirectReject::Notification)? {
@@ -1564,25 +1510,6 @@ impl MoonshineCompositor {
 				|_, _| Some(self.output.clone()),
 			);
 			window.take_presentation_feedback(
-				&mut feedback,
-				|_, _| Some(self.output.clone()),
-				|_, _| {
-					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-				},
-			);
-		}
-		// Every bound swapchain is serviced like its window, so a background
-		// game stays resumable when it is shown again.
-		for surface in self.wsi.live_surfaces() {
-			send_frames_surface_tree(
-				surface,
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
-			take_presentation_feedback_surface_tree(
-				surface,
 				&mut feedback,
 				|_, _| Some(self.output.clone()),
 				|_, _| {
@@ -1625,7 +1552,7 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Diagnostics for a commit of the WSI-presented game surface.
+	/// Diagnostics for a commit of the focused application surface.
 	pub(super) fn note_source_commit(&mut self) {
 		self.source_commit_generation = self.source_commit_generation.wrapping_add(1);
 		if !self.log_stats {
@@ -1677,17 +1604,18 @@ impl MoonshineCompositor {
 		}
 		self.retired_buffer_pools
 			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));
+		if self
+			.color_management
+			.as_mut()
+			.is_some_and(|cm| cm.refresh_color_state())
+		{
+			self.damage_tracker = OutputDamageTracker::from_output(&self.output);
+			self.screen_dirty = true;
+		}
 		// Keep the Steam overlay z-ordered above the game while it is open.
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.
 		self.update_overlay_z_order();
-
-		// Drop bindings whose swapchain surface died with its client (no owner
-		// release); their windows present XWayland content again.
-		if self.wsi.prune_dead() {
-			tracing::debug!("Dead WSI binding cleared");
-			self.screen_dirty = true;
-		}
 
 		// A held cursor whose hide outlasted the hold disappears now.
 		if self.cursor.settle(std::time::Instant::now()) {
@@ -1850,11 +1778,6 @@ impl MoonshineCompositor {
 		// game on the gfx queue and inflates per-frame encode latency at
 		// GPU saturation.
 		//
-		// When the WSI layer has an active override surface, scanout from
-		// the override's wl_surface (the gamescope_swapchain image) and
-		// deliver frame callbacks to it. Otherwise scanout from the lone
-		// space toplevel as before.
-		//
 		// Direct scanout bypasses GLES, so skip it while an actually-drawn
 		// cursor (not client-hidden) needs compositing.
 		//
@@ -1894,19 +1817,11 @@ impl MoonshineCompositor {
 			Ok((layers, hold)) => {
 				let late_notification = layers[0].is_some();
 				let late_cursor = layers[1].is_some();
-				let override_source = self.direct_override_source();
-				let override_active = override_source.is_some();
-				let exported = if let Some(surface) = override_source {
-					self.try_direct_scanout_override(surface, &mut credit, send_callbacks, layers, hold)
-				} else {
-					self.try_direct_scanout(&mut credit, send_callbacks, layers, hold)
-				};
-				if exported {
-					self.record_capture_path(match (override_active, late_notification || late_cursor) {
-						(true, true) => "direct_override+late",
-						(true, false) => "direct_override",
-						(false, true) => "direct+late",
-						(false, false) => "direct",
+				if self.try_direct_scanout(&mut credit, send_callbacks, layers, hold) {
+					self.record_capture_path(if late_notification || late_cursor {
+						"direct+late"
+					} else {
+						"direct"
 					});
 					if self.log_stats {
 						self.late_cursor_frames += u64::from(late_cursor);
@@ -1944,13 +1859,17 @@ impl MoonshineCompositor {
 		// mutable borrow from renderer.bind(). This avoids a borrow
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
-		let frame_cs = self.color_management.as_ref().map(|cm| cm.frame_color_space());
+		let source_surface = self
+			.focused_window
+			.as_ref()
+			.filter(|window| self.space.elements().any(|w| w == *window))
+			.and_then(|window| window.wl_surface().map(|s| s.into_owned()));
 		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&self.buffer_pool[idx].dmabuf,
 			idx,
 			consumed.clone(),
-			frame_cs.unwrap_or(FrameColorSpace::Srgb),
-			self.color_management.as_ref().and_then(|cm| cm.hdr_metadata()),
+			FrameColorSpace::Srgb,
+			None,
 		);
 
 		// Composition must consume part of the capture-to-send pacing window.
@@ -2021,13 +1940,10 @@ impl MoonshineCompositor {
 		let mut elements: Vec<OutputRenderElements> = Vec::new();
 		elements.extend(cursor_elements);
 
-		// A window whose content is overridden by the WSI presents its binding
-		// in place of its X11 content (gamescope `current_surface()`).
-		let space_elements = Self::space_render_elements_with_override(
+		let space_elements = Self::scene_render_elements(
 			&mut self.renderer,
 			&self.space,
 			&self.output,
-			&self.wsi,
 			SceneLayers {
 				decorations: &self.decoration_windows,
 				upper: [
@@ -2046,6 +1962,51 @@ impl MoonshineCompositor {
 			},
 		);
 		elements.extend(space_elements);
+		// Resolve the composed frame from the real render list, not merely
+		// the shell root: native Vulkan content can live on a subsurface.
+		// Stop at a fullscreen opaque foreground element so a covered HDR
+		// window cannot supply metadata for the visible SDR scene.
+		let bounds: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
+			smithay::utils::Rectangle::from_size((self.width as i32, self.height as i32).into());
+		let hdr_source = source_surface.as_ref().and_then(|root| {
+			let cm = self.color_management.as_ref()?;
+			for element in &elements {
+				let geometry = element.geometry(scale);
+				if element.alpha() == 0.0 || !geometry.overlaps(bounds) {
+					continue;
+				}
+				if let Some(surface) = cm.hdr_element_surface(element.id(), root) {
+					return Some(surface);
+				}
+				if element.opaque_regions(scale).iter().any(|region| {
+					let region = smithay::utils::Rectangle::new(region.loc + geometry.loc, region.size);
+					region.contains_rect(bounds)
+				}) {
+					break;
+				}
+			}
+			None
+		});
+		exported_frame.color_space = if self.hdr && hdr_source.is_some() {
+			FrameColorSpace::Bt2020Pq
+		} else {
+			FrameColorSpace::Srgb
+		};
+		exported_frame.hdr_metadata = hdr_source
+			.as_ref()
+			.filter(|_| self.hdr)
+			.and_then(|s| self.color_management.as_ref()?.surface_hdr_metadata(s));
+		for element in &mut elements {
+			let source = self
+				.color_management
+				.as_ref()
+				.map(|cm| cm.element_encoding(element.id()))
+				.unwrap_or(0);
+			let program = self.color_shaders.program(source, exported_frame.color_space);
+			match element {
+				OutputRenderElements::Space(_, p) | OutputRenderElements::Pointer(_, p) => *p = program,
+			}
+		}
 
 		tracing::trace!(
 			num_space_elements,
@@ -2196,35 +2157,6 @@ impl MoonshineCompositor {
 			}
 		}
 
-		// Bound swapchains receive their windows' frame callbacks, so the
-		// NVIDIA driver's Wayland WSI unblocks and presents the next frame; a
-		// background game stays resumable like any other space window.
-		// Presentation feedback is drained so WaitForPresentKHR can return; it
-		// reports a swapchain as displayed only when this frame composed it.
-		for surface in self.wsi.live_surfaces() {
-			if send_callbacks {
-				send_frames_surface_tree(
-					surface,
-					&self.output,
-					self.clock.now(),
-					Some(std::time::Duration::ZERO),
-					|_, _| Some(self.output.clone()),
-				);
-			}
-			take_presentation_feedback_surface_tree(
-				surface,
-				&mut feedback,
-				|surface, _| {
-					render_result
-						.as_ref()
-						.is_ok_and(|result| result.states.element_was_presented(surface))
-						.then(|| self.output.clone())
-				},
-				|_, _| {
-					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-				},
-			);
-		}
 		let frame_period = self
 			.output
 			.preferred_mode()
@@ -2427,295 +2359,6 @@ impl MoonshineCompositor {
 		}
 
 		true
-	}
-
-	/// The WSI binding a direct export reads: the top window's own binding, or
-	/// a standalone native swapchain when the scene has no windows.
-	fn direct_override_source(&self) -> Option<WlSurface> {
-		if self.space.elements().next().is_none() {
-			return self.wsi.standalone().cloned();
-		}
-		self.direct_source_window(true)
-			.and_then(|window| self.wsi_surface(window))
-			.cloned()
-	}
-
-	/// Direct DMA-BUF scanout for a gamescope/moonshine WSI binding.
-	///
-	/// When the WSI layer has bound a swapchain surface (gamescope_swapchain
-	/// or moonshine_swapchain protocol), the game's frames are committed to
-	/// that surface rather than to its space toplevel. Without this
-	/// path the compositor falls back to a GLES blit on the gfx queue, which
-	/// competes with the game's rendering at GPU saturation and inflates encode
-	/// latency. This sends the override surface's committed DMA-BUF straight
-	/// to the encoder and delivers frame callbacks to the override surface so
-	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
-	fn try_direct_scanout_override(
-		&mut self,
-		override_surface: WlSurface,
-		credit: &mut Option<super::admission::CaptureCredit>,
-		send_callbacks: bool,
-		overlays: super::frame::FrameOverlays,
-		overlay_hold: Option<HeldBuffer>,
-	) -> bool {
-		if !override_surface.alive() {
-			return false;
-		}
-
-		let scanout_buffer = with_renderer_surface_state(&override_surface, |state| {
-			let buffer = state.buffer()?;
-			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
-				return None;
-			}
-			Some(buffer.clone())
-		});
-		let Some(Some(buffer)) = scanout_buffer else {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
-			}
-			tracing::trace!("Override scanout: no committed buffer");
-			return false;
-		};
-		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
-			}
-			tracing::trace!("Override scanout: failed to get DMA-BUF from buffer");
-			return false;
-		};
-		let client_dmabuf = client_dmabuf.clone();
-
-		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::Size as usize] += 1;
-			}
-			tracing::trace!(
-				"Override scanout: size mismatch (client {}x{} vs output {}x{})",
-				client_dmabuf.width(),
-				client_dmabuf.height(),
-				self.width,
-				self.height,
-			);
-			return false;
-		}
-
-		let buffer_id = buffer.id();
-		let buffer_index = *self.scanout_buffer_map.entry(buffer_id.clone()).or_insert_with(|| {
-			let idx = self.scanout_next_index;
-			self.scanout_next_index += 1;
-			idx
-		});
-
-		// Log buffer parameters only when they change — logging every new
-		// buffer index would spam at frame rate on NVIDIA (see
-		// `last_scanout_buffer_desc`).
-		let buffer_desc = (
-			client_dmabuf.format().code as u32,
-			Into::<u64>::into(client_dmabuf.format().modifier),
-			client_dmabuf.num_planes(),
-			client_dmabuf.width(),
-			client_dmabuf.height(),
-		);
-		if self.last_scanout_buffer_desc != Some(buffer_desc) {
-			tracing::debug!(
-				buffer_index,
-				fourcc = ?client_dmabuf.format().code,
-				modifier = format!("{:#x}", Into::<u64>::into(client_dmabuf.format().modifier)).as_str(),
-				num_planes = client_dmabuf.num_planes(),
-				width = client_dmabuf.width(),
-				height = client_dmabuf.height(),
-				"Override scanout: buffer parameters changed",
-			);
-			self.last_scanout_buffer_desc = Some(buffer_desc);
-		}
-
-		let consumed = Arc::new(AtomicBool::new(false));
-
-		let color_space = self
-			.color_management
-			.as_ref()
-			.map(|cm| cm.surface_color_space(&override_surface))
-			.unwrap_or(FrameColorSpace::Srgb);
-		let hdr_metadata = self
-			.color_management
-			.as_ref()
-			.and_then(|cm| cm.surface_hdr_metadata(&override_surface));
-
-		// The frame takes its own reference to the client's DMA-BUF; the held
-		// wl_buffer below only defers the client's content reuse.
-		let mut exported_frame = ExportedFrame::from_dmabuf(
-			&client_dmabuf,
-			buffer_index,
-			consumed.clone(),
-			color_space,
-			hdr_metadata,
-		);
-		exported_frame.overlays = overlays;
-
-		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
-		// A DMA-BUF notification layer is read by the same GPU work.
-		if let Some((id, buffer)) = overlay_hold {
-			self.held_scanout_buffers.push((consumed.clone(), id, buffer));
-		}
-
-		match self
-			.frame_tx
-			.try_send(exported_frame, credit.take().expect("capture credit"))
-		{
-			Err(super::admission::CaptureSendError::Disconnected) => {
-				consumed.store(true, Ordering::Release);
-				tracing::debug!("Frame channel disconnected, compositor stopping.");
-			},
-			Err(super::admission::CaptureSendError::Full) => {
-				consumed.store(true, Ordering::Release);
-			},
-			Ok(()) => {
-				if self.log_stats {
-					self.captured_frames += 1;
-					self.direct_frames += 1;
-				}
-				self.capture_published(send_callbacks, std::time::Instant::now());
-			},
-		}
-
-		// Frame callbacks must go to the override surface (the game's WSI
-		// layer is waiting on these to unblock vkQueuePresentKHR). Without
-		// this the game would block forever after the first frame.
-		if send_callbacks {
-			send_frames_surface_tree(
-				&override_surface,
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
-		}
-
-		let mut feedback = OutputPresentationFeedback::new(&self.output);
-		take_presentation_feedback_surface_tree(
-			&override_surface,
-			&mut feedback,
-			|_, _| Some(self.output.clone()),
-			|_, _| {
-				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-			},
-		);
-		let frame_period = self
-			.output
-			.preferred_mode()
-			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-			.unwrap_or(std::time::Duration::from_millis(11));
-		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
-			self.clock.now(),
-			Refresh::Fixed(frame_period),
-			0,
-			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
-			),
-		);
-
-		if let Err(e) = self.display_handle.flush_clients() {
-			tracing::error!("Failed to flush clients after override scanout: {e}");
-		}
-
-		true
-	}
-
-	/// Handle the WSI layer's `override_window_content` request: bind the
-	/// swapchain surface to the X11 window it presents.
-	///
-	/// Other windows keep their own bindings. A different surface reporting the
-	/// same window replaces that window's binding; the displaced surface's HDR
-	/// state is evicted explicitly because `create_swapchain` only sees the new
-	/// surface. (When DXVK recreates its swapchain on a new X11 window, e.g. to
-	/// toggle HDR, the old binding instead goes with its owner's destroy.)
-	pub fn override_window_surface(&mut self, x11_window: u32, surface: WlSurface) {
-		let displaced = self.wsi.bind(surface.clone(), x11_window);
-		for old_surface in &displaced {
-			if let Some(cm) = &mut self.color_management {
-				cm.clear_gamescope_current(old_surface);
-			}
-		}
-		tracing::debug!(
-			reported = x11_window,
-			surface = ?surface.id(),
-			displaced = ?displaced.iter().map(|s| s.id()).collect::<Vec<_>>(),
-			bindings = self.wsi.live_surfaces().count(),
-			"WSI binding registered"
-		);
-		self.resolve_override_window();
-		self.screen_dirty = true;
-	}
-
-	/// Remove WSI bindings presenting a destroyed X11 window.
-	pub(super) fn release_window_bindings(&mut self, x11_window: u32) {
-		let removed = self.wsi.remove_window(x11_window);
-		if removed.is_empty() {
-			return;
-		}
-		for surface in &removed {
-			if let Some(cm) = &mut self.color_management {
-				cm.clear_gamescope_current(surface);
-			}
-		}
-		tracing::debug!(
-			x11_window,
-			removed = ?removed.iter().map(|s| s.id()).collect::<Vec<_>>(),
-			"WSI bindings released with their destroyed window"
-		);
-		self.invalidate_presentation();
-	}
-
-	/// The scene presents different content for an unchanged window set:
-	/// forget damage history so the next frame redraws everything.
-	pub(super) fn invalidate_presentation(&mut self) {
-		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
-		self.screen_dirty = true;
-	}
-
-	/// Resolve each binding's target window from the WSI-reported xid.
-	///
-	/// The WSI reports the window its Vulkan swapchain is created on, which for
-	/// Wine/DXVK is a child of the WM-visible toplevel. Key the binding by the
-	/// ancestor the compositor actually renders, independent of the current
-	/// focus (which can change after the binding is stored).
-	///
-	/// Smithay's XWM reparents clients into frame windows, so the root's child
-	/// is a frame that is never rendered; the managed client window is the
-	/// first ancestor present in the space. Re-run on window map because the
-	/// swapchain can be created before its window is mapped. Bindings that
-	/// already point at a rendered window issue no X11 query.
-	pub fn resolve_override_window(&mut self) {
-		let space = &self.space;
-		let is_rendered = |id: u32| {
-			space
-				.elements()
-				.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == id))
-		};
-		let x11_focus = self.x11_focus.as_ref();
-		let changed = self.wsi.resolve(is_rendered, |reported| {
-			x11_focus.map(|xf| xf.get_ancestor_chain(reported)).unwrap_or_default()
-		});
-		for (reported, resolved) in changed {
-			tracing::debug!(reported, resolved, "Resolved WSI binding window");
-		}
-	}
-
-	/// The WSI binding presenting `window`'s content, if any.
-	pub(super) fn wsi_surface(&self, window: &smithay::desktop::Window) -> Option<&WlSurface> {
-		window
-			.x11_surface()
-			.and_then(|x| self.wsi.surface_for_window(x.window_id()))
-	}
-
-	/// Returns `true` when a live WSI binding presents a window in the scene
-	/// (or a standalone native swapchain). A binding *is* its window's content,
-	/// so it applies whenever the window is shown, not only while focused.
-	pub fn is_override_active(&self) -> bool {
-		self.wsi.any_presented(|id| {
-			self.space
-				.elements()
-				.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == id))
-		})
 	}
 
 	/// Clear all dropdown/override windows.

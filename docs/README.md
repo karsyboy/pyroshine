@@ -29,7 +29,7 @@ the guide for the area being changed:
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |
 | Cross-fork framing and authenticated calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
-| Vulkan layer, bypass safety and swapchain image counts | [Vulkan WSI](VULKAN_IMAGE_COUNTS.md) |
+| Native Wayland/XWayland presentation, HDR and Wine/Proton | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity/report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
 | Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |

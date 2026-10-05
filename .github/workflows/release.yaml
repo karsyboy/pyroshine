@@ -86,7 +86,7 @@ jobs:
 
     - name: Strip and fixup
       run: |
-        strip ./target/release/moonshine ./target/release/libmoonshine_wsi.so
+        strip ./target/release/moonshine
         # Remove libunwind — pulled in transitively via libc++ on Ubuntu but
         # never called at runtime (no C++ exceptions in the code path).
         # Can be removed if inputtino-sys is changed to link -lc++ statically
@@ -101,13 +101,12 @@ jobs:
     - name: Package portable tarball
       run: |
         STAGE="$RUNNER_TEMP/pyroshine"
-        mkdir -p "$STAGE/bin" "$STAGE/lib/pyroshine/vulkan-layers" "$STAGE/share/pyroshine"
+        mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share/pyroshine"
         cp ./target/release/moonshine "$STAGE/bin/pyroshine"
         cp ./target/release/libpyrowave-shared.so.0 "$STAGE/lib/"
-        cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/pyroshine/vulkan-layers/"
         cp ./dist/start-pyroshine.sh ./dist/60-pyroshine.rules ./dist/50-pyroshine-inhibit-sleep.rules \
            ./dist/pyroshine-modules.conf ./dist/pyroshine-sysusers.conf \
-           ./dist/pyroshine@.service ./dist/VkLayer_pyroshine_wsi.json \
+           ./dist/pyroshine@.service \
            ./dist/pyroshine-atomic-update.conf "$STAGE/share/pyroshine/"
         cp ./dist/pyroshine-install.sh "$STAGE/bin/"
         cp README.md CONTRIBUTING.md LICENSE "$STAGE/"

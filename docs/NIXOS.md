@@ -6,7 +6,7 @@ package, executable, and module retain the upstream `moonshine` names.
 
 ## What you get
 
-- **A package**: the `moonshine` binary, the moonshine-wsi Vulkan layer, and the udev rules, built from this repository.
+- **A package**: the `moonshine` binary, PyroWave library, and the udev rules, built from this repository.
 - **A NixOS module**: a `services.moonshine` service that takes care of lingering, kernel modules, device permissions, and the systemd service described in the [installation guide](INSTALLATION.md).
 - **A dev shell**: the full build environment for working on Pyroshine.
 

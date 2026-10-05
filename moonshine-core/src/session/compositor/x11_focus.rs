@@ -248,15 +248,6 @@ struct LoadedXRes {
 
 static LOADED_XRES: OnceLock<LoadedXRes> = OnceLock::new();
 
-/// Convert a display number to a gamescope XWayland server ID.
-///
-/// Gamescope encodes the display number as `(display_number + 100) << 8 | display_number`.
-/// This is used by the gamescope-swapchain protocol for WSI clients to discover
-/// the XWayland server.
-fn display_id_to_server_id(display_number: u32) -> u32 {
-	((display_number + 100) << 8) | display_number
-}
-
 /// Convert a `dlsym` result (`*mut c_void`) to an `Option<FnType>`.
 ///
 /// # Safety
@@ -546,7 +537,6 @@ struct CachedAtoms {
 	gamescope_focused_app: Atom,
 	gamescope_focusable_apps: Atom,
 	gamescope_focusable_windows: Atom,
-	gamescope_xwayland_server_id: Atom,
 	gamescope_focused_app_gfx: Atom,
 	gamescope_focused_window: Atom,
 	gamescope_focus_display: Atom,
@@ -591,7 +581,6 @@ impl CachedAtoms {
 					gamescope_focused_app: intern_one(b"GAMESCOPE_FOCUSED_APP")?,
 					gamescope_focusable_apps: intern_one(b"GAMESCOPE_FOCUSABLE_APPS")?,
 					gamescope_focusable_windows: intern_one(b"GAMESCOPE_FOCUSABLE_WINDOWS")?,
-					gamescope_xwayland_server_id: intern_one(b"GAMESCOPE_XWAYLAND_SERVER_ID")?,
 					gamescope_focused_app_gfx: intern_one(b"GAMESCOPE_FOCUSED_APP_GFX")?,
 					gamescope_focused_window: intern_one(b"GAMESCOPE_FOCUSED_WINDOW")?,
 					gamescope_focus_display: intern_one(b"GAMESCOPE_FOCUS_DISPLAY")?,
@@ -641,37 +630,6 @@ impl X11Focus {
 			display_name: format!(":{}", display_number),
 			watched_keyboard_focus: std::cell::Cell::new(0),
 		};
-
-		// Initialize GAMESCOPE_XWAYLAND_SERVER_ID on the root window so that
-		// compatible WSI clients can discover this compositor's XWayland server
-		// and succeed the override_window_content handshake.
-		if x11_focus.atoms.gamescope_xwayland_server_id != 0 {
-			let server_id = display_id_to_server_id(display_number);
-			with_xlib(|loaded| {
-				let seterr = loaded.xseterrorhandler?;
-				let change = loaded.xchangeproperty?;
-				unsafe {
-					let prev = seterr(Some(silent_x11_error));
-					// XChangeProperty with format=32 expects native C `long`
-					// elements.  On LP64 (64-bit) `long` is 8 bytes but `u32`
-					// is 4 bytes, so we must convert to native `long` to avoid
-					// reading garbage past the value.
-					let server_id_long = server_id as libc_c_long;
-					change(
-						x11_focus.dpy,
-						x11_focus.root,
-						x11_focus.atoms.gamescope_xwayland_server_id,
-						XA_CARDINAL,
-						32,
-						1,
-						&server_id_long as *const libc_c_long as *const c_void,
-						1,
-					);
-					seterr(prev);
-				}
-				Some(())
-			});
-		}
 
 		tracing::debug!(target: "focus", "Opened X11 connection to :{}", display_number);
 		Some(x11_focus)

@@ -156,7 +156,7 @@ identity recovery, state migration and authorized revocation.
 | `pyrowave_queue` | string, `"auto"` | Prefer graphics for PyroWave. `"auto"` and `"graphics"` select graphics; `"compute"` explicitly requests compute with library fallback to graphics. All modes retain normal Vulkan queue priority. |
 | `conversion_queue` | string, `"auto"` | Queue for the H.264/HEVC/AV1 RGB-to-YCbCr conversion. `"auto"` and `"compute"` use the device's dedicated compute family when it has one (otherwise graphics); `"graphics"` uses the graphics family. Normal queue priority in all modes. |
 | `encrypt` | boolean, `false` | Enable AES-128-GCM video encryption when supported by client negotiation. |
-| `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries and swapchain feedback. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
+| `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
 | `log_frame_spikes` | boolean, `false` | Warn when a frame's encoding and packetization exceeds the frame budget. Useful for latency diagnostics. |
 | `max_packet_size` | nonnegative integer, `0` | Cap the client-requested stream packet size in bytes. `0` disables the cap; caps below `200` are ignored with a warning. Smaller client requests are honored. With video encryption the cap also covers the 32-byte encryption prefix, keeping the same on-wire size. |
 
@@ -169,8 +169,7 @@ log_stats = false
 ```
 
 This setting controls diagnostic output and collection. It does not alter GPU
-encoding, capture cadence, bitrate, FEC, or transport behavior. The optional WSI
-layer's `MOONSHINE_WSI_LOG` filter and per-call TRACE logging remain separate.
+encoding, capture cadence, bitrate, FEC, or transport behavior.
 
 Auto FEC clamps its initial `fec_percentage` to the configured minimum/maximum.
 FEC adds bandwidth overhead; it does not replace a reliable network connection.

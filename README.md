@@ -15,6 +15,7 @@ headless sessions and streams them to Moonlight-compatible clients.
 
 - Native PyroWave 4:2:0 and 4:4:4 streaming in SDR and HDR10.
 - H.264, HEVC, and AV1 through Vulkan Video.
+- [Native Wayland HDR](docs/NATIVE_PRESENTATION.md) through standard color management; ordinary XWayland applications remain supported as SDR.
 - Hardware encoding with DMA-BUF import, low-latency transport, and forward error correction.
 - Keyboard, mouse, touch, pen, controller, haptics, and surround audio support.
 - Optional desktop app with a system tray, pairing notifications, client management,

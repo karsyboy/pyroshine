@@ -26,8 +26,6 @@ contents:
     dst: /usr/bin/pyroshine
   - src: ./dist/start-pyroshine.sh
     dst: /usr/bin/start-pyroshine.sh
-  - src: ./target/release/libmoonshine_wsi.so
-    dst: /usr/lib/pyroshine/vulkan-layers/libmoonshine_wsi.so
   - src: ./target/release/libpyrowave-shared.so.0
     dst: /usr/lib/libpyrowave-shared.so.0
   - src: ./dist/60-pyroshine.rules
@@ -36,8 +34,6 @@ contents:
     dst: /usr/lib/modules-load.d/pyroshine.conf
   - src: ./dist/pyroshine@.service
     dst: /usr/lib/systemd/system/pyroshine@.service
-  - src: ./dist/VkLayer_pyroshine_wsi.json
-    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_pyroshine_wsi.json
   - src: ./dist/50-pyroshine-inhibit-sleep.rules
     dst: /usr/share/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules
   - src: ./dist/pyroshine-sysusers.conf
@@ -58,7 +54,6 @@ scripts:
   postremove: ./dist/nfpm/pyroshine-postremove.sh
 
 # Dependency names differ per distro.
-# (libwayland-client is needed by the WSI layer, which is dlopen'd into games.)
 overrides:
   deb:
     depends:

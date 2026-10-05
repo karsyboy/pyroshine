@@ -32,7 +32,6 @@ let
       ../moonshine-core
       ../moonshine-management
       ../moonshine-tools
-      ../moonshine-wsi
       ../assets
       ../dist
       ../vendor
@@ -67,9 +66,6 @@ rustPlatform.buildRustPackage {
       --replace-fail 'println!("cargo:rustc-link-lib=c++");' ""
   '';
 
-  # A bare `cargo build` only builds the root package; the workspace also
-  # produces libmoonshine_wsi.so, the Vulkan implicit layer that routes a
-  # game's swapchain frames into moonshine's headless compositor.
   cargoBuildFlags = [ "--workspace" ];
 
   nativeBuildInputs = [
@@ -100,18 +96,6 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
-    # cargoInstallHook has placed the moonshine binary in $out/bin and the
-    # moonshine-wsi cdylib in $out/lib; fail loudly if the layer is missing
-    # (e.g. --workspace stopped covering it).
-    test -f $out/lib/libmoonshine_wsi.so
-
-    # Vulkan implicit-layer manifest, pointed at the store path.
-    install -Dm644 dist/VkLayer_moonshine_wsi.json \
-      $out/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
-    substituteInPlace $out/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json \
-      --replace-fail /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so \
-      $out/lib/libmoonshine_wsi.so
-
     # Input-group access + active-seat ACLs for /dev/uinput and /dev/uhid,
     # picked up by services.udev.packages.
     install -Dm644 dist/60-moonshine.rules $out/lib/udev/rules.d/60-moonshine.rules

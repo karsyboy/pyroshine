@@ -7,8 +7,7 @@ Remove pairing credentials and other private data before sharing logs.
 
 Keep changes focused and explain the resulting behavior and validation in your
 pull request. Preserve upstream license notices and the internal `moonshine`
-names used by crates, configuration, state, environment variables, and the WSI
-protocol. The public packaged command and service are named `pyroshine`.
+names used by crates, configuration, state, and environment variables. The public packaged command and service are named `pyroshine`.
 
 ## Manually building the app
 
@@ -46,7 +45,6 @@ Build outputs:
 | Artifact | Purpose |
 | --- | --- |
 | `target/release/moonshine` | Server; installed as `pyroshine` |
-| `target/release/libmoonshine_wsi.so` | Vulkan WSI layer loaded into applications |
 | `target/release/moonshine-bench` | Developer benchmark utility |
 | `/tmp/pyrowave-install/lib/libpyrowave-shared.so.0` | Optional PyroWave backend |
 
@@ -61,7 +59,7 @@ The optional desktop app is a separate workspace under `pyroshine-ui/` with its
 own Node.js and WebKitGTK prerequisites; see [pyroshine-ui/README.md](pyroshine-ui/README.md).
 Building the server never compiles it.
 
-A successful compile alone does not install the WSI manifest or device rules.
+A successful compile alone does not install device rules.
 Use the installation steps below before validating streaming. When the optional
 PyroWave library cannot load or has the wrong C API version, conventional codecs
 remain available.
@@ -72,8 +70,7 @@ These instructions install local build outputs into the same system paths used
 by native packages. Use this layout for a manually maintained installation on a
 writable Linux system. For SteamOS use the [portable installer](docs/INSTALLATION.md#portable-installer-and-steamos).
 Avoid mixing this layout with a package-managed or `/opt/pyroshine` installation:
-package upgrades can overwrite local artifacts, and `/etc` units or Vulkan
-manifests can take precedence over the files installed here. Choose one method
+package upgrades can overwrite local artifacts, and `/etc` units can take precedence over the files installed here. Choose one method
 and remove the old integration with its original package manager or installer
 when changing methods.
 
@@ -92,9 +89,7 @@ install the artifacts and integration files:
 ```sh
 sudo install -Dm755 target/release/moonshine /usr/bin/pyroshine
 sudo install -Dm755 dist/start-pyroshine.sh /usr/bin/start-pyroshine.sh
-sudo install -Dm755 target/release/libmoonshine_wsi.so /usr/lib/pyroshine/vulkan-layers/libmoonshine_wsi.so
 sudo install -Dm755 /tmp/pyrowave-install/lib/libpyrowave-shared.so.0 /usr/lib/libpyrowave-shared.so.0
-sudo install -Dm644 dist/VkLayer_pyroshine_wsi.json /usr/share/vulkan/implicit_layer.d/VkLayer_pyroshine_wsi.json
 sudo install -Dm644 dist/pyroshine@.service /usr/lib/systemd/system/pyroshine@.service
 sudo install -Dm644 dist/60-pyroshine.rules /usr/lib/udev/rules.d/60-pyroshine.rules
 sudo install -Dm644 dist/pyroshine-modules.conf /usr/lib/modules-load.d/pyroshine.conf
@@ -111,8 +106,6 @@ sudo modprobe uhid
 sudo systemctl reload-or-restart polkit.service
 ```
 
-The shipped manifest assumes `/usr/lib/pyroshine/vulkan-layers/libmoonshine_wsi.so`.
-If you choose a different library directory, update its `library_path` too.
 If `/usr/lib` is outside your loader's search path, install PyroWave in your
 distribution's library directory and run `ldconfig`, or set
 `MOONSHINE_PYROWAVE_LIBRARY` to the installed library path in the service environment.
@@ -138,6 +131,9 @@ pyroshine healthcheck
 systemctl status "pyroshine@$USER"
 journalctl -u "pyroshine@$USER" -e
 ```
+
+Remove the old layer artifacts and session environment on upgrade as described
+in [native presentation migration](docs/NATIVE_PRESENTATION.md#migration).
 
 Repeat the build, stop, install, and start steps for subsequent manual upgrades.
 Do not replace your config or pairing state with defaults. If validation fails,
@@ -262,4 +258,4 @@ upgrade from the previous release.
 Packaging is defined in [nfpm.yaml](nfpm.yaml), [nfpm-ui.yaml](nfpm-ui.yaml)
 (the separate desktop app package) and [dist/](dist/). Keep the
 portable and native package integration files consistent when changing service,
-udev, Vulkan, or policy paths.
+udev or policy paths.

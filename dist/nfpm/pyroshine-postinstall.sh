@@ -1,6 +1,11 @@
 #!/bin/sh
 # Post-install script for Pyroshine packages.
 
+# Remove manifests left by previous portable/manual releases. Native package
+# upgrades remove their old /usr/share manifests through package ownership.
+rm -f /etc/vulkan/implicit_layer.d/VkLayer_pyroshine_wsi.json \
+  /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+
 udevadm control --reload || true
 udevadm trigger || true
 systemd-sysusers 2>/dev/null || true

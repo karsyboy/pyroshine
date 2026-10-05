@@ -1,17 +1,7 @@
-//! Minimal `wp_color_management_v1` and `wp_color_representation_v1` protocol
-//! support for HDR passthrough.
-//!
-//! Since Moonshine always has a single fullscreen surface, full color-managed
-//! compositing is not needed.  The compositor only needs to:
-//!
-//! 1. Advertise the protocol so applications can declare their color space.
-//! 2. Track which color space the fullscreen surface is using.
-//! 3. Pass through the pixel data unmodified (no color conversion).
-//! 4. Tag the exported frame with the correct `FrameColorSpace`.
-//!
-//! The protocol handling code is implemented out-of-tree since Smithay 0.7.0
-//! does not include it.  The protocol bindings come from the
-//! `wayland-protocols` crate (staging feature).
+//! Native Wayland image descriptions are the sole source of surface color state.
+//! Descriptions are applied at commit, looked up for the actual captured surface,
+//! and carried with its pixels to the encoder. Unsupported encodings fail rather
+//! than being mislabeled SDR. scRGB uses the encoder's 80 cd/m² linear scale.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -30,6 +20,32 @@ use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, DisplayHand
 use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata};
 use crate::session::compositor::state::MoonshineCompositor;
 
+fn send_ready(resource: &wp_image_description_v1::WpImageDescriptionV1) {
+	static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3);
+	let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	if resource.version() >= 2 {
+		resource.ready2((id >> 32) as u32, id as u32);
+	} else {
+		resource.ready(id as u32);
+	}
+}
+
+fn supported_description(desc: ImageDescription, luminances: Option<(u32, u32, u32)>) -> bool {
+	match (desc.primaries, desc.transfer_function) {
+		(Primaries::Bt2020, TransferFunction::St2084Pq) => {
+			// PQ is absolute. Keep the stream's reference white at 203 nits;
+			// arbitrary viewing-condition adaptation is not implemented.
+			luminances.is_none_or(|(min, _, reference)| min <= 50 && reference == 203)
+		},
+		(Primaries::Srgb, TransferFunction::Srgb | TransferFunction::Gamma22 | TransferFunction::ScrgbLinear) => {
+			// The native encoder's linear unit is 80 nits. Do not silently
+			// accept another scale: it would change highlights at capture.
+			luminances.is_none_or(|(min, max, reference)| min <= 2000 && max == 80 && reference == 80)
+		},
+		_ => false,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -37,6 +53,7 @@ use crate::session::compositor::state::MoonshineCompositor;
 /// Transfer function as declared by a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransferFunction {
+	Srgb,
 	Gamma22,
 	St2084Pq,
 	/// Linear light with extended range (scRGB). Values may exceed 1.0 to
@@ -71,7 +88,7 @@ pub(crate) struct ImageDescription {
 impl ImageDescription {
 	pub fn srgb() -> Self {
 		Self {
-			transfer_function: TransferFunction::Gamma22,
+			transfer_function: TransferFunction::Srgb,
 			primaries: Primaries::Srgb,
 			max_cll: None,
 			max_fall: None,
@@ -117,6 +134,7 @@ impl ImageDescription {
 /// Builder state while creating a parametric image description.
 #[derive(Debug, Default)]
 pub(crate) struct CreatorParams {
+	luminances: Option<(u32, u32, u32)>,
 	transfer_function: Option<TransferFunction>,
 	primaries: Option<Primaries>,
 	max_cll: Option<u32>,
@@ -140,6 +158,8 @@ pub(crate) struct ColorSurfaceData {
 /// User data for `wp_image_description_v1`.
 pub(crate) struct ImageDescriptionUserData {
 	pub desc: ImageDescription,
+	pub valid: bool,
+	pub information_allowed: bool,
 }
 
 /// User data for `wp_image_description_creator_params_v1`.
@@ -148,7 +168,9 @@ pub(crate) struct CreatorParamsUserData {
 }
 
 /// User data for `wp_color_management_output_v1` (minimal).
-pub(crate) struct ColorOutputData;
+pub(crate) struct ColorOutputData {
+	output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+}
 
 /// User data for `wp_color_management_surface_feedback_v1`.
 ///
@@ -173,72 +195,30 @@ pub(crate) struct ColorRepresentationSurfaceData {
 // Compositor-level color management state
 // ---------------------------------------------------------------------------
 
-/// Mastering metadata from `vkSetHdrMetadataEXT`, in raw protocol units.
-///
-/// Holds no transfer function or primaries, so it cannot imply a color space.
-/// [`HdrMetadata`] is the u16 wire form sent to the Moonlight client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MasteringMetadata {
-	max_cll: u32,
-	max_fall: u32,
-	mastering_luminance: (u32, u32),
-	mastering_primaries: [(u32, u32); 3],
-	white_point: (u32, u32),
+#[derive(Clone, Copy, Default)]
+struct SurfaceColor {
+	description: Option<ImageDescription>,
 }
-
-impl MasteringMetadata {
-	/// Whether the values describe a real mastering display.
-	///
-	/// Gamescope: `gamescope_swapchain_set_hdr_metadata()`
-	fn is_plausible(self) -> bool {
-		// Zero CLL/FALL mean unknown content light levels, not invalid mastering data.
-		self.mastering_luminance.1 != 0 && (self.white_point.0 != 0 || self.white_point.1 != 0)
-	}
-
-	fn apply_to(self, desc: &mut ImageDescription) {
-		desc.max_cll = Some(self.max_cll);
-		desc.max_fall = Some(self.max_fall);
-		desc.mastering_luminance = Some(self.mastering_luminance);
-		desc.mastering_primaries = Some(self.mastering_primaries);
-		desc.white_point = Some(self.white_point);
-	}
-}
-
-/// Color state a surface declared through the swapchain protocol.
-///
-/// `swapchain_feedback` owns the colorspace and `vkSetHdrMetadataEXT` the
-/// metadata. They arrive in either order, and metadata alone yields no image
-/// description, so an SDR swapchain can never be read as BT.2020+PQ.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct SwapchainColor {
-	colorspace: Option<(TransferFunction, Primaries)>,
-	metadata: Option<MasteringMetadata>,
-}
-
-impl SwapchainColor {
-	fn to_image_description(self) -> Option<ImageDescription> {
-		let (transfer_function, primaries) = self.colorspace?;
-		// `srgb()` only supplies the empty metadata fields here.
-		let mut desc = ImageDescription {
-			transfer_function,
-			primaries,
-			..ImageDescription::srgb()
-		};
-		if let Some(metadata) = self.metadata {
-			metadata.apply_to(&mut desc);
+impl smithay::wayland::compositor::Cacheable for SurfaceColor {
+	fn commit(&mut self, _: &DisplayHandle) -> Self {
+		Self {
+			description: self.description,
 		}
-		Some(desc)
+	}
+	fn merge_into(self, destination: &mut Self, _: &DisplayHandle) {
+		destination.description = self.description;
 	}
 }
 
 /// Tracks per-surface color space declarations.
 pub(crate) struct ColorManagementState {
-	/// Pending image description per surface (applied on next commit).
-	pending: HashMap<WlSurface, Option<ImageDescription>>,
-	/// Current (committed) image description per surface.
-	current: HashMap<WlSurface, ImageDescription>,
-	/// Current image description per surface from gamescope/moonshine swapchain.
-	gamescope_current: HashMap<WlSurface, SwapchainColor>,
+	/// Surface references used to resolve render-element IDs. Color itself is
+	/// held in Smithay's transaction cache, atomically with its buffer.
+	declared: HashMap<smithay::backend::renderer::element::Id, WlSurface>,
+	observed: HashMap<smithay::backend::renderer::element::Id, Option<ImageDescription>>,
+	surfaces: HashMap<WlSurface, wp_color_management_surface_v1::WpColorManagementSurfaceV1>,
+	outputs: Vec<wp_color_management_output_v1::WpColorManagementOutputV1>,
+	feedback: Vec<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1>,
 	/// Whether HDR mode was negotiated with the Moonlight client.
 	pub hdr: bool,
 }
@@ -256,10 +236,37 @@ impl ColorManagementState {
 			);
 
 		Self {
-			pending: HashMap::new(),
-			current: HashMap::new(),
-			gamescope_current: HashMap::new(),
+			declared: HashMap::new(),
+			observed: HashMap::new(),
+			surfaces: HashMap::new(),
+			outputs: Vec::new(),
+			feedback: Vec::new(),
 			hdr,
+		}
+	}
+
+	/// Output feedback changes with the negotiated stream, including reconnects.
+	pub fn reconfigure(&mut self, hdr: bool) {
+		if self.hdr == hdr {
+			return;
+		}
+		self.hdr = hdr;
+		self.outputs.retain(Resource::is_alive);
+		self.feedback.retain(Resource::is_alive);
+		for resource in &self.outputs {
+			resource.image_description_changed();
+			if let Some(data) = resource.data::<ColorOutputData>()
+				&& data.output.version() >= 2
+			{
+				data.output.done();
+			}
+		}
+		for resource in &self.feedback {
+			if resource.version() >= 2 {
+				resource.preferred_changed2(0, if hdr { 2 } else { 1 });
+			} else {
+				resource.preferred_changed(if hdr { 2 } else { 1 });
+			}
 		}
 	}
 
@@ -270,102 +277,35 @@ impl ColorManagementState {
 			color_space = ?desc.to_frame_color_space(),
 			"set_pending"
 		);
-		self.pending.insert(surface.clone(), Some(desc));
-	}
-
-	/// Gamescope: `swapchain_feedback` carries the color space only.
-	pub fn set_gamescope_colorspace(
-		&mut self,
-		surface: &WlSurface,
-		transfer_function: TransferFunction,
-		primaries: Primaries,
-	) {
-		let entry = self.gamescope_current.entry(surface.clone()).or_default();
-		entry.colorspace = Some((transfer_function, primaries));
-		tracing::debug!(
-			surface_id = ?surface.id(),
-			color_space = ?entry.to_image_description().map(ImageDescription::to_frame_color_space),
-			has_metadata = entry.metadata.is_some(),
-			"set_gamescope_colorspace"
+		self.declared.insert(
+			smithay::backend::renderer::element::Id::from_wayland_resource(surface),
+			surface.clone(),
 		);
+		smithay::wayland::compositor::with_states(surface, |states| {
+			states.cached_state.get::<SurfaceColor>().pending().description = Some(desc);
+		});
 	}
 
-	/// Record a surface's HDR mastering metadata.
-	///
-	/// `vkSetHdrMetadataEXT` carries no transfer function, so this never affects
-	/// which color space the surface is in.
-	pub fn set_gamescope_hdr_metadata(
-		&mut self,
-		surface: &WlSurface,
-		max_cll: u32,
-		max_fall: u32,
-		mastering_luminance: (u32, u32),
-		mastering_primaries: [(u32, u32); 3],
-		white_point: (u32, u32),
-	) {
-		let metadata = MasteringMetadata {
-			max_cll,
-			max_fall,
-			mastering_luminance,
-			mastering_primaries,
-			white_point,
-		};
-		if !metadata.is_plausible() {
-			tracing::debug!(
-				surface_id = ?surface.id(),
-				max_cll,
-				max_fall,
-				?white_point,
-				"set_gamescope_hdr_metadata: implausible metadata, discarding"
-			);
-			return;
-		}
-
-		let entry = self.gamescope_current.entry(surface.clone()).or_default();
-		entry.metadata = Some(metadata);
-		tracing::debug!(
-			surface_id = ?surface.id(),
-			color_space = ?entry.to_image_description().map(ImageDescription::to_frame_color_space),
-			max_cll,
-			max_fall,
-			"set_gamescope_hdr_metadata"
-		);
-	}
-
-	/// Clear the pending image description (from `unset_image_description`).
+	/// Reset on the next surface transaction, including synchronized children.
 	pub fn unset_pending(&mut self, surface: &WlSurface) {
-		self.pending.insert(surface.clone(), None);
+		smithay::wayland::compositor::with_states(surface, |states| {
+			states.cached_state.get::<SurfaceColor>().pending().description = None;
+		});
 	}
 
-	/// Apply pending state on surface commit.
-	pub fn commit(&mut self, surface: &WlSurface) {
-		// Apply wp_color_management pending state.
-		if let Some(pending) = self.pending.remove(surface) {
-			match pending {
-				Some(desc) => {
-					// Some clients (e.g. Forza Horizon via vkd3d-proton)
-					// re-set an identical description every frame; log only
-					// actual changes to keep debug output readable.
-					let prev = self.current.insert(surface.clone(), desc);
-					if prev != Some(desc) {
-						tracing::debug!(
-							surface_id = ?surface.id(),
-							color_space = ?desc.to_frame_color_space(),
-							num_current = self.current.len(),
-							"commit: inserting into current"
-						);
-					}
-				},
-				None => {
-					if self.current.remove(surface).is_some() {
-						tracing::debug!(
-							surface_id = ?surface.id(),
-							"commit: removing from current"
-						);
-					}
-				},
+	/// Detect color changes after native buffer transactions have latched.
+	/// A transfer-function change needs redraw even without pixel damage.
+	pub fn refresh_color_state(&mut self) -> bool {
+		let mut changed = false;
+		for (id, surface) in &self.declared {
+			let description = self.surface_description(surface);
+			if self.observed.get(id).copied().flatten() != description {
+				self.observed.insert(id.clone(), description);
+				tracing::debug!(surface_id = ?surface.id(), ?description, "Native Wayland color state committed");
+				changed = true;
 			}
 		}
+		changed
 	}
 
 	/// Resolve only the surface whose pixels are being exported. Other live
@@ -377,69 +317,24 @@ impl ColorManagementState {
 	}
 
 	fn surface_description(&self, surface: &WlSurface) -> Option<ImageDescription> {
-		self.gamescope_current
-			.get(surface)
-			.and_then(|color| color.to_image_description())
-			.or_else(|| self.current.get(surface).copied())
+		if !surface.is_alive() {
+			return None;
+		}
+		smithay::wayland::compositor::with_states(surface, |states| {
+			states.cached_state.get::<SurfaceColor>().current().description
+		})
 	}
 
 	pub fn surface_hdr_metadata(&self, surface: &WlSurface) -> Option<HdrMetadata> {
 		Self::description_hdr_metadata(self.surface_description(surface)?)
 	}
 
-	/// Get the frame color space for the current fullscreen surface.
-	///
-	/// When multiple HDR surfaces are declared, already-encoded BT.2020+PQ is
-	/// preferred over scRGB-linear: it is a passthrough path, whereas scRGB
-	/// requires a gamut+PQ conversion, so picking PQ avoids an unnecessary
-	/// conversion when both are present. Falls back to `Srgb` when no surface
-	/// declares an HDR color space. Gamescope swapchain declarations are checked
-	/// before wp_color_management declarations within each pass.
-	pub fn frame_color_space(&self) -> FrameColorSpace {
-		let color_spaces = || {
-			self.gamescope_current
-				.values()
-				.filter_map(|c| c.to_image_description())
-				.chain(self.current.values().copied())
-		};
-
-		// First pass: prefer already-encoded BT.2020+PQ (passthrough).
-		if color_spaces().any(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq) {
-			return FrameColorSpace::Bt2020Pq;
-		}
-
-		// Second pass: fall back to scRGB-linear, then sRGB.
-		color_spaces()
-			.map(|desc| desc.to_frame_color_space())
-			.find(|cs| *cs != FrameColorSpace::Srgb)
-			.unwrap_or(FrameColorSpace::Srgb)
-	}
-
-	/// Get HDR metadata from the current fullscreen surface, if any.
-	///
-	/// Returns `Some(HdrMetadata)` when a surface has declared an HDR color
-	/// space (BT.2020+PQ or scRGB-linear) together with mastering metadata.
-	/// scRGB surfaces are included because their content reaches the client
-	/// as BT.2020+PQ after conversion, so the game's metadata (e.g. from
-	/// `vkSetHdrMetadataEXT`) still describes the transported stream.
-	pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
-		// Search all HDR surfaces (gamescope/moonshine swapchain first, then
-		// wp_color_management) for the first one that carries HDR metadata —
-		// not just the first HDR surface, which may have none while another
-		// one does.
-		let desc = self
-			.gamescope_current
-			.values()
-			.filter_map(|c| c.to_image_description())
-			.chain(self.current.values().copied())
-			.filter(|desc| desc.to_frame_color_space() != FrameColorSpace::Srgb)
-			.find(|desc| desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some())?;
-		Self::description_hdr_metadata(desc)
-	}
-
 	fn description_hdr_metadata(desc: ImageDescription) -> Option<HdrMetadata> {
 		if desc.to_frame_color_space() == FrameColorSpace::Srgb
-			|| (desc.max_cll.is_none() && desc.max_fall.is_none() && desc.mastering_luminance.is_none())
+			|| (desc.max_cll.is_none()
+				&& desc.max_fall.is_none()
+				&& desc.mastering_luminance.is_none()
+				&& desc.mastering_primaries.is_none())
 		{
 			return None;
 		}
@@ -447,49 +342,80 @@ impl ColorManagementState {
 		// Well-behaved clients stay within range; clamp rather than truncate.
 		let sat = |v: u32| -> u16 { u16::try_from(v).unwrap_or(u16::MAX) };
 		Some(HdrMetadata {
-			display_primaries: desc.mastering_primaries.map_or([(0, 0); 3], |p| {
-				[
-					(sat(p[0].0), sat(p[0].1)),
-					(sat(p[1].0), sat(p[1].1)),
-					(sat(p[2].0), sat(p[2].1)),
-				]
-			}),
-			white_point: desc.white_point.map_or((0, 0), |(x, y)| (sat(x), sat(y))),
-			max_luminance: desc.mastering_luminance.map_or(0, |(_, max)| max),
+			display_primaries: desc.mastering_primaries.map_or(
+				if desc.primaries == Primaries::Bt2020 {
+					[(35400, 14600), (8500, 39850), (6550, 2300)]
+				} else {
+					[(32000, 16500), (15000, 30000), (7500, 3000)]
+				},
+				|p| {
+					[
+						(sat(p[0].0), sat(p[0].1)),
+						(sat(p[1].0), sat(p[1].1)),
+						(sat(p[2].0), sat(p[2].1)),
+					]
+				},
+			),
+			white_point: desc.white_point.map_or((15635, 16450), |(x, y)| (sat(x), sat(y))),
+			max_luminance: desc.mastering_luminance.map_or(
+				if desc.transfer_function == TransferFunction::St2084Pq {
+					100_000_000
+				} else {
+					// The 80-nit scRGB unit is reference white, not peak
+					// mastering luminance. Keep the existing HDR10 fallback
+					// when a partial declaration supplies no mastering range.
+					HdrMetadata::fallback().max_luminance
+				},
+				|(_, max)| max,
+			),
 			min_luminance: desc.mastering_luminance.map_or(0, |(min, _)| min),
 			max_cll: sat(desc.max_cll.unwrap_or(0)),
 			max_fall: sat(desc.max_fall.unwrap_or(0)),
 		})
 	}
 
-	/// Clear only the gamescope swapchain HDR state for a surface.
-	///
-	/// This is called in two situations:
-	///
-	/// 1. **Same surface, new swapchain**: `create_swapchain` calls this so that
-	///    stale HDR metadata from the previous swapchain does not linger when
-	///    the same `wl_surface` is reused.
-	///
-	/// 2. **New surface replaces old**: `override_window_surface` calls this for
-	///    the *old* override surface when a different `wl_surface` takes over.
-	///    DXVK sometimes creates a new X11 window (and thus a new `wl_surface`)
-	///    when toggling HDR mode, so the old surface's entry must be evicted here
-	///    — it won't be seen by `create_swapchain`, which only sees the new surface.
-	///
-	/// The HDR state will be re-established by `set_gamescope_colorspace` /
-	/// `set_gamescope_hdr_metadata` when the new swapchain reports its color
-	/// space or calls `vkSetHdrMetadataEXT`.
-	pub fn clear_gamescope_current(&mut self, surface: &WlSurface) {
-		if self.gamescope_current.remove(surface).is_some() {
-			tracing::debug!(surface_id = ?surface.id(), "clear_gamescope_current: removed stale HDR state");
+	/// Resolve HDR only from a rendered element belonging to the primary
+	/// application's actual surface tree, including native Vulkan children.
+	pub fn hdr_element_surface(
+		&self,
+		id: &smithay::backend::renderer::element::Id,
+		root: &WlSurface,
+	) -> Option<WlSurface> {
+		let surface = self.declared.get(id)?;
+		if self.surface_color_space(surface) == FrameColorSpace::Srgb {
+			return None;
 		}
+		let mut ancestor = Some(surface.clone());
+		while let Some(current) = ancestor {
+			if &current == root {
+				return Some(surface.clone());
+			}
+			ancestor = smithay::wayland::compositor::get_parent(&current);
+		}
+		None
+	}
+
+	/// Match a draw element to its own surface declaration; undeclared elements
+	/// (including cursors and XWayland) use the default SDR encoding.
+	pub fn element_encoding(&self, id: &smithay::backend::renderer::element::Id) -> usize {
+		self.declared
+			.get(id)
+			.and_then(|s| self.surface_description(s))
+			.map_or(0, |desc| match desc.transfer_function {
+				TransferFunction::Srgb => 0,
+				TransferFunction::St2084Pq => 1,
+				TransferFunction::ScrgbLinear => 2,
+				TransferFunction::Gamma22 => 3,
+			})
 	}
 
 	/// Clean up tracking for a destroyed surface.
 	pub fn surface_destroyed(&mut self, surface: &WlSurface) {
-		self.pending.remove(surface);
-		self.current.remove(surface);
-		self.gamescope_current.remove(surface);
+		self.declared
+			.remove(&smithay::backend::renderer::element::Id::from_wayland_resource(surface));
+		self.surfaces.remove(surface);
+		self.observed
+			.remove(&smithay::backend::renderer::element::Id::from_wayland_resource(surface));
 	}
 }
 
@@ -512,7 +438,7 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineComp
 		// Advertise supported capabilities.
 		resource.supported_intent(wp_color_manager_v1::RenderIntent::Perceptual);
 		resource.supported_feature(wp_color_manager_v1::Feature::Parametric);
-		resource.supported_feature(wp_color_manager_v1::Feature::SetPrimaries);
+		// Arbitrary container primaries are not supported by the encoder.
 		resource.supported_feature(wp_color_manager_v1::Feature::SetMasteringDisplayPrimaries);
 		resource.supported_feature(wp_color_manager_v1::Feature::ExtendedTargetVolume);
 		resource.supported_feature(wp_color_manager_v1::Feature::SetLuminances);
@@ -523,6 +449,7 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineComp
 		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::Srgb);
 		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::Gamma22);
 		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
+		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::ExtLinear);
 		resource.supported_primaries_named(wp_color_manager_v1::Primaries::Srgb);
 		resource.supported_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
 		resource.done();
@@ -531,7 +458,7 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineComp
 
 impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor {
 	fn request(
-		_state: &mut Self,
+		state: &mut Self,
 		_client: &Client,
 		_resource: &wp_color_manager_v1::WpColorManagerV1,
 		request: wp_color_manager_v1::Request,
@@ -544,15 +471,43 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 			wp_color_manager_v1::Request::Destroy => {},
 
 			wp_color_manager_v1::Request::GetSurface { id, surface } => {
-				data_init.init(id, ColorSurfaceData { surface });
+				// Initialize new IDs even on protocol errors: wayland-server
+				// requires object data before returning from a constructor.
+				let resource = data_init.init(
+					id,
+					ColorSurfaceData {
+						surface: surface.clone(),
+					},
+				);
+				if let Some(cm) = &mut state.color_management {
+					if cm.surfaces.contains_key(&surface) {
+						_resource.post_error(
+							wp_color_manager_v1::Error::SurfaceExists,
+							"Surface already has a color object",
+						);
+						return;
+					}
+					cm.surfaces.insert(surface, resource);
+				}
 			},
 
-			wp_color_manager_v1::Request::GetOutput { id, .. } => {
-				data_init.init(id, ColorOutputData);
+			wp_color_manager_v1::Request::GetOutput { id, output } => {
+				let resource = data_init.init(id, ColorOutputData { output });
+				if let Some(cm) = &mut state.color_management {
+					cm.outputs.push(resource);
+				}
 			},
 
 			wp_color_manager_v1::Request::GetSurfaceFeedback { id, surface } => {
-				data_init.init(id, ColorSurfaceFeedbackData { _surface: surface });
+				let resource = data_init.init(id, ColorSurfaceFeedbackData { _surface: surface });
+				if resource.version() >= 2 {
+					resource.preferred_changed2(0, if state.hdr { 2 } else { 1 });
+				} else {
+					resource.preferred_changed(if state.hdr { 2 } else { 1 });
+				}
+				if let Some(cm) = &mut state.color_management {
+					cm.feedback.push(resource);
+				}
 			},
 
 			wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
@@ -566,26 +521,37 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 
 			wp_color_manager_v1::Request::CreateIccCreator { obj } => {
 				data_init.init(obj, IccCreatorData);
+				_resource.post_error(
+					wp_color_manager_v1::Error::UnsupportedFeature,
+					"ICC profiles are not supported",
+				);
 			},
 
 			wp_color_manager_v1::Request::CreateWindowsBt2100 { image_description } => {
 				// Predefined BT.2020/PQ space (HDR10) from the Windows-compatibility requests.
 				let desc = ImageDescription::bt2020_pq();
-				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
-				resource.ready(0);
+				let resource = data_init.init(
+					image_description,
+					ImageDescriptionUserData {
+						desc,
+						valid: true,
+						information_allowed: false,
+					},
+				);
+				send_ready(&resource);
 			},
 
 			wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
-				// Windows scRGB is linear light with sRGB/BT.709 primaries (values
-				// > 1.0 for HDR highlights). Tag it scRGB-linear so the encoder
-				// applies the BT.709→BT.2020 gamut mapping + PQ OETF. DXVK content
-				// never arrives here: Mesa's Vulkan WSI expresses scRGB as a
-				// parametric ext_linear description (which we don't advertise, so
-				// DXVK falls back to an HDR10 swapchain and pre-converts). Only
-				// clients implementing windows_scrgb directly (e.g. mpv) use this.
 				let desc = ImageDescription::scrgb_linear();
-				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
-				resource.ready(0);
+				let resource = data_init.init(
+					image_description,
+					ImageDescriptionUserData {
+						desc,
+						valid: true,
+						information_allowed: false,
+					},
+				);
+				send_ready(&resource);
 			},
 
 			_ => {
@@ -609,14 +575,45 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, ColorS
 		_dhandle: &DisplayHandle,
 		_data_init: &mut DataInit<'_, Self>,
 	) {
+		if !data.surface.is_alive() {
+			if !matches!(request, wp_color_management_surface_v1::Request::Destroy) {
+				_resource.post_error(
+					wp_color_management_surface_v1::Error::Inert,
+					"Surface has been destroyed",
+				);
+			}
+			return;
+		}
 		match request {
-			wp_color_management_surface_v1::Request::Destroy => {},
+			wp_color_management_surface_v1::Request::Destroy => {
+				if let Some(cm) = &mut state.color_management {
+					cm.unset_pending(&data.surface);
+					cm.surfaces.remove(&data.surface);
+				}
+			},
 
 			wp_color_management_surface_v1::Request::SetImageDescription {
 				image_description,
-				render_intent: _,
+				render_intent,
 			} => {
+				if !matches!(
+					render_intent.into_result(),
+					Ok(wp_color_manager_v1::RenderIntent::Perceptual)
+				) {
+					_resource.post_error(
+						wp_color_management_surface_v1::Error::RenderIntent,
+						"Unsupported render intent",
+					);
+					return;
+				}
 				if let Some(desc_data) = image_description.data::<ImageDescriptionUserData>() {
+					if !desc_data.valid {
+						_resource.post_error(
+							wp_color_management_surface_v1::Error::ImageDescription,
+							"Image description is not ready",
+						);
+						return;
+					}
 					tracing::trace!(
 						?desc_data.desc,
 						"Surface set image description"
@@ -658,64 +655,139 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 		match request {
 			wp_image_description_creator_params_v1::Request::Create { image_description } => {
 				let params = data.params.lock().unwrap();
+				let (Some(transfer_function), Some(primaries)) = (params.transfer_function, params.primaries) else {
+					data_init.init(
+						image_description,
+						ImageDescriptionUserData {
+							desc: ImageDescription::srgb(),
+							valid: false,
+							information_allowed: false,
+						},
+					);
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::IncompleteSet,
+						"Transfer function and primaries are required",
+					);
+					return;
+				};
 				let desc = ImageDescription {
-					transfer_function: params.transfer_function.unwrap_or(TransferFunction::Gamma22),
-					primaries: params.primaries.unwrap_or(Primaries::Srgb),
+					transfer_function,
+					primaries,
 					max_cll: params.max_cll,
 					max_fall: params.max_fall,
 					mastering_luminance: params.mastering_luminance,
 					mastering_primaries: params.mastering_primaries,
 					white_point: params.white_point,
 				};
+				if !supported_description(desc, params.luminances) {
+					let resource = data_init.init(
+						image_description,
+						ImageDescriptionUserData {
+							desc,
+							valid: false,
+							information_allowed: false,
+						},
+					);
+					resource.failed(
+						wp_image_description_v1::Cause::Unsupported,
+						"Unsupported color encoding or luminance scale".to_string(),
+					);
+					return;
+				}
 				tracing::trace!(?desc, "Created parametric image description");
 
-				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
+				let resource = data_init.init(
+					image_description,
+					ImageDescriptionUserData {
+						desc,
+						valid: true,
+						information_allowed: false,
+					},
+				);
 				// Signal that the image description is ready.
-				resource.ready(0);
+				send_ready(&resource);
 			},
 
 			wp_image_description_creator_params_v1::Request::SetTfNamed { tf } => {
 				let tf = match tf.into_result() {
 					Ok(wp_color_manager_v1::TransferFunction::St2084Pq) => TransferFunction::St2084Pq,
-					// sRGB's piecewise EOTF is close enough to pure gamma 2.2
-					// for SDR passthrough; both named TFs are advertised.
-					Ok(wp_color_manager_v1::TransferFunction::Gamma22)
-					| Ok(wp_color_manager_v1::TransferFunction::Srgb) => TransferFunction::Gamma22,
-					other => {
-						tracing::debug!(?other, "Unsupported transfer function, defaulting to gamma22");
-						TransferFunction::Gamma22
+					Ok(wp_color_manager_v1::TransferFunction::Gamma22) => TransferFunction::Gamma22,
+					Ok(wp_color_manager_v1::TransferFunction::Srgb) => TransferFunction::Srgb,
+					Ok(wp_color_manager_v1::TransferFunction::ExtLinear) => TransferFunction::ScrgbLinear,
+					_ => {
+						_resource.post_error(
+							wp_image_description_creator_params_v1::Error::InvalidTf,
+							"Unsupported transfer function",
+						);
+						return;
 					},
 				};
-				data.params.lock().unwrap().transfer_function = Some(tf);
+				let mut params = data.params.lock().unwrap();
+				if params.transfer_function.is_some() {
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::AlreadySet,
+						"Parameter already set",
+					);
+					return;
+				}
+				params.transfer_function = Some(tf);
 			},
 
 			wp_image_description_creator_params_v1::Request::SetPrimariesNamed { primaries } => {
 				let p = match primaries.into_result() {
 					Ok(wp_color_manager_v1::Primaries::Bt2020) => Primaries::Bt2020,
 					Ok(wp_color_manager_v1::Primaries::Srgb) => Primaries::Srgb,
-					other => {
-						tracing::debug!(?other, "Unsupported primaries, defaulting to sRGB");
-						Primaries::Srgb
+					_ => {
+						_resource.post_error(
+							wp_image_description_creator_params_v1::Error::InvalidPrimariesNamed,
+							"Unsupported primaries",
+						);
+						return;
 					},
 				};
-				data.params.lock().unwrap().primaries = Some(p);
+				let mut params = data.params.lock().unwrap();
+				if params.primaries.is_some() {
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::AlreadySet,
+						"Parameter already set",
+					);
+					return;
+				}
+				params.primaries = Some(p);
 			},
 
 			wp_image_description_creator_params_v1::Request::SetMaxCll { max_cll } => {
 				tracing::debug!(max_cll, "Set max content light level");
-				data.params.lock().unwrap().max_cll = Some(max_cll);
+				let mut params = data.params.lock().unwrap();
+				params.max_cll = Some(max_cll);
 			},
 
 			wp_image_description_creator_params_v1::Request::SetMaxFall { max_fall } => {
 				tracing::debug!(max_fall, "Set max frame-average light level");
-				data.params.lock().unwrap().max_fall = Some(max_fall);
+				let mut params = data.params.lock().unwrap();
+				params.max_fall = Some(max_fall);
 			},
 
 			wp_image_description_creator_params_v1::Request::SetMasteringLuminance { min_lum, max_lum } => {
+				if u64::from(max_lum) * 10000 <= u64::from(min_lum) {
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::InvalidLuminance,
+						"Invalid mastering luminance range",
+					);
+					return;
+				}
 				tracing::debug!(min_lum, max_lum, "Set mastering luminance");
 				// min_lum is in 0.0001 cd/m² units; max_lum is in 1 cd/m² units.
 				// Normalize both to 0.0001 cd/m² units.
-				data.params.lock().unwrap().mastering_luminance = Some((min_lum, max_lum.saturating_mul(10000)));
+				let mut params = data.params.lock().unwrap();
+				if params.mastering_luminance.is_some() {
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::AlreadySet,
+						"Parameter already set",
+					);
+					return;
+				}
+				params.mastering_luminance = Some((min_lum, max_lum.saturating_mul(10000)));
 			},
 
 			wp_image_description_creator_params_v1::Request::SetMasteringDisplayPrimaries {
@@ -732,6 +804,13 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 				// Convert to 0.00002 units (divide by 20) to match CTA-861.G format.
 				let to_cta = |v: i32| -> u32 { (v.max(0) as u32) / 20 };
 				let mut params = data.params.lock().unwrap();
+				if params.mastering_primaries.is_some() {
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::AlreadySet,
+						"Mastering primaries already set",
+					);
+					return;
+				}
 				params.mastering_primaries = Some([
 					(to_cta(r_x), to_cta(r_y)),
 					(to_cta(g_x), to_cta(g_y)),
@@ -751,10 +830,34 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 				);
 			},
 
+			wp_image_description_creator_params_v1::Request::SetLuminances {
+				min_lum,
+				max_lum,
+				reference_lum,
+			} => {
+				if u64::from(max_lum) * 10000 <= u64::from(min_lum)
+					|| u64::from(reference_lum) * 10000 <= u64::from(min_lum)
+				{
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::InvalidLuminance,
+						"Invalid luminance range",
+					);
+					return;
+				}
+				let mut params = data.params.lock().unwrap();
+				if params.luminances.replace((min_lum, max_lum, reference_lum)).is_some() {
+					_resource.post_error(
+						wp_image_description_creator_params_v1::Error::AlreadySet,
+						"Luminances already set",
+					);
+				}
+			},
 			wp_image_description_creator_params_v1::Request::SetTfPower { .. }
-			| wp_image_description_creator_params_v1::Request::SetPrimaries { .. }
-			| wp_image_description_creator_params_v1::Request::SetLuminances { .. } => {
-				tracing::trace!("Ignoring advanced parametric creator parameter");
+			| wp_image_description_creator_params_v1::Request::SetPrimaries { .. } => {
+				_resource.post_error(
+					wp_image_description_creator_params_v1::Error::UnsupportedFeature,
+					"Only advertised named encodings are supported",
+				);
 			},
 
 			_ => {},
@@ -780,8 +883,15 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionUse
 			wp_image_description_v1::Request::Destroy => {},
 
 			wp_image_description_v1::Request::GetInformation { information } => {
-				tracing::debug!(?data.desc, "GetInformation: sending image description info");
 				let info = data_init.init(information, ImageDescriptionInfoData);
+				if !data.information_allowed {
+					_resource.post_error(
+						wp_image_description_v1::Error::NoInformation,
+						"This description does not allow information queries",
+					);
+					return;
+				}
+				tracing::debug!(?data.desc, "GetInformation: sending image description info");
 
 				// Send parametric description events.
 				match data.desc.primaries {
@@ -789,8 +899,12 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionUse
 					Primaries::Bt2020 => info.primaries_named(wp_color_manager_v1::Primaries::Bt2020),
 				}
 				match data.desc.transfer_function {
-					TransferFunction::Gamma22 => {
-						info.tf_named(wp_color_manager_v1::TransferFunction::Gamma22);
+					TransferFunction::Srgb | TransferFunction::Gamma22 => {
+						info.tf_named(if data.desc.transfer_function == TransferFunction::Srgb {
+							wp_color_manager_v1::TransferFunction::Srgb
+						} else {
+							wp_color_manager_v1::TransferFunction::Gamma22
+						});
 						// sRGB: 0.2–80 cd/m², reference white 80 cd/m².
 						info.luminances(2000, 80, 80);
 						info.target_luminance(2000, 80);
@@ -804,7 +918,7 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionUse
 					TransferFunction::ScrgbLinear => {
 						info.tf_named(wp_color_manager_v1::TransferFunction::ExtLinear);
 						// scRGB: linear with extended range, 1.0 == 80 cd/m² (IEC 61966-2-2).
-						info.luminances(0, 10000, 80);
+						info.luminances(0, 80, 80);
 						info.target_luminance(0, 10000);
 					},
 				}
@@ -856,7 +970,11 @@ impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, ColorOut
 		data_init: &mut DataInit<'_, Self>,
 	) {
 		match request {
-			wp_color_management_output_v1::Request::Destroy => {},
+			wp_color_management_output_v1::Request::Destroy => {
+				if let Some(cm) = &mut state.color_management {
+					cm.outputs.retain(|r| r != _resource);
+				}
+			},
 
 			wp_color_management_output_v1::Request::GetImageDescription { image_description } => {
 				// Return a BT.2020+PQ description if HDR is active, otherwise sRGB.
@@ -865,8 +983,24 @@ impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, ColorOut
 				} else {
 					ImageDescription::srgb()
 				};
-				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
-				resource.ready(0);
+				let resource = data_init.init(
+					image_description,
+					ImageDescriptionUserData {
+						desc,
+						valid: true,
+						information_allowed: true,
+					},
+				);
+				let identity = if desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq {
+					2
+				} else {
+					1
+				};
+				if resource.version() >= 2 {
+					resource.ready2(0, identity);
+				} else {
+					resource.ready(identity);
+				}
 			},
 
 			_ => {},
@@ -886,23 +1020,58 @@ impl Dispatch<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceF
 		_client: &Client,
 		_resource: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
 		request: wp_color_management_surface_feedback_v1::Request,
-		_data: &ColorSurfaceFeedbackData,
+		data: &ColorSurfaceFeedbackData,
 		_dhandle: &DisplayHandle,
 		data_init: &mut DataInit<'_, Self>,
 	) {
 		match request {
-			wp_color_management_surface_feedback_v1::Request::Destroy => {},
+			wp_color_management_surface_feedback_v1::Request::Destroy => {
+				if let Some(cm) = &mut state.color_management {
+					cm.feedback.retain(|r| r != _resource);
+				}
+			},
 
 			wp_color_management_surface_feedback_v1::Request::GetPreferred { image_description }
 			| wp_color_management_surface_feedback_v1::Request::GetPreferredParametric { image_description } => {
+				if !data._surface.is_alive() {
+					data_init.init(
+						image_description,
+						ImageDescriptionUserData {
+							desc: ImageDescription::srgb(),
+							valid: false,
+							information_allowed: false,
+						},
+					);
+					_resource.post_error(
+						wp_color_management_surface_feedback_v1::Error::Inert,
+						"Surface has been destroyed",
+					);
+					return;
+				}
 				let desc = if state.color_management.as_ref().is_some_and(|cm| cm.hdr) {
 					ImageDescription::bt2020_pq()
 				} else {
 					ImageDescription::srgb()
 				};
 				tracing::debug!(?desc, "GetPreferred: returning image description");
-				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
-				resource.ready(0);
+				let resource = data_init.init(
+					image_description,
+					ImageDescriptionUserData {
+						desc,
+						valid: true,
+						information_allowed: true,
+					},
+				);
+				let identity = if desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq {
+					2
+				} else {
+					1
+				};
+				if resource.version() >= 2 {
+					resource.ready2(0, identity);
+				} else {
+					resource.ready(identity);
+				}
 			},
 
 			_ => {},
@@ -934,6 +1103,8 @@ impl Dispatch<wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV
 					image_description,
 					ImageDescriptionUserData {
 						desc: ImageDescription::srgb(),
+						valid: false,
+						information_allowed: false,
 					},
 				);
 				resource.failed(
@@ -966,7 +1137,6 @@ impl GlobalDispatch<wp_color_representation_manager_v1::WpColorRepresentationMan
 
 		// Advertise supported alpha modes.
 		resource.supported_alpha_mode(wp_color_representation_surface_v1::AlphaMode::PremultipliedElectrical);
-		resource.supported_alpha_mode(wp_color_representation_surface_v1::AlphaMode::Straight);
 
 		// Advertise identity coefficients (RGB) with full range.
 		resource.supported_coefficients_and_ranges(
@@ -1021,12 +1191,29 @@ impl Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1
 
 			wp_color_representation_surface_v1::Request::SetAlphaMode { alpha_mode } => {
 				tracing::debug!(?alpha_mode, "Surface set alpha mode");
-				// Accept but don't act — single fullscreen passthrough.
+				if !matches!(
+					alpha_mode.into_result(),
+					Ok(wp_color_representation_surface_v1::AlphaMode::PremultipliedElectrical)
+				) {
+					_resource.post_error(
+						wp_color_representation_surface_v1::Error::AlphaMode,
+						"Only premultiplied electrical alpha is supported",
+					);
+				}
 			},
 
 			wp_color_representation_surface_v1::Request::SetCoefficientsAndRange { coefficients, range } => {
 				tracing::debug!(?coefficients, ?range, "Surface set coefficients and range");
-				// Accept but don't act — we only support identity/full range RGB.
+				if !matches!(
+					coefficients.into_result(),
+					Ok(wp_color_representation_surface_v1::Coefficients::Identity)
+				) || !matches!(range.into_result(), Ok(wp_color_representation_surface_v1::Range::Full))
+				{
+					_resource.post_error(
+						wp_color_representation_surface_v1::Error::Coefficients,
+						"Only identity/full-range RGB is supported",
+					);
+				}
 			},
 
 			wp_color_representation_surface_v1::Request::SetChromaLocation { chroma_location } => {
@@ -1041,201 +1228,335 @@ impl Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1
 
 #[cfg(test)]
 mod tests {
-	use super::{
-		ColorManagementState, FrameColorSpace, ImageDescription, MasteringMetadata, Primaries, SwapchainColor,
-		TransferFunction,
+	use super::*;
+	use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
+	use std::{os::unix::net::UnixStream, sync::Arc};
+	use wayland_client::{
+		Connection, QueueHandle,
+		protocol::{wl_compositor, wl_registry, wl_subcompositor, wl_subsurface, wl_surface},
 	};
-
-	fn mastering_metadata() -> MasteringMetadata {
-		MasteringMetadata {
-			max_cll: 2000,
-			max_fall: 500,
-			mastering_luminance: (0, 1200),
-			mastering_primaries: [(1, 2), (3, 4), (5, 6)],
-			white_point: (7, 8),
+	struct Server {
+		compositor: CompositorState,
+		surfaces: Vec<WlSurface>,
+	}
+	struct ClientData {
+		compositor: CompositorClientState,
+	}
+	impl smithay::reexports::wayland_server::backend::ClientData for ClientData {}
+	impl CompositorHandler for Server {
+		fn compositor_state(&mut self) -> &mut CompositorState {
+			&mut self.compositor
 		}
+		fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+			&client.get_data::<ClientData>().unwrap().compositor
+		}
+		fn new_surface(&mut self, surface: &WlSurface) {
+			self.surfaces.push(surface.clone());
+		}
+		fn commit(&mut self, _: &WlSurface) {}
 	}
-
-	/// The reported bug: an SDR swapchain that sets metadata must not end up
-	/// described as BT.2020+PQ.
-	#[test]
-	fn metadata_without_a_color_space_describes_nothing() {
-		let color = SwapchainColor {
-			colorspace: None,
-			metadata: Some(mastering_metadata()),
-		};
-
-		assert_eq!(color.to_image_description(), None);
+	smithay::delegate_dispatch2!(Server);
+	#[derive(Default)]
+	struct Peer {
+		compositor_name: u32,
+		subcompositor_name: u32,
+		color_manager_name: u32,
 	}
-
-	#[test]
-	fn color_space_without_metadata_describes_itself() {
-		let color = SwapchainColor {
-			colorspace: Some((TransferFunction::St2084Pq, Primaries::Bt2020)),
-			metadata: None,
-		};
-
-		let desc = color.to_image_description().expect("color space was declared");
-		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Bt2020Pq);
-		assert_eq!(desc.max_cll, None);
-	}
-
-	/// DXVK's HDR10 path: metadata attaches to the declared space, and does not
-	/// pick one of its own.
-	#[test]
-	fn metadata_attaches_to_the_declared_color_space() {
-		let color = SwapchainColor {
-			colorspace: Some((TransferFunction::ScrgbLinear, Primaries::Srgb)),
-			metadata: Some(mastering_metadata()),
-		};
-
-		let desc = color.to_image_description().expect("color space was declared");
-		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::ScrgbLinear);
-		assert_eq!(desc.max_cll, Some(2000));
-		assert_eq!(desc.max_fall, Some(500));
-		assert_eq!(desc.mastering_luminance, Some((0, 1200)));
-		assert_eq!(desc.mastering_primaries, Some([(1, 2), (3, 4), (5, 6)]));
-		assert_eq!(desc.white_point, Some((7, 8)));
-	}
-
-	#[test]
-	fn srgb_helper_maps_to_srgb_frame_color_space() {
-		assert_eq!(ImageDescription::srgb().to_frame_color_space(), FrameColorSpace::Srgb);
-	}
-
-	#[test]
-	fn direct_capture_color_is_scoped_to_the_exported_surface() {
-		use smithay::reexports::wayland_server::protocol::wl_surface::{self, WlSurface};
-		use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, Resource};
-		use std::{collections::HashMap, os::unix::net::UnixStream, sync::Arc};
-		struct TestState;
-		impl Dispatch<WlSurface, ()> for TestState {
-			fn request(
-				_: &mut Self,
-				_: &Client,
-				_: &WlSurface,
-				_: wl_surface::Request,
-				_: &(),
-				_: &DisplayHandle,
-				_: &mut DataInit<'_, Self>,
-			) {
+	impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for Peer {
+		fn event(
+			state: &mut Self,
+			_: &wl_registry::WlRegistry,
+			event: wl_registry::Event,
+			_: &(),
+			_: &Connection,
+			_: &QueueHandle<Self>,
+		) {
+			if let wl_registry::Event::Global { name, interface, .. } = event {
+				match interface.as_str() {
+					"wl_compositor" => state.compositor_name = name,
+					"wl_subcompositor" => state.subcompositor_name = name,
+					"wp_color_manager_v1" => state.color_manager_name = name,
+					_ => {},
+				}
 			}
 		}
-		let display = Display::<TestState>::new().unwrap();
-		let mut handle = display.handle();
-		let (server, _peer) = UnixStream::pair().unwrap();
-		let client = handle.insert_client(server, Arc::new(())).unwrap();
-		let captured = client
-			.create_resource::<WlSurface, (), TestState>(&handle, 1, ())
-			.unwrap();
-		let hidden = client
-			.create_resource::<WlSurface, (), TestState>(&handle, 1, ())
-			.unwrap();
-		assert!(captured.is_alive());
-		let mut cm = ColorManagementState {
-			pending: HashMap::new(),
-			current: HashMap::new(),
-			gamescope_current: HashMap::new(),
-			hdr: true,
-		};
-		cm.current.insert(hidden, ImageDescription::bt2020_pq());
-		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::Srgb);
-		cm.current.insert(captured.clone(), ImageDescription::scrgb_linear());
-		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::ScrgbLinear);
-		cm.gamescope_current.insert(
-			captured.clone(),
-			SwapchainColor {
-				colorspace: Some((TransferFunction::St2084Pq, Primaries::Bt2020)),
-				metadata: Some(mastering_metadata()),
+	}
+	wayland_client::delegate_noop!(Peer: ignore wl_compositor::WlCompositor);
+	wayland_client::delegate_noop!(Peer: ignore wl_surface::WlSurface);
+	wayland_client::delegate_noop!(Peer: ignore wl_subcompositor::WlSubcompositor);
+	wayland_client::delegate_noop!(Peer: ignore wl_subsurface::WlSubsurface);
+	use wayland_protocols::wp::color_management::v1::client as native;
+	wayland_client::delegate_noop!(Peer: ignore native::wp_color_manager_v1::WpColorManagerV1);
+	wayland_client::delegate_noop!(Peer: ignore native::wp_color_management_surface_v1::WpColorManagementSurfaceV1);
+	wayland_client::delegate_noop!(Peer: ignore native::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1);
+	wayland_client::delegate_noop!(Peer: ignore native::wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1);
+	wayland_client::delegate_noop!(Peer: ignore native::wp_image_description_v1::WpImageDescriptionV1);
+	wayland_client::delegate_noop!(Peer: ignore native::wp_image_description_info_v1::WpImageDescriptionInfoV1);
+
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn invalid_native_color_constructors_disconnect_only_the_offending_client() {
+		use super::super::{Compositor, CompositorConfig, CompositorContext};
+		use crate::session::manager::SessionShutdownReason;
+		let stop = async_shutdown::ShutdownManager::new();
+		let (foreground, _) = tokio::sync::watch::channel(None);
+		let (compositor, _handles) = Compositor::new(
+			CompositorConfig::default(),
+			CompositorContext {
+				width: 1280,
+				height: 720,
+				refresh_rate: 60,
+				hdr: false,
+				output_scale: 1.0,
+				log_stats: false,
 			},
+			stop.clone(),
+			foreground,
 		);
-		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::Bt2020Pq);
-		assert_eq!(cm.surface_hdr_metadata(&captured).unwrap().max_cll, 2000);
-		cm.clear_gamescope_current(&captured);
-		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::ScrgbLinear);
-		assert!(cm.surface_hdr_metadata(&captured).is_none());
-		cm.current.remove(&captured);
-		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::Srgb);
+		let launched = compositor.launch().unwrap();
+		let socket_path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+			.join(&launched.ready().wayland_display);
+		for case in 0..4 {
+			let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+			let mut queue = connection.new_event_queue::<Peer>();
+			let qh = queue.handle();
+			let registry = connection.display().get_registry(&qh, ());
+			let mut peer = Peer::default();
+			queue.roundtrip(&mut peer).unwrap();
+			let manager: native::wp_color_manager_v1::WpColorManagerV1 =
+				registry.bind(peer.color_manager_name, 3, &qh, ());
+			let compositor: wl_compositor::WlCompositor = registry.bind(peer.compositor_name, 6, &qh, ());
+			let surface = compositor.create_surface(&qh, ());
+			match case {
+				0 => {
+					let _a = manager.get_surface(&surface, &qh, ());
+					let _b = manager.get_surface(&surface, &qh, ());
+				},
+				1 => {
+					let creator = manager.create_parametric_creator(&qh, ());
+					let _desc = creator.create(&qh, ());
+				},
+				2 => {
+					let _icc = manager.create_icc_creator(&qh, ());
+				},
+				3 => {
+					let desc = manager.create_windows_scrgb(&qh, ());
+					queue.roundtrip(&mut peer).unwrap();
+					let _info = desc.get_information(&qh, ());
+				},
+				_ => unreachable!(),
+			}
+			assert!(
+				queue.roundtrip(&mut peer).is_err(),
+				"case {case} did not reject invalid protocol use"
+			);
+		}
+		// A fresh, valid client must still be served after every invalid one.
+		let connection = Connection::from_socket(UnixStream::connect(socket_path).unwrap()).unwrap();
+		let mut queue = connection.new_event_queue::<Peer>();
+		let _registry = connection.display().get_registry(&queue.handle(), ());
+		queue.roundtrip(&mut Peer::default()).unwrap();
+		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
+		tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap()
+			.block_on(async {
+				tokio::time::timeout(std::time::Duration::from_secs(10), stop.wait_shutdown_complete())
+					.await
+					.unwrap();
+			});
+	}
+
+	struct Harness {
+		display: smithay::reexports::wayland_server::Display<Server>,
+		server: Server,
+		connection: Connection,
+		a: wl_surface::WlSurface,
+		b: wl_surface::WlSurface,
+		subcompositor: wl_subcompositor::WlSubcompositor,
+		qh: QueueHandle<Peer>,
+	}
+	impl Harness {
+		fn new() -> Self {
+			let mut display = smithay::reexports::wayland_server::Display::<Server>::new().unwrap();
+			let mut handle = display.handle();
+			let compositor = CompositorState::new_v6::<Server>(&handle);
+			let mut server = Server {
+				compositor,
+				surfaces: Vec::new(),
+			};
+			let (socket, peer) = UnixStream::pair().unwrap();
+			handle
+				.insert_client(
+					socket,
+					Arc::new(ClientData {
+						compositor: CompositorClientState::default(),
+					}),
+				)
+				.unwrap();
+			let connection = Connection::from_socket(peer).unwrap();
+			let mut queue = connection.new_event_queue::<Peer>();
+			let qh = queue.handle();
+			let registry = connection.display().get_registry(&qh, ());
+			connection.flush().unwrap();
+			display.dispatch_clients(&mut server).unwrap();
+			handle.flush_clients().unwrap();
+			queue.prepare_read().unwrap().read().unwrap();
+			let mut state = Peer::default();
+			queue.dispatch_pending(&mut state).unwrap();
+			let compositor: wl_compositor::WlCompositor = registry.bind(state.compositor_name, 6, &qh, ());
+			let subcompositor = registry.bind(state.subcompositor_name, 1, &qh, ());
+			let a = compositor.create_surface(&qh, ());
+			let b = compositor.create_surface(&qh, ());
+			connection.flush().unwrap();
+			display.dispatch_clients(&mut server).unwrap();
+			assert_eq!(server.surfaces.len(), 2);
+			Self {
+				display,
+				server,
+				connection,
+				a,
+				b,
+				subcompositor,
+				qh,
+			}
+		}
+		fn commit(&mut self, index: usize) {
+			if index == 0 {
+				self.a.commit();
+			} else {
+				self.b.commit();
+			}
+			self.dispatch();
+		}
+		fn dispatch(&mut self) {
+			self.connection.flush().unwrap();
+			self.display.dispatch_clients(&mut self.server).unwrap();
+		}
+	}
+	fn colors() -> ColorManagementState {
+		ColorManagementState {
+			declared: HashMap::new(),
+			observed: HashMap::new(),
+			surfaces: HashMap::new(),
+			outputs: Vec::new(),
+			feedback: Vec::new(),
+			hdr: true,
+		}
+	}
+	#[test]
+	fn native_surface_color_lifecycle_and_metadata_isolation() {
+		let mut h = Harness::new();
+		let a = h.server.surfaces[0].clone();
+		let b = h.server.surfaces[1].clone();
+		let mut cm = colors();
+		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Srgb);
+		let mut pq = ImageDescription::bt2020_pq();
+		pq.max_cll = Some(2000);
+		pq.max_fall = Some(500);
+		pq.mastering_luminance = Some((10, 12_000_000));
+		pq.mastering_primaries = Some([(35400, 14600), (8500, 39850), (6550, 2300)]);
+		pq.white_point = Some((15635, 16450));
+		cm.set_pending(&a, pq);
+		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Srgb);
+		h.commit(0);
+		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Bt2020Pq);
+		let metadata = cm.surface_hdr_metadata(&a).unwrap();
+		assert_eq!(metadata.max_cll, 2000);
+		assert_eq!(metadata.max_fall, 500);
+		assert_eq!(metadata.max_luminance, 12_000_000);
+		assert_eq!(metadata.min_luminance, 10);
+		assert_eq!(
+			metadata.display_primaries,
+			[(35400, 14600), (8500, 39850), (6550, 2300)]
+		);
+		assert_eq!(metadata.white_point, (15635, 16450));
+		assert_eq!(cm.surface_color_space(&b), FrameColorSpace::Srgb);
+		assert!(cm.surface_hdr_metadata(&b).is_none());
+		cm.set_pending(&b, ImageDescription::scrgb_linear());
+		h.commit(1);
+		assert_eq!(cm.surface_color_space(&b), FrameColorSpace::ScrgbLinear);
+		assert!(cm.surface_hdr_metadata(&b).is_none());
+		cm.set_pending(&a, ImageDescription::srgb());
+		h.commit(0);
+		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Srgb);
+		assert!(cm.surface_hdr_metadata(&a).is_none());
+		cm.set_pending(&a, pq);
+		h.commit(0);
+		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Bt2020Pq);
+		cm.unset_pending(&a);
+		h.commit(0);
+		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Srgb);
+		cm.set_pending(&a, pq);
+		h.commit(0);
+		cm.surface_destroyed(&a);
+		h.a.destroy();
+		h.dispatch();
+		assert!(
+			cm.declared
+				.keys()
+				.all(|id| id != &smithay::backend::renderer::element::Id::from_wayland_resource(&a))
+		);
+		assert_eq!(cm.surface_color_space(&b), FrameColorSpace::ScrgbLinear);
+	}
+	#[test]
+	fn synchronized_subsurface_color_follows_its_parent_transaction() {
+		let mut h = Harness::new();
+		let child = h.server.surfaces[1].clone();
+		let _subsurface = h.subcompositor.get_subsurface(&h.b, &h.a, &h.qh, ());
+		h.dispatch();
+		let mut cm = colors();
+		cm.set_pending(&child, ImageDescription::scrgb_linear());
+		h.commit(1);
+		assert_eq!(cm.surface_color_space(&child), FrameColorSpace::Srgb);
+		h.commit(0);
+		assert_eq!(cm.surface_color_space(&child), FrameColorSpace::ScrgbLinear);
+		let id = smithay::backend::renderer::element::Id::from_wayland_resource(&child);
+		assert_eq!(cm.hdr_element_surface(&id, &h.server.surfaces[0]), Some(child.clone()));
+		assert!(cm.hdr_element_surface(&id, &child).is_some());
+		cm.unset_pending(&child);
+		h.commit(1);
+		assert_eq!(cm.surface_color_space(&child), FrameColorSpace::ScrgbLinear);
+		h.commit(0);
+		assert_eq!(cm.surface_color_space(&child), FrameColorSpace::Srgb);
 	}
 
 	#[test]
-	fn hdr_metadata_stays_with_its_declared_pixels() {
-		let mut desc = ImageDescription::bt2020_pq();
-		desc.max_cll = Some(1200);
-		desc.max_fall = Some(400);
-		desc.mastering_luminance = Some((10, 10_000_000));
-		let metadata = ColorManagementState::description_hdr_metadata(desc).unwrap();
-		assert_eq!(metadata.max_cll, 1200);
-		assert_eq!(metadata.max_luminance, 10_000_000);
-		desc.transfer_function = TransferFunction::Gamma22;
-		desc.primaries = Primaries::Srgb;
-		assert!(ColorManagementState::description_hdr_metadata(desc).is_none());
-		assert!(ColorManagementState::description_hdr_metadata(ImageDescription::bt2020_pq()).is_none());
-	}
-
-	#[test]
-	fn implausible_mastering_metadata_is_rejected() {
-		assert!(mastering_metadata().is_plausible());
-
-		let zero_cll = MasteringMetadata {
-			max_cll: 0,
-			..mastering_metadata()
-		};
-		let zero_fall = MasteringMetadata {
-			max_fall: 0,
-			..mastering_metadata()
-		};
-		let zero_white_point = MasteringMetadata {
-			white_point: (0, 0),
-			..mastering_metadata()
-		};
-
-		assert!(zero_cll.is_plausible());
-		assert!(zero_fall.is_plausible());
-		assert!(!zero_white_point.is_plausible());
-	}
-
-	/// One non-zero coordinate is still a coordinate.
-	#[test]
-	fn partially_zero_white_point_is_plausible() {
-		let half = MasteringMetadata {
-			white_point: (0, 8),
-			..mastering_metadata()
-		};
-		assert!(half.is_plausible());
-	}
-
-	#[test]
-	fn bt2020_pq_helper_maps_to_bt2020pq_frame_color_space() {
-		let desc = ImageDescription::bt2020_pq();
-		assert_eq!(desc.primaries, Primaries::Bt2020);
-		assert_eq!(desc.transfer_function, TransferFunction::St2084Pq);
-		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Bt2020Pq);
-	}
-
-	#[test]
-	fn scrgb_linear_helper_maps_to_scrgb_frame_color_space() {
-		let desc = ImageDescription::scrgb_linear();
-		// scRGB uses BT.709 primaries, which share values with sRGB.
-		assert_eq!(desc.primaries, Primaries::Srgb);
-		assert_eq!(desc.transfer_function, TransferFunction::ScrgbLinear);
-		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::ScrgbLinear);
-	}
-
-	#[test]
-	fn unrecognized_color_combination_falls_back_to_sdr() {
-		// Gamma22 with BT.2020 primaries is nonsensical; the fallback arm must
-		// route such descriptors to Srgb so SDR behaviour is preserved rather
-		// than misclassifying them as HDR.
+	fn partial_scrgb_metadata_keeps_reference_white_distinct_from_mastering_peak() {
 		let desc = ImageDescription {
-			primaries: Primaries::Bt2020,
-			transfer_function: TransferFunction::Gamma22,
-			max_cll: None,
-			max_fall: None,
-			mastering_luminance: None,
-			mastering_primaries: None,
-			white_point: None,
+			max_cll: Some(2000),
+			max_fall: Some(500),
+			..ImageDescription::scrgb_linear()
 		};
-		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Srgb);
+		let metadata = ColorManagementState::description_hdr_metadata(desc).unwrap();
+		assert_eq!(metadata.max_cll, 2000);
+		assert_eq!(metadata.max_fall, 500);
+		assert_eq!(metadata.max_luminance, HdrMetadata::fallback().max_luminance);
+		assert_ne!(metadata.max_luminance, 80 * 10000);
+	}
+
+	#[test]
+	fn supported_encodings_and_luminance_scales() {
+		assert!(supported_description(ImageDescription::srgb(), None));
+		assert!(supported_description(
+			ImageDescription::bt2020_pq(),
+			Some((50, 10000, 203))
+		));
+		assert!(supported_description(
+			ImageDescription::scrgb_linear(),
+			Some((0, 80, 80))
+		));
+		assert!(!supported_description(
+			ImageDescription::scrgb_linear(),
+			Some((0, 1000, 203))
+		));
+		assert!(!supported_description(
+			ImageDescription {
+				primaries: Primaries::Bt2020,
+				..ImageDescription::srgb()
+			},
+			None
+		));
 	}
 }

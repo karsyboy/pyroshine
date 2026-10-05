@@ -5,6 +5,10 @@ are available from the [Pyroshine releases page](https://github.com/karsyboy/pyr
 The published portable archive and native packages target x86_64 Linux; release
 binaries are built on Ubuntu 24.04 (glibc 2.39), so older systems may need a source build.
 
+Presentation uses ordinary Wayland/XWayland surfaces. For native HDR,
+Wine/Proton selection and upgrades from earlier builds, see
+[native presentation](NATIVE_PRESENTATION.md).
+
 ## Native packages
 
 Download the package for your distribution. These commands install a new package
@@ -22,7 +26,7 @@ sudo dnf install ./pyroshine-*.rpm
 ```
 
 Run only the command for your distribution. The package installs the binary,
-PyroWave library, Vulkan WSI layer, systemd service, udev rules, kernel-module
+PyroWave library, systemd service, udev rules, kernel-module
 configuration, and sleep-inhibition policy. Start it as your regular streaming user:
 
 ```sh
@@ -50,7 +54,7 @@ bash pyroshine-install.sh
 ```
 
 The installer deploys to `/opt/pyroshine`, configures systemd, udev, kernel
-modules, the Vulkan layer, and polkit, and offers to enable lingering and start
+modules and polkit, and offers to enable lingering and start
 the service. It also installs SteamOS atomic-update integration when available.
 Runtime libraries such as Opus, libevdev, libxkbcommon, GBM, Wayland, and
 Xwayland must be supplied by the host; the portable archive does not include them.

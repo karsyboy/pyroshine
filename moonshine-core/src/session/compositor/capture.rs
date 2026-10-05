@@ -501,7 +501,7 @@ pub(super) struct CaptureCadence {
 	pub superseded_slots: u64,
 	/// Deferred slots still waiting when the next refresh deadline arrived.
 	pub expired_slots: u64,
-	/// Same coverage for commits of the WSI-presented game surface only,
+	/// Same coverage for commits of the focused application surface only,
 	/// excluding cursor, overlay and other client surfaces.
 	last_source_generation: u64,
 	source_commits: [u64; 4],

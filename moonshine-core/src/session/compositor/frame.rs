@@ -382,6 +382,25 @@ mod tests {
 		builder.build().unwrap()
 	}
 
+	#[test]
+	fn high_precision_buffers_without_a_color_declaration_remain_sdr() {
+		for format in [Fourcc::Abgr2101010, Fourcc::Abgr16161616f] {
+			let fd: OwnedFd = tempfile::tempfile().unwrap().into();
+			let mut builder = Dmabuf::builder((64, 64), format, Modifier::Linear, DmabufFlags::empty());
+			assert!(builder.add_plane(fd, 0, 512));
+			let dmabuf = builder.build().unwrap();
+			let frame = ExportedFrame::from_dmabuf(
+				&dmabuf,
+				0,
+				Arc::new(AtomicBool::new(false)),
+				FrameColorSpace::default(),
+				None,
+			);
+			assert_eq!(frame.color_space, FrameColorSpace::Srgb);
+			assert!(frame.hdr_metadata.is_none());
+		}
+	}
+
 	/// STAB-004: the compositor dropping its pool (shutdown, resolution
 	/// retirement or a released client buffer) before a frame is imported does
 	/// not close the frame's descriptors, and their numbers are not reused for

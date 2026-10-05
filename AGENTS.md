@@ -33,7 +33,7 @@ Related repositories:
   module interface; follow `docs/NIXOS.md` for that integration.
 - `dist/` holds `pyroshine-*` files (used by `nfpm.yaml` and the release
   workflow) alongside upstream-named `moonshine-*` files, some of which Nix uses
-  (`nix/package.nix`). Check both when changing service, udev, Vulkan or policy
+  (`nix/package.nix`). Check both when changing service, udev or policy
   integration.
 - Preserve license notices and attribution.
 
@@ -53,7 +53,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `session/manager.rs`, `session/mod.rs`, `session/lifecycle.rs` | Session states, transitions, teardown ownership, worker guards and start latches |
 | `session/application.rs`, `session/inhibit.rs` | Application systemd unit and environment; logind sleep inhibition |
 | `session/authorization.rs`, `session/keys.rs`, `session/negotiation.rs` | Authorization generations; validated keys and nonce ownership; shared numeric domains |
-| `session/compositor/` | Headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, color/swapchain protocols, capture admission and DMA-BUF export |
+| `session/compositor/` | Headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, native color-management protocols, capture admission and DMA-BUF export |
 | `session/stream/audio/` | Embedded PulseAudio-compatible server, Opus encoding, audio FEC/encryption, UDP |
 | `session/stream/control/` | ENet control protocol, peer authorization (`peers.rs`), input decoding/routing, Inputtino devices, ownership and feedback |
 | `session/stream/video/` | Negotiated formats, stream epochs, packetization, FEC, GSO/pacing, diagnostics |
@@ -64,9 +64,6 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 
 Other workspace and integration areas:
 
-- `moonshine-wsi/`: Vulkan implicit layer intercepting instance/device/surface/
-  swapchain behavior and routing presentation to the compositor over Wayland.
-  Its `protocols/` XML must agree with `session/compositor/protocols/`.
 - `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark.
 - `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
   error names, proxies) shared by the daemon and the desktop app.
@@ -76,7 +73,7 @@ Other workspace and integration areas:
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
   (`build-shaders.sh`), changelog tooling/tests, measurement harnesses.
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
-  installers, systemd, Vulkan manifests, device permissions and system policy.
+  installers, systemd, device permissions and system policy.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
 - `vendor/inputtino/`: maintained native Inputtino patch, including build/binding sources.
 
@@ -89,7 +86,7 @@ Other workspace and integration areas:
 | Configuration fields, defaults or semantics | `docs/CONFIGURATION.md` and the owning Rust config/default implementations |
 | PyroWave, codec negotiation, GPU ownership, FEC or transport | `docs/PYROWAVE.md`, `docs/PYROWAVE_COMPATIBILITY.md` |
 | Capture, cursor lifetime, focus, Steam surfaces/overlays or input | `docs/COMPOSITOR.md` |
-| Vulkan layer, bypass, extension gates, swapchain image counts | `docs/VULKAN_IMAGE_COUNTS.md` |
+| Native presentation, HDR/color management and Wine/Proton setup | `docs/NATIVE_PRESENTATION.md` |
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
 | Performance measurements | `docs/BENCHMARKING.md`; lifetime/soak diagnostics in `docs/LONG_SESSION_PERFORMANCE.md` |
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
@@ -102,10 +99,10 @@ Other workspace and integration areas:
 ## Architectural boundaries
 
 - Keep protocol/session orchestration, compositor scene decisions, encoding,
-  packet transport, input/control, WSI interception and packaging in their owning
+  packet transport, input/control and packaging in their owning
   layers. Extend existing interfaces rather than coupling unrelated layers or
   introducing parallel systems; inspect nearby patterns first.
-- Capture, rendering, encoding, packetization, UDP/FEC/pacing, WSI presentation
+- Capture, rendering, encoding, packetization, UDP/FEC/pacing, Wayland presentation
   and controller/input routing are latency-sensitive. Avoid adding unnecessary
   allocations, copies, blocking I/O, locks, synchronous waits, per-frame logging
   or indirection in these loops. Preserve bounded queues/backpressure and buffer
@@ -118,9 +115,9 @@ Other workspace and integration areas:
 - Capture visibility and input focus are distinct but interacting responsibilities.
   Review cursor, scene, Steam overlays and input routing together before fixing
   capture/focus/cursor/Steam-input symptoms; follow `docs/COMPOSITOR.md`.
-- WSI changes must preserve Vulkan object lifetimes, dispatch/extension semantics
-  and compositor protocol agreement. Assess capture and session consequences;
-  changing the layer alone does not establish correct streaming behavior.
+- Applications present on their actual Wayland/XWayland surfaces. Do not add
+  Vulkan interception or replacement surfaces. Native color descriptions are
+  the only HDR declarations; buffer depth/format never implies HDR.
 - At unsafe/native boundaries (Vulkan, DMA-BUF handles, Inputtino, PyroWave), keep
   new `unsafe` scopes narrow. Explain non-obvious ownership, lifetime,
   synchronization, ABI and cleanup assumptions, including failure paths.

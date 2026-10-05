@@ -424,15 +424,10 @@ impl CompositorHandler for MoonshineCompositor {
 		if self
 			.focused_window
 			.as_ref()
-			.and_then(|window| self.wsi_surface(window))
-			.is_some_and(|s| s == surface)
+			.and_then(|window| window.wl_surface())
+			.is_some_and(|s| &*s == surface)
 		{
 			self.note_source_commit();
-		}
-
-		// Apply pending color management state.
-		if let Some(cm) = &mut self.color_management {
-			cm.commit(surface);
 		}
 
 		// Whether this surface already had a buffer before this commit, to
@@ -460,8 +455,7 @@ impl CompositorHandler for MoonshineCompositor {
 			&& (self
 				.space
 				.elements()
-				.any(|w| w.wl_surface().is_some_and(|s| &*s == surface))
-				|| self.wsi.contains(surface))
+				.any(|w| w.wl_surface().is_some_and(|s| &*s == surface)))
 		{
 			self.reevaluate_focus();
 		}
@@ -1041,7 +1035,7 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Whether a window has a committed buffer (own surface or WSI override).
+	/// Whether a window has a committed compositor-visible buffer.
 	fn window_has_buffer(&self, window: &Window) -> bool {
 		let surface_has_buffer = |s: &WlSurface| {
 			smithay::backend::renderer::utils::with_renderer_surface_state(s, |st| st.buffer().is_some())
@@ -1050,7 +1044,7 @@ impl MoonshineCompositor {
 		if window.wl_surface().is_some_and(|s| surface_has_buffer(&s)) {
 			return true;
 		}
-		self.wsi_surface(window).is_some_and(surface_has_buffer)
+		false
 	}
 
 	/// Defer to the Steam UI only while `requested` hasn't presented yet.
@@ -1776,11 +1770,6 @@ impl MoonshineCompositor {
 	fn reevaluate_focus_inner(&mut self) {
 		// Mark focus as dirty before recalculating.
 		self.focus_state.mark_dirty();
-
-		// The WSI swapchain can be created before its window is mapped, so
-		// re-resolve the override target now that the window set may have
-		// changed. Cheap when the current mapping is already rendered.
-		self.resolve_override_window();
 
 		// Step 1: Metadata is cached by map/property/configure events.
 
@@ -2798,9 +2787,6 @@ impl XwmHandler for MoonshineCompositor {
 		// Usually already retired by its unmap; a window destroyed while still
 		// mapped (or whose unmap was not observed) is retired here the same way.
 		self.retire_x11_window(window.window_id());
-		// Unlike unmap (Wine withdraws and remaps a restored window), a
-		// destroyed window never presents its swapchain again.
-		self.release_window_bindings(window.window_id());
 	}
 
 	fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -2830,10 +2816,9 @@ impl XwmHandler for MoonshineCompositor {
 		h: Option<u32>,
 		_reorder: Option<Reorder>,
 	) {
-		// Gamescope holds the game window at the output size, so a game
-		// running below the stream resolution is scaled up to fill the whole
-		// output. This also anchors the WSI swapchain extent (read from the
-		// X11 window) to the output before the game creates it.
+		// Keep primary XWayland windows at the virtual output geometry.
+		// Capture sizing still comes from their actual committed buffers;
+		// lower-resolution content is scaled by the compositor.
 		let elem = self.find_window_by_x11_surface(&window);
 		let is_game = elem
 			.as_ref()

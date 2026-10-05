@@ -243,16 +243,17 @@ CMDS=(
   "mkdir -p /etc/udev/rules.d"
   "mkdir -p /etc/modules-load.d"
   "mkdir -p /etc/sysusers.d"
-  "mkdir -p /etc/vulkan/implicit_layer.d"
   "mkdir -p /etc/polkit-1/rules.d"
   # Deploy pyroshine binary
   "cp '${S}/bin/pyroshine' '${PYROSHINE_HOME}/bin/pyroshine'"
   "chmod 755 '${PYROSHINE_HOME}/bin/pyroshine'"
 
-  # Deploy Vulkan WSI layer
+  # Remove presentation-layer artifacts left by previous portable releases.
+  "rm -f '${PYROSHINE_HOME}/lib/libmoonshine_wsi.so'"
+  "rm -f /etc/vulkan/implicit_layer.d/VkLayer_pyroshine_wsi.json /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json"
+
+  # Deploy PyroWave encoder library
   "mkdir -p '${PYROSHINE_HOME}/lib'"
-  "cp '${S}/lib/pyroshine/vulkan-layers/libmoonshine_wsi.so' '${PYROSHINE_HOME}/lib/libmoonshine_wsi.so'"
-  "chmod 755 '${PYROSHINE_HOME}/lib/libmoonshine_wsi.so'"
   "cp '${S}/lib/libpyrowave-shared.so.0' '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.0'"
   "chmod 755 '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.0'"
 
@@ -275,9 +276,6 @@ CMDS=(
 
   # Deploy sysusers config
   "cp '${S}/share/pyroshine/pyroshine-sysusers.conf' /etc/sysusers.d/pyroshine.conf"
-
-  # Deploy Vulkan layer manifest with library_path patched
-  "sed 's|/usr/lib/pyroshine/vulkan-layers/libmoonshine_wsi.so|${PYROSHINE_HOME}/lib/libmoonshine_wsi.so|' '${S}/share/pyroshine/VkLayer_pyroshine_wsi.json' > /etc/vulkan/implicit_layer.d/VkLayer_pyroshine_wsi.json"
 
   # Deploy polkit sleep-inhibit rules
   "cp '${S}/share/pyroshine/50-pyroshine-inhibit-sleep.rules' /etc/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules"

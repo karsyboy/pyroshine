@@ -2,7 +2,7 @@
 
 ## Setup
 
-Use the intended installed server/WSI/PyroWave build and record host/client
+Use the intended installed server/PyroWave build and record host/client
 revisions, GPU/driver and starting settings. Confirm initial launch has audio,
 video, correct mode metadata and working input before testing resume. For the
 negotiation/epoch contract see [ARCHITECTURE.md](ARCHITECTURE.md#session-lifecycle-and-negotiation).

@@ -38,7 +38,7 @@ class ChangelogTests(unittest.TestCase):
             )
 
         (self.root / "Cargo.lock").write_text(
-            lock(["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools", "moonshine-wsi"])
+            lock(["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools"])
         )
         ui = self.root / "pyroshine-ui"
         (ui / "src-tauri").mkdir(parents=True, exist_ok=True)

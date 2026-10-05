@@ -286,7 +286,6 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	let vk_context = check_vulkan(report, render_node_open.as_ref().filter(|_| egl_result.is_some()));
 	check_codecs(report, vk_context.as_ref());
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
-	check_wsi_layer(report);
 
 	if let Some(ref ctx) = vk_context {
 		let props = ctx.device_properties();
@@ -1198,49 +1197,6 @@ fn check_input_group(report: &mut HealthReport) {
 			 If you always stream while a desktop session is active, this is not required: the\n  \
 			 active seat user is granted access to input devices via ACLs (uaccess)."
 				.into(),
-			start.elapsed().as_millis() as u64,
-		);
-	}
-}
-
-fn check_wsi_layer(report: &mut HealthReport) {
-	let start = Instant::now();
-
-	let entry = match unsafe { ash::Entry::load() } {
-		Ok(e) => e,
-		Err(_) => {
-			report.add_failed(
-				"WSI layer",
-				"  Skipped (Vulkan check failed).".into(),
-				start.elapsed().as_millis() as u64,
-			);
-			return;
-		},
-	};
-
-	let layers = match unsafe { entry.enumerate_instance_layer_properties() } {
-		Ok(l) => l,
-		Err(_) => {
-			report.add_warn(
-				"WSI layer",
-				"  Could not enumerate Vulkan instance layers.".into(),
-				start.elapsed().as_millis() as u64,
-			);
-			return;
-		},
-	};
-
-	let found = layers.iter().any(|l| {
-		l.layer_name_as_c_str()
-			.is_ok_and(|name| name.to_bytes() == b"VK_LAYER_MOONSHINE_wsi")
-	});
-
-	if found {
-		report.add_passed("WSI layer", String::new(), start.elapsed().as_millis() as u64);
-	} else {
-		report.add_warn(
-			"WSI layer",
-			"  Not found in Vulkan instance layers.\n  Install the moonshine-wsi Vulkan layer.\n  Games will render through XWayland (higher latency, no direct scanout).".into(),
 			start.elapsed().as_millis() as u64,
 		);
 	}

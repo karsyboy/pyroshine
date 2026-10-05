@@ -75,7 +75,6 @@ tracing = "0.1.44"
 url = "2.5.8"
 uuid = { version = "1.23.3", features = ["v4"] }
 walkdir = "2.5.0"
-wayland-scanner = "0.31"
 which = "8.0.3"
 x509-parser = "0.18.1"
 xcursor = "0.3.10"
@@ -83,6 +82,8 @@ zbus = { version = "5.16.0", features = ["blocking"] }
 zvariant = "5.12.0"
 
 [dev-dependencies]
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-client = "0.31"
 tempfile = "3.27.0"
 # X11 client for the ignored compositor/XWayland tests (same version as Smithay's).
 x11rb = "0.13.2"

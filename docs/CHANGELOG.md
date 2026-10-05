@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Removed
+
+- Delete the custom Vulkan implicit layer, private presentation protocols and XWayland content replacement. Applications use their actual compositor surfaces; legacy XWayland HDR requiring interception is intentionally unsupported.
+
+### Changed
+
+- Native Wayland color management owns HDR declarations and mastering metadata. Add parametric scRGB support, transactional surface color state, version-correct readiness and output feedback, and color conversion within scene composition. Clean real surfaces retain direct DMA-BUF export.
+
 ## [v0.17.0-beta.14] - 2026-10-05
 
 ### Added

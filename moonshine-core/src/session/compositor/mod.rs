@@ -7,18 +7,16 @@
 pub(crate) mod admission;
 mod capture;
 mod color_management;
+mod color_render;
 mod cursor;
 mod focus;
 mod foreground;
 pub(crate) mod frame;
-mod gamescope_swapchain;
 mod gpu_timing;
 mod handlers;
 pub(crate) mod input;
-mod protocols;
 mod scaling;
 mod state;
-mod wsi_bindings;
 mod x11_focus;
 mod xwayland_process;
 
@@ -423,7 +421,7 @@ fn run_compositor(
 	let capabilities = unsafe { GlesRenderer::supported_capabilities(&egl_context) }
 		.map_err(|e| format!("Failed to query renderer capabilities: {e}"))?;
 	let capabilities = capabilities.into_iter().filter(|c| *c != Capability::Fencing);
-	let renderer = unsafe { GlesRenderer::with_capabilities(egl_context, capabilities) }
+	let mut renderer = unsafe { GlesRenderer::with_capabilities(egl_context, capabilities) }
 		.map_err(|e| format!("Failed to create GLES renderer: {e}"))?;
 
 	// Query the EGL display for formats that can be used as render targets.
@@ -540,6 +538,10 @@ fn run_compositor(
 	// Create the damage tracker for this output.
 	let damage_tracker = OutputDamageTracker::from_output(&output);
 
+	// Compile scene color transforms once; direct export never invokes them.
+	let color_shaders = color_render::ColorShaders::new(&mut renderer)
+		.map_err(|e| format!("Failed to compile scene color shaders: {e}"))?;
+
 	// Build the compositor state.
 	let (mut state, display) = MoonshineCompositor::new(
 		display,
@@ -549,6 +551,7 @@ fn run_compositor(
 		damage_tracker,
 		gbm_allocator,
 		renderer,
+		color_shaders,
 		frame_tx,
 		foreground_tx,
 		context.width,

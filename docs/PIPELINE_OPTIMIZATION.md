@@ -46,7 +46,7 @@ many client surface commits each capture covered. Average FPS cannot reveal
 uneven sampling: steady 120 FPS with captures covering 0 or 2+ commits means
 repeated or never-captured application frames. Cursor and overlay surfaces also
 commit, so these counts bound rather than equal game-frame repeats/skips; the
-`game_*` fields count only the WSI-presented game surface and report when its
+`game_*` fields count the actual focused application surface and report when its
 commits land after the refresh deadline. A game paced by frame callbacks covers
 one commit per capture and commits shortly after each tick.
 `same_slot_captures` must stay zero.
@@ -57,7 +57,7 @@ its swapchain buffers, not that client lifecycle work is unnecessary.
 
 ## Direct export and composition
 
-Direct/override export requires complete-scene eligibility from
+Direct export requires complete-scene eligibility from
 [COMPOSITOR.md](COMPOSITOR.md#scene-and-input-decisions). Visible cursors, overlays,
 scaling and other scene content can require GLES composition. Rejection diagnostics
 record the first blocking condition with fixed counters, avoiding per-frame strings.

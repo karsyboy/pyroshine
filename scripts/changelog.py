@@ -74,7 +74,7 @@ def workspace_version(root):
 # workspace's members, and the desktop app's separate workspace (which also
 # locks moonshine-management through its path dependency, so `--locked`
 # builds fail when it is stale).
-SERVER_LOCK = ("Cargo.lock", ["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools", "moonshine-wsi"])
+SERVER_LOCK = ("Cargo.lock", ["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools"])
 UI_LOCK = ("pyroshine-ui/src-tauri/Cargo.lock", ["moonshine-ui", "moonshine-management"])
 UI_MANIFEST = "pyroshine-ui/src-tauri/Cargo.toml"
 NPM_FILES = {

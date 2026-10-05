@@ -16,7 +16,8 @@ cargo build -p moonshine-tools --release
 The binary will be at `target/release/moonshine-bench`.
 See the [contributor guide](../CONTRIBUTING.md#manually-building-the-app) for
 build dependencies and the pinned PyroWave library. Streaming benchmarks also
-need the installed Vulkan layer and device rules.
+need device rules and a working GPU. Applications present on their ordinary
+Wayland/XWayland surfaces; see [native presentation](NATIVE_PRESENTATION.md).
 
 ### Usage
 

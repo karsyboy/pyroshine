@@ -15,7 +15,6 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 | --- | --- | --- |
 | Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown |
 | `moonshine-core` | Library | Every server subsystem: protocol endpoints, pairing, sessions, compositor, encoders, transport, input |
-| `moonshine-wsi` | `libmoonshine_wsi.so` | Implicit Vulkan layer loaded into streamed applications |
 | `moonshine-tools` | `moonshine-bench` | Developer benchmark that drives the production session stack without a client |
 | `moonshine-management` | Library | Local management API contract: D-Bus names, JSON documents, error names and client proxies |
 | `pyroshine-ui/` (separate workspace) | `pyroshine-ui` | Optional desktop app: tray, notifications, pairing, settings and dashboard |
@@ -49,7 +48,6 @@ flowchart LR
   end
 
   APP["Application<br/>(systemd user unit)"]
-  WSI["moonshine-wsi<br/>Vulkan layer"]
 
   C -- "pair / launch / resume / cancel" --> HTTP
   C -- "DESCRIBE / ANNOUNCE / PLAY" --> RTSP
@@ -57,7 +55,7 @@ flowchart LR
   RTSP --> MGR
   MGR --> Session
   APP -- "Wayland / X11 surfaces" --> COMP
-  APP -- "Vulkan present" --> WSI -- "swapchain protocol" --> COMP
+  APP -- "Wayland / XWayland surfaces" --> COMP
   APP -- "PulseAudio protocol" --> AUD
   COMP -- "DMA-BUF frames" --> VID -- "RTP video" --> C
   AUD -- "RTP audio" --> C
@@ -83,7 +81,6 @@ flowchart LR
 | `session/stream/video/` | Import, convert and encode captured frames; packetize, protect, encrypt, pace and send | Scene composition |
 | `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
 | `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
-| `moonshine-wsi` | Intercept Vulkan surfaces and swapchains in applications; route presentation and swapchain metadata to the compositor | Capture, encoding |
 | `management/` | Session-bus management interface: status, pairing, clients, configuration store, telemetry aggregation | Session, pairing or trust decisions (it calls the owners) |
 | `session/status.rs` | Public session phase from manager status and control-stream ownership | Lifecycle transitions |
 
@@ -92,8 +89,8 @@ Boundaries to preserve:
 - Scene visibility and input focus belong to the compositor. Encoding, packet
   transport and FEC belong to `stream/video/`. Control decoding and virtual
   devices belong to `stream/control/`.
-- The WSI layer participates in presentation only. A WSI change alone does not
-  establish correct capture or streaming behavior.
+- Surface presentation and native color descriptions belong to the compositor;
+  frames carry their declared encoding to the video pipeline.
 - Developer tools reuse the production session interfaces through
   `SessionManager`; they do not own a parallel stack.
 
@@ -176,8 +173,7 @@ sequenceDiagram
 2. **Launch.** An authenticated HTTPS `/launch` validates the request, creates an
    authorization generation and session keys, then initializes and launches the
    session: the compositor starts (with XWayland), and the application starts as
-   a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY`, `PULSE_SERVER` and the
-   WSI layer enabled.
+   a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY` and `PULSE_SERVER`.
 3. **Negotiation.** RTSP DESCRIBE advertises the probed formats. ANNOUNCE carries
    the client's codec, chroma, dynamic range, resolution, FPS, bitrate, packet
    size, encryption and audio layout; it is validated and stored as a *pending*
@@ -336,8 +332,8 @@ thread. It owns:
 - scene, stacking, focus and Steam window classification (`focus.rs`,
   `x11_focus.rs`), following Gamescope's Steam focus model;
 - cursor state (`cursor.rs`) and output scaling (`scaling.rs`);
-- color metadata from `wp_color_management_v1` and the swapchain protocols
-  (`color_management.rs`, `gamescope_swapchain.rs`);
+- native `wp_color_management_v1` surface descriptions and scene color draws
+  (`color_management.rs`, `color_render.rs`);
 - input injection into the Smithay seat (`input.rs`);
 - capture and frame export (`capture.rs`, `admission.rs`, `frame.rs`).
 
@@ -346,15 +342,6 @@ most one capture, independent of encoder completion. Buffer releases, frame
 callbacks and input continue even while capture is blocked.
 
 **Presentation.** Applications present through ordinary Wayland or X11 surfaces.
-For Vulkan applications under XWayland, the `moonshine-wsi` layer (enabled by
-`ENABLE_MOONSHINE_WSI=1` in the application environment) can replace the
-XCB/Xlib surface with a Wayland surface ("bypass") and report swapchain color
-space, HDR metadata, present mode and image counts over the private
-`moonshine_swapchain` protocol. The compositor also implements
-`gamescope_swapchain` for DXVK. Bypass is rejected for unsafe X11 presentation
-topologies, which keep the real XCB surface. See
-[Vulkan WSI](VULKAN_IMAGE_COUNTS.md).
-
 **Capture.** Capture visibility and input focus are separate decisions:
 
 - *Direct export* hands the encoder the application's own DMA-BUF when it
@@ -364,7 +351,10 @@ topologies, which keep the real XCB surface. See
   pool and waits for completion before export.
 
 Commits are latched only once their DMA-BUF has finished rendering, and color
-format and metadata (sRGB, BT.2020/PQ, scRGB) pass through unchanged. See
+descriptions and metadata (sRGB, BT.2020/PQ, scRGB) follow the captured source.
+Direct PQ stays encoded; direct scRGB is converted by the encoder. Composition
+normalizes HDR into PQ during the existing scene draw. XWayland without native
+color declarations is SDR. See [native presentation](NATIVE_PRESENTATION.md). See
 [Compositor](COMPOSITOR.md) for eligibility, cursor and Steam rules.
 
 ## Video path
@@ -625,7 +615,7 @@ Changes must preserve these properties unless a task explicitly redesigns them:
 | Capture admission, encoder queues and transport accounting | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC, pacing and GPU matrix | [PyroWave](PYROWAVE.md) |
 | PyroWave dialects and authenticated bandwidth calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
-| WSI extension gates, image counts and bypass safety | [Vulkan WSI](VULKAN_IMAGE_COUNTS.md) |
+| Native color descriptions and Wine/Proton setup | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity and report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
 | Measurements, diagnostics and reconnect acceptance | [Benchmarking](BENCHMARKING.md), [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md), [Reconnect validation](reconnect-validation.md) |
 

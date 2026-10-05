@@ -237,9 +237,6 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		),
 		format!("DISPLAY=:{}", context.xdisplay),
 		format!("WAYLAND_DISPLAY={}", context.wayland_display),
-		format!("MOONSHINE_WAYLAND_DISPLAY={}", context.wayland_display),
-		// Activate the moonshine WSI Vulkan layer.
-		"ENABLE_MOONSHINE_WSI=1".to_string(),
 		// Force Proton to use winepulse.drv instead of winepipewire.drv,
 		// so it respects PULSE_SERVER and routes audio through Moonshine.
 		"PROTON_USE_PIPEWIRE=0".to_string(),
@@ -249,30 +246,42 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 	envs.push("XDG_CURRENT_DESKTOP=gamescope".to_string());
 	envs.push(format!("GAMESCOPE_WAYLAND_DISPLAY={}", context.wayland_display));
 	envs.push(format!("STEAM_GAME_DISPLAY_0=:{}", context.xdisplay));
-	envs.push("STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1".to_string());
 	envs.push("STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1".to_string());
 	envs.push("STEAM_GAMESCOPE_NIS_SUPPORTED=1".to_string());
 	envs.push("STEAM_GAMESCOPE_VRR_SUPPORTED=1".to_string());
-	if context.hdr {
-		envs.push("STEAM_GAMESCOPE_HDR_SUPPORTED=1".to_string());
-	}
 
 	if context.hdr {
 		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
 		// games will not see HDR as available.
 		envs.push("DXVK_HDR=1".to_string());
-		// Signal HDR mode to the moonshine-wsi layer so it can advertise HDR
-		// surface formats correctly (the factory global is always present for
-		// SDR sessions too, so we need an explicit capability signal).
-		envs.push("MOONSHINE_HDR=1".to_string());
 	}
 
 	for (key, value) in &context.extra_env {
+		if obsolete_presentation_environment(key, value) {
+			tracing::error!(
+				key,
+				"Removed presentation-layer setting; remove it from the application environment"
+			);
+			return Err(());
+		}
 		envs.push(format!("{key}={value}"));
 	}
 
 	Ok(envs)
+}
+
+// Upgrade validation only: these settings have no supported native equivalent.
+fn obsolete_presentation_environment(key: &str, value: &str) -> bool {
+	key.starts_with("MOONSHINE_WSI_")
+		|| matches!(
+			key,
+			"ENABLE_MOONSHINE_WSI"
+				| "DISABLE_MOONSHINE_WSI"
+				| "MOONSHINE_WAYLAND_DISPLAY"
+				| "MOONSHINE_HDR"
+				| "MOONSHINE_LIMITER_FILE"
+		) || (key == "VK_INSTANCE_LAYERS" && value.split(':').any(|layer| layer == "VK_LAYER_MOONSHINE_wsi"))
 }
 
 /// Wait for a `JobRemoved` signal matching the given job path, accepting only `"done"` as success.
@@ -601,6 +610,17 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		("Slice".to_string(), zvariant::Value::Str("moonshine.slice".into())),
 		// Environment: as
 		("Environment".to_string(), zvariant::Value::from(options.envs.to_vec())),
+		// A lingering user manager can retain activation from an older install.
+		// Unset it at the final systemd environment merge, including ExecStartPre.
+		(
+			"UnsetEnvironment".to_string(),
+			zvariant::Value::from(vec![
+				"ENABLE_MOONSHINE_WSI",
+				"MOONSHINE_WAYLAND_DISPLAY",
+				"MOONSHINE_HDR",
+				"MOONSHINE_LIMITER_FILE",
+			]),
+		),
 		// ExecStart: a(sasb)
 		("ExecStart".to_string(), build_exec_array(&[main_entry])?),
 		("TimeoutStopUSec".to_string(), zvariant::Value::U64(5_000_000)),
@@ -789,6 +809,36 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn launch_environment_exposes_real_displays_without_presentation_injection() {
+		let context = super::ApplicationContext {
+			unit_name: "test.service".into(),
+			pulse_socket_path: "/tmp/audio/socket".into(),
+			xdisplay: 5,
+			wayland_display: "wayland-pyroshine-test".into(),
+			hdr: true,
+			extra_env: Default::default(),
+		};
+		let env = super::make_envs(&context).unwrap();
+		assert!(env.contains(&"DISPLAY=:5".into()));
+		assert!(env.contains(&"WAYLAND_DISPLAY=wayland-pyroshine-test".into()));
+		assert!(env.iter().all(|e| !super::obsolete_presentation_environment(
+			e.split('=').next().unwrap(),
+			e.split_once('=').unwrap().1
+		)));
+		let mut obsolete = context;
+		obsolete.extra_env.insert("ENABLE_MOONSHINE_WSI".into(), "1".into());
+		assert!(super::make_envs(&obsolete).is_err());
+		assert!(super::obsolete_presentation_environment(
+			"MOONSHINE_WSI_DISABLE_BYPASS",
+			"1"
+		));
+		assert!(super::obsolete_presentation_environment(
+			"VK_INSTANCE_LAYERS",
+			"VK_LAYER_MESA_device_select:VK_LAYER_MOONSHINE_wsi"
+		));
+	}
+
 	use super::{ApplicationConfig, split_standard_io};
 
 	#[test]

@@ -781,10 +781,7 @@ fn clamp_cursor(state: &mut MoonshineCompositor) {
 /// Priority order:
 /// 1. An interactive Steam input-focus window, then a dropdown (override
 ///    window), when they accept pointer input.
-/// 2. While a WSI binding presents a window, the pointer-focus (or focused)
-///    game window: its XWayland surface carries input even though the
-///    binding supplies its pixels. A standalone native binding comes last.
-/// 3. Otherwise, the topmost window under the cursor that accepts input.
+/// 2. The topmost actual scene surface accepting input.
 fn find_surface_under(
 	state: &MoonshineCompositor,
 ) -> Option<(
@@ -802,7 +799,7 @@ fn find_surface_at(
 	Point<f64, Logical>,
 )> {
 	// Input state is independent of which buffer supplies the video frame.
-	// Interactive Steam focus takes precedence over WSI and dropdown routing.
+	// Interactive Steam focus takes precedence over dropdown routing.
 	for (window, focus_fallback) in [
 		(state.input_focus_window.as_ref(), true),
 		(state.override_window.as_ref(), false),
@@ -826,20 +823,6 @@ fn find_surface_at(
 		}
 		if focus_fallback && let Some(surface) = window.wl_surface() {
 			return Some((surface.into_owned(), location));
-		}
-	}
-	if state.is_override_active() {
-		if let Some(window) = state.pointer_focus_window.as_ref().or(state.focused_window.as_ref()) {
-			let location = state.space.element_geometry(window)?.loc.to_f64();
-			if let Some((surface, offset)) = window.surface_under(position - location, WindowSurfaceType::ALL) {
-				return Some((surface, offset.to_f64() + location));
-			}
-			if let Some(surface) = window.wl_surface() {
-				return Some((surface.into_owned(), location));
-			}
-		}
-		if let Some(surface) = state.wsi.standalone() {
-			return Some((surface.clone(), Point::from((0.0, 0.0))));
 		}
 	}
 	// Passive notifications are render-only, including over their own pixels.

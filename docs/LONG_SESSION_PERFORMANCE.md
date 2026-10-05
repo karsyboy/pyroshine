@@ -31,7 +31,6 @@ Protect pairing credentials and other private data before sharing logs.
 | --- | --- |
 | `Video runtime health` | CPU (100% = one core), open fds, resident KiB, packet occupancy and independent timer lateness; unavailable values are `None` |
 | `Video capture resources` | Capture path/age, dirty state, busy/held buffers, releases, retired pools, admission/rejection and GLES timing counters |
-| `Video swapchain feedback` | Surface identity, actual image count (zero = unknown), Vulkan format/colorspace; WSI logs add requested/effective modes |
 | `Video pipeline summary` | Completed FPS, stage timings, stale drops, in-flight/packet occupancy and PyroWave import-cache size |
 | `Video direct-export rejections` | First blocking reason for direct eligibility, counted per attempt |
 | `PyroWave DMA-BUF import summary` | Import-cache hit/miss/recreate/evict counters |
@@ -87,7 +86,6 @@ and counts together before weakening ownership or synchronization.
 | PyroWave imports | Unused entries expire after synchronous GPU completion; preserve fd identity/layout checks |
 | Partial Vulkan imports | Owned fd/image/memory guards clean up failures; transfer fd ownership only on successful import |
 | FEC and diagnostics | Bounded policy/cache keys and windowed samples, not histories indexed by frame number |
-| WSI maps | Remove instance/device/surface/swapchain state on object destruction |
 
 Presentation timing is an inactive boundary: the compositor ignores
 `SetPresentTime` and produces no `past_present_timing` events. Before enabling
@@ -96,8 +94,8 @@ retention semantics; current smoke tests do not establish live timing behavior.
 
 ## Long-run acceptance
 
-1. Install the intended build and identify which server, WSI layer and PyroWave
-   library are loaded. A running game retains its old layer until restart.
+1. Install the intended build and identify which server and PyroWave library
+   are loaded. Restart applications after updating their runtime dependencies.
 2. Reproduce the actual game/scene at the requested mode for long enough to cover
    the reported degradation. Keep periodic stage/resource/transport summaries.
 3. Compare early and late windows: delivered FPS/latency, imports/fds/RSS, held

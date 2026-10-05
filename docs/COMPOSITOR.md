@@ -19,8 +19,8 @@ and protocol handlers in `compositor/{mod,state,handlers}.rs`, capture and
 eligibility in `compositor/{capture,admission,frame}.rs`, cursor in
 `compositor/cursor.rs`, focus and Steam classification in
 `compositor/{focus,x11_focus}.rs`, input injection in `compositor/input.rs`,
-swapchain and color protocols in
-`compositor/{gamescope_swapchain,wsi_bindings,color_management}.rs`,
+native color protocols and draws in
+`compositor/{color_management,color_render}.rs`,
 and controller emulation in `stream/control/input/{gamepad,mod}.rs`.
 
 ## Configuration
@@ -124,6 +124,11 @@ it composites as a layer.
   place and held with the game buffer until the encoder's reads finished; a
   `wl_shm` buffer is copied like a cursor. X formats ignore the alpha byte.
 
+Late layers currently require an SDR base and SDR layer declarations: the
+encoder overlay APIs do not carry per-layer color descriptions. HDR scenes
+with overlays use color-managed GLES composition; a clean HDR scene remains
+directly exportable.
+
 Every layer must be 1:1: one surface without subsurface content, buffer scale
 1, normal transform, no viewport crop or scale. Anything else (scaled output,
 fractional scale, interactive Steam overlays, dropdowns, decorations, cursor
@@ -148,45 +153,6 @@ queued behind a GPU-bound game, making every consumer (GLES composition or
 encoder import) wait on them. `MOONSHINE_DISABLE_READY_LATCH=1` restores
 immediate latching for diagnosis.
 
-### WSI and transparency
-
-Both swapchain protocols convey Vulkan composite-alpha intent. The
-compositor honors `VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR` for the declared root
-image in direct eligibility and GLES blending, including alpha-capable HDR
-buffers. Child surfaces retain their own transparency. See the
-[Vulkan definition](https://github.khronos.org/Vulkan-Site/spec/latest/chapters/VK_KHR_surface/wsi.html).
-
-### WSI presentation bindings
-
-`override_window_content` binds a swapchain `wl_surface` to the X11 window it
-presents (`compositor/wsi_bindings.rs`), like gamescope's per-window override
-surface. Each window keeps its own binding, so simultaneously running games never
-replace each other's presentation; rendering, direct export, source size and
-focus readiness ask which surface presents a given window. The reported window
-(often a Wine/DXVK child) resolves to the rendered toplevel when it maps; a
-resolved binding issues no further X11 queries.
-
-A surface binds one window, and a newer surface for the same window replaces the
-older binding. A binding is removed when its owning swapchain object is
-destroyed (an older swapchain cannot remove a newer chain's binding of the same
-surface), when its surface dies, or when its X11 window is destroyed (X11 ids are
-reused). Unmap keeps it: Wine restores a minimized window by withdrawing and
-remapping it. Every live binding receives its window's frame callbacks on
-composited and idle refresh ticks, so a background game stays resumable; direct
-export services only the exported surface, as for any window. Presentation
-feedback reports a binding as displayed only when the frame composed it.
-
-### Unsafe XWayland replacement cleanup
-
-Wine presentation safety is checked before accepting any top-level bypass.
-Unsafe windows present via the retained XCB surface without a replacement binding.
-When safety changes, the WSI layer destroys its protocol override before requesting
-swapchain recreation. The compositor clears only the owning swapchain's binding,
-invalidates damage, and restores the XWayland scene even though the Vulkan/Wayland
-surface itself may remain alive. Capture eligibility, focus classification, and
-GPU export rules remain independent of this presentation decision. See
-[presentation topology and fullscreen diagnosis](VULKAN_IMAGE_COUNTS.md#presentation-topology-and-fallback).
-
 ### Steam classification and input
 
 Steam classification has one rule: `STEAM_OVERLAY != 0` is interactive when it
@@ -199,7 +165,7 @@ Passive notifications are excluded from primary focus, dropdown selection, and
 pointer hit testing. Mapping, updating, or unmapping one changes the video scene
 but does not reapply unchanged input targets. Compositor-owned root properties
 are written only when their desired values change, including focusable lists.
-An interactive overlay routes pointer input before WSI routing. Mode 2 keeps the
+An interactive overlay routes pointer input before game-surface hit testing. Mode 2 keeps the
 keyboard on the game; closing the overlay restores the game target and unified
 focused-app contract. These match the inspected
 [gamescope focus logic](https://github.com/ValveSoftware/gamescope/blob/master/src/steamcompmgr.cpp).
@@ -246,22 +212,24 @@ Guide or the explicit Back+Start policy so games receive real Select holds.
 Activation rumble deadlines preserve every held button; disconnect drops all
 per-controller shortcut state.
 
-DEBUG logs report classification, cursor, virtual-device creation, WSI binding
-registration/resolution/release, X11 window retirement, iconic acknowledgements
-and restores, and capture path transitions (`direct`, `direct_override`,
+DEBUG logs report classification, cursor, virtual-device creation, native color
+transactions, X11 window retirement, iconic acknowledgements
+and restores, and capture path transitions (`direct`,
 `composited`); rendering itself does not emit per-frame INFO messages. Window,
 focus and overlay transitions use the `focus` target and need it enabled
 (for example `MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
 
 ## Color and output changes
 
-Direct and composited paths must preserve the source format and color metadata.
+Direct export preserves the source format and color metadata. Composition
+converts each surface in its existing texture draw to the primary scene
+encoding; HDR composition exports BT.2020/PQ.
 `sRGB`, BT.2020/PQ and scRGB linear frames are distinct: scRGB requires gamut/PQ
-conversion in the encoder, while PQ input is already transfer-encoded. Do not
+conversion in the encoder on direct export, while PQ input is already encoded. Do not
 replace them with a generic HDR boolean or insert an SDR intermediate.
 Output-mode changes retire pools until their buffers are consumed; coordinate
 resolution/refresh/HDR changes with the session epoch rather than resizing only
-the scene. See [PyroWave ownership](PYROWAVE.md#gpu-path-and-ownership) and
+the scene. See [native HDR](NATIVE_PRESENTATION.md), [PyroWave ownership](PYROWAVE.md#gpu-path-and-ownership) and
 [reconnect validation](reconnect-validation.md).
 
 ## Foreground application reporting
@@ -305,9 +273,9 @@ Unit tests cover cursor activation/idle/hide, real Wayland resource replacement
 and destruction, scene extras and automatic restoration, capture configuration,
 cropping/scaling/rotation, Steam classification transitions, notification focus
 and dropdown exclusion, unchanged focus-contract suppression, and controller
-kind/policy parsing. `wsi_bindings` tests cover two simultaneous games,
-swapchain recreation and old-owner release, deterministic fallback, late window
-resolution and window destruction; `focus` tests cover the overlay open/close
+kind/policy parsing. Native color tests cover transactional surface declarations,
+PQ/scRGB distinction, metadata isolation, SDR transitions and cleanup.
+`focus` tests cover the overlay open/close
 cycle (modes 2, 1 and 0, opacity 0), input routing back to the game, and role
 cleanup for an overlay destroyed without being hidden or unmapped; `cursor` tests
 cover the hide hold (reverted hides never presented, sustained hides presented
@@ -355,7 +323,7 @@ with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
 
 1. **Direct export.** Run a fullscreen workload with an explicitly hidden cursor
    and no extra content. Confirm the capture path is `direct` or
-   `direct_override`, and check GPU utilization and frame latency.
+   `direct+late`, and check GPU utilization and frame latency.
 2. **Cursor.** Expose the cursor, leave the mouse idle for more than three
    seconds, and navigate a game (for example Grim Dawn) using only a controller.
    Visible cursor composition must persist; an explicit application hide must
@@ -375,9 +343,8 @@ with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
    closing the first, and switch between them through Steam at least ten times,
    then close the second, continue the first and relaunch the second. The
    selected game must always show its own picture, with no persistent black
-   frame, and `direct_override` must return when the scene is eligible. Check
-   `WSI binding registered`/`released` logs per game. Repeat without
-   `MOONSHINE_WSI_DISABLE_BYPASS`.
+   frame, and `direct` must return when the scene is eligible. Each game
+   must retain its actual compositor-visible surface.
 6. **Controller cursor.** In a game whose own controller support moves a
    visible cursor (for example Grim Dawn under Proton), move it continuously
    with the controller, then with the mouse, alternating repeatedly. The cursor
