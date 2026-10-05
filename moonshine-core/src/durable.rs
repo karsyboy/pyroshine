@@ -50,7 +50,19 @@ pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+	replace_with_mode(path, bytes, None)
+}
+
+/// [`replace`] with the replacement's permission bits set to `mode` (the
+/// staging file is private until then); `None` keeps it private.
+pub(crate) fn replace_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
 	let temporary = stage(path, bytes)?;
+	if let Some(mode) = mode {
+		use std::os::unix::fs::PermissionsExt;
+		temporary
+			.as_file()
+			.set_permissions(std::fs::Permissions::from_mode(mode))?;
+	}
 	checkpoint("rename")?;
 	temporary.persist(path).map_err(|e| e.error)?;
 	sync_parent(path)

@@ -37,6 +37,7 @@ pub mod keys;
 pub(crate) mod lifecycle;
 pub mod manager;
 pub(crate) mod negotiation;
+pub(crate) mod status;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
@@ -135,6 +136,7 @@ pub(crate) struct SystemSession {
 	pub(crate) stream_timeout: u64,
 	pub(crate) inhibit_sleep: bool,
 	pub(crate) stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	pub(crate) presence_tx: std::sync::Arc<watch::Sender<status::ClientPresence>>,
 }
 
 impl SessionBackend for SystemSession {
@@ -176,7 +178,13 @@ impl SessionBackend for SystemSession {
 		} else {
 			None
 		};
-		session.start(self.video_config.clone(), self.stream_timeout, request, sleep_inhibitor)
+		session.start(
+			self.video_config.clone(),
+			self.stream_timeout,
+			request,
+			sleep_inhibitor,
+			self.presence_tx.clone(),
+		)
 	}
 
 	fn pause(
@@ -354,6 +362,7 @@ impl LaunchedSession {
 		stream_timeout: u64,
 		request: StartRequest,
 		sleep_inhibitor: Option<SleepInhibitor>,
+		presence_tx: std::sync::Arc<watch::Sender<status::ClientPresence>>,
 	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
 		let Self {
 			context,
@@ -401,7 +410,7 @@ impl LaunchedSession {
 		let video_handle_for_resume = video_handle.clone();
 
 		// Start control stream — receives both handles.
-		let control_ctx = ControlStreamContext::new(&context, authorization_rx);
+		let control_ctx = ControlStreamContext::new(&context, authorization_rx, presence_tx);
 		control_stream.start(
 			stream_timeout,
 			control_ctx,

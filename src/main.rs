@@ -14,6 +14,7 @@ pub use moonshine_core::ShutdownReason;
 use moonshine_core::clients::ClientManager;
 use moonshine_core::config::Config;
 use moonshine_core::discovery::MdnsDiscovery;
+use moonshine_core::management::{ManagementService, ServerFacts};
 use moonshine_core::rtsp::RtspServer;
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::webserver::Webserver;
@@ -79,7 +80,7 @@ async fn main() -> Result<(), ()> {
 
 	// Run health checks unless the user explicitly disabled them.
 	// If health checks are disabled, we still probe the GPU for supported codecs and HDR support.
-	let (supported_codecs, hdr_supported, dma_buf_supported) = if args.no_health_check {
+	let (supported_codecs, hdr_supported, dma_buf_supported, gpu_name, health) = if args.no_health_check {
 		tracing::info!("Health checks disabled (--no-health-check); probing GPU capabilities only.");
 		let capabilities = tokio::task::spawn_blocking({
 			let cfg = config.clone();
@@ -92,6 +93,8 @@ async fn main() -> Result<(), ()> {
 			capabilities.supported_codecs,
 			capabilities.hdr_supported,
 			capabilities.dma_buf_supported,
+			capabilities.gpu_name,
+			None,
 		)
 	} else {
 		tracing::debug!("Running health checks...");
@@ -107,7 +110,13 @@ async fn main() -> Result<(), ()> {
 			return Err(());
 		}
 
-		(report.supported_codecs, report.hdr_supported, report.dma_buf_supported)
+		(
+			report.supported_codecs,
+			report.hdr_supported,
+			report.dma_buf_supported,
+			report.gpu_name.clone(),
+			Some(report),
+		)
 	};
 
 	if !dma_buf_supported {
@@ -139,7 +148,16 @@ async fn main() -> Result<(), ()> {
 		}
 	});
 
-	let moonshine = Moonshine::new(config, supported_codecs, hdr_supported, shutdown.clone())?;
+	let facts = ServerFacts {
+		version: env!("CARGO_PKG_VERSION").to_string(),
+		config_path,
+		supported_codecs,
+		hdr_advertised: hdr_supported,
+		dma_buf: dma_buf_supported,
+		gpu_name,
+		health,
+	};
+	let moonshine = Moonshine::new(config, supported_codecs, hdr_supported, facts, shutdown.clone())?;
 	tracing::info!("Pyroshine is ready and waiting for connections.");
 
 	shutdown.wait_shutdown_triggered().await;
@@ -189,6 +207,8 @@ async fn wait_for_dbus() -> Result<(), ()> {
 }
 
 pub struct Moonshine {
+	// Dropped first: the desktop UI sees the daemon leave before listeners close.
+	_management: ManagementService,
 	_rtsp_server: RtspServer,
 	_session_manager: SessionManager,
 	_client_manager: ClientManager,
@@ -202,6 +222,7 @@ impl Moonshine {
 		config: Config,
 		supported_codecs: u32,
 		hdr_supported: bool,
+		facts: ServerFacts,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let (cert, pkey) = moonshine_core::tls::load_or_create_certificate(&config)?;
@@ -217,8 +238,17 @@ impl Moonshine {
 			shutdown.clone(),
 		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;
+		// Optional: without a session bus name the server runs unchanged.
+		let management = ManagementService::spawn(
+			facts,
+			&config,
+			session_manager.clone(),
+			client_manager.clone(),
+			shutdown.clone(),
+		);
 
 		Ok(Self {
+			_management: management,
 			_rtsp_server: RtspServer::new(
 				config.address.clone(),
 				config.stream.port,

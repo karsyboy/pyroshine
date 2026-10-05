@@ -10,6 +10,7 @@ runs:
           build-essential \
           clang \
           cmake \
+          dbus \
           libc++-dev \
           libc++abi-dev \
           libclang-dev \

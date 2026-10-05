@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
-	clients::ClientManager,
+	clients::{ClientManager, RevokeError},
 	ingress::Ingress,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
@@ -387,7 +387,7 @@ impl Webserver {
 					.await
 				},
 				(&Method::GET, "/pyrowave-bandwidth-probe") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					if self.supported_codecs & 0x01800000 == 0 {
@@ -414,13 +414,13 @@ impl Webserver {
 					return Ok(bandwidth::response(permit));
 				},
 				(&Method::GET, "/applist") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.app_list()
 				},
 				(&Method::GET, "/appasset") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.app_asset(params)
@@ -444,7 +444,7 @@ impl Webserver {
 					.await
 				},
 				(&Method::GET, "/unpair") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					// TLS self-revocation targets the authenticated credential, never a
@@ -452,19 +452,19 @@ impl Webserver {
 					self.unpair(None, peer_cert_fingerprint.as_deref()).await
 				},
 				(&Method::GET, "/launch") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.launch(params, local_address, peer_address).await
 				},
 				(&Method::GET, "/resume") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.resume(params, local_address, peer_address).await
 				},
 				(&Method::GET, "/cancel") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.cancel().await
@@ -708,8 +708,10 @@ impl Webserver {
 			server_codec_mode_support
 		);
 		if https
-			&& peer_cert_fingerprint.is_some_and(|fp| self.verify_paired_client(&Some(fp.clone())).is_none())
-			&& self.supported_codecs & 0x01800000 != 0
+			&& peer_cert_fingerprint.is_some_and(|fp| {
+				self.verify_paired_client(&Some(fp.clone()), peer_address.ip())
+					.is_none()
+			}) && self.supported_codecs & 0x01800000 != 0
 		{
 			let speed = local_address
 				.map(|a| bandwidth::routed_link_mbps(a.ip(), peer_address.ip()))
@@ -816,17 +818,20 @@ impl Webserver {
 	}
 
 	async fn unpair(&self, id: Option<&str>, fingerprint: Option<&str>) -> Response<Full<Bytes>> {
-		let _authorization = self.client_manager.authorization_gate.write().await;
-		if matches!(self.client_manager.revoke(id, fingerprint), Ok(true)) {
-			// Session state does not record the TLS credential owner. Conservatively
-			// stop the active stream on any revocation instead of leaving stale keys.
-			if self.session_manager.stop_session().await.is_err() {
+		match self
+			.client_manager
+			.revoke_and_stop_session(&self.session_manager, id, fingerprint)
+			.await
+		{
+			Ok(()) => {},
+			Err(RevokeError::SessionStopFailed) => {
 				return bad_request("Trust revoked, but session shutdown failed.".to_string());
-			}
-		} else {
-			return bad_request(
-				"Revocation failed or credential not found; legacy clients require fingerprint.".to_string(),
-			);
+			},
+			Err(RevokeError::NotRevoked) => {
+				return bad_request(
+					"Revocation failed or credential not found; legacy clients require fingerprint.".to_string(),
+				);
+			},
 		}
 		let xml = r#"<root status_code="200"/>"#;
 		let mut response = Response::new(Full::new(Bytes::from(xml)));
@@ -1097,10 +1102,17 @@ impl Webserver {
 	/// Verify that the connecting client has presented a TLS certificate
 	/// that belongs to a paired client. Returns `None` if authorized,
 	/// or `Some(response)` with a 401 response if not.
-	fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
+	fn verify_paired_client(
+		&self,
+		peer_cert_fingerprint: &Option<String>,
+		peer: IpAddr,
+	) -> Option<Response<Full<Bytes>>> {
 		match peer_cert_fingerprint {
 			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint) {
-				Ok(true) => None,
+				Ok(true) => {
+					self.client_manager.record_seen(fingerprint, peer);
+					None
+				},
 				Ok(false) => {
 					tracing::warn!("Client certificate not recognized (fingerprint: {fingerprint})");
 					Some(unauthorized("Client certificate is not from a paired client."))

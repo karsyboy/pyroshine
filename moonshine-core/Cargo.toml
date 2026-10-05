@@ -32,6 +32,7 @@ libloading = "0.8.9"
 mdns-sd = "0.20.0"
 mio = { version = "1.2.1", features = ["net", "os-ext", "os-poll"] }
 mio-timerfd = "0.2.0"
+moonshine-management = { path = "../moonshine-management" }
 network-interface = "2.0.5"
 notify-rust = "4.17.0"
 opus = "0.3.1"
@@ -69,6 +70,7 @@ tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "net", "pro
 tokio-enet = "0.1.0"
 tokio-rustls = "0.26.4"
 toml = "1.1.2"
+toml_edit = "0.25.13"
 tracing = "0.1.44"
 url = "2.5.8"
 uuid = { version = "1.23.3", features = ["v4"] }

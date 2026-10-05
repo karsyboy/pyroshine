@@ -1,0 +1,78 @@
+# nfpm configuration for the optional desktop app (tray, pairing, dashboard,
+# settings). Used by .github/workflows/release.yaml next to nfpm.yaml; the
+# server package does not depend on it, so headless installs never pull in
+# GTK or WebKitGTK.
+#
+# VERSION is injected by the release workflow (GITHUB_REF_NAME minus the 'v').
+
+name: pyroshine-ui
+arch: amd64
+platform: linux
+version: ${VERSION}
+release: "1"
+maintainer: "Pyroshine contributors"
+description: |
+  Desktop app for the Pyroshine streaming server: system tray, pairing
+  notifications and approval, client management, settings and stream dashboard.
+homepage: "https://github.com/karsyboy/pyroshine"
+license: "BSD-2-Clause"
+
+contents:
+  - src: ./pyroshine-ui/src-tauri/target/release/pyroshine-ui
+    dst: /usr/bin/pyroshine-ui
+  - src: ./dist/pyroshine-ui.desktop
+    dst: /usr/share/applications/pyroshine-ui.desktop
+  # Starts the tray at desktop login; users can disable it in their desktop's
+  # autostart settings.
+  - src: ./dist/pyroshine-ui-autostart.desktop
+    dst: /etc/xdg/autostart/pyroshine-ui.desktop
+    type: config
+  - src: ./dist/icons/hicolor/16x16/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/16x16/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/22x22/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/22x22/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/24x24/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/24x24/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/32x32/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/32x32/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/48x48/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/48x48/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/64x64/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/64x64/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/128x128/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/128x128/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/256x256/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/256x256/apps/pyroshine.png
+  - src: ./dist/icons/hicolor/512x512/apps/pyroshine.png
+    dst: /usr/share/icons/hicolor/512x512/apps/pyroshine.png
+  - src: ./LICENSE
+    dst: /usr/share/licenses/pyroshine-ui/LICENSE
+    packager: rpm
+  - src: ./LICENSE
+    dst: /usr/share/doc/pyroshine-ui/copyright
+    packager: deb
+  - src: ./LICENSE
+    dst: /usr/share/licenses/pyroshine-ui/LICENSE
+    packager: archlinux
+
+scripts:
+  postinstall: ./dist/nfpm/pyroshine-ui-postinstall.sh
+  postremove: ./dist/nfpm/pyroshine-ui-postremove.sh
+
+# The app manages the server package; the WebKitGTK runtime names differ per distro.
+overrides:
+  deb:
+    depends:
+      - pyroshine
+      - libwebkit2gtk-4.1-0
+      - libgtk-3-0
+  rpm:
+    depends:
+      - pyroshine
+      - webkit2gtk4.1
+      - gtk3
+  archlinux:
+    depends:
+      - pyroshine
+      - webkit2gtk-4.1
+      - gtk3

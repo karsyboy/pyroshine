@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Pyroshine
+GenericName=Game Streaming Host
+Comment=Pair clients, watch streams and configure the Pyroshine server
+Exec=pyroshine-ui
+Icon=pyroshine
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=moonlight;stream;gamestream;pair;server;
+StartupNotify=true
+StartupWMClass=pyroshine-ui
+SingleMainWindow=true

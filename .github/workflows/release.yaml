@@ -64,6 +64,26 @@ jobs:
     - name: Build
       run: cargo build --release --workspace
 
+    # The optional desktop app is a separate workspace and package, so the
+    # server package keeps no GTK/WebKitGTK dependency.
+    - name: Install desktop app dependencies
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: pyroshine-ui/package-lock.json
+
+    - name: Build desktop app
+      working-directory: pyroshine-ui
+      run: |
+        npm ci
+        npm run build
+        cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+
     - name: Strip and fixup
       run: |
         strip ./target/release/moonshine ./target/release/libmoonshine_wsi.so
@@ -107,6 +127,7 @@ jobs:
         export VERSION="${{ steps.tag.outputs.version }}"
         for fmt in deb rpm archlinux; do
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
+          nfpm package --config nfpm-ui.yaml --packager "$fmt" --target .
         done
 
     - name: Generate checksums
@@ -114,6 +135,7 @@ jobs:
         sha256sum \
           ./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst \
           ./pyroshine_*.deb \
+          ./pyroshine-ui_*.deb \
           ./pyroshine-*.rpm \
           ./pyroshine-*.pkg.tar.zst \
           ./dist/pyroshine-install.sh \
@@ -128,6 +150,7 @@ jobs:
         files: |
           ./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
           ./pyroshine_*.deb
+          ./pyroshine-ui_*.deb
           ./pyroshine-*.rpm
           ./pyroshine-*.pkg.tar.zst
           ./dist/pyroshine-install.sh

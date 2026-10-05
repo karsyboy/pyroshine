@@ -30,6 +30,10 @@ sudo systemctl enable --now "pyroshine@$USER"
 pyroshine healthcheck
 ```
 
+On a desktop, also install the optional `pyroshine-ui` package from the same
+release for a system tray, pairing notifications, client management and a
+settings editor; see [Desktop app](DESKTOP.md). Headless hosts do not need it.
+
 After an upgrade, restart the service to use the new binaries:
 
 ```sh
@@ -100,10 +104,11 @@ Pairing state remains under `~/.local/share/moonshine` by default. Back up these
 paths before upgrading or migrating from Moonshine.
 
 See the [configuration reference](CONFIGURATION.md) for application entries and
-server settings. Add the host in Moonlight and submit its pairing PIN at
-`http://localhost:47989/pin` on the host (or the configured HTTP port). The page
-only accepts requests from the host itself; on a headless host, use an SSH port
-forward as described under [`[webserver]`](CONFIGURATION.md#webserver).
+server settings. Add the host in Moonlight and enter its pairing PIN in the
+[desktop app](DESKTOP.md#pair-a-client), or at the host-local page linked in the
+service log (`http://localhost:47989/pin?uniqueid=…`, or the configured HTTP
+port). The page only accepts requests from the host itself; on a headless host,
+use an SSH port forward as described under [`[webserver]`](CONFIGURATION.md#webserver).
 Keep the host on a trusted LAN or VPN and restrict its listening ports.
 
 ## Service diagnostics

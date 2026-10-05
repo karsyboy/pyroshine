@@ -30,6 +30,7 @@ let
       ../Cargo.lock
       ../src
       ../moonshine-core
+      ../moonshine-management
       ../moonshine-tools
       ../moonshine-wsi
       ../assets

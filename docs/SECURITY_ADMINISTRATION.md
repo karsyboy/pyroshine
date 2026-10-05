@@ -1,11 +1,22 @@
 # Pairing, identity and revocation
 
-Pairing approval is a host operator action. Open the loopback HTTP `/pin` page
-linked in the server log, check the requester and certificate fingerprint, then
-enter the PIN displayed by the client. The approval token applies to that exact
-request; replacing a client ID requires a fresh approval. A remote client cannot
-approve itself. For a headless host, forward the HTTP port over SSH as described
-in [Configuration](CONFIGURATION.md#webserver).
+Pairing approval is a host operator action. With the [desktop app](DESKTOP.md),
+open the pairing notification or **Clients**; otherwise open the loopback HTTP
+`/pin` page linked in the server log. Check the requester and certificate
+fingerprint, then enter the PIN displayed by the client. The approval token
+applies to that exact request; replacing a client ID requires a fresh approval.
+A remote client cannot approve itself. For a headless host, forward the HTTP
+port over SSH as described in [Configuration](CONFIGURATION.md#webserver).
+
+## Local management interface
+
+The desktop app uses the service's management interface on the D-Bus session
+bus of the user running Pyroshine. Only that user can reach the bus, and the
+service also rejects calls from any other Unix user. Like the loopback `/pin`
+and `/unpair` routes, it is available to every process of that user (including
+streamed applications): approving a request still requires the PIN shown by the
+client, and the interface never exposes session keys, pairing secrets or private
+keys. It is not reachable over the network.
 
 ## Pending transactions
 
@@ -19,8 +30,10 @@ their transaction. Approved requests abandoned between protocol steps expire.
 Older approval waiters cannot remove replacement requests. Challenges and PINs
 are accepted once per transaction.
 
-Desktop notifications are coalesced to at most one per 30 seconds, with at most
-one notification worker. They do not wait for a click. Use the logged loopback
+While the desktop app runs it notifies the operator about pairing requests;
+repeated requests replace one notification. Without the app, the server's own
+desktop notifications are coalesced to at most one per 30 seconds, with at most
+one notification worker, and do not wait for a click. Use the logged loopback
 URL when notifications are unavailable or coalesced. Global shutdown clears
 pending requests. New approval is required after restart.
 
@@ -51,10 +64,16 @@ legacy file needs restoration from backup; migration cannot reconstruct missing
 records. Restoring an old backup can restore revoked trust: reapply revocations
 before exposing the server.
 
+`state.toml` may also hold `client_metadata`: an operator name and pairing time
+per certificate fingerprint. It is display-only and never consulted for trust;
+versions without it ignore the table. Revocation removes a certificate's entry.
+
 ## Revoke a client
 
-The host operator uses **POST** to the loopback HTTP `/unpair` route, with the
-same peer, Host and browser-origin checks as PIN approval:
+In the desktop app, select **Revoke** on the client in **Clients**; it revokes
+that certificate. Without the app, the host operator uses **POST** to the
+loopback HTTP `/unpair` route, with the same peer, Host and browser-origin
+checks as PIN approval:
 
 ```sh
 curl --fail -X POST 'http://localhost:47989/unpair?uniqueid=CLIENT_ID'

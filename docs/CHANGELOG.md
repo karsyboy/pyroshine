@@ -14,6 +14,17 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Add the optional `pyroshine-ui` desktop app and package: a system tray whose icon shows whether a client is streaming (green play), the session is retained without a client (amber pause), or a client waits to pair; pairing notifications that open the request; PIN approval and rejection; paired-client naming and revocation; a settings editor for every `config.toml` setting, including applications and scanners; a stream dashboard with one-second performance statistics; and diagnostics. It starts in the tray at desktop login and manages, but never starts or stops, the service. See [Desktop app](DESKTOP.md).
+- Add a local management interface on the service user's D-Bus session bus (`io.github.karsyboy.Pyroshine`), used by the desktop app. Pyroshine runs unchanged without it or without a graphical session.
+- Record an optional operator name and the pairing time for newly paired clients in `state.toml` (display only).
+
+### Changed
+
+- Configuration saved from the desktop app is validated first, edits only the changed settings (keeping comments and formatting), refuses to overwrite a file changed since it was loaded, and is replaced atomically with its permissions. A restart is still required to apply it.
+- The server's own pairing notification is skipped while the desktop app runs, which shows its own.
+
 ## [v0.17.0-beta-11] - 2026-10-03
 
 ### Changed

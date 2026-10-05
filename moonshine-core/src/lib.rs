@@ -10,6 +10,7 @@ pub(crate) mod durable;
 pub(crate) mod gpu;
 pub mod healthcheck;
 pub(crate) mod ingress;
+pub mod management;
 pub mod rtsp;
 pub mod session;
 pub(crate) mod state;

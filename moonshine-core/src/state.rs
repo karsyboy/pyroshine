@@ -16,6 +16,20 @@ struct StateData {
 	/// Explicit associations only; legacy sets cannot safely be zipped together.
 	#[serde(default)]
 	client_certs: HashMap<String, HashSet<String>>,
+	/// Operator-facing details per paired certificate fingerprint. Optional
+	/// and display-only: trust decisions never read it.
+	#[serde(default, skip_serializing_if = "HashMap::is_empty")]
+	client_metadata: HashMap<String, ClientMetadata>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ClientMetadata {
+	/// Name assigned by the host operator.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	label: Option<String>,
+	/// Unix time of the most recent completed pairing, in seconds.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	paired_at: Option<u64>,
 }
 
 impl StateData {
@@ -25,8 +39,19 @@ impl StateData {
 			clients: Default::default(),
 			paired_certs: Default::default(),
 			client_certs: Default::default(),
+			client_metadata: Default::default(),
 		}
 	}
+}
+
+/// A paired certificate and what is known about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairedCredential {
+	pub fingerprint: String,
+	/// Client IDs explicitly associated with the certificate.
+	pub client_ids: Vec<String>,
+	pub label: Option<String>,
+	pub paired_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -158,13 +183,81 @@ impl PersistentState {
 		Ok(data.paired_certs.contains(&fingerprint))
 	}
 
+	#[cfg(test)]
 	pub(crate) fn pair(&self, id: String, fingerprint: String) -> Result<bool, ()> {
+		self.pair_with_label(id, fingerprint, None)
+	}
+
+	/// Trust `fingerprint` for `id`, recording when it was paired and, if
+	/// given, the operator's name for it (an existing name is kept otherwise).
+	pub(crate) fn pair_with_label(&self, id: String, fingerprint: String, label: Option<String>) -> Result<bool, ()> {
+		let paired_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|elapsed| elapsed.as_secs())
+			.ok();
 		self.transaction(|data| {
 			let client_added = data.clients.insert(id.clone());
 			let cert_added = data.paired_certs.insert(fingerprint.clone());
-			let association_added = data.client_certs.entry(id).or_default().insert(fingerprint);
-			Ok(client_added || cert_added || association_added)
+			let association_added = data.client_certs.entry(id).or_default().insert(fingerprint.clone());
+			let metadata = data.client_metadata.entry(fingerprint).or_default();
+			metadata.paired_at = paired_at.or(metadata.paired_at);
+			if label.is_some() {
+				metadata.label = label;
+			}
+			Ok(client_added || cert_added || association_added || paired_at.is_some())
 		})
+	}
+
+	/// Set or clear the operator's name for a paired certificate. Fails for
+	/// an unknown certificate.
+	pub(crate) fn set_label(&self, fingerprint: &str, label: Option<String>) -> Result<bool, ()> {
+		self.transaction(|data| {
+			if !data.paired_certs.contains(fingerprint) {
+				return Err(());
+			}
+			let metadata = data.client_metadata.entry(fingerprint.to_string()).or_default();
+			let changed = metadata.label != label;
+			metadata.label = label;
+			if *metadata == ClientMetadata::default() {
+				data.client_metadata.remove(fingerprint);
+			}
+			Ok(changed)
+		})
+	}
+
+	/// Paired certificates (sorted by fingerprint) and the legacy client IDs
+	/// that have no known certificate association.
+	pub(crate) fn paired_credentials(&self) -> Result<(Vec<PairedCredential>, Vec<String>), ()> {
+		let data = self.data.read().map_err(|_| ())?;
+		let mut credentials: Vec<_> = data
+			.paired_certs
+			.iter()
+			.map(|fingerprint| {
+				let mut client_ids: Vec<_> = data
+					.client_certs
+					.iter()
+					.filter(|(_, certs)| certs.contains(fingerprint))
+					.map(|(id, _)| id.clone())
+					.collect();
+				client_ids.sort();
+				let metadata = data.client_metadata.get(fingerprint).cloned().unwrap_or_default();
+				PairedCredential {
+					fingerprint: fingerprint.clone(),
+					client_ids,
+					label: metadata.label,
+					paired_at: metadata.paired_at,
+				}
+			})
+			.collect();
+		credentials.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+		let mut legacy: Vec<_> = data
+			.clients
+			.iter()
+			.filter(|id| !data.client_certs.contains_key(*id))
+			.cloned()
+			.collect();
+		legacy.sort();
+		Ok((credentials, legacy))
 	}
 
 	/// Revoke a credential and every known alias for it. Legacy IDs are retained
@@ -183,6 +276,7 @@ impl PersistentState {
 			let mut changed = false;
 			for fp in &targets {
 				changed |= data.paired_certs.remove(fp);
+				data.client_metadata.remove(fp);
 			}
 			data.client_certs.retain(|client, certs| {
 				certs.retain(|fp| !targets.contains(fp));
@@ -315,5 +409,48 @@ mod tests {
 		assert_eq!(data.clients.len(), 32);
 		assert_eq!(data.paired_certs.len(), 32);
 		assert_eq!(data.client_certs.len(), 32);
+	}
+
+	#[test]
+	fn operator_metadata_is_optional_display_state_removed_with_trust() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("state.toml");
+		// A state file written before metadata existed loads unchanged.
+		std::fs::write(
+			&path,
+			"unique_id = 'u'\nclients = ['A', 'legacy']\npaired_certs = ['cert-A']\n[client_certs]\nA = ['cert-A']\n",
+		)
+		.unwrap();
+		let state = PersistentState::load(path.clone()).unwrap();
+		let (credentials, legacy) = state.paired_credentials().unwrap();
+		assert_eq!(
+			credentials,
+			vec![PairedCredential {
+				fingerprint: "cert-A".into(),
+				client_ids: vec!["A".into()],
+				label: None,
+				paired_at: None,
+			}]
+		);
+		assert_eq!(legacy, vec!["legacy".to_string()]);
+
+		assert!(state.set_label("cert-A", Some("Living room".into())).unwrap());
+		assert!(state.set_label("unknown", Some("x".into())).is_err());
+		state
+			.pair_with_label("B".into(), "cert-B".into(), Some("Laptop".into()))
+			.unwrap();
+		// Re-pairing without a name keeps the existing one.
+		state.pair("B2".into(), "cert-B".into()).unwrap();
+		let restarted = PersistentState::load(path.clone()).unwrap();
+		let (credentials, _) = restarted.paired_credentials().unwrap();
+		assert_eq!(credentials[0].label.as_deref(), Some("Living room"));
+		assert_eq!(credentials[1].label.as_deref(), Some("Laptop"));
+		assert_eq!(credentials[1].client_ids, vec!["B".to_string(), "B2".to_string()]);
+		assert!(credentials[1].paired_at.is_some());
+
+		assert!(restarted.revoke(None, Some("cert-B")).unwrap());
+		assert!(!std::fs::read_to_string(&path).unwrap().contains("Laptop"));
+		assert!(restarted.set_label("cert-A", None).unwrap());
+		assert!(!std::fs::read_to_string(&path).unwrap().contains("client_metadata"));
 	}
 }

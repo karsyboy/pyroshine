@@ -1,0 +1,45 @@
+[package]
+name = "moonshine-ui"
+version = "0.17.0-beta-11"
+edition = "2024"
+description = "Optional Pyroshine desktop app: system tray, pairing, dashboard and settings"
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "pyroshine-ui"
+path = "src/main.rs"
+
+# A workspace of its own: headless builds of the server never compile the
+# GUI stack. See ../README.md.
+[workspace]
+
+[features]
+# Embed `dist/` and serve it to the webview. Without this feature Tauri builds
+# in development mode and loads `devUrl` (the Vite dev server) instead, so it is
+# on for every plain `cargo build`; `npm run tauri:dev` turns it off.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+gtk = "0.18"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# Unreleased upstream API: `Tray::provide_xdg_activation_token` (Plasma's
+# ProvideXdgActivationToken). Return to a crates.io release after 0.3.6.
+ksni = { git = "https://github.com/iovxw/ksni", rev = "547cc42b9e24ed58c20e7643644184bc2264c9b0" }
+moonshine-management = { path = "../../moonshine-management" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tauri = { version = "2.12.1", features = [] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zbus = { version = "5.16.0", features = ["tokio"] }
+
+[profile.release]
+lto = "thin"
+strip = true

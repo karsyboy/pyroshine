@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Pyroshine
+Comment=Pyroshine system tray and pairing notifications
+Exec=pyroshine-ui --background
+Icon=pyroshine
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=2

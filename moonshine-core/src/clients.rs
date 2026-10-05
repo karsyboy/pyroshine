@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use std::time::SystemTime;
 
 use aes::Aes128;
 use aes::cipher::Array;
@@ -14,18 +16,41 @@ use aws_lc_rs::signature::KeyPair;
 use aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256;
 use aws_lc_rs::signature::RSA_PKCS1_SHA256;
 use aws_lc_rs::signature::RsaKeyPair;
+use moonshine_management::dto::PairingOutcome;
 use sha2::Digest;
 use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 use tokio::time::Instant;
 use x509_parser::prelude::*;
 
-use crate::state::PersistentState;
+use crate::session::manager::SessionManager;
+use crate::state::{PairedCredential, PersistentState};
 
 /// Bound retained certificates, challenge state and human approvals.
 pub(crate) const MAX_PENDING_PAIRINGS: usize = 32;
+
+/// Longest operator-assigned client name, in characters.
+pub(crate) const MAX_CLIENT_LABEL_CHARS: usize = 64;
+
+/// Pairing and trust changes, for management consumers. Sending never blocks
+/// pairing; a consumer that falls behind resynchronizes from the listings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PairingEvent {
+	/// A request is waiting for the operator.
+	Requested { client_id: String, approval: String },
+	/// The operator's PIN was accepted; the client continues the protocol.
+	Approved { client_id: String, approval: String },
+	/// A request left the queue.
+	Resolved {
+		client_id: String,
+		approval: String,
+		outcome: PairingOutcome,
+	},
+	/// Durable trust (paired certificates or their names) changed.
+	TrustChanged,
+}
 
 /// A client that is not yet paired, but in the pairing process.
 pub(crate) struct PendingClient {
@@ -50,6 +75,13 @@ pub(crate) struct PendingClient {
 	/// Address that sent the pairing request, shown to the operator.
 	pub(crate) requester: IpAddr,
 
+	/// When the request arrived and until when the operator can approve it.
+	pub(crate) received_at: SystemTime,
+	pub(crate) approval_deadline: Instant,
+
+	/// Name the operator gave the client while approving it.
+	pub(crate) label: Option<String>,
+
 	/// Cryptographic key.
 	pub(crate) key: Option<[u8; 16]>,
 
@@ -65,9 +97,60 @@ pub(crate) struct PendingClient {
 
 /// A pending pairing request as presented to the operator.
 pub(crate) struct PendingApproval {
+	pub(crate) client_id: String,
 	pub(crate) approval: String,
 	pub(crate) requester: IpAddr,
 	pub(crate) fingerprint: Option<String>,
+	pub(crate) received_at: SystemTime,
+	pub(crate) approval_deadline: Instant,
+	/// The operator's PIN was accepted.
+	pub(crate) approved: bool,
+}
+
+impl PendingApproval {
+	fn of(client: &PendingClient) -> Self {
+		Self {
+			client_id: client.id.clone(),
+			approval: client.approval.clone(),
+			requester: client.requester,
+			fingerprint: cert_pem_fingerprint(&client.pem),
+			received_at: client.received_at,
+			approval_deadline: client.approval_deadline,
+			approved: client.key.is_some(),
+		}
+	}
+}
+
+/// A paired certificate as presented to the operator.
+pub(crate) struct PairedClientView {
+	pub(crate) credential: PairedCredential,
+	/// Last authenticated HTTPS request since the server started.
+	pub(crate) last_seen: Option<(SystemTime, IpAddr)>,
+}
+
+/// Why the canonical revocation did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RevokeError {
+	/// Unknown or already revoked credential, an ambiguous legacy ID, or a
+	/// trust state that cannot be committed.
+	NotRevoked,
+	/// Trust was revoked, but stopping the active session failed.
+	SessionStopFailed,
+}
+
+/// Validate an operator-assigned client name. Empty means "no name".
+pub(crate) fn normalize_client_label(label: &str) -> Result<Option<String>, &'static str> {
+	let label = label.trim();
+	if label.is_empty() {
+		return Ok(None);
+	}
+	if label.chars().count() > MAX_CLIENT_LABEL_CHARS {
+		return Err("Client names are limited to 64 characters.");
+	}
+	if label.chars().any(char::is_control) {
+		return Err("Client names cannot contain control characters.");
+	}
+	Ok(Some(label.to_string()))
 }
 
 /// Generate a pending request's approval token.
@@ -91,6 +174,11 @@ pub struct ClientManager {
 	pub(crate) authorization_gate: Arc<tokio::sync::RwLock<()>>,
 	server_cert_pem: String,
 	server_private_key_pem: String,
+	events: broadcast::Sender<PairingEvent>,
+	/// Last authenticated request per paired certificate; memory only.
+	last_seen: Arc<Mutex<HashMap<String, (SystemTime, IpAddr)>>>,
+	/// The desktop UI is running and notifies the operator itself.
+	operator_ui: Arc<AtomicBool>,
 }
 
 impl ClientManager {
@@ -112,6 +200,9 @@ impl ClientManager {
 			state: PersistentState::isolated(path),
 			server_cert_pem,
 			server_private_key_pem,
+			events: broadcast::channel(PAIRING_EVENT_CAPACITY).0,
+			last_seen: Default::default(),
+			operator_ui: Default::default(),
 		}
 	}
 
@@ -134,7 +225,96 @@ impl ClientManager {
 			state: PersistentState::new()?,
 			server_cert_pem,
 			server_private_key_pem,
+			events: broadcast::channel(PAIRING_EVENT_CAPACITY).0,
+			last_seen: Default::default(),
+			operator_ui: Default::default(),
 		})
+	}
+
+	/// Follow pairing and trust changes.
+	pub(crate) fn subscribe(&self) -> broadcast::Receiver<PairingEvent> {
+		self.events.subscribe()
+	}
+
+	fn emit(&self, event: PairingEvent) {
+		let _ = self.events.send(event);
+	}
+
+	/// Whether the desktop UI handles operator notifications.
+	pub(crate) fn operator_ui_present(&self) -> bool {
+		self.operator_ui.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn set_operator_ui_present(&self, present: bool) {
+		self.operator_ui.store(present, Ordering::Release);
+	}
+
+	/// Record an authenticated request from a paired certificate.
+	pub(crate) fn record_seen(&self, fingerprint: &str, address: IpAddr) {
+		if let Ok(mut seen) = self.last_seen.lock() {
+			seen.insert(fingerprint.to_string(), (SystemTime::now(), address));
+		}
+	}
+
+	/// Every pending request the operator can still act on, oldest first.
+	pub(crate) fn pending_approvals(&self) -> Vec<PendingApproval> {
+		let Ok(inner) = self.pending_clients.read() else {
+			return Vec::new();
+		};
+		let now = Instant::now();
+		let mut pending: Vec<_> = inner
+			.values()
+			.filter(|client| client.deadline > now)
+			.map(PendingApproval::of)
+			.collect();
+		pending.sort_by_key(|approval| approval.received_at);
+		pending
+	}
+
+	/// Paired certificates and legacy client IDs without a known certificate.
+	pub(crate) fn paired_clients(&self) -> Result<(Vec<PairedClientView>, Vec<String>), ()> {
+		let (credentials, legacy) = self.state.paired_credentials()?;
+		let seen = self.last_seen.lock().map(|seen| seen.clone()).unwrap_or_default();
+		let clients = credentials
+			.into_iter()
+			.map(|credential| PairedClientView {
+				last_seen: seen.get(&credential.fingerprint).copied(),
+				credential,
+			})
+			.collect();
+		Ok((clients, legacy))
+	}
+
+	/// Name (or with `None`, unname) a paired certificate.
+	pub(crate) fn set_client_label(&self, fingerprint: &str, label: Option<String>) -> Result<bool, ()> {
+		let changed = self.state.set_label(fingerprint, label)?;
+		if changed {
+			self.emit(PairingEvent::TrustChanged);
+		}
+		Ok(changed)
+	}
+
+	/// The canonical revocation: revoke durable trust, drain in-flight
+	/// launch/resume/cancel requests, clear pending approvals and stop the
+	/// active session.
+	///
+	/// Sessions do not record the TLS credential that launched them, so any
+	/// revocation conservatively stops any active session instead of leaving
+	/// stale keys in use.
+	pub(crate) async fn revoke_and_stop_session(
+		&self,
+		sessions: &SessionManager,
+		id: Option<&str>,
+		fingerprint: Option<&str>,
+	) -> Result<(), RevokeError> {
+		let _authorization = self.authorization_gate.write().await;
+		if !matches!(self.revoke(id, fingerprint), Ok(true)) {
+			return Err(RevokeError::NotRevoked);
+		}
+		sessions
+			.stop_session()
+			.await
+			.map_err(|()| RevokeError::SessionStopFailed)
 	}
 
 	pub fn persistent_state(&self) -> &PersistentState {
@@ -153,7 +333,7 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		Self::expire(&mut inner);
+		self.expire(&mut inner);
 		if pending_client.id.is_empty()
 			|| pending_client.id.len() > 256
 			|| pending_client.pem.len() > 16 * 1024
@@ -164,21 +344,53 @@ impl ClientManager {
 		if !inner.contains_key(&pending_client.id) && inner.len() >= MAX_PENDING_PAIRINGS {
 			return Err(());
 		}
+		let requested = PairingEvent::Requested {
+			client_id: pending_client.id.clone(),
+			approval: pending_client.approval.clone(),
+		};
 		if let Some(old) = inner.insert(pending_client.id.clone(), pending_client) {
 			old.pin_notify.notify_one();
+			self.emit(PairingEvent::Resolved {
+				client_id: old.id,
+				approval: old.approval,
+				outcome: PairingOutcome::Replaced,
+			});
 		}
+		self.emit(requested);
 		Ok(())
 	}
 
-	fn expire(inner: &mut BTreeMap<String, PendingClient>) {
+	fn expire(&self, inner: &mut BTreeMap<String, PendingClient>) {
+		Self::expire_pending(inner, &self.events);
+	}
+
+	fn expire_pending(inner: &mut BTreeMap<String, PendingClient>, events: &broadcast::Sender<PairingEvent>) {
 		inner.retain(|_, client| {
 			if client.deadline <= Instant::now() {
 				client.pin_notify.notify_one();
+				let _ = events.send(PairingEvent::Resolved {
+					client_id: client.id.clone(),
+					approval: client.approval.clone(),
+					outcome: PairingOutcome::Expired,
+				});
 				false
 			} else {
 				true
 			}
 		});
+	}
+
+	/// Remove every pending request, waking its waiter.
+	fn clear_pending(inner: &mut BTreeMap<String, PendingClient>, events: &broadcast::Sender<PairingEvent>) {
+		for client in inner.values() {
+			client.pin_notify.notify_one();
+			let _ = events.send(PairingEvent::Resolved {
+				client_id: client.id.clone(),
+				approval: client.approval.clone(),
+				outcome: PairingOutcome::Cleared,
+			});
+		}
+		inner.clear();
 	}
 
 	/// One sweeper per manager, no per-transaction timer/task accumulation.
@@ -190,6 +402,7 @@ impl ClientManager {
 			return;
 		};
 		let pending = Arc::downgrade(&self.pending_clients);
+		let events = self.events.clone();
 		tokio::spawn(async move {
 			// Global shutdown completion includes clearing all pending state.
 			let _delay = delay;
@@ -203,12 +416,9 @@ impl ClientManager {
 				};
 				if let Ok(mut inner) = pending.write() {
 					if stopping {
-						for client in inner.values() {
-							client.pin_notify.notify_one();
-						}
-						inner.clear();
+						Self::clear_pending(&mut inner, &events);
 					} else {
-						Self::expire(&mut inner);
+						Self::expire_pending(&mut inner, &events);
 					}
 				}
 				if stopping {
@@ -232,10 +442,11 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|_| ())?;
 		let changed = self.state.revoke(id, fingerprint)?;
 		if changed {
-			for client in inner.values() {
-				client.pin_notify.notify_one();
+			Self::clear_pending(&mut inner, &self.events);
+			if let Ok(mut seen) = self.last_seen.lock() {
+				seen.retain(|fingerprint, _| self.state.has_paired_cert(fingerprint.clone()).unwrap_or(false));
 			}
-			inner.clear();
+			self.emit(PairingEvent::TrustChanged);
 		}
 		Ok(changed)
 	}
@@ -251,26 +462,48 @@ impl ClientManager {
 		if client.deadline <= Instant::now() {
 			return None;
 		}
-		Some(PendingApproval {
-			approval: client.approval.clone(),
-			requester: client.requester,
-			fingerprint: cert_pem_fingerprint(&client.pem),
-		})
+		Some(PendingApproval::of(client))
 	}
 
-	/// Forget a pending request that was not approved in time, unless it was
-	/// already replaced by a newer request for the same client ID.
-	pub(crate) fn cancel_pairing(&self, id: &str, approval: &str) {
+	/// Forget a pending request, unless it was already replaced by a newer
+	/// request for the same client ID. `outcome` tells observers why.
+	pub(crate) fn cancel_pairing(&self, id: &str, approval: &str, outcome: PairingOutcome) -> bool {
 		if let Ok(mut inner) = self.pending_clients.write()
 			&& inner.get(id).is_some_and(|client| client.approval == approval)
 			&& let Some(client) = inner.remove(id)
 		{
 			client.pin_notify.notify_one();
+			self.emit(PairingEvent::Resolved {
+				client_id: client.id,
+				approval: client.approval,
+				outcome,
+			});
+			return true;
 		}
+		false
+	}
+
+	/// The operator rejects the pending request identified by `approval`.
+	/// Its waiter answers the client with an error; a request that replaced
+	/// it under the same client ID is unaffected.
+	pub(crate) fn reject_pairing(&self, id: &str, approval: &str) -> bool {
+		self.cancel_pairing(id, approval, PairingOutcome::Rejected)
 	}
 
 	/// Apply the operator's PIN to the pending request identified by `approval`.
 	pub(crate) fn register_pin(&self, id: &str, pin: &str, approval: &str) -> Result<(), ()> {
+		self.register_pin_with_label(id, pin, approval, None)
+	}
+
+	/// [`Self::register_pin`], also recording the operator's name for the
+	/// client, which is stored once (and only if) pairing completes.
+	pub(crate) fn register_pin_with_label(
+		&self,
+		id: &str,
+		pin: &str,
+		approval: &str,
+		label: Option<String>,
+	) -> Result<(), ()> {
 		if pin.is_empty() || pin.len() > 16 || !pin.bytes().all(|b| b.is_ascii_digit()) {
 			tracing::warn!("Rejected PIN that is not a short decimal number");
 			return Err(());
@@ -278,7 +511,7 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		Self::expire(&mut inner);
+		self.expire(&mut inner);
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
@@ -292,7 +525,12 @@ impl ClientManager {
 		}
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
 		client.key = Some(key);
+		client.label = label;
 		client.pin_notify.notify_one();
+		self.emit(PairingEvent::Approved {
+			client_id: client.id.clone(),
+			approval: client.approval.clone(),
+		});
 		Ok(())
 	}
 
@@ -308,7 +546,7 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		Self::expire(&mut inner);
+		self.expire(&mut inner);
 		if inner
 			.get(id)
 			.is_none_or(|client| generation != Some(client.approval.as_str()))
@@ -374,7 +612,7 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		Self::expire(&mut inner);
+		self.expire(&mut inner);
 		if inner
 			.get(id)
 			.is_none_or(|client| generation != Some(client.approval.as_str()))
@@ -422,7 +660,7 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		Self::expire(&mut inner);
+		self.expire(&mut inner);
 		if inner
 			.get(id)
 			.is_none_or(|client| generation != Some(client.approval.as_str()))
@@ -434,14 +672,35 @@ impl ClientManager {
 			return Err(());
 		}
 		let mut client = inner.remove(id).ok_or(())?;
-		verify_pairing_secret(&mut client, client_secret)
-			.map_err(|e| tracing::warn!("Failed to verify client pairing secret: {e}"))?;
-		let fingerprint = cert_pem_fingerprint(&client.pem).ok_or(())?;
-		self.state.pair(id.to_string(), fingerprint)?;
-
-		Ok(())
+		let (client_id, approval) = (client.id.clone(), client.approval.clone());
+		let resolved = |outcome| PairingEvent::Resolved {
+			client_id: client_id.clone(),
+			approval: approval.clone(),
+			outcome,
+		};
+		let result = verify_pairing_secret(&mut client, client_secret)
+			.map_err(|e| tracing::warn!("Failed to verify client pairing secret: {e}"))
+			.and_then(|()| cert_pem_fingerprint(&client.pem).ok_or(()))
+			.and_then(|fingerprint| {
+				self.state
+					.pair_with_label(id.to_string(), fingerprint, client.label.clone())
+			});
+		match result {
+			Ok(_) => {
+				self.emit(resolved(PairingOutcome::Paired));
+				self.emit(PairingEvent::TrustChanged);
+				Ok(())
+			},
+			Err(()) => {
+				self.emit(resolved(PairingOutcome::Failed));
+				Err(())
+			},
+		}
 	}
 }
+
+/// Pairing events buffered for a slow consumer before it must resynchronize.
+const PAIRING_EVENT_CAPACITY: usize = 64;
 
 pub(crate) fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 	let mut key = Vec::with_capacity(salt.len() + pin.len());
@@ -588,6 +847,9 @@ mod pairing_lifecycle_tests {
 			pin_notify: Arc::new(Notify::new()),
 			approval: new_approval_token().unwrap(),
 			requester: "192.0.2.1".parse().unwrap(),
+			received_at: SystemTime::now(),
+			approval_deadline: Instant::now() + Duration::from_secs(seconds),
+			label: None,
 			deadline: Instant::now() + Duration::from_secs(seconds),
 			key: None,
 			server_secret: None,
@@ -671,13 +933,13 @@ mod pairing_lifecycle_tests {
 				.check_client_pairing_secret("duplicate", Some(&token), vec![0; 272])
 				.is_err()
 		);
-		manager.cancel_pairing("duplicate", &token);
+		manager.cancel_pairing("duplicate", &token, PairingOutcome::Cancelled);
 		assert_eq!(
 			manager.pending_approval("duplicate").unwrap().approval,
 			replacement_token
 		);
 		assert!(manager.register_pin("duplicate", "1234", &token).is_err());
-		manager.cancel_pairing("duplicate", &replacement_token);
+		manager.cancel_pairing("duplicate", &replacement_token, PairingOutcome::Cancelled);
 		assert!(manager.pending_clients.read().unwrap().is_empty());
 	}
 

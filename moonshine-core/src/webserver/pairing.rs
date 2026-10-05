@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration, time::SystemTime};
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
@@ -7,6 +7,7 @@ use hyper::{
 	body::Bytes,
 	header::{self, HeaderValue},
 };
+use moonshine_management::dto::PairingOutcome;
 use notify_rust::Notification;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,11 +34,15 @@ struct PairingWaitGuard<'a> {
 impl Drop for PairingWaitGuard<'_> {
 	fn drop(&mut self) {
 		if !self.approved {
-			self.manager.cancel_pairing(self.id, self.approval);
+			self.manager
+				.cancel_pairing(self.id, self.approval, PairingOutcome::Cancelled);
 		}
 	}
 }
 
+/// Headless fallback notification. While the desktop UI runs it receives the
+/// pairing request over the management interface and notifies the operator
+/// itself (linking to its pairing page), so this is skipped.
 fn notify_operator(pin_url: String) {
 	let Ok(mut last) = LAST_NOTIFICATION.lock() else {
 		return;
@@ -52,7 +57,7 @@ fn notify_operator(pin_url: String) {
 		.name("pin-notification".into())
 		.spawn(move || {
 			let _ = Notification::new()
-				.appname("Moonshine")
+				.appname("Pyroshine")
 				.summary("Received pairing request")
 				.body(&format!("Open {pin_url} on the host to enter the PIN."))
 				.timeout(30_000)
@@ -172,7 +177,7 @@ pub async fn handle_pair_request(
 		&& was_approved
 		&& let Some((id, approval)) = cleanup
 	{
-		client_manager.cancel_pairing(&id, &approval);
+		client_manager.cancel_pairing(&id, &approval, PairingOutcome::Failed);
 	}
 	response
 }
@@ -248,6 +253,9 @@ async fn get_server_cert(
 		pin_notify: pin_notify.clone(),
 		approval: approval.clone(),
 		requester: peer_address.ip(),
+		received_at: SystemTime::now(),
+		approval_deadline: Instant::now() + approval_timeout,
+		label: None,
 		key: None,
 		server_secret: None,
 		server_challenge: None,
@@ -272,21 +280,23 @@ async fn get_server_cert(
 	if local_address.is_some() {
 		let encoded_id: String = url::form_urlencoded::byte_serialize(unique_id.as_bytes()).collect();
 		let pin_url = format!("http://localhost:{http_port}/pin?uniqueid={encoded_id}");
-		tracing::info!(requester = %peer_address, "Waiting for the host operator to enter the PIN at {pin_url}");
+		tracing::info!(requester = %peer_address, "Waiting for the host operator to enter the PIN in the Pyroshine desktop app or at {pin_url}");
 
-		notify_operator(pin_url);
+		if !client_manager.operator_ui_present() {
+			notify_operator(pin_url);
+		}
 	}
 
 	tokio::select! {
 		_ = &mut pin_notified => {},
 		_ = tokio::time::sleep(approval_timeout) => {
 			tracing::warn!(requester = %peer_address, "Pairing request was not approved in time.");
-			client_manager.cancel_pairing(&unique_id, &approval);
+			client_manager.cancel_pairing(&unique_id, &approval, PairingOutcome::Expired);
 			return bad_request("Pairing was not approved in time.".to_string());
 		},
 		_ = shutdown.wait_shutdown_triggered() => {
 			tracing::info!("Shutdown triggered, aborting pairing.");
-			client_manager.cancel_pairing(&unique_id, &approval);
+			client_manager.cancel_pairing(&unique_id, &approval, PairingOutcome::Cleared);
 			return bad_request("Server is shutting down.".to_string());
 		},
 	}

@@ -17,6 +17,8 @@ headless sessions and streams them to Moonlight-compatible clients.
 - H.264, HEVC, and AV1 through Vulkan Video.
 - Hardware encoding with DMA-BUF import, low-latency transport, and forward error correction.
 - Keyboard, mouse, touch, pen, controller, haptics, and surround audio support.
+- Optional desktop app with a system tray, pairing notifications, client management,
+  a settings editor, and a live stream dashboard. The server runs headless without it.
 
 Use [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave)
 for PyroWave streaming. Standard Moonlight clients can use the conventional codecs.
@@ -58,20 +60,55 @@ title = "My game"
 command = ["/absolute/path/to/game"]
 ```
 
-Restart the service after editing, add the host in Moonlight, and enter the
-client's pairing PIN at `http://localhost:47989/pin` on the host (the page only
-accepts requests from the host itself; see [headless pairing](docs/CONFIGURATION.md#webserver)):
+Restart the service after editing:
 
 ```sh
 sudo systemctl restart "pyroshine@$USER"
 ```
 
+Add the host in Moonlight and enter the PIN it shows on the host, either in the
+[desktop app](#desktop-app) or on the host-local page linked in the service log
+(`http://localhost:47989/pin?uniqueid=…`). The page only accepts requests from the
+host itself (see [headless pairing](docs/CONFIGURATION.md#webserver)).
+
 Use a trusted LAN or VPN and restrict the GameStream ports with a firewall.
 Do not expose Pyroshine directly to the public internet.
+
+## Desktop app
+
+On a desktop, install the optional `pyroshine-ui` package from the same release
+to manage Pyroshine without editing files or reading logs:
+
+| Distribution | Install or upgrade |
+| --- | --- |
+| Arch Linux / CachyOS | `sudo pacman -U ./pyroshine-ui-*.pkg.tar.zst` |
+| Debian / Ubuntu | `sudo apt install ./pyroshine-ui_*.deb` |
+| Fedora / RHEL | `sudo dnf install ./pyroshine-ui-*.rpm` |
+
+It starts in the system tray at login, or open **Pyroshine** from the application
+menu. It provides:
+
+- **Tray icon** showing whether a client is streaming (green play), the game is
+  still running after the client disconnected (amber pause), or a client is
+  waiting to pair, with an **End Session** action.
+- **Pairing** from a notification: check the requesting device and enter the
+  PIN Moonlight shows. Paired clients can be named and revoked.
+- **Settings** for every `config.toml` option, including applications and
+  scanners. Changes are validated before saving and keep your comments; restart
+  the service to apply them.
+- **Dashboard** with the application, negotiated video and audio format, client,
+  and per-second frame rate, bitrate, and pipeline timing while streaming.
+
+The app manages a running `pyroshine@<user>` service; it never starts or stops it,
+and quitting the app does not affect a stream. It needs WebKitGTK and GTK 3, and a
+StatusNotifierItem tray (KDE Plasma natively, GNOME with the AppIndicator
+extension). See the [desktop app guide](docs/DESKTOP.md) for details and
+troubleshooting.
 
 ## Documentation
 
 - [Installation, upgrades, and headless setup](docs/INSTALLATION.md)
+- [Desktop app: tray, pairing, and settings](docs/DESKTOP.md)
 - [Complete config.toml reference](docs/CONFIGURATION.md)
 - [Tips and troubleshooting](docs/TIPS.md)
 - [Pairing, revocation, and state recovery](docs/SECURITY_ADMINISTRATION.md)
