@@ -53,6 +53,8 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
+| `--detach-seconds <N>` | `0` | After the run, measure N s attached, then N s with both media epochs paused by a reconnecting client's ANNOUNCE (no PLAY), then PLAY and time the first frame; reports frames, process CPU and per-engine GPU time of the benchmark process |
+| `--runtime-probe` | off | Run a 1 ms timer task on the session runtime and report its lateness percentiles (scheduling delay caused by packetization and transport) |
 
 ### Examples
 

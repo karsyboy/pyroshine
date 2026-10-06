@@ -177,6 +177,7 @@ impl CaptureReceiver {
 	pub(crate) fn set_overlay_caps(&self, caps: OverlayCaps) {
 		self.overlay_caps.store(caps.0, Ordering::Release);
 	}
+	#[cfg(test)]
 	pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<ExportedFrame, mpsc::RecvTimeoutError> {
 		self.recv_timeout_if(timeout, true)
 	}

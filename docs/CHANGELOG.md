@@ -35,6 +35,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Changed
 
+- Stop capturing, converting and encoding video and audio while no client is connected to a retained session; the game keeps running and is presented normally. On an RX 9070 XT a detached 1080p60 session previously used the same encode GPU time as a streaming one; it now uses none, and the first frame after reconnecting is a keyframe of the current scene.
+- Keep large encrypted frames' packetization from delaying other server tasks: frames of 128 KiB or more are packetized off the shared runtime worker.
 - Reject `pre_command`/`post_command` entries that are empty or whose executable cannot be found, instead of silently leaving them out of the application unit; the log names the stage and entry. Check custom application hooks after upgrading.
 - Reject a configuration with a listener port of 0 or a `[stream].timeout` outside 1–86400 seconds at startup, with the setting named, as the settings editor already did. A timeout of 0 previously disconnected every client immediately, and port 0 was advertised to clients as an unusable port.
 

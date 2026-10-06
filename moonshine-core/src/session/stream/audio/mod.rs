@@ -379,12 +379,14 @@ impl AudioStream {
 
 		// Create packet channel and spawn handler — registered now, gated behind the latch.
 		let (packet_tx, packet_rx) = mpsc::channel::<AudioPacketMessage>(16);
+		let demand = crate::session::stream::MediaDemand::new();
 		let worker = WorkerGuard::register(&self.stop, SessionShutdownReason::AudioPacketHandlerStopped)?;
 		spawn_handle_audio_packets(
 			packet_rx,
 			self.udp_socket,
 			authorization_rx,
 			generation,
+			demand.clone(),
 			start.waiter(),
 			self.stop.clone(),
 			worker,
@@ -422,6 +424,7 @@ impl AudioStream {
 			start.waiter(),
 			encoder_reconfigure_rx,
 			generation,
+			demand,
 		)?;
 
 		Ok(AudioStartHandle {
@@ -440,11 +443,13 @@ impl AudioStream {
 /// served from the start, so a reconnect can negotiate with workers that never
 /// received `StartB`. Packets are sent only after `StartB`, to the endpoint the
 /// active generation discovered, while that generation is still current.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handle_audio_packets(
 	packet_rx: mpsc::Receiver<AudioPacketMessage>,
 	socket: UdpSocket,
 	authorization: AuthorizationReceiver,
 	initial_generation: u64,
+	demand: crate::session::stream::MediaDemand,
 	start: StartWaiter,
 	stop: ShutdownManager<SessionShutdownReason>,
 	worker: WorkerGuard,
@@ -481,11 +486,13 @@ fn spawn_handle_audio_packets(
 						Ok(Some(AudioPacketMessage::Pause(ready))) => {
 							if !paused { client_address = None; }
 							paused = true;
+							demand.set(false);
 							let _ = ready.send(());
 						},
 						Ok(Some(AudioPacketMessage::BeginEpoch { generation, qos, ready })) => {
 							active_generation = generation;
 							paused = false;
+							demand.set(true);
 							let _ = socket.set_tos_v4(if qos { 224 } else { 0 });
 							let _ = ready.send(());
 						},
@@ -559,7 +566,16 @@ mod tests {
 		let mut auth = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
 		auth.require_session_id();
 		let (auth_tx, auth_rx) = watch::channel(auth.clone());
-		spawn_handle_audio_packets(rx, socket, auth_rx, 1, start.waiter(), stop.clone(), worker(&stop));
+		spawn_handle_audio_packets(
+			rx,
+			socket,
+			auth_rx,
+			1,
+			crate::session::stream::MediaDemand::new(),
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+		);
 		start.open();
 		let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let new = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -644,6 +660,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			crate::session::stream::MediaDemand::new(),
 			handle.start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -687,6 +704,7 @@ mod tests {
 				socket,
 				authorization_rx,
 				1,
+				crate::session::stream::MediaDemand::new(),
 				start.waiter(),
 				stop.clone(),
 				worker(&stop),
@@ -719,6 +737,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			crate::session::stream::MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -844,6 +863,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			crate::session::stream::MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),

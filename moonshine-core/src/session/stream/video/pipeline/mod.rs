@@ -399,6 +399,10 @@ pub(crate) struct EpochActivation {
 	pub applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
 }
 
+/// Encoded frames at least this large are packetized with
+/// `tokio::task::block_in_place`; see `run_packet_consumer`.
+const PACKETIZE_OFFLOAD_BYTES: usize = 128 * 1024;
+
 /// An owned useful-work credit travels from submission through transport release.
 use super::shard_batch::NetworkCredit as InFlightGuard;
 
@@ -527,17 +531,31 @@ async fn run_packet_consumer(
 		let processing_latency = t_start.duration_since(frame_context.created_at);
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
-		let mut shards = match packetizer.packetize(
-			&packet.data,
-			is_key_frame,
-			ctx.packet_size,
-			fec_controller.minimum_packets(ctx.minimum_fec_packets),
-			fec_controller.percentage(),
-			frame_number,
-			&mut sequence_number,
-			rtp_timestamp,
-			latency_100us,
-		) {
+		let mut packetize = || {
+			packetizer.packetize(
+				&packet.data,
+				is_key_frame,
+				ctx.packet_size,
+				fec_controller.minimum_packets(ctx.minimum_fec_packets),
+				fec_controller.percentage(),
+				frame_number,
+				&mut sequence_number,
+				rtp_timestamp,
+				latency_100us,
+			)
+		};
+		// Large frames (FEC and encryption scale with size) can occupy a runtime
+		// worker for about a millisecond; let the runtime move its other tasks
+		// off this worker meanwhile. Ordering is unchanged: this task still
+		// packetizes one frame at a time (review 2026-10-05 PERF-002).
+		let offload = packet.data.len() >= PACKETIZE_OFFLOAD_BYTES
+			&& tokio::runtime::Handle::current().runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread;
+		let packetized = if offload {
+			tokio::task::block_in_place(packetize)
+		} else {
+			packetize()
+		};
+		let mut shards = match packetized {
 			Ok(shards) => shards,
 			// Drop just this frame rather than tearing down the session: the
 			// client sees a gap (the frame number was already consumed) and
@@ -716,6 +734,7 @@ impl VideoPipeline {
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
+		demand: crate::session::stream::MediaDemand,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -728,6 +747,7 @@ impl VideoPipeline {
 			context,
 			keys_rx,
 			fec_feedback_rx,
+			demand: DemandTracker::new(demand),
 		};
 
 		// Capture the main (multi-threaded) runtime handle so the OS-threaded
@@ -771,6 +791,43 @@ struct VideoPipelineInner {
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
 	fec_feedback_rx: watch::Receiver<FrameFecStatus>,
+	demand: DemandTracker,
+}
+
+/// [`crate::session::stream::MediaDemand`] as the encoding loops see it: whether to produce,
+/// and whether a replay of the last frame may stand in for a fresh capture.
+struct DemandTracker {
+	demand: crate::session::stream::MediaDemand,
+	/// When demand last became wanted; `None` while it is clear. Only the
+	/// encoding thread touches it.
+	wanted_since: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl DemandTracker {
+	fn new(demand: crate::session::stream::MediaDemand) -> Self {
+		Self {
+			wanted_since: std::cell::Cell::new(demand.wanted().then(std::time::Instant::now)),
+			demand,
+		}
+	}
+
+	/// Whether media is wanted now; records the moment it resumed.
+	fn wanted(&self) -> bool {
+		let wanted = self.demand.wanted();
+		match (wanted, self.wanted_since.get()) {
+			(true, None) => self.wanted_since.set(Some(std::time::Instant::now())),
+			(false, Some(_)) => self.wanted_since.set(None),
+			_ => {},
+		}
+		wanted
+	}
+
+	/// A replay of the last produced frame (static-scene IDR, PyroWave resend)
+	/// is allowed only once a fresh capture had `grace` to arrive after media
+	/// resumed: the last frame may predate a detach.
+	fn may_replay(&self, grace: std::time::Duration) -> bool {
+		self.wanted() && self.wanted_since.get().is_some_and(|since| since.elapsed() >= grace)
+	}
 }
 
 impl VideoPipelineInner {
@@ -1075,6 +1132,8 @@ impl VideoPipelineInner {
 		let mut gpu_window_frames = 0u64;
 		let mut gpu_window_encodes = 0u64;
 		let mut failures = FailurePolicy::default();
+		// A requested replay of the last frame, kept until a frame is sent.
+		let mut resend_last = false;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			if let Ok(command) = reconfigure_rx.try_recv() {
@@ -1084,7 +1143,6 @@ impl VideoPipelineInner {
 			if fec_feedback_rx.has_changed().unwrap_or(false) {
 				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 			}
-			let mut resend_last = false;
 			while let Ok(activation) = reset_request_rx.try_recv() {
 				frame_rx.reset();
 				frame_number = 0;
@@ -1103,7 +1161,8 @@ impl VideoPipelineInner {
 			// encoder-state invalidation. Drain the channel so it cannot lag.
 			while invalidate_request_rx.try_recv().is_ok() {}
 
-			let mut received = match frame_rx.recv_timeout(frame_interval) {
+			// No captures while no client can receive them (PERF-001).
+			let mut received = match frame_rx.recv_timeout_if(frame_interval, self.demand.wanted()) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1122,6 +1181,7 @@ impl VideoPipelineInner {
 					continue;
 				}
 				gpu_window_encodes += 1;
+				resend_last = false;
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
 				let pacing_origin = frame.pacing_origin();
@@ -1165,10 +1225,11 @@ impl VideoPipelineInner {
 					buffer_index,
 					received_at.saturating_duration_since(created_at),
 				)
-			} else if resend_last {
+			} else if resend_last && self.demand.may_replay(2 * frame_interval) {
 				let Some(encoded) = last_encoded.take() else {
 					continue;
 				};
+				resend_last = false;
 				(
 					encoded,
 					std::time::Instant::now(),
@@ -1560,14 +1621,22 @@ impl VideoPipelineInner {
 			}
 
 			// Try to receive a frame from compositor (with timeout).
-			let received_frame = match frame_rx.recv_timeout_if(frame_interval, conventional_can_admit(&in_flight)) {
+			// No captures while no client can receive them (PERF-001).
+			let received_frame = match frame_rx.recv_timeout_if(
+				frame_interval,
+				conventional_can_admit(&in_flight) && self.demand.wanted(),
+			) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the static scene from the latest converted frame
 					// (see `encode_static_recovery`).
-					if pending_idr && has_encoded && last_output.is_some() && conventional_can_admit(&in_flight) {
+					if pending_idr
+						&& has_encoded && last_output.is_some()
+						&& conventional_can_admit(&in_flight)
+						&& self.demand.may_replay(2 * frame_interval)
+					{
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
@@ -2339,6 +2408,24 @@ mod tests {
 		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
 		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
 		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
+	}
+
+	/// Review 2026-10-05 PERF-001: replays wait for a fresh capture's chance
+	/// after media resumes, and never happen while it is not wanted.
+	#[test]
+	fn replays_need_demand_and_a_grace_after_resuming() {
+		let demand = crate::session::stream::MediaDemand::new();
+		let tracker = super::DemandTracker::new(demand.clone());
+		let grace = std::time::Duration::from_millis(30);
+		std::thread::sleep(grace);
+		assert!(tracker.wanted() && tracker.may_replay(grace));
+		demand.set(false);
+		assert!(!tracker.wanted() && !tracker.may_replay(grace));
+		demand.set(true);
+		assert!(tracker.wanted());
+		assert!(!tracker.may_replay(grace), "the last frame may predate the pause");
+		std::thread::sleep(grace);
+		assert!(tracker.may_replay(grace));
 	}
 
 	/// A model of the pinned Pixelforge input-slot contract: two slots,

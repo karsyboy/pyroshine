@@ -8,6 +8,7 @@ use crate::session::authorization::MediaStream;
 use crate::session::compositor::frame::HdrModeState;
 use crate::session::lifecycle::{StartLatch, StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::MediaDemand;
 use crate::session::{AuthorizationReceiver, SessionKeysReceiver};
 
 mod diagnostics;
@@ -561,6 +562,7 @@ impl VideoStream {
 			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
 
 		// Spawn packet handler — registered now, gated behind the start latch.
+		let demand = MediaDemand::new();
 		let worker = WorkerGuard::register(&stop, SessionShutdownReason::VideoPacketHandlerStopped)?;
 		spawn_handle_video_packets(
 			packet_rx,
@@ -568,6 +570,7 @@ impl VideoStream {
 			socket,
 			authorization_rx,
 			generation,
+			demand.clone(),
 			start.waiter(),
 			stop.clone(),
 			worker,
@@ -593,6 +596,7 @@ impl VideoStream {
 			stats_tx,
 			fec_feedback_rx,
 			reconfigure_rx,
+			demand,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
@@ -626,6 +630,7 @@ fn spawn_handle_video_packets(
 	socket: UdpGsoSocket,
 	mut authorization: AuthorizationReceiver,
 	initial_generation: u64,
+	demand: MediaDemand,
 	start: StartWaiter,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	worker: WorkerGuard,
@@ -667,6 +672,7 @@ fn spawn_handle_video_packets(
 				Ok(()) = pause_rx.changed() => {
 					if !paused { client_address = None; }
 					paused = true;
+					demand.set(false);
 				},
 				message = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match message {
@@ -681,6 +687,7 @@ fn spawn_handle_video_packets(
 							// PING may discover the next endpoint, but only an ordered
 							// BeginEpoch from the producer can enable delivery again.
 							paused = true;
+							demand.set(false);
 							let _ = ready.send(());
 						},
 						Ok(Some(VideoPacketMessage::BeginEpoch { context, generation, ready })) => {
@@ -689,6 +696,7 @@ fn spawn_handle_video_packets(
 							fps = context.fps;
 							active_generation = generation;
 							paused = false;
+							demand.set(true);
 							let tos = if context.qos { 160 } else { 0 };
 							let _ = socket.set_tos_v4(tos);
 							let _ = ready.send(());
@@ -712,6 +720,7 @@ fn spawn_handle_video_packets(
 											biased;
 											Ok(()) = pause_rx.changed() => {
 												paused = true;
+												demand.set(false);
 												client_address = None;
 												break None;
 											},
@@ -878,6 +887,7 @@ mod tests {
 				socket,
 				authorization_rx,
 				1,
+				MediaDemand::new(),
 				handle.start.waiter(),
 				stop.clone(),
 				worker(&stop),
@@ -970,6 +980,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1031,6 +1042,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1116,6 +1128,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(stop),
@@ -1332,6 +1345,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1422,6 +1436,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1507,6 +1522,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1553,6 +1569,67 @@ mod tests {
 			.unwrap();
 	}
 
+	/// Review 2026-10-05 PERF-001: every pause (urgent notification or the
+	/// ordered barrier) clears media demand, and only an epoch activation
+	/// restores it, so producers stop while no client can receive media.
+	#[tokio::test]
+	async fn pauses_clear_media_demand_until_an_epoch_activates() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (tx, rx) = mpsc::channel(16);
+		let (pause_tx, pause_rx) = watch::channel(0u64);
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		let demand = MediaDemand::new();
+		spawn_handle_video_packets(
+			rx,
+			pause_rx,
+			socket,
+			authorization_rx,
+			1,
+			demand.clone(),
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+			None,
+			60,
+			false,
+		);
+		start.open();
+		assert!(demand.wanted());
+		let activate = || async {
+			let (ready, activated) = tokio::sync::oneshot::channel();
+			tx.send(VideoPacketMessage::BeginEpoch {
+				context: VideoStreamContext::default(),
+				generation: 1,
+				ready,
+			})
+			.await
+			.unwrap();
+			activated.await.unwrap();
+		};
+		// Ordered barrier.
+		let (paused, acknowledged) = tokio::sync::oneshot::channel();
+		tx.send(VideoPacketMessage::Pause(paused)).await.unwrap();
+		acknowledged.await.unwrap();
+		assert!(!demand.wanted());
+		activate().await;
+		assert!(demand.wanted());
+		// Urgent notification alone.
+		pause_tx.send_modify(|g| *g += 1);
+		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+			while demand.wanted() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		activate().await;
+		assert!(demand.wanted());
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		stop.wait_shutdown_complete().await;
+	}
+
 	/// Review 2026-10-05 STAB-002: the one-shot media latch gates media, not
 	/// lifecycle commands. A client that completes PLAY and disappears before
 	/// `StartB` leaves workers that a reconnect ANNOUNCE must still be able to
@@ -1575,6 +1652,7 @@ mod tests {
 			socket,
 			authorization_rx,
 			1,
+			MediaDemand::new(),
 			handle.start.waiter(),
 			stop.clone(),
 			worker(&stop),

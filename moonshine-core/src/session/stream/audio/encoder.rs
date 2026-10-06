@@ -48,6 +48,7 @@ impl AudioEncoder {
 		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 		generation: u64,
+		demand: crate::session::stream::MediaDemand,
 	) -> Result<(), ()> {
 		let stream_config = &context.audio_config.stream_config;
 		tracing::debug!("Starting audio encoder.");
@@ -83,6 +84,7 @@ impl AudioEncoder {
 					start,
 					reconfigure_rx,
 					generation,
+					demand,
 				)
 			})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
@@ -144,6 +146,7 @@ impl AudioEncoderInner {
 		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 		mut generation: u64,
+		demand: crate::session::stream::MediaDemand,
 	) {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
@@ -240,7 +243,9 @@ impl AudioEncoderInner {
 					},
 					recv(frames) -> frame => match frame {
 						Ok(frame) => {
-							if frame.generation == generation { break frame; }
+							// While no client receives audio (PERF-001), the PCM is
+							// returned unencoded; Pulse keeps serving the application.
+							if frame.generation == generation && demand.wanted() { break frame; }
 							let _ = frame_recycle_tx.try_send(frame);
 						},
 						Err(_) => {
@@ -429,6 +434,74 @@ impl AudioEncoderInner {
 mod tests {
 	use super::*;
 
+	/// Review 2026-10-05 PERF-001: while no client receives audio, PCM is
+	/// recycled without being encoded; encoding resumes with demand.
+	#[tokio::test]
+	async fn no_encoding_without_media_demand() {
+		use crate::session::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+		use std::time::Duration;
+		let stop = ShutdownManager::new();
+		let start = crate::session::lifecycle::StartLatch::new();
+		let keys = crate::session::keys::KeyLedger::default().publish(SessionKeyData::new(
+			RemoteInputKey::from_bytes([1; 16]),
+			RemoteInputKeyId::new(1),
+		));
+		let (_keys_tx, keys_rx) = tokio::sync::watch::channel(keys);
+		let (frames, frame_rx) = crossbeam_channel::bounded(16);
+		let (recycle, recycled) = crossbeam_channel::bounded(16);
+		let (packets, mut packet_rx) = mpsc::channel(32);
+		let (_commands, command_rx) = crossbeam_channel::unbounded();
+		let demand = crate::session::stream::MediaDemand::new();
+		demand.set(false);
+		AudioEncoder::spawn(
+			48_000,
+			AudioStreamContext {
+				packet_duration_ms: 5,
+				..Default::default()
+			},
+			frame_rx,
+			recycle,
+			keys_rx,
+			packets,
+			stop.clone(),
+			start.waiter(),
+			command_rx,
+			1,
+			demand.clone(),
+		)
+		.unwrap();
+		start.open();
+		let frame = || AudioFrame {
+			buf: vec![0.5; 240],
+			capture_ts_ms: 0,
+			generation: 1,
+		};
+		for _ in 0..4 {
+			frames.send(frame()).unwrap();
+		}
+		assert!(
+			tokio::time::timeout(Duration::from_millis(200), packet_rx.recv())
+				.await
+				.is_err()
+		);
+		// The frames went back to the Pulse server (three pre-seeded plus four).
+		let returned =
+			tokio::task::spawn_blocking(move || (0..7).all(|_| recycled.recv_timeout(Duration::from_secs(1)).is_ok()))
+				.await
+				.unwrap();
+		assert!(returned);
+		demand.set(true);
+		frames.send(frame()).unwrap();
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(2), packet_rx.recv()).await,
+			Ok(Some(AudioPacketMessage::Packet { generation: 1, .. }))
+		));
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
 	/// Review 2026-10-05 STAB-002: a reconnect can reconfigure audio before
 	/// the first `StartB`. The encoder applies it and activates the epoch for
 	/// the PLAY's generation, but encodes nothing until `StartB`.
@@ -463,6 +536,7 @@ mod tests {
 			start.waiter(),
 			command_rx,
 			1,
+			crate::session::stream::MediaDemand::new(),
 		)
 		.unwrap();
 		let resumed = ledger.publish(SessionKeyData::new(
@@ -547,6 +621,7 @@ mod tests {
 			start.waiter(),
 			command_rx,
 			1,
+			crate::session::stream::MediaDemand::new(),
 		)
 		.unwrap();
 		start.open();
