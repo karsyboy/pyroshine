@@ -61,7 +61,7 @@ pub struct SessionDetails {
 	/// Primary application presented by the embedded compositor, if named.
 	#[serde(default)]
 	pub foreground_application: Option<ForegroundApplication>,
-	/// Address of the paired client authorized for the session.
+	/// Address of the client authorized by the latest accepted launch/resume.
 	pub client_address: String,
 	pub started_at_ms: u64,
 	/// Values from the client's launch or latest resume request.

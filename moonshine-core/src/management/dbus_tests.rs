@@ -295,6 +295,63 @@ async fn foreground_only_changes_emit_session_snapshots_without_lifecycle_change
 	harness.sessions.stop_session().await.unwrap();
 }
 
+/// The generation watch wakes the existing signal path even when the public
+/// phase and retained session metadata do not change.
+#[tokio::test]
+async fn authorization_changes_emit_current_client_address() {
+	use crate::session::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+	use crate::session::stream::audio::AudioChannels;
+	use crate::session::{SessionContext, SessionKeys};
+
+	let harness = Harness::start().await;
+	let mut signals = harness
+		.proxy
+		.receive_session_changed()
+		.await
+		.unwrap()
+		.map(|signal| signal.args().unwrap().snapshot().clone());
+	let _foreground = harness
+		.sessions
+		.reporting_session_for_test(SessionContext {
+			application: Default::default(),
+			application_id: 42,
+			resolution: (1920, 1080),
+			refresh_rate: 60,
+			hdr: false,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: "127.0.0.1".parse().unwrap(),
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				RemoteInputKey::from_bytes([7; 16]),
+				RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let initializing: SessionSnapshot = next(&mut signals).await;
+	assert_eq!(initializing.session.as_ref().unwrap().client_address, "127.0.0.1");
+	harness
+		.sessions
+		.authorize_client_for_test("127.0.0.1".parse().unwrap())
+		.await;
+	let initial: SessionSnapshot = next(&mut signals).await;
+	assert_eq!(initial.session.as_ref().unwrap().client_address, "127.0.0.1");
+	for address in ["127.0.0.2", "127.0.0.3", "127.0.0.1"] {
+		// Same authorization rotation as launch/resume; lifecycle transitions
+		// and application retention are exercised by the manager's fake backend.
+		harness
+			.sessions
+			.authorize_client_for_test(address.parse().unwrap())
+			.await;
+		let snapshot: SessionSnapshot = next(&mut signals).await;
+		let mut expected = initial.clone();
+		expected.session.as_mut().unwrap().client_address = address.into();
+		assert_eq!(snapshot, expected);
+		let fetched: SessionSnapshot = serde_json::from_str(&harness.proxy.get_session().await.unwrap()).unwrap();
+		assert_eq!(fetched, snapshot);
+	}
+	harness.sessions.stop_session().await.unwrap();
+}
+
 #[tokio::test]
 async fn pairing_approval_is_bound_to_the_displayed_request() {
 	let harness = Harness::start().await;

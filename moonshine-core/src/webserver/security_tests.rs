@@ -696,6 +696,58 @@ fn launch_params(overrides: &[(&str, Option<&str>)]) -> HashMap<String, String> 
 	params
 }
 
+#[tokio::test]
+async fn malformed_resume_from_another_client_preserves_reported_address() {
+	use crate::session::stream::audio::AudioChannels;
+
+	let fixture = fixture(true, WebLimits::default());
+	let server = &fixture.server;
+	let client = "127.0.0.1".parse().unwrap();
+	let peer: SocketAddr = "127.0.0.2:50000".parse().unwrap();
+	let _foreground = server
+		.session_manager
+		.reporting_session_for_test(SessionContext {
+			application: Default::default(),
+			application_id: 1,
+			resolution: (1920, 1080),
+			refresh_rate: 60,
+			hdr: false,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: client,
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				crate::session::RemoteInputKey::from_bytes([7; 16]),
+				crate::session::RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let grant = server.session_manager.authorize_client_for_test(client).await;
+	let original = server.session_manager.session_view().await.unwrap();
+	for (name, value) in [
+		("rikey", Some("nothex")),
+		("rikeyid", None),
+		("mode", Some("3840x2160x0")),
+		("hdrMode", Some("yes")),
+		("surroundAudioInfo", Some("196611")),
+	] {
+		let response = body_text(server.resume(launch_params(&[(name, value)]), None, peer).await).await;
+		assert!(response.contains("status_code=\"400\""), "{name}: {response}");
+		assert!(
+			!response.contains("Failed to update session keys"),
+			"rejected before the manager"
+		);
+		assert_eq!(
+			server.session_manager.authorize_stream(client).await,
+			Some(grant.clone())
+		);
+		assert!(server.session_manager.authorize_stream(peer.ip()).await.is_none());
+		let view = server.session_manager.session_view().await.unwrap();
+		assert_eq!(view.client_ip, client);
+		assert_eq!(view.epoch, original.epoch);
+	}
+	server.session_manager.stop_session().await.unwrap();
+}
+
 /// CFG-001/SEC-004: launch and resume reject malformed keys and numeric
 /// domains at the authenticated boundary, before the session manager creates,
 /// rekeys or re-authorizes anything.

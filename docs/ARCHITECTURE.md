@@ -529,6 +529,16 @@ derives the public phase:
 A retained session without its client is therefore never reported as
 streaming, and a peer of a replaced generation cannot make it so.
 
+**Client address.** Session details report the client IP from the manager's
+current `StreamAuthorization`, falling back to the launch context only during
+initialization before the first grant exists. An accepted HTTPS resume rotates
+that authorization and publishes its new generation through `ManagerStatus`,
+so management emits `SessionChanged` with the new address through the existing
+Tauri/React bridge. The launch address stays in `SessionContext`; the session
+epoch, start time and application lifetime survive client changes. A rejected
+resume does not rotate authorization. An accepted resume owns the reported
+address even if the client has not completed ANNOUNCE/PLAY.
+
 **Foreground application.** Each session record owns a watch receiver for its
 compositor's primary application metadata. The compositor publishes only
 changed values on primary-focus selection and title/class/app-ID events.

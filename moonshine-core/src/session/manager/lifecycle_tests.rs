@@ -700,6 +700,119 @@ async fn concurrent_announce_and_play_are_ordered() {
 	h.assert_released().await;
 }
 
+/// Reporting follows the authenticated generation, even before reconnect PLAY,
+/// while the launch context, application and session lifetime remain retained.
+#[tokio::test]
+async fn retained_session_reports_current_authorized_client() {
+	let h = Harness::new();
+	let mut grant = h.active().await;
+	let original = h.core.session_view().await.unwrap();
+	assert_eq!(original.client_ip, h.client);
+	let resources = h.counters().resources.load(Ordering::SeqCst);
+	let mut status = h.core.subscribe_status();
+
+	// Different IP, same IP, abandoned resume, then back to the launch client.
+	for (address, play) in [
+		("127.0.0.2", true),
+		("127.0.0.2", true),
+		("127.0.0.3", false),
+		("127.0.0.1", true),
+	] {
+		let client: IpAddr = address.parse().unwrap();
+		status.borrow_and_update();
+		h.core
+			.resume_session(keys(), ResumeRequest::default(), client)
+			.await
+			.unwrap();
+		assert!(status.has_changed().unwrap(), "resume must wake management reporting");
+		let next = h.core.authorize_stream(client).await.unwrap();
+		assert!(next.generation() > grant.generation());
+		assert_eq!(next.client_ip(), client);
+		assert!(!h.core.inner.lock().await.is_current(&grant));
+		if client != grant.client_ip() {
+			assert!(h.core.authorize_stream(grant.client_ip()).await.is_none());
+		}
+		let view = h.core.session_view().await.unwrap();
+		assert_eq!(view.client_ip, client, "accepted resume updates reporting before PLAY");
+		assert_eq!(view.epoch, original.epoch);
+		assert_eq!(view.started_at, original.started_at);
+		assert_eq!(h.core.get_session_context().await.unwrap().client_ip, h.client);
+
+		assert!(h.announce(&grant).await.is_err(), "late old ANNOUNCE");
+		assert!(h.core.start_session(&grant).await.is_err(), "late old PLAY");
+		if play {
+			h.announce(&next).await.unwrap();
+			h.core.start_session(&next).await.unwrap();
+		}
+		assert_eq!(h.core.session_view().await.unwrap().client_ip, client);
+		assert_eq!(h.core.session_view().await.unwrap().epoch, original.epoch);
+		assert_eq!(h.calls(Op::Initialize), 1);
+		assert_eq!(h.calls(Op::Launch), 1);
+		assert_eq!(h.calls(Op::Start), 1);
+		assert_eq!(h.calls(Op::StopApplication), 0);
+		assert!(h.counters().unit_created.load(Ordering::SeqCst));
+		assert_eq!(h.counters().resources.load(Ordering::SeqCst), resources);
+		grant = next;
+	}
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+#[tokio::test]
+async fn rejected_resume_preserves_reported_client_and_authorization() {
+	let h = Harness::new();
+	h.launched().await;
+	let grant = h.grant().await;
+	let original = h.core.session_view().await.unwrap();
+	let mut status = h.core.subscribe_status();
+	status.borrow_and_update();
+	assert!(
+		h.core
+			.resume_session(keys(), ResumeRequest::default(), "127.0.0.2".parse().unwrap())
+			.await
+			.is_err()
+	);
+	assert!(!status.has_changed().unwrap());
+	assert_eq!(h.core.authorize_stream(h.client).await, Some(grant));
+	assert!(h.core.authorize_stream("127.0.0.2".parse().unwrap()).await.is_none());
+	let view = h.core.session_view().await.unwrap();
+	assert_eq!(view.client_ip, original.client_ip);
+	assert_eq!(view.epoch, original.epoch);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// An ANNOUNCE pause completing after another client's resume must not report
+/// the old client's address or publish its pending stream contexts.
+#[tokio::test]
+async fn superseded_announce_cannot_restore_previous_client_address() {
+	let h = Harness::new();
+	let old = h.active().await;
+	h.hold(Op::Pause);
+	let announce = {
+		let core = h.core.clone();
+		let old = old.clone();
+		tokio::spawn(async move { core.set_stream_context(&old, video(), audio(), false).await })
+	};
+	h.entered(Op::Pause, 1).await;
+	let client = "127.0.0.2".parse().unwrap();
+	h.core
+		.resume_session(keys(), ResumeRequest::default(), client)
+		.await
+		.unwrap();
+	assert_eq!(h.core.session_view().await.unwrap().client_ip, client);
+	h.release(Op::Pause);
+	assert!(announce.await.unwrap().is_err());
+	assert_eq!(h.core.session_view().await.unwrap().client_ip, client);
+	assert!(h.core.inner.lock().await.pending.is_none());
+	let current = h.core.authorize_stream(client).await.unwrap();
+	h.announce(&current).await.unwrap();
+	h.core.start_session(&current).await.unwrap();
+	assert_eq!(h.core.session_view().await.unwrap().client_ip, client);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
 /// Stale generations: contexts announced before a newer `/resume` cannot be
 /// committed, and the live session is unaffected.
 #[tokio::test]

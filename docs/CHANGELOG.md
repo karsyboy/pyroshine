@@ -18,6 +18,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Preserve explicitly identified Xbox Elite Series 1/2, classic Steam Controller and Steam Deck models in automatic gamepad emulation. Elite exposes four native Linux grip events; Valve models use a shared UHID report backend with motion and Deck touch events when the client SDL build supplies them. Steam recognition and hardware feedback require the documented physical acceptance checks.
 
+### Fixed
+
+- Update the desktop dashboard and tray client address when a different client resumes a retained session, following the current authorized client without restarting the application or session.
+
 ## [v0.17.0-beta.14] - 2026-10-05
 
 ### Added

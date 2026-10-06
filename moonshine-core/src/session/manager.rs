@@ -315,6 +315,7 @@ pub(crate) struct SessionView {
 	pub hdr: bool,
 	pub audio_channels: crate::session::stream::audio::AudioChannels,
 	pub audio_channel_mask: u32,
+	/// Current authorized launch/resume client, or the launch client while initializing.
 	pub client_ip: IpAddr,
 	pub streams: Option<(VideoStreamContext, AudioStreamContext)>,
 }
@@ -621,6 +622,10 @@ impl<B: SessionBackend> SessionCore<B> {
 	/// Read-only view of the live session for status reporting.
 	pub(crate) async fn session_view(&self) -> Option<SessionView> {
 		let mut guard = self.lock().await;
+		// Authorization is the source of current client identity; the context
+		// retains the launch address. Read both under the manager lock so a
+		// concurrent resume cannot mix session and authorization generations.
+		let client_ip = guard.authorization_tx.as_ref().map(|tx| tx.borrow().client_ip());
 		guard.live().map(|live| {
 			let context = &live.record.context;
 			SessionView {
@@ -634,7 +639,8 @@ impl<B: SessionBackend> SessionCore<B> {
 				hdr: context.hdr,
 				audio_channels: context.audio_channels,
 				audio_channel_mask: context.audio_channel_mask,
-				client_ip: context.client_ip,
+				// Initialization publishes the record before creating its first grant.
+				client_ip: client_ip.unwrap_or(context.client_ip),
 				streams: live.record.streams.clone(),
 			}
 		})

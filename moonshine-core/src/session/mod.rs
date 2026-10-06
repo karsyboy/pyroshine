@@ -105,8 +105,9 @@ pub struct SessionContext {
 	/// If true, the compositor will be launched with HDR support.
 	pub hdr: bool,
 
-	/// Address of the paired client that authenticated the launch. RTSP, control
-	/// and media endpoint discovery are bound to it (see `authorization`).
+	/// Address of the paired client that authenticated the original launch.
+	/// The current launch/resume client is owned by `StreamAuthorization`;
+	/// this launch metadata does not change when the retained session resumes.
 	pub client_ip: IpAddr,
 }
 
