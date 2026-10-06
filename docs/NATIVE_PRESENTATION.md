@@ -292,7 +292,7 @@ undeclared high-precision buffers. Passing them does not replace the live client
 game, controller and HDR-display checks above.
 
 For packaging checks, build the workspace first, build the pinned PyroWave
-library, then run `VERSION=0.17.0-beta.14 nfpm package --config nfpm.yaml
+library, then run `VERSION=0.17.0 nfpm package --config nfpm.yaml
 --packager deb --target /tmp/pyroshine.deb` (substitute the workspace version;
 repeat for `rpm` and `archlinux`). Inspect the payloads with `bsdtar`; neither a
 custom Vulkan library nor an implicit-layer manifest should be present. Execute
