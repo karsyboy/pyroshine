@@ -109,10 +109,12 @@ private_key = "$HOME/.config/moonshine/key.pem"
 
 Changing ports may require corresponding client and firewall changes. Keep
 listeners accessible only over a trusted LAN or VPN. Startup refuses a
-configuration in which two TCP listeners (`webserver.port`,
+configuration in which a listener port is 0 (clients are told these ports, so
+they must be fixed), two TCP listeners (`webserver.port`,
 `webserver.port_https`, `stream.port`) or two UDP listeners
 (`stream.video.port`, `stream.audio.port`, `stream.control.port`) share a
-nonzero port, or whose `address` is not an IP address.
+port, `[stream].timeout` is outside 1–86400, or whose `address` is not an IP
+address. The desktop settings editor applies the same checks.
 
 Pairing approval is an operator action on the host. `/pin` and `/submit-pin`
 reject requests whose peer or `Host` is not loopback and cross-origin browser
@@ -137,7 +139,7 @@ identity recovery, state migration and authorized revocation.
 | Setting | Type / default | Effect |
 | --- | --- | --- |
 | `port` | integer, `48010` | RTSP negotiation listener port (TCP). |
-| `timeout` | nonnegative integer, `60` | Seconds the streaming client may go without a control ping before it is treated as disconnected: its held input is released and media delivery pauses, as for a clean disconnect. The session and application keep running, without a further deadline, until a resume or an explicit quit. |
+| `timeout` | integer from 1 to 86400, `60` | Seconds the streaming client may go without a control ping before it is treated as disconnected: its held input is released and media delivery pauses, as for a clean disconnect. The session and application keep running, without a further deadline, until a resume or an explicit quit. |
 | `video` | table | Video transport settings below. |
 | `audio` | table | Audio transport settings below. |
 | `control` | table | Control transport and gamepad settings below. |
@@ -312,8 +314,8 @@ capture selection retains the NVIDIA/AMD/other preference and stable node sortin
 | `command` | array of strings, required | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
 | `boxart` | optional path string, unset | Local cover image. Missing art is resolved automatically when possible. |
 | `output_scale` | optional number, effective `1.0` | Wayland output scale for this application. Finite values from `0.25` through `8.0` are accepted; other values fall back to `1.0`. The physical video resolution stays at the client's requested size. |
-| `pre_command` | array of command arrays, `[]` | Run in order before launching the app, via systemd `ExecStartPre`. A failed command can prevent launch. |
-| `post_command` | array of command arrays, `[]` | Run after the session's application unit stops, via systemd `ExecStopPost`. Useful for cleanup. |
+| `pre_command` | array of command arrays, `[]` | Run in order before launching the app, via systemd `ExecStartPre`. A failed command can prevent launch. Every entry must name an executable found in `PATH` (or an absolute path); otherwise the launch fails and the log names the entry (for example `pre_command[1]`). |
+| `post_command` | array of command arrays, `[]` | Run after the session's application unit stops, via systemd `ExecStopPost`. Useful for cleanup. Resolved like `pre_command`; an unresolvable entry fails the launch rather than being skipped. Post commands share the unit's 5-second stop allowance. |
 | `stdout` | optional string, effective `"null"` | systemd `StandardOutput` destination, e.g. `journal`, `file:/path`, or `append:/path`. |
 | `stderr` | optional string, effective `"null"` | systemd `StandardError` destination. Set `journal` to capture errors. |
 | `launch_timeout_secs` | nonnegative integer, `2` | Time allowed for the application to reach an active state after launch; separate from the wait for pre-commands. Increase for slow launchers. |

@@ -120,7 +120,7 @@ Teardown is ordered and complete ([session ownership](ARCHITECTURE.md#session-ow
   compositor cannot apply) ends the session, application included, rather than
   continuing with partially changed settings;
 - stop the service during streaming: it exits only after the unit stopped, within
-  the 16 s teardown deadline.
+  the 25 s teardown deadline.
 
 Unit tests of reconnect decisions and epoch barriers do not prove remote-client
 resume. Include relevant [compositor checks](COMPOSITOR.md#validation-and-runtime-checks)

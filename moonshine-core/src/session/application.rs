@@ -90,11 +90,20 @@ const PROPERTIES_CHANGED: &str = "PropertiesChanged";
 const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 
-const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2);
-/// systemd's `TimeoutStopUSec` for the application unit: how long a stop job
-/// may legitimately take before systemd escalates to SIGKILL.
+/// systemd's `TimeoutStopUSec` for the application unit: how long the
+/// application may take to exit after SIGTERM before systemd sends SIGKILL.
+/// The same allowance bounds `ExecStopPost` hooks.
 const UNIT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
+/// Client-side wait for the stop job: the SIGTERM allowance, the post-hook
+/// allowance, and slack for SIGKILL and job bookkeeping. A process that exits
+/// within systemd's allowance is never reported as a failed stop.
+const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2 * UNIT_STOP_TIMEOUT.as_secs() + 2);
+/// Wait for systemd to report the unit inactive with no processes, or unloaded.
+const UNIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound of [`stop_application_unit`], including the session-bus
+/// connection. The session manager's teardown allows exactly this long.
+pub(crate) const APPLICATION_STOP_DEADLINE: Duration =
+	Duration::from_secs(STOP_JOB_TIMEOUT.as_secs() + UNIT_SETTLE_TIMEOUT.as_secs() + 1);
 
 /// Start-job wait (includes `ExecStartPre`), decoupled from `launch_timeout_secs` so a `pre_command` isn't cut off.
 const START_JOB_TIMEOUT: Duration = Duration::from_secs(90);
@@ -172,8 +181,17 @@ impl Application {
 			.map_err(|e| tracing::error!("Failed to connect to session bus: {e}"))?;
 		subscribe_to_systemd_signals(&conn).await?;
 
-		// Stop any leftover unit from a previous session.
-		let _ = stop_unit(&conn, &context.unit_name).await;
+		// Stop any leftover unit from a previous session. A unit whose processes
+		// cannot be shown gone, or that is still loaded, cannot be replaced
+		// safely: refuse the launch rather than overlap it.
+		stop_unit(&conn, &context.unit_name, Settled::Unloaded)
+			.await
+			.map_err(|()| {
+				tracing::error!(
+					unit = context.unit_name,
+					"A previous application unit is still present; refusing to launch over it"
+				)
+			})?;
 
 		// Launch the application as a transient systemd service unit.
 		let options = LaunchOptions {
@@ -191,8 +209,9 @@ impl Application {
 		let unit_path = match start_transient_service(&conn, &options).await {
 			Ok(unit_path) => unit_path,
 			Err(_) => {
-				// Best effort cleanup on launch failure.
-				stop_unit(&conn, &context.unit_name).await.ok();
+				// Best effort cleanup on launch failure; the session's teardown
+				// stops (and verifies) the unit again.
+				stop_unit(&conn, &context.unit_name, Settled::Terminated).await.ok();
 				return Err(());
 			},
 		};
@@ -216,10 +235,13 @@ impl Drop for Application {
 	}
 }
 
-/// Stop the session's application unit and wait for systemd to unload it.
+/// Stop the session's application unit and establish that it terminated.
 ///
-/// Idempotent: an absent unit is already stopped. Bounded by the stop-job and
-/// unit-removal timeouts plus the session-bus connection.
+/// `Ok` means systemd reports the unit gone, or inactive/failed with no
+/// processes left in its cgroup (it may still be awaiting garbage collection).
+/// `Err` means termination could not be established: the stop failed, timed
+/// out, or the bus was unavailable. Idempotent; bounded by
+/// [`APPLICATION_STOP_DEADLINE`].
 pub(crate) async fn stop_application_unit(unit_name: &str) -> Result<(), ()> {
 	tracing::info!(unit = unit_name, "Stopping application unit.");
 	stop_unit_owned(unit_name.to_string()).await
@@ -331,11 +353,114 @@ async fn wait_for_job_signal(
 	}
 }
 
-/// Stop a unit via the user session bus.
+/// What a stop must reach before it counts as complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settled {
+	/// No process of the unit remains (it may still be loaded).
+	Terminated,
+	/// The unit is unloaded, so a transient unit of the same name can start.
+	Unloaded,
+}
+
+/// The unit as systemd reports it after a stop.
+#[derive(Debug, PartialEq, Eq)]
+enum UnitState {
+	Absent,
+	Loaded { active_state: String, processes: usize },
+}
+
+impl UnitState {
+	fn reached(&self, settled: Settled) -> bool {
+		match self {
+			Self::Absent => true,
+			Self::Loaded {
+				active_state,
+				processes,
+			} => {
+				settled == Settled::Terminated
+					&& *processes == 0
+					&& matches!(active_state.as_str(), "inactive" | "failed")
+			},
+		}
+	}
+}
+
+fn no_such_unit(error: &zbus::Error) -> bool {
+	matches!(error, zbus::Error::MethodError(name, ..) if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit")
+}
+
+/// Query whether `unit_name` is loaded, its `ActiveState` and the processes
+/// left in its cgroup.
+async fn unit_state(conn: &Connection, unit_name: &str) -> Result<UnitState, ()> {
+	let path: OwnedObjectPath = match conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			SYSTEMD_PATH,
+			Some(SYSTEMD_MANAGER),
+			"GetUnit",
+			&(unit_name,),
+		)
+		.await
+	{
+		Ok(reply) => reply
+			.body()
+			.deserialize()
+			.map_err(|e| tracing::warn!("Failed to deserialize GetUnit reply for {unit_name}: {e}"))?,
+		Err(error) if no_such_unit(&error) => return Ok(UnitState::Absent),
+		Err(error) => {
+			tracing::warn!("Failed to look up unit {unit_name}: {error}");
+			return Err(());
+		},
+	};
+	let active_state: zvariant::OwnedValue = conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			&path,
+			Some(PROPERTIES_INTERFACE),
+			"Get",
+			&(UNIT_INTERFACE, ACTIVE_STATE_PROPERTY),
+		)
+		.await
+		.map_err(|e| tracing::warn!("Failed to read ActiveState of {unit_name}: {e}"))?
+		.body()
+		.deserialize()
+		.map_err(|e| tracing::warn!("Failed to deserialize ActiveState of {unit_name}: {e}"))?;
+	let active_state = String::try_from(active_state)
+		.map_err(|e| tracing::warn!("Unexpected ActiveState type for {unit_name}: {e}"))?;
+	let processes: Vec<(String, u32, String)> = match conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			SYSTEMD_PATH,
+			Some(SYSTEMD_MANAGER),
+			"GetUnitProcesses",
+			&(unit_name,),
+		)
+		.await
+	{
+		Ok(reply) => reply
+			.body()
+			.deserialize()
+			.map_err(|e| tracing::warn!("Failed to deserialize the processes of {unit_name}: {e}"))?,
+		Err(error) if no_such_unit(&error) => return Ok(UnitState::Absent),
+		Err(error) => {
+			tracing::warn!("Failed to list the processes of {unit_name}: {error}");
+			return Err(());
+		},
+	};
+	Ok(UnitState::Loaded {
+		active_state,
+		processes: processes.len(),
+	})
+}
+
+/// Stop a unit via the user session bus and establish the `settled` outcome.
 ///
-/// Waits for the stop job to complete and the unit to be removed, with a timeout.
-async fn stop_unit(conn: &Connection, unit_name: &str) -> Result<(), ()> {
-	// Subscribe to both JobRemoved and UnitRemoved before calling StopUnit to avoid races.
+/// The stop job's own result is informative only: systemd may report
+/// `canceled` (another stop replaced it) or `failed` (an `ExecStopPost` hook
+/// failed) after the processes are gone. What counts is the unit state
+/// afterwards, observed for up to [`UNIT_SETTLE_TIMEOUT`].
+async fn stop_unit(conn: &Connection, unit_name: &str, settled: Settled) -> Result<(), ()> {
+	// Subscribe to JobRemoved before calling StopUnit to avoid races.
 	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
 		.await
 		.map_err(|e| tracing::error!("Failed to create systemd proxy: {e}"))?;
@@ -343,13 +468,9 @@ async fn stop_unit(conn: &Connection, unit_name: &str) -> Result<(), ()> {
 		.receive_signal("JobRemoved")
 		.await
 		.map_err(|e| tracing::error!("Failed to subscribe to JobRemoved signals: {e}"))?;
-	let mut unit_removed_stream = proxy
-		.receive_signal("UnitRemoved")
-		.await
-		.map_err(|e| tracing::error!("Failed to subscribe to UnitRemoved signals: {e}"))?;
 
 	// Call StopUnit, which queues a stop job but does not wait for it to complete.
-	let reply = conn
+	match conn
 		.call_method(
 			Some(SYSTEMD_BUS),
 			SYSTEMD_PATH,
@@ -357,59 +478,47 @@ async fn stop_unit(conn: &Connection, unit_name: &str) -> Result<(), ()> {
 			"StopUnit",
 			&(unit_name, "replace"),
 		)
-		.await;
-	let reply = match reply {
-		Ok(reply) => reply,
-		Err(zbus::Error::MethodError(ref err_name, ..))
-			if err_name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
-		{
-			tracing::debug!("Unit was already stopped.");
-			return Ok(());
-		},
-		Err(e) => {
-			tracing::error!("Failed to stop unit {unit_name}: {e}");
-			return Err(());
-		},
-	};
-
-	let job_path = reply
-		.body()
-		.deserialize()
-		.map_err(|e| tracing::warn!("Failed to deserialize StopUnit reply for {unit_name}: {e}"))?;
-
-	// Wait for JobRemoved with result "done" — the stop job completed.
-	wait_for_job_signal(&mut job_removed_stream, &job_path, STOP_JOB_TIMEOUT, "Stop").await?;
-
-	// Stop job succeeded — wait for the unit to be collected and removed.
-	let unit_result = tokio::time::timeout(UNIT_REMOVED_TIMEOUT, async {
-		while let Some(message) = unit_removed_stream.next().await {
-			let (id, _path): (String, OwnedObjectPath) = message
+		.await
+	{
+		Ok(reply) => {
+			let job_path: OwnedObjectPath = reply
 				.body()
 				.deserialize()
-				.map_err(|e| tracing::error!("Failed to deserialize UnitRemoved signal: {e}"))?;
+				.map_err(|e| tracing::warn!("Failed to deserialize StopUnit reply for {unit_name}: {e}"))?;
+			// Bounded by systemd's own stop policy; the state check decides.
+			let _ = wait_for_job_signal(&mut job_removed_stream, &job_path, STOP_JOB_TIMEOUT, "Stop").await;
+		},
+		Err(error) if no_such_unit(&error) => {
+			tracing::debug!(unit = unit_name, "Unit was already stopped.");
+			return Ok(());
+		},
+		Err(error) => {
+			tracing::error!("Failed to stop unit {unit_name}: {error}");
+			return Err(());
+		},
+	}
 
-			if id == unit_name {
+	let deadline = tokio::time::Instant::now() + UNIT_SETTLE_TIMEOUT;
+	let mut last = None;
+	loop {
+		match unit_state(conn, unit_name).await {
+			Ok(state) if state.reached(settled) => {
+				tracing::debug!(unit = unit_name, ?state, "Unit stopped.");
 				return Ok(());
-			}
+			},
+			Ok(state) => last = Some(state),
+			Err(()) => {},
 		}
-		Err(())
-	})
-	.await;
-
-	match unit_result {
-		Ok(Ok(())) => {
-			tracing::debug!("Leftover unit {unit_name} stopped and unloaded.");
-			Ok(())
-		},
-		Ok(Err(())) => Err(()),
-		Err(_) => {
-			tracing::warn!(
-				timeout_secs = UNIT_REMOVED_TIMEOUT.as_secs(),
+		if tokio::time::Instant::now() >= deadline {
+			tracing::error!(
 				unit = unit_name,
-				"Timed out waiting for leftover unit to be removed."
+				?settled,
+				state = ?last,
+				"Could not establish that the unit stopped"
 			);
-			Err(())
-		},
+			return Err(());
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
 	}
 }
 
@@ -419,7 +528,7 @@ async fn stop_unit_owned(unit_name: String) -> Result<(), ()> {
 		tracing::error!("Failed to connect to session bus: {e}");
 	})?;
 	subscribe_to_systemd_signals(&conn).await?;
-	stop_unit(&conn, &unit_name).await
+	stop_unit(&conn, &unit_name, Settled::Terminated).await
 }
 
 fn spawn_unit_exit_monitor(
@@ -582,12 +691,18 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		let args = options.args.to_vec();
 		move || -> Result<_, ()> {
 			let program_for_error = main_program.clone();
+			// Every configured hook is installed in order, or the launch fails;
+			// systemd can only enforce hooks it is given.
+			let hooks = |stage, commands| {
+				build_exec_entries(stage, commands)
+					.map_err(|error| tracing::error!(%error, "Application hook cannot be installed; not launching"))
+			};
 			Ok((
-				build_exec_entries(&pre_commands),
+				hooks("pre_command", &pre_commands)?,
 				build_exec_entry(main_program, args.clone()).ok_or_else(move || {
 					tracing::error!("Main program '{}' not found in PATH.", program_for_error);
 				})?,
-				build_exec_entries(&post_commands),
+				hooks("post_command", &post_commands)?,
 			))
 		}
 	})
@@ -769,19 +884,31 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 	}
 }
 
-/// Build a list of exec command entries from a list of command configs.
-/// Each entry is (absolute_path, argv, ignore_errors=false).
-fn build_exec_entries(commands: &[Vec<String>]) -> Vec<(String, Vec<String>, bool)> {
+/// Resolve configured `stage` (`pre_command`/`post_command`) hooks into exec
+/// entries `(absolute_path, argv, ignore_errors=false)`, in order.
+///
+/// Fails on the first entry that is empty or whose executable cannot be
+/// resolved, naming the stage, its index and the executable. Arguments are not
+/// included in the error: users may keep secrets in them.
+fn build_exec_entries(stage: &str, commands: &[Vec<String>]) -> Result<Vec<(String, Vec<String>, bool)>, String> {
 	commands
 		.iter()
-		.filter_map(|cmd| {
-			let first = cmd.first()?;
-			let abs = which::which(first).ok()?;
-			let abs_str = abs.to_str()?.to_string();
+		.enumerate()
+		.map(|(index, cmd)| {
+			let first = cmd
+				.first()
+				.filter(|program| !program.trim().is_empty())
+				.ok_or_else(|| format!("{stage}[{index}] is empty"))?;
+			let abs = which::which(first)
+				.map_err(|error| format!("{stage}[{index}]: executable '{first}' cannot be resolved: {error}"))?;
+			let abs_str = abs
+				.to_str()
+				.ok_or_else(|| format!("{stage}[{index}]: resolved path {} is not UTF-8", abs.display()))?
+				.to_string();
 			let argv: Vec<String> = std::iter::once(abs_str.clone())
 				.chain(cmd[1..].iter().cloned())
 				.collect();
-			Some((abs_str, argv, false))
+			Ok((abs_str, argv, false))
 		})
 		.collect()
 }
@@ -815,45 +942,58 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	/// Review 2026-10-05 CFG-002: every configured pre/post hook must reach the
-	/// unit in order, or unit preparation must fail with a diagnostic. Today an
-	/// empty or unresolvable entry is silently dropped, so systemd never sees it.
+	/// Review 2026-10-05 CFG-002: every configured pre/post hook reaches the
+	/// unit in order, or unit preparation fails naming the stage, index and
+	/// executable. An empty or unresolvable entry is never silently dropped.
+	/// An executable that exists regardless of `PATH` (another test replaces
+	/// `PATH` temporarily).
+	fn absolute_executable() -> String {
+		std::env::current_exe().unwrap().to_str().unwrap().to_string()
+	}
+
 	#[test]
-	#[ignore = "known defect: review 2026-10-05 CFG-002 (batch D)"]
-	fn unresolvable_hooks_are_not_silently_dropped() {
-		let commands = vec![
-			vec!["true".to_string()],
-			vec!["pyroshine-review-missing-hook".to_string(), "--flag".to_string()],
-			Vec::new(),
-			vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-		];
-		let entries = super::build_exec_entries(&commands);
+	fn unresolvable_hooks_fail_with_their_position() {
+		let error = super::build_exec_entries(
+			"pre_command",
+			&[
+				vec![absolute_executable()],
+				vec![
+					"pyroshine-review-missing-hook".to_string(),
+					"--secret=hunter2".to_string(),
+				],
+				vec!["/bin/sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+			],
+		)
+		.unwrap_err();
 		assert!(
-			entries.iter().all(|(path, argv, _)| argv.first() == Some(path)),
-			"fixture: resolved entries keep argv[0] as the resolved path"
+			error.starts_with("pre_command[1]: executable 'pyroshine-review-missing-hook'"),
+			"{error}"
 		);
-		assert_eq!(
-			entries.len(),
-			commands.len(),
-			"review 2026-10-05 CFG-002: {} of {} configured hooks were silently omitted from the unit",
-			commands.len() - entries.len(),
-			commands.len()
-		);
+		assert!(!error.contains("hunter2"), "arguments are not logged: {error}");
+		for empty in [Vec::new(), vec![String::new()], vec!["  ".to_string()]] {
+			let error = super::build_exec_entries("post_command", &[vec![absolute_executable()], empty]).unwrap_err();
+			assert_eq!(error, "post_command[1] is empty");
+		}
+		assert_eq!(super::build_exec_entries("post_command", &[]), Ok(Vec::new()));
 	}
 
 	/// Valid hooks keep their order and arguments (current behavior to retain).
 	#[test]
 	fn resolvable_hooks_keep_order_and_arguments() {
 		let commands = vec![
-			vec!["true".to_string()],
-			vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+			vec![absolute_executable()],
+			vec!["/bin/sh".to_string(), "-c".to_string(), "exit 0".to_string()],
 		];
-		let entries = super::build_exec_entries(&commands);
+		let entries = super::build_exec_entries("pre_command", &commands).unwrap();
 		assert_eq!(entries.len(), 2);
-		assert!(entries[0].0.ends_with("/true") && entries[0].1.len() == 1);
-		assert!(entries[1].0.ends_with("/sh"));
+		assert!(entries[0].0 == absolute_executable() && entries[0].1.len() == 1);
+		assert_eq!(entries[1].0, "/bin/sh");
 		assert_eq!(entries[1].1[1..], ["-c".to_string(), "exit 0".to_string()]);
-		assert!(entries.iter().all(|(_, _, ignore_errors)| !ignore_errors));
+		assert!(
+			entries
+				.iter()
+				.all(|(path, argv, ignore_errors)| argv[0] == *path && !ignore_errors)
+		);
 	}
 
 	/// Review 2026-10-05 STAB-003: the client-side wait for the stop job must
@@ -861,7 +1001,6 @@ mod tests {
 	/// that exits within systemd's allowance (for example after three seconds)
 	/// is reported as a failed stop and teardown proceeds while it still runs.
 	#[test]
-	#[ignore = "known defect: review 2026-10-05 STAB-003 (batch D)"]
 	fn stop_job_wait_covers_the_unit_stop_allowance() {
 		assert!(
 			super::STOP_JOB_TIMEOUT > super::UNIT_STOP_TIMEOUT,
@@ -869,6 +1008,113 @@ mod tests {
 			super::STOP_JOB_TIMEOUT,
 			super::UNIT_STOP_TIMEOUT
 		);
+		assert!(
+			super::APPLICATION_STOP_DEADLINE >= super::STOP_JOB_TIMEOUT + super::UNIT_SETTLE_TIMEOUT,
+			"the overall stop deadline covers the job wait and the state check"
+		);
+	}
+
+	/// Review 2026-10-05 STAB-003 against the real user systemd: each stop is
+	/// reported complete only once the unit's processes are gone, within the
+	/// stop deadline, including an exit that takes longer than the old 2 s wait
+	/// and a process that ignores SIGTERM until systemd kills it.
+	/// `MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core transient_unit_stop -- --ignored --nocapture`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs a user systemd session: MOONSHINE_TEST_SYSTEMD=1"]
+	async fn transient_unit_stop_establishes_termination() {
+		use super::*;
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_SYSTEMD").is_some(),
+			"set MOONSHINE_TEST_SYSTEMD=1"
+		);
+		let conn = Connection::session().await.unwrap();
+		subscribe_to_systemd_signals(&conn).await.unwrap();
+		let secs = Duration::from_secs;
+		// (name, shell script, post hooks, minimum and maximum stop time)
+		type StopCase = (&'static str, &'static str, Vec<Vec<String>>, Duration, Duration);
+		let cases: [StopCase; 5] = [
+			("immediate", "exec sleep 600", Vec::new(), Duration::ZERO, secs(2)),
+			(
+				"slow-exit",
+				"trap 'sleep 3; exit 0' TERM; while :; do sleep 0.1; done",
+				Vec::new(),
+				secs(3),
+				secs(5),
+			),
+			(
+				"ignores-term",
+				"trap '' TERM; while :; do sleep 0.1; done",
+				Vec::new(),
+				UNIT_STOP_TIMEOUT,
+				UNIT_STOP_TIMEOUT + secs(3),
+			),
+			(
+				"descendants",
+				"setsid sh -c \"trap '' TERM; while :; do sleep 0.1; done\" & wait",
+				Vec::new(),
+				Duration::ZERO,
+				UNIT_STOP_TIMEOUT + secs(3),
+			),
+			(
+				"failing-post-hook",
+				"exec sleep 600",
+				vec![vec!["false".to_string()]],
+				Duration::ZERO,
+				secs(3),
+			),
+		];
+		for (name, script, post, min, max) in cases {
+			let unit = format!("pyroshine-test-{}-{name}.service", std::process::id());
+			let args = vec!["-c".to_string(), script.to_string()];
+			let options = LaunchOptions {
+				unit_name: &unit,
+				program: "sh",
+				args: &args,
+				envs: &[],
+				timeout: Duration::from_millis(500),
+				pre_commands: &Vec::new(),
+				post_commands: &post,
+				stdout_value: &None,
+				stderr_value: &None,
+			};
+			start_transient_service(&conn, &options).await.unwrap();
+			let started = std::time::Instant::now();
+			let stopped = stop_application_unit(&unit).await;
+			let elapsed = started.elapsed();
+			eprintln!("{name}: {stopped:?} after {elapsed:?}");
+			assert!(stopped.is_ok(), "{name}: termination was not established");
+			assert!(elapsed >= min && elapsed <= max, "{name}: took {elapsed:?}");
+			assert!(elapsed <= APPLICATION_STOP_DEADLINE, "{name}");
+			let state = unit_state(&conn, &unit).await.unwrap();
+			assert!(state.reached(Settled::Terminated), "{name}: {state:?}");
+			// The next launch's leftover cleanup waits until the unit is unloaded.
+			stop_unit(&conn, &unit, Settled::Unloaded).await.unwrap();
+			assert_eq!(unit_state(&conn, &unit).await.unwrap(), UnitState::Absent, "{name}");
+		}
+		// An absent unit is already stopped.
+		assert_eq!(stop_application_unit("pyroshine-test-absent.service").await, Ok(()));
+	}
+
+	#[test]
+	fn unit_state_decides_termination() {
+		use super::{Settled, UnitState};
+		let loaded = |state: &str, processes| UnitState::Loaded {
+			active_state: state.to_string(),
+			processes,
+		};
+		assert!(UnitState::Absent.reached(Settled::Terminated));
+		assert!(UnitState::Absent.reached(Settled::Unloaded));
+		for state in ["inactive", "failed"] {
+			assert!(loaded(state, 0).reached(Settled::Terminated), "{state}");
+			assert!(!loaded(state, 0).reached(Settled::Unloaded), "{state}");
+			assert!(
+				!loaded(state, 1).reached(Settled::Terminated),
+				"{state}: a process remains"
+			);
+		}
+		for state in ["active", "deactivating", "activating", "reloading"] {
+			assert!(!loaded(state, 0).reached(Settled::Terminated), "{state}");
+		}
 	}
 
 	#[test]

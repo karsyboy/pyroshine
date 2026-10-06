@@ -1052,7 +1052,6 @@ async fn hung_application_stop_is_bounded() {
 /// termination unverified. Teardown must not report success or Idle, and a new
 /// session must not be initialized over that unresolved ownership.
 #[tokio::test]
-#[ignore = "known defect: review 2026-10-05 STAB-003 (batch D)"]
 async fn failed_application_stop_is_not_reported_idle() {
 	let h = Harness::new();
 	h.active().await;
@@ -1078,7 +1077,6 @@ async fn failed_application_stop_is_not_reported_idle() {
 /// (bus loss, a stop job outliving its wait): the bounded teardown ends in a
 /// failure state, not Idle.
 #[tokio::test(start_paused = true)]
-#[ignore = "known defect: review 2026-10-05 STAB-003 (batch D)"]
 async fn hung_application_stop_is_not_reported_idle() {
 	let h = Harness::new();
 	h.active().await;

@@ -24,6 +24,12 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Resume a retained session whose client completed PLAY but disconnected before starting the stream. The reconnect previously waited forever for media workers that had not started.
 - Apply the resolution, refresh rate and HDR mode negotiated in the first RTSP ANNOUNCE to the compositor when they differ from the launch request, or refuse the stream; capture previously kept the launch mode while encoding used the negotiated one.
 - End the session when a reconnect cannot pause its media, instead of reporting it as active with one stream possibly paused.
+- Report a stopped session as idle only once the application unit's processes are gone. An application that took longer than two seconds to exit (within systemd's five-second allowance), or a stop the session bus could not confirm, was reported as stopped while it still ran, and a new launch could overlap it. A stop that cannot be confirmed now fails the teardown and restarts the service, and a launch refuses to start over a previous unit that is still loaded.
+
+### Changed
+
+- Reject `pre_command`/`post_command` entries that are empty or whose executable cannot be found, instead of silently leaving them out of the application unit; the log names the stage and entry. Check custom application hooks after upgrading.
+- Reject a configuration with a listener port of 0 or a `[stream].timeout` outside 1–86400 seconds at startup, with the setting named, as the settings editor already did. A timeout of 0 previously disconnected every client immediately, and port 0 was advertised to clients as an unusable port.
 
 ## [v0.17.0-beta.15] - 2026-10-05
 

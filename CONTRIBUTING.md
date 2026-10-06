@@ -204,6 +204,15 @@ manifest entry in the same change; the checker reports a known-defect test
 that passes as an error. GPU entries run only with `--gpu` and are otherwise
 reported as not run.
 
+With a user systemd session, the application-unit stop cases (slow exit,
+ignored SIGTERM, descendants, failing post hook):
+
+```sh
+MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core \
+  session::application::tests::transient_unit_stop_establishes_termination \
+  -- --ignored --exact --nocapture
+```
+
 Repeated-session acceptance on real hardware uses the benchmark's
 [lifecycle cycles](docs/BENCHMARKING.md#lifecycle-cycles).
 

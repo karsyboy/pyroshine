@@ -142,7 +142,7 @@ impl ControlPeers {
 	pub(super) fn keep_alive(&mut self, peer: PeerId, now: Instant) -> bool {
 		match &mut self.active {
 			Some(active) if active.id == peer => {
-				active.deadline = now + self.liveness;
+				active.deadline = liveness_deadline(now, self.liveness);
 				true
 			},
 			_ => false,
@@ -230,11 +230,20 @@ impl ControlPeers {
 			self.candidates.retain(|candidate| *candidate != peer);
 			self.active = Some(ActivePeer {
 				id: peer,
-				deadline: Instant::now() + self.liveness,
+				deadline: liveness_deadline(Instant::now(), self.liveness),
 			});
 		}
 		Ok(plaintext)
 	}
+}
+
+/// `now + liveness`, saturating instead of panicking for a liveness the
+/// clock cannot represent. Configuration bounds the timeout; this keeps the
+/// arithmetic safe for any `Duration`.
+fn liveness_deadline(now: Instant, liveness: Duration) -> Instant {
+	now.checked_add(liveness)
+		.or_else(|| now.checked_add(Duration::from_secs(u64::from(u32::MAX))))
+		.unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -299,7 +308,6 @@ mod tests {
 	/// any value validation accepts must not overflow the deadline arithmetic
 	/// once a peer authenticates.
 	#[test]
-	#[ignore = "known defect: review 2026-10-05 CFG-001 (batch D)"]
 	fn configured_liveness_cannot_expire_immediately_or_overflow() {
 		let parse =
 			|timeout: u64| toml::from_str::<crate::config::Config>(&format!("[stream]\ntimeout = {timeout}")).unwrap();

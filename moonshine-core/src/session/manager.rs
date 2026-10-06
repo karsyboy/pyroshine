@@ -49,15 +49,17 @@ use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
-/// Bound for stopping the application unit (bus connection, stop job and
-/// unit removal, each internally bounded).
-const APPLICATION_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Bound for stopping the application unit: the systemd stop policy (SIGTERM
+/// allowance, post hooks, SIGKILL) plus the termination check, as derived in
+/// `application.rs`.
+const APPLICATION_STOP_TIMEOUT: Duration = crate::session::application::APPLICATION_STOP_DEADLINE;
 /// Bound for every session worker to exit and release its resources.
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// End-to-end teardown deadline, from the stop request through application
-/// cleanup and every worker's exit. Exceeding it is a terminal failure: the
-/// session stays `Stopping` (it may still own resources) and the service
-/// shuts down so its supervisor can restart it.
+/// cleanup and every worker's exit. Exceeding it, or failing to establish that
+/// the application terminated, is a terminal failure: the session stays
+/// `Stopping` (it may still own resources) and the service shuts down so its
+/// supervisor can restart it.
 pub(crate) const SESSION_TEARDOWN_DEADLINE: Duration =
 	Duration::from_secs(APPLICATION_STOP_TIMEOUT.as_secs() + WORKER_SHUTDOWN_TIMEOUT.as_secs());
 
@@ -189,7 +191,9 @@ pub(crate) trait SessionBackend: Send + Sync + 'static {
 
 	fn resume(&self, session: &mut Self::Active, plan: ResumePlan) -> impl Future<Output = Result<(), ()>> + Send;
 
-	/// Stop the application unit. Must be idempotent.
+	/// Stop the application unit and establish that it terminated. Must be
+	/// idempotent; `Ok` for an absent unit. `Err` keeps the session from being
+	/// reported idle.
 	fn stop_application(&self, unit_name: &str) -> impl Future<Output = Result<(), ()>> + Send;
 }
 
@@ -734,13 +738,14 @@ impl<B: SessionBackend> SessionCore<B> {
 		let deadline = tokio::time::Instant::now() + SESSION_TEARDOWN_DEADLINE;
 		let result = tokio::time::timeout_at(deadline, async {
 			let mut application = record.application_unit;
+			let mut application_stopped = true;
 			// Stop the application while the compositor and audio server still
 			// serve it, so it can exit cleanly. A transition in flight is cancelled
 			// first instead; its application is stopped after it handed back.
 			if transition.is_none()
 				&& let Some(unit) = application.take()
 			{
-				self.stop_application(unit).await;
+				application_stopped = self.stop_application(unit).await;
 			}
 			let _ = record.stop.trigger_shutdown(reason);
 			drop(state);
@@ -757,8 +762,11 @@ impl<B: SessionBackend> SessionCore<B> {
 			};
 			drop(orphans);
 			if let Some(unit) = application {
-				self.stop_application(unit).await;
+				application_stopped = self.stop_application(unit).await;
 			}
+			// Workers are released either way; only an established application
+			// termination lets the session become idle.
+			application_stopped
 		})
 		.await;
 
@@ -769,6 +777,11 @@ impl<B: SessionBackend> SessionCore<B> {
 			completed: result.is_ok(),
 			at: SystemTime::now(),
 		});
+		let result = match result {
+			Ok(true) => Ok(()),
+			Ok(false) => Err("the application unit's termination could not be established"),
+			Err(_) => Err("teardown exceeded its deadline"),
+		};
 		match result {
 			Ok(()) => {
 				guard.lifecycle = Lifecycle::Idle;
@@ -776,15 +789,17 @@ impl<B: SessionBackend> SessionCore<B> {
 				tracing::info!(epoch, "Session stopped; ready for a new session.");
 				done.send_replace(TeardownStatus::Completed);
 			},
-			Err(_) => {
-				// Workers may still own ports, the Pulse socket or GPU objects: never
-				// report idle. Restarting the service is the only safe recovery.
+			Err(failure) => {
+				// Workers may still own ports, the Pulse socket or GPU objects, or the
+				// application may still run: never report idle. Restarting the service
+				// is the only safe recovery.
 				guard.teardown_failed = true;
 				drop(guard);
 				tracing::error!(
 					epoch,
+					failure,
 					deadline_secs = SESSION_TEARDOWN_DEADLINE.as_secs(),
-					"Session teardown exceeded its deadline; refusing new sessions and stopping the service"
+					"Session teardown failed; refusing new sessions and stopping the service"
 				);
 				let _ = self.shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
 				done.send_replace(TeardownStatus::Failed);
@@ -792,17 +807,22 @@ impl<B: SessionBackend> SessionCore<B> {
 		}
 	}
 
-	async fn stop_application(&self, unit: &'static str) {
+	/// Whether the application unit's termination was established.
+	async fn stop_application(&self, unit: &'static str) -> bool {
 		match tokio::time::timeout(APPLICATION_STOP_TIMEOUT, self.backend.stop_application(unit)).await {
-			Ok(Ok(())) => {},
-			// The unit name is fixed; the next launch also replaces a leftover
-			// unit, so a failed stop is reported but does not wedge the manager.
-			Ok(Err(())) => tracing::error!(unit, "Failed to stop the application unit"),
-			Err(_) => tracing::error!(
-				unit,
-				timeout_secs = APPLICATION_STOP_TIMEOUT.as_secs(),
-				"Timed out stopping the application unit"
-			),
+			Ok(Ok(())) => true,
+			Ok(Err(())) => {
+				tracing::error!(unit, "Failed to stop the application unit");
+				false
+			},
+			Err(_) => {
+				tracing::error!(
+					unit,
+					timeout_secs = APPLICATION_STOP_TIMEOUT.as_secs(),
+					"Timed out stopping the application unit"
+				);
+				false
+			},
 		}
 	}
 

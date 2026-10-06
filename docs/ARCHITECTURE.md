@@ -329,11 +329,24 @@ unit name is recorded before a launch starts, so a launch cancelled after
 systemd accepted the unit is still stopped. `Application` drop never blocks;
 stopping the unit is an awaited, bounded D-Bus job.
 
-**Deadlines.** Application stop is bounded to 6 s and worker exit to the rest of
-a 16 s end-to-end deadline (`SESSION_TEARDOWN_DEADLINE`). A failed unit stop is
-logged without wedging the manager. Exceeding the deadline is terminal: the
-session stays `Stopping`, new sessions are refused, and the service shuts down
-for its supervisor to restart it. Service shutdown (SIGTERM/SIGINT) completes
+`Idle` requires established application termination: after the stop job,
+systemd must report the unit unloaded, or inactive/failed with no process left
+in its cgroup (a unit awaiting garbage collection counts as stopped). The stop
+job's own result is not trusted on its own. The client waits as long as
+systemd's stop policy allows (5 s SIGTERM allowance for the application and
+again for `ExecStopPost` hooks, then SIGKILL; `application.rs` derives the
+deadline and the manager uses it). If termination cannot be established, the
+session follows the terminal teardown policy below instead of becoming idle.
+A launch first stops a leftover unit of the same name and refuses to start
+until it is unloaded.
+
+**Deadlines.** Application stop is bounded to 15 s (`APPLICATION_STOP_DEADLINE`:
+the 12 s stop-job wait plus the 2 s termination check and bus connection) and
+worker exit to the rest of a 25 s end-to-end deadline
+(`SESSION_TEARDOWN_DEADLINE`). Exceeding the deadline, or failing to establish
+that the application terminated, is terminal: the session stays `Stopping`, new
+sessions are refused, and the service shuts down for its supervisor to restart
+it. Service shutdown (SIGTERM/SIGINT) completes
 only after session teardown finishes or fails within the same deadline.
 
 Tests: `session/manager/lifecycle_tests.rs` drives the manager through a fake

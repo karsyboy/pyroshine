@@ -1117,7 +1117,6 @@ mod tests {
 		use super::super::*;
 
 		#[tokio::test]
-		#[ignore = "known defect: review 2026-10-05 CFG-001 (batch D)"]
 		async fn validated_configuration_never_advertises_port_zero() {
 			let mut config = crate::config::Config::default();
 			config.stream.video.port = 0;

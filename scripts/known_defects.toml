@@ -12,42 +12,6 @@
 # error until then. Do not weaken a test to make it pass.
 
 [[rust]]
-finding = "STAB-003"
-batch = "D"
-test = "session::manager::lifecycle_tests::failed_application_stop_is_not_reported_idle"
-marker = "review 2026-10-05 STAB-003: teardown reported Ok(()) and phase idle"
-
-[[rust]]
-finding = "STAB-003"
-batch = "D"
-test = "session::manager::lifecycle_tests::hung_application_stop_is_not_reported_idle"
-marker = "review 2026-10-05 STAB-003: an unconfirmed application stop reported Ok(())"
-
-[[rust]]
-finding = "STAB-003"
-batch = "D"
-test = "session::application::tests::stop_job_wait_covers_the_unit_stop_allowance"
-marker = "review 2026-10-05 STAB-003: the stop job wait"
-
-[[rust]]
-finding = "CFG-001"
-batch = "D"
-test = "session::stream::control::peers::tests::configured_liveness_cannot_expire_immediately_or_overflow"
-marker = "review 2026-10-05 CFG-001: stream.timeout = 0 passed startup validation"
-
-[[rust]]
-finding = "CFG-001"
-batch = "D"
-test = "rtsp::tests::advertised_ports::validated_configuration_never_advertises_port_zero"
-marker = "review 2026-10-05 CFG-001: SETUP advertised port 0"
-
-[[rust]]
-finding = "CFG-002"
-batch = "D"
-test = "session::application::tests::unresolvable_hooks_are_not_silently_dropped"
-marker = "review 2026-10-05 CFG-002: 2 of 4 configured hooks were silently omitted"
-
-[[rust]]
 finding = "STAB-004"
 batch = "E"
 test = "session::stream::control::input::tests::ownership_tests::full_feedback_queue_cannot_block_gamepad_shutdown"
