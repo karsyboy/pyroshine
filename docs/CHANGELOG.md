@@ -29,6 +29,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Keep controller input and session shutdown responsive while a client is slow to accept controller feedback. Rumble, LED, trigger and motion-enable feedback no longer waits on a full queue: rumble coalesces to the latest command, persistent state is re-sent, and a stop can no longer wait forever on the feedback queue.
 - Stop virtual controllers' background threads before their devices are destroyed. Report, UHID and force-feedback threads could outlive a destroyed controller (an Xbox controller lingered for up to half a second), race with input updates and callbacks, and read a closed device descriptor.
 
+- Remove a PulseAudio client that closes its connection in the middle of a request. The audio server previously retried the closed socket forever, burning a CPU core and stopping capture, reconfiguration and session shutdown; requests completed before the close are still answered. A client that floods requests without reading replies can no longer starve other clients or the capture clock.
+
 ### Changed
 
 - Reject `pre_command`/`post_command` entries that are empty or whose executable cannot be found, instead of silently leaving them out of the application unit; the log names the stage and entry. Check custom application hooks after upgrading.

@@ -473,6 +473,13 @@ GameStream audio FEC and optional AES-CBC encryption, and the packet task sends
 them over UDP. Opus bitrate is bounded by Moonlight's 1400-byte audio packet
 limit. Reconnects follow the epoch barrier described under negotiation.
 
+The server's single thread serves every client, the capture clock and
+reconfiguration, so no client may hold it: a receive pass reads at most
+256 KiB before others get a turn (the client is rescheduled explicitly, since
+its edge-triggered readiness will not fire again), a zero-byte read ends the
+client after handling its complete requests, and unread replies above 64 MiB
+drop the client while it is being served.
+
 ## Control and input path
 
 `stream/control/` runs the GameStream control protocol over ENet (UDP). After

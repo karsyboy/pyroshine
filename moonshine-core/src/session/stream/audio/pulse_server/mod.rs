@@ -26,6 +26,21 @@ const CLOCK: mio::Token = mio::Token(1);
 /// client has stopped reading; the stuck client is dropped rather than letting
 /// the buffer grow unboundedly, and the session survives.
 const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
+/// Bytes read from one client per dispatch before other clients, capture ticks
+/// and lifecycle commands get a turn. The client is rescheduled explicitly
+/// because its edge-triggered readiness does not fire again for unread data.
+const READ_BUDGET: usize = 256 * 1024;
+
+/// How a receive pass ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Received {
+	/// Everything available was read.
+	Drained,
+	/// The read budget ran out; more may be buffered in the socket.
+	Budget,
+	/// The client ended its stream; complete requests before it were handled.
+	Closed,
+}
 
 /// The server emits samples at this rate to the encoder.
 pub(crate) const CAPTURE_SAMPLE_RATE: u32 = 48000;
@@ -358,6 +373,8 @@ impl PulseServer {
 			.register(&mut self.listener, LISTENER, mio::Interest::READABLE)?;
 
 		let mut events = mio::Events::with_capacity(1024);
+		// Clients whose last receive pass stopped at the budget.
+		let mut rescheduled: Vec<mio::Token> = Vec::new();
 
 		loop {
 			while let Ok(request) = self.reconfigure_rx.try_recv() {
@@ -381,7 +398,12 @@ impl PulseServer {
 				let _ = request.applied.send(result.map_err(|error| error.to_string()));
 			}
 
-			match self.poll.poll(&mut events, Some(time::Duration::from_millis(50))) {
+			let timeout = if rescheduled.is_empty() {
+				time::Duration::from_millis(50)
+			} else {
+				time::Duration::ZERO
+			};
+			match self.poll.poll(&mut events, Some(timeout)) {
 				Ok(_) => (),
 				Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
 				Err(e) => return Err(e.into()),
@@ -432,18 +454,17 @@ impl PulseServer {
 							},
 						);
 					},
-					client_token if event.is_read_closed() => {
-						if let Some(mut client) = self.clients.remove(&client_token) {
-							tracing::debug!("PulseAudio client disconnected (id={})", client.id);
-							let _ = self.poll.registry().deregister(&mut client.socket);
+					// A closed peer may still have complete requests buffered:
+					// read them, then remove the client at end of stream.
+					client_token
+						if (event.is_readable() || event.is_read_closed())
+							&& self.clients.contains_key(&client_token) =>
+					{
+						if self.service_client(client_token) && !rescheduled.contains(&client_token) {
+							rescheduled.push(client_token);
 						}
-					},
-					client_token if event.is_readable() && self.clients.contains_key(&client_token) => {
-						if let Err(e) = self.recv(client_token) {
-							tracing::error!("PulseAudio client error: {:#}", e);
-							if let Some(mut client) = self.clients.remove(&client_token) {
-								let _ = self.poll.registry().deregister(&mut client.socket);
-							}
+						if event.is_writable() {
+							self.flush_client(client_token);
 						}
 					},
 					client_token if event.is_writable() => {
@@ -452,7 +473,37 @@ impl PulseServer {
 					_ => (),
 				}
 			}
+
+			// Continue clients that used their budget, after this round's events.
+			for client_token in std::mem::take(&mut rescheduled) {
+				if self.clients.contains_key(&client_token) && self.service_client(client_token) {
+					rescheduled.push(client_token);
+				}
+			}
 		}
+	}
+
+	/// One receive pass for a readable client. Removes it at end of stream or
+	/// on error; returns whether it must be continued (budget exhausted).
+	fn service_client(&mut self, client_token: mio::Token) -> bool {
+		let outcome = self.recv(client_token);
+		let remove = match &outcome {
+			Ok(Received::Budget) => return true,
+			Ok(Received::Drained) => false,
+			Ok(Received::Closed) => {
+				tracing::debug!(token = client_token.0, "PulseAudio client ended its stream");
+				true
+			},
+			Err(e) => {
+				tracing::error!("PulseAudio client error: {:#}", e);
+				true
+			},
+		};
+		if remove && let Some(mut client) = self.clients.remove(&client_token) {
+			tracing::debug!("PulseAudio client disconnected (id={})", client.id);
+			let _ = self.poll.registry().deregister(&mut client.socket);
+		}
+		false
 	}
 
 	fn reconfigure(&mut self, channels: u8, packet_duration_ms: u32) -> Result<(), Error> {
@@ -547,29 +598,23 @@ impl PulseServer {
 		Ok(())
 	}
 
-	fn recv(&mut self, client_token: mio::Token) -> Result<(), Error> {
-		let result = (|| -> Result<(), Error> {
+	/// Read and handle a client's requests until its socket would block, its
+	/// stream ends or the read budget is used. A zero-byte read is the end of
+	/// stream: complete requests already buffered are handled, an incomplete
+	/// one is discarded, and the caller removes the client.
+	fn recv(&mut self, client_token: mio::Token) -> Result<Received, Error> {
+		let result = (|| -> Result<Received, Error> {
 			let client = self.clients.get_mut(&client_token).unwrap();
 
-			let mut read_size = 8192;
+			let mut read_size;
+			let mut budget = READ_BUDGET;
 
-			'read: loop {
-				let off = client.incoming.len();
-				client.incoming.resize(off + read_size, 0);
-				let n = match client.socket.read(&mut client.incoming[off..]) {
-					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-						client.incoming.truncate(off);
-						return Ok(());
-					},
-					v => v.map_err(|e| -> Error { format!("recv error: {e}").into() })?,
-				};
-
-				client.incoming.truncate(off + n);
-
+			loop {
+				// Handle every complete request already buffered.
 				loop {
 					if client.incoming.len() < pulse::DESCRIPTOR_SIZE {
 						read_size = 8192;
-						continue 'read;
+						break;
 					}
 
 					let desc = pulse::read_descriptor(&mut Cursor::new(&client.incoming[..pulse::DESCRIPTOR_SIZE]))?;
@@ -582,7 +627,7 @@ impl PulseServer {
 
 					if client.incoming.len() < (desc.length as usize + pulse::DESCRIPTOR_SIZE) {
 						read_size = desc.length as usize + pulse::DESCRIPTOR_SIZE - client.incoming.len();
-						continue 'read;
+						break;
 					}
 
 					let _desc_bytes = client.incoming.split_to(pulse::DESCRIPTOR_SIZE);
@@ -618,7 +663,46 @@ impl PulseServer {
 					} else {
 						commands::handle_stream_write(client, desc, &payload)?;
 					}
+
+					// Replies a client does not read are bounded while it is being
+					// served, not only after its socket drains.
+					if client.outgoing.len() > MAX_OUTGOING_BUFFER {
+						return Err(format!(
+							"client {} is not reading its replies (outgoing buffer exceeds {MAX_OUTGOING_BUFFER} B)",
+							client.id
+						)
+						.into());
+					}
 				}
+
+				if budget == 0 {
+					return Ok(Received::Budget);
+				}
+				let size = read_size.min(budget);
+				let off = client.incoming.len();
+				client.incoming.resize(off + size, 0);
+				let n = match client.socket.read(&mut client.incoming[off..]) {
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+						client.incoming.truncate(off);
+						return Ok(Received::Drained);
+					},
+					Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+						client.incoming.truncate(off);
+						continue;
+					},
+					v => v.map_err(|e| -> Error { format!("recv error: {e}").into() })?,
+				};
+				client.incoming.truncate(off + n);
+				if n == 0 {
+					if !client.incoming.is_empty() {
+						tracing::debug!(
+							bytes = client.incoming.len(),
+							"PulseAudio client ended its stream inside a request"
+						);
+					}
+					return Ok(Received::Closed);
+				}
+				budget -= n;
 			}
 		})();
 
@@ -907,5 +991,298 @@ mod epoch_tests {
 		}
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 		stop.wait_shutdown_complete().await;
+	}
+}
+
+/// Review 2026-10-05 STAB-006: a client's end of stream and a client that never
+/// stops writing must not trap the server's single thread. Each case is judged
+/// by whether the server still serves reconfiguration, capture ticks and stop.
+#[cfg(test)]
+mod receive_tests {
+	use super::*;
+	use std::io::{Read, Write};
+	use std::os::unix::net::UnixStream;
+
+	struct Server {
+		_dir: tempfile::TempDir,
+		path: PathBuf,
+		frames: crossbeam_channel::Receiver<AudioFrame>,
+		_recycle: crossbeam_channel::Sender<AudioFrame>,
+		commands: crossbeam_channel::Sender<PulseReconfigure>,
+		stop: ShutdownManager<SessionShutdownReason>,
+		generation: u64,
+	}
+
+	impl Server {
+		fn spawn() -> Self {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("native");
+			let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+			let (frame_tx, frames) = crossbeam_channel::bounded(3);
+			let (recycle, recycle_rx) = crossbeam_channel::bounded(3);
+			let (commands, command_rx) = crossbeam_channel::unbounded();
+			let stop = ShutdownManager::new();
+			PulseServer::spawn(
+				listener,
+				path.clone(),
+				2,
+				5,
+				frame_tx,
+				recycle_rx,
+				stop.clone(),
+				command_rx,
+				1,
+			)
+			.unwrap();
+			Self {
+				_dir: dir,
+				path,
+				frames,
+				_recycle: recycle,
+				commands,
+				stop,
+				generation: 1,
+			}
+		}
+
+		/// The event loop still answers a reconfiguration and still produces
+		/// capture frames for it.
+		async fn responsive(&mut self) -> bool {
+			self.generation += 1;
+			let generation = self.generation;
+			let (applied, waiting) = tokio::sync::oneshot::channel();
+			self.commands
+				.send(PulseReconfigure {
+					generation,
+					reconfigure_capture: false,
+					channels: 2,
+					packet_duration_ms: 5,
+					applied,
+				})
+				.unwrap();
+			if !matches!(
+				tokio::time::timeout(time::Duration::from_secs(2), waiting).await,
+				Ok(Ok(Ok(())))
+			) {
+				return false;
+			}
+			let frames = self.frames.clone();
+			tokio::task::spawn_blocking(move || {
+				let deadline = time::Instant::now() + time::Duration::from_secs(2);
+				while let Some(left) = deadline.checked_duration_since(time::Instant::now()) {
+					match frames.recv_timeout(left) {
+						Ok(frame) if frame.generation == generation => return true,
+						Ok(_) => {},
+						Err(_) => return false,
+					}
+				}
+				false
+			})
+			.await
+			.unwrap()
+		}
+
+		async fn stop(self) -> bool {
+			self.stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+			tokio::time::timeout(time::Duration::from_secs(2), self.stop.wait_shutdown_complete())
+				.await
+				.is_ok()
+		}
+	}
+
+	fn command(seq: u32, command: &pulse::Command) -> Vec<u8> {
+		let mut message = Vec::new();
+		pulse::write_command_message(&mut message, seq, command, pulse::MAX_VERSION).unwrap();
+		message
+	}
+
+	fn descriptor(length: u32, channel: u32) -> Vec<u8> {
+		let mut bytes = [0u8; pulse::DESCRIPTOR_SIZE];
+		pulse::encode_descriptor(
+			&mut bytes,
+			&pulse::Descriptor {
+				length,
+				channel,
+				offset: 0,
+				flags: pulse::DescriptorFlags::empty(),
+			},
+		);
+		bytes.to_vec()
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn end_of_stream_in_any_receive_state_removes_the_client() {
+		let complete = command(1, &pulse::Command::GetServerInfo);
+		let cases: [(&str, Vec<u8>); 4] = [
+			("empty", Vec::new()),
+			("partial descriptor", descriptor(100, u32::MAX)[..5].to_vec()),
+			("partial payload", [descriptor(100, u32::MAX), vec![0; 10]].concat()),
+			("complete command", complete),
+		];
+		for (name, bytes) in cases {
+			let mut server = Server::spawn();
+			let mut client = UnixStream::connect(&server.path).unwrap();
+			assert!(server.responsive().await, "{name}: fixture");
+			client.write_all(&bytes).unwrap();
+			client.shutdown(std::net::Shutdown::Write).unwrap();
+			assert!(
+				server.responsive().await,
+				"review 2026-10-05 STAB-006: {name} followed by EOF stalled the PulseAudio server"
+			);
+			// A complete request before the EOF is still answered, then the
+			// server closes its side.
+			client.set_read_timeout(Some(time::Duration::from_secs(2))).unwrap();
+			let mut reply = Vec::new();
+			let closed = client.read_to_end(&mut reply).is_ok();
+			assert!(closed, "{name}: the server closes a client that ended its stream");
+			assert_eq!(
+				!reply.is_empty(),
+				name == "complete command",
+				"{name}: {} reply bytes",
+				reply.len()
+			);
+			assert!(server.stop().await, "{name}: stop");
+		}
+	}
+
+	/// A client that keeps sending requests without reading the replies is
+	/// served in bounded slices: capture and reconfiguration keep running, and
+	/// the client is dropped once its unread replies exceed the cap.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_flooding_non_reading_client_cannot_starve_the_server() {
+		let mut server = Server::spawn();
+		let mut client = UnixStream::connect(&server.path).unwrap();
+		let request = command(1, &pulse::Command::GetServerInfo);
+		let batch = request.repeat(1024);
+		let writer = std::thread::spawn(move || {
+			let mut written = 0usize;
+			while client.write_all(&batch).is_ok() {
+				written += batch.len();
+				if written > 1 << 30 {
+					break;
+				}
+			}
+			written
+		});
+		for _ in 0..3 {
+			assert!(server.responsive().await, "the server kept serving while flooded");
+		}
+		assert!(server.stop().await);
+		// The server dropped the client (or stopped): the writer ends.
+		assert!(writer.join().unwrap() > 0);
+	}
+
+	/// Real libpulse clients (`pacat`) play stereo, 5.1 and 7.1 into the
+	/// server; every channel reaches the capture frames. A second client is
+	/// killed mid-stream (its socket ends without any shutdown handshake) while
+	/// the first keeps playing, and the server stays responsive.
+	/// `MOONSHINE_TEST_PULSE_CLIENT=1 cargo test -p moonshine-core real_pulse_clients -- --ignored`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs pacat (libpulse): MOONSHINE_TEST_PULSE_CLIENT=1"]
+	async fn real_pulse_clients_play_every_layout_and_may_vanish() {
+		use std::process::{Command, Stdio};
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_PULSE_CLIENT").is_some(),
+			"set MOONSHINE_TEST_PULSE_CLIENT=1"
+		);
+		for channels in [2u8, 6, 8] {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("native");
+			let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+			let (frame_tx, frames) = crossbeam_channel::bounded(3);
+			let (_recycle, recycle_rx) = crossbeam_channel::bounded(3);
+			let (_commands, command_rx) = crossbeam_channel::unbounded();
+			let stop = ShutdownManager::new();
+			PulseServer::spawn(
+				listener,
+				path.clone(),
+				channels,
+				5,
+				frame_tx,
+				recycle_rx,
+				stop.clone(),
+				command_rx,
+				1,
+			)
+			.unwrap();
+			let pacat = |seconds: usize| {
+				let mut child = Command::new("pacat")
+					.args([
+						&format!("--server=unix:{}", path.display()),
+						"--playback",
+						"--raw",
+						"--format=float32le",
+						"--rate=48000",
+						&format!("--channels={channels}"),
+						"--latency-msec=20",
+					])
+					.stdin(Stdio::piped())
+					.stderr(Stdio::null())
+					.spawn()
+					.expect("pacat");
+				let mut stdin = child.stdin.take().unwrap();
+				let writer = std::thread::spawn(move || {
+					// A distinct level per channel, so a dropped channel shows.
+					let frame: Vec<u8> = (0..channels)
+						.flat_map(|channel| (0.1 + 0.1 * f32::from(channel)).to_le_bytes())
+						.collect();
+					let block = frame.repeat(480);
+					for _ in 0..seconds * 100 {
+						if std::io::Write::write_all(&mut stdin, &block).is_err() {
+							break;
+						}
+					}
+				});
+				(child, writer)
+			};
+			let (mut player, player_writer) = pacat(3);
+			let (mut victim, _victim_writer) = pacat(30);
+			// Mixed output carries every channel of the playing client.
+			let levels = tokio::task::spawn_blocking({
+				let frames = frames.clone();
+				move || {
+					let deadline = time::Instant::now() + time::Duration::from_secs(3);
+					while time::Instant::now() < deadline {
+						let frame = frames.recv_timeout(time::Duration::from_secs(1)).unwrap();
+						let levels: Vec<f32> = (0..usize::from(channels))
+							.map(|channel| {
+								frame
+									.buf
+									.iter()
+									.skip(channel)
+									.step_by(usize::from(channels))
+									.fold(0f32, |m, v| m.max(v.abs()))
+							})
+							.collect();
+						if levels.iter().all(|level| *level > 0.05) {
+							return Some(levels);
+						}
+					}
+					None
+				}
+			})
+			.await
+			.unwrap();
+			assert!(levels.is_some(), "{channels} channels: every channel reaches capture");
+			// End one client abruptly while the other plays.
+			victim.kill().unwrap();
+			victim.wait().unwrap();
+			let still_capturing = tokio::task::spawn_blocking({
+				let frames = frames.clone();
+				move || (0..20).all(|_| frames.recv_timeout(time::Duration::from_secs(1)).is_ok())
+			})
+			.await
+			.unwrap();
+			assert!(
+				still_capturing,
+				"{channels} channels: capture continues after a client vanished"
+			);
+			player_writer.join().unwrap();
+			let _ = player.wait();
+			stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+			tokio::time::timeout(time::Duration::from_secs(2), stop.wait_shutdown_complete())
+				.await
+				.expect("stop after real clients");
+		}
 	}
 }
