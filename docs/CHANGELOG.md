@@ -31,6 +31,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Remove a PulseAudio client that closes its connection in the middle of a request. The audio server previously retried the closed socket forever, burning a CPU core and stopping capture, reconfiguration and session shutdown; requests completed before the close are still answered. A client that floods requests without reading replies can no longer starve other clients or the capture clock.
 
+- Send the current picture when a keyframe is requested on a static screen with H.264, HEVC or AV1 (after a reconnect, packet loss or a client request). The recovery keyframe re-encoded the encoder's next input slot, which held an older frame or nothing, so the client could show a stale or garbage picture until the scene changed; it now re-encodes the last converted frame and stays pending until it is actually submitted. PyroWave was not affected.
+
 ### Changed
 
 - Reject `pre_command`/`post_command` entries that are empty or whose executable cannot be found, instead of silently leaving them out of the application unit; the log names the stage and entry. Check custom application hooks after upgrading.

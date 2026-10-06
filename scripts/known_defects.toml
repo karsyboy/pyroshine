@@ -10,16 +10,3 @@
 # When a fix lands, remove the test's `#[ignore]` (or DISABLED property) and
 # its entry here in the same change; the checker reports a passing entry as an
 # error until then. Do not weaken a test to make it pass.
-
-[[rust]]
-finding = "BUG-002"
-batch = "G"
-test = "session::stream::video::pipeline::tests::static_recovery_encodes_the_latest_converted_frame"
-marker = "review 2026-10-05 BUG-002: after 1 frame(s), static recovery encoded"
-
-[[rust]]
-finding = "BUG-002"
-batch = "G"
-test = "session::stream::video::pipeline::convert::tests::static_recovery_decodes_to_the_latest_frame_on_gpu"
-marker = "review 2026-10-05 BUG-002: static recovery did not decode to the latest scene"
-gpu = true

@@ -105,6 +105,15 @@ rather than freeing it at enqueue. RAII also covers queued encoder messages,
 packetization errors, sender failure, cancellation and discarded epochs.
 The three credits retain the existing encode/send overlap on healthy links.
 
+A requested IDR on a static scene (no new capture within a frame interval) is
+replayed from the converter, not from the encoder's input image: Pixelforge
+rotates two input slots and advances on every encode, so the current slot
+holds an older frame or none. The packed converter's output buffer (or
+Pixelforge's converter's, for unaligned extents) still holds the last
+completed conversion and is copied into the current slot before it is encoded.
+The IDR stays pending across loop iterations until a recovery or a new frame is
+actually submitted, including while network credits are exhausted.
+
 Network output storage is bounded by three frames. For a negotiated wire shard
 size `S`, the protocol's maximum four unprotected blocks of 1023 data shards
 bound it by `3 * 4092 * S` bytes; protected blocks have at most 255 total shards.

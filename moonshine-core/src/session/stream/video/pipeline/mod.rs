@@ -199,12 +199,27 @@ impl EncoderInput for Encoder {
 /// Encode a recovery keyframe for a static scene: an IDR is pending (already
 /// requested from the encoder) and no new frame arrived.
 ///
-/// Known defect (review 2026-10-05 BUG-002): after an `encode`, `input_image`
-/// is the next slot rather than the last converted frame, so this submits a
-/// never-written or older image. See the `static_recovery_*` tests.
-fn encode_static_recovery<E: EncoderInput>(encoder: &mut E) -> Result<E::Future, E::Error> {
+/// After an `encode`, `input_image` is the *next* slot, which holds an older
+/// frame or none (review 2026-10-05 BUG-002). `restore` therefore first writes
+/// the latest converted frame into that slot (from the converter's output
+/// buffer, which still holds it) and only then is the slot encoded. A failed
+/// restore submits nothing.
+fn encode_static_recovery<E: EncoderInput>(
+	encoder: &mut E,
+	restore: impl FnOnce(&mut E, vk::Image) -> Result<(), E::Error>,
+) -> Result<E::Future, E::Error> {
 	let image = encoder.input_image();
+	restore(encoder, image)?;
 	encoder.encode(image)
+}
+
+/// Which converter's output buffer holds the latest converted frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastOutput {
+	/// The packed converter.
+	Packed,
+	/// Pixelforge's converter for this input format key.
+	Fallback(u32),
 }
 
 /// Apply a frame failure: release the source only if no GPU work can still
@@ -1436,6 +1451,11 @@ impl VideoPipelineInner {
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
+		// The converter output holding the latest frame, for static recovery.
+		let mut last_output: Option<LastOutput> = None;
+		// A requested IDR not yet submitted. Persistent across iterations so a
+		// recovery that cannot be admitted yet (network credits) is retried.
+		let mut pending_idr = false;
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
@@ -1476,7 +1496,6 @@ impl VideoPipelineInner {
 				consumer.join()?;
 				return Ok(reconfigure);
 			}
-			let mut pending_idr = false;
 
 			// Drain any pending stream-reset requests (client reconnect/resume).
 			//
@@ -1546,16 +1565,44 @@ impl VideoPipelineInner {
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
-					// re-encode the static scene. This assumes the encoder's
-					// input image still holds the last converted frame, which
-					// the slot contract does not provide (review 2026-10-05
-					// BUG-002; see `encode_static_recovery`).
-					if pending_idr && has_encoded && conventional_can_admit(&in_flight) {
+					// re-encode the static scene from the latest converted frame
+					// (see `encode_static_recovery`).
+					if pending_idr && has_encoded && last_output.is_some() && conventional_can_admit(&in_flight) {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
-						match encode_static_recovery(&mut encoder) {
+						let restore = |_: &mut Encoder, target: vk::Image| -> Result<(), PixelForgeError> {
+							let restored = match last_output {
+								Some(LastOutput::Packed) => input_converter
+									.as_ref()
+									.map_or(Ok(false), |converter| converter.copy_last_output(target)),
+								Some(LastOutput::Fallback(key)) => match color_converters.get(&key) {
+									Some((converter, _)) => convert::copy_output_to_input(
+										&context,
+										context.compute_queue(),
+										context.compute_queue_family(),
+										converter.output_buffer(),
+										output_format,
+										ctx.width,
+										ctx.height,
+										target,
+									)
+									.map(|()| true),
+									None => Ok(false),
+								},
+								None => Ok(false),
+							};
+							match restored {
+								Ok(true) => Ok(()),
+								Ok(false) => Err(PixelForgeError::CommandBuffer(
+									"no converted frame to recover from".to_string(),
+								)),
+								Err(e) => Err(PixelForgeError::Vulkan(e)),
+							}
+						};
+						match encode_static_recovery(&mut encoder, restore) {
 							Ok(future) => {
+								pending_idr = false;
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
@@ -1877,6 +1924,9 @@ impl VideoPipelineInner {
 				};
 
 				// Convert to YUV.
+				if converted.is_err() {
+					last_output = None;
+				}
 				if let Err(e) = converted {
 					// Both converters submit the conversion and wait for its fence; an
 					// error may follow a submission whose reads are still pending.
@@ -1917,6 +1967,11 @@ impl VideoPipelineInner {
 				// The DMA-BUF content has been read into the encoder's input
 				// image — signal the compositor that this GBM buffer is free.
 				frame.consumed.store(true, Ordering::Release);
+				last_output = Some(if input_converter.is_some() {
+					LastOutput::Packed
+				} else {
+					LastOutput::Fallback(frame.format)
+				});
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
@@ -1957,6 +2012,8 @@ impl VideoPipelineInner {
 				match encode_result {
 					Ok(future) => {
 						failures.record_success();
+						// Any requested IDR applies to this submitted frame.
+						pending_idr = false;
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
@@ -2293,6 +2350,8 @@ mod tests {
 		slots: [Option<char>; 2],
 		current: usize,
 		encoded: Vec<Option<char>>,
+		/// The converter's output buffer: the latest converted content.
+		converted: Option<char>,
 	}
 
 	impl FakeSlots {
@@ -2302,6 +2361,7 @@ mod tests {
 			use super::EncoderInput;
 			let target = self.input_image();
 			self.slots[target.as_raw() as usize - 1] = Some(content);
+			self.converted = Some(content);
 			let image = self.input_image();
 			self.encode(image).unwrap();
 		}
@@ -2333,10 +2393,16 @@ mod tests {
 		assert_eq!(encoder.encoded, ['A', 'B', 'C', 'D', 'E'].map(Some).to_vec());
 	}
 
+	/// The pipeline's restore step: copy the converter output into the slot.
+	fn restore(encoder: &mut FakeSlots, target: vk::Image) -> Result<(), ()> {
+		encoder.slots[target.as_raw() as usize - 1] = Some(encoder.converted.ok_or(())?);
+		Ok(())
+	}
+
 	/// Review 2026-10-05 BUG-002: with no new frame, a recovery keyframe must
-	/// encode the latest converted scene, after one, two or many frames.
+	/// encode the latest converted scene, after one, two or many frames, and
+	/// repeated recoveries keep encoding it.
 	#[test]
-	#[ignore = "known defect: review 2026-10-05 BUG-002 (batch G)"]
 	fn static_recovery_encodes_the_latest_converted_frame() {
 		for preceding in [1usize, 2, 5] {
 			let mut encoder = FakeSlots::default();
@@ -2344,7 +2410,7 @@ mod tests {
 			for &content in &frames {
 				encoder.convert_and_encode(content);
 			}
-			super::encode_static_recovery(&mut encoder).unwrap();
+			super::encode_static_recovery(&mut encoder, restore).unwrap();
 			let latest = *frames.last().unwrap();
 			assert_eq!(
 				encoder.encoded.last().copied().flatten(),
@@ -2352,7 +2418,17 @@ mod tests {
 				"review 2026-10-05 BUG-002: after {preceding} frame(s), static recovery encoded {:?} instead of the latest frame {latest:?}",
 				encoder.encoded.last().copied().flatten()
 			);
+			super::encode_static_recovery(&mut encoder, restore).unwrap();
+			assert_eq!(
+				encoder.encoded.last().copied().flatten(),
+				Some(latest),
+				"repeated recovery"
+			);
 		}
+		// Without a converted frame nothing is submitted.
+		let mut encoder = FakeSlots::default();
+		assert!(super::encode_static_recovery(&mut encoder, restore).is_err());
+		assert!(encoder.encoded.is_empty());
 	}
 
 	#[test]

@@ -289,6 +289,9 @@ pub(crate) struct InputConverter {
 	descriptor_set: vk::DescriptorSet,
 	output_buffer: vk::Buffer,
 	output_memory: vk::DeviceMemory,
+	/// Whether `output_buffer` holds a completed conversion (false from the
+	/// start of a conversion until it succeeds).
+	output_valid: bool,
 	/// Upload textures for CPU-texel layers, one per layer slot.
 	layer_textures: [OverlayTexture; MAX_OVERLAYS],
 	/// Views of recently used source images. The `Arc` pins each image for as
@@ -362,6 +365,7 @@ impl InputConverter {
 			descriptor_pool: vk::DescriptorPool::null(),
 			descriptor_set: vk::DescriptorSet::null(),
 			output_buffer: vk::Buffer::null(),
+			output_valid: false,
 			output_memory: vk::DeviceMemory::null(),
 			layer_textures: [OverlayTexture::EMPTY; MAX_OVERLAYS],
 			views: Vec::new(),
@@ -789,6 +793,7 @@ impl InputConverter {
 		layers: &Layers<'_>,
 		target: vk::Image,
 	) -> Result<ConvertOutcome, vk::Result> {
+		self.output_valid = false;
 		let source_view = self
 			.source_view(source, source_format)
 			.map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -1157,7 +1162,144 @@ impl InputConverter {
 					.map(|()| (stamps[1].saturating_sub(stamps[0]) as f64 * self.timestamp_period_ns) as u64)
 			})
 			.flatten();
+		self.output_valid = true;
 		Ok(ConvertOutcome { gpu_ns })
+	}
+
+	/// Copy the last completed conversion into `target` (an encoder input
+	/// slot) without converting again. `Ok(false)` if there is none.
+	pub(crate) fn copy_last_output(&self, target: vk::Image) -> Result<bool, vk::Result> {
+		if !self.output_valid {
+			return Ok(false);
+		}
+		copy_output_to_input(
+			&self.context,
+			self.queue,
+			self.queue_family,
+			self.output_buffer,
+			self.output_format,
+			self.width,
+			self.height,
+			target,
+		)?;
+		Ok(true)
+	}
+}
+
+/// Copy a converter's packed output buffer, which still holds its last
+/// completed conversion, into an encoder input image and wait for it.
+///
+/// Static-scene recovery needs this: the encoder rotates its input slots, so
+/// the current slot never holds the latest frame (review 2026-10-05 BUG-002).
+/// Runs on `queue`, which must be of the family that wrote `buffer`; the target
+/// is left in `VIDEO_ENCODE_SRC_KHR` like after a conversion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_output_to_input(
+	context: &VideoContext,
+	queue: vk::Queue,
+	queue_family: u32,
+	buffer: vk::Buffer,
+	format: OutputFormat,
+	width: u32,
+	height: u32,
+	target: vk::Image,
+) -> Result<(), vk::Result> {
+	let device = context.device();
+	// SAFETY: every object is created and destroyed here; the submission is
+	// waited for before they are destroyed. The buffer's writes completed under
+	// its converter's fence, and the target slot is free (Pixelforge returns it
+	// from `input_image` only once its previous encode completed).
+	unsafe {
+		let pool = device.create_command_pool(
+			&vk::CommandPoolCreateInfo::default()
+				.queue_family_index(queue_family)
+				.flags(vk::CommandPoolCreateFlags::TRANSIENT),
+			None,
+		)?;
+		let fence = match device.create_fence(&vk::FenceCreateInfo::default(), None) {
+			Ok(fence) => fence,
+			Err(e) => {
+				device.destroy_command_pool(pool, None);
+				return Err(e);
+			},
+		};
+		let result = (|| {
+			let cmd = device.allocate_command_buffers(
+				&vk::CommandBufferAllocateInfo::default()
+					.command_pool(pool)
+					.command_buffer_count(1),
+			)?[0];
+			device.begin_command_buffer(
+				cmd,
+				&vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+			)?;
+			let buffer_barrier = [vk::BufferMemoryBarrier::default()
+				.src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+				.dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+				.buffer(buffer)
+				.size(vk::WHOLE_SIZE)];
+			let to_transfer = [vk::ImageMemoryBarrier::default()
+				.src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+				.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+				.old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+				.new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+				.image(target)
+				.subresource_range(color_range())];
+			device.cmd_pipeline_barrier(
+				cmd,
+				vk::PipelineStageFlags::ALL_COMMANDS,
+				vk::PipelineStageFlags::TRANSFER,
+				vk::DependencyFlags::empty(),
+				&[],
+				&buffer_barrier,
+				&to_transfer,
+			);
+			device.cmd_copy_buffer_to_image(
+				cmd,
+				buffer,
+				target,
+				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+				&copy_regions(format, width, height),
+			);
+			let to_encode = [vk::ImageMemoryBarrier::default()
+				.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+				.dst_access_mask(vk::AccessFlags::empty())
+				.old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+				.new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+				.image(target)
+				.subresource_range(color_range())];
+			device.cmd_pipeline_barrier(
+				cmd,
+				vk::PipelineStageFlags::TRANSFER,
+				vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+				vk::DependencyFlags::empty(),
+				&[],
+				&[],
+				&to_encode,
+			);
+			device.end_command_buffer(cmd)?;
+			let command_buffers = [cmd];
+			device.queue_submit(
+				queue,
+				&[vk::SubmitInfo::default().command_buffers(&command_buffers)],
+				fence,
+			)?;
+			device.wait_for_fences(&[fence], true, u64::MAX)
+		})();
+		if result.is_err() {
+			// A failed wait leaves the submission state unknown; idle the queue
+			// before destroying what it may still reference.
+			let _ = device.queue_wait_idle(queue);
+		}
+		device.destroy_fence(fence, None);
+		device.destroy_command_pool(pool, None);
+		result
 	}
 }
 
@@ -1279,7 +1421,7 @@ mod tests {
 	/// compare the recovered picture with the latest scene.
 	/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core static_recovery_decodes -- --ignored --nocapture`
 	#[test]
-	#[ignore = "known defect: review 2026-10-05 BUG-002 (batch G); needs a Vulkan Video GPU and ffmpeg: MOONSHINE_TEST_GPU=1"]
+	#[ignore = "needs a Vulkan Video GPU and ffmpeg: MOONSHINE_TEST_GPU=1"]
 	fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
 		assert!(
 			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
@@ -1652,16 +1794,60 @@ mod gpu_fixture {
 		}
 	}
 
-	/// A small encoder for the slot/recovery fixtures.
-	fn recovery_encoder() -> (VideoContext, Encoder, (u32, u32)) {
+	/// One conventional codec configuration of the recovery fixture: the
+	/// encoder, its converter output and how ffmpeg reads the raw stream.
+	#[derive(Clone, Copy, Debug)]
+	struct RecoveryCodec {
+		codec: Codec,
+		depth: EncodeBitDepth,
+		output: OutputFormat,
+		demuxer: &'static str,
+	}
+
+	const RECOVERY_CODECS: [RecoveryCodec; 4] = [
+		RecoveryCodec {
+			codec: Codec::H264,
+			depth: EncodeBitDepth::Eight,
+			output: OutputFormat::NV12,
+			demuxer: "h264",
+		},
+		RecoveryCodec {
+			codec: Codec::H265,
+			depth: EncodeBitDepth::Eight,
+			output: OutputFormat::NV12,
+			demuxer: "hevc",
+		},
+		RecoveryCodec {
+			codec: Codec::H265,
+			depth: EncodeBitDepth::Ten,
+			output: OutputFormat::P010,
+			demuxer: "hevc",
+		},
+		RecoveryCodec {
+			codec: Codec::AV1,
+			depth: EncodeBitDepth::Eight,
+			output: OutputFormat::NV12,
+			demuxer: "obu",
+		},
+	];
+
+	/// A small encoder for the slot/recovery fixtures, or `None` when the GPU
+	/// does not encode this configuration.
+	fn recovery_encoder(codec: RecoveryCodec) -> Option<(VideoContext, Encoder, (u32, u32))> {
 		let context = VideoContextBuilder::new()
 			.app_name("recovery-fixture")
-			.require_encode(Codec::H265)
+			.require_encode(codec.codec)
 			.build()
-			.expect("Vulkan Video context");
+			.ok()?;
 		let size = (256u32, 128u32);
-		let encoder = Encoder::new(context.clone(), EncodeConfig::h265(size.0, size.1)).unwrap();
-		(context, encoder, size)
+		let config = match codec.codec {
+			Codec::H264 => EncodeConfig::h264(size.0, size.1),
+			Codec::H265 => EncodeConfig::h265(size.0, size.1),
+			Codec::AV1 => EncodeConfig::av1(size.0, size.1),
+		}
+		.with_bit_depth(codec.depth);
+		let encoder = Encoder::new(context.clone(), config).ok()?;
+		Some((context, encoder, size))
 	}
 
 	fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -1672,7 +1858,7 @@ mod gpu_fixture {
 	}
 
 	pub(super) fn slot_rotation() {
-		let (_context, mut encoder, _) = recovery_encoder();
+		let (_context, mut encoder, _) = recovery_encoder(RECOVERY_CODECS[1]).expect("HEVC encoder");
 		let mut inputs = vec![encoder.input_image()];
 		for _ in 0..4 {
 			let image = encoder.input_image();
@@ -1685,12 +1871,12 @@ mod gpu_fixture {
 		assert_eq!(inputs[2], inputs[4]);
 	}
 
-	/// Decode an H.265 Annex-B stream to one 8-bit luma plane per frame.
-	fn decode_luma(stream: &[u8], (w, h): (u32, u32)) -> Vec<Vec<u8>> {
-		let path = std::env::temp_dir().join(format!("pyroshine-static-recovery-{}.h265", std::process::id()));
+	/// Decode a raw elementary stream to one 8-bit luma plane per frame.
+	fn decode_luma(stream: &[u8], demuxer: &str, (w, h): (u32, u32)) -> Vec<Vec<u8>> {
+		let path = std::env::temp_dir().join(format!("pyroshine-static-recovery-{}.{demuxer}", std::process::id()));
 		std::fs::write(&path, stream).unwrap();
 		let output = std::process::Command::new("ffmpeg")
-			.args(["-hide_banner", "-loglevel", "error", "-f", "hevc", "-i"])
+			.args(["-hide_banner", "-loglevel", "error", "-f", demuxer, "-i"])
 			.arg(&path)
 			.args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
 			.output();
@@ -1717,14 +1903,22 @@ mod gpu_fixture {
 		// a stale recovery could read.
 		const LEVELS: [u8; 5] = [200, 40, 120, 160, 80];
 		let mut failures = Vec::new();
-		for preceding in [1usize, 2, 5] {
-			let (context, mut encoder, (w, h)) = recovery_encoder();
+		let mut checked = 0;
+		for (codec, preceding) in RECOVERY_CODECS
+			.into_iter()
+			.flat_map(|codec| [1usize, 2, 5].map(|preceding| (codec, preceding)))
+		{
+			let Some((context, mut encoder, (w, h))) = recovery_encoder(codec) else {
+				eprintln!("{codec:?}: not encoded by this GPU; skipped");
+				continue;
+			};
+			checked += 1;
 			let mut converter = InputConverter::new(
 				context.clone(),
 				ConversionQueueMode::Auto,
 				w,
 				h,
-				OutputFormat::NV12,
+				codec.output,
 				ColorSpace::Bt709,
 				true,
 			)
@@ -1746,20 +1940,33 @@ mod gpu_fixture {
 				let image = encoder.input_image();
 				stream.extend(block_on(encoder.encode(image).unwrap()).unwrap().data);
 			}
-			encoder.request_idr();
-			let recovery = block_on(super::super::encode_static_recovery(&mut encoder).unwrap()).unwrap();
-			assert!(recovery.is_key_frame, "the recovery frame is an IDR");
-			stream.extend(recovery.data);
-			let frames = decode_luma(&stream, (w, h));
-			assert_eq!(frames.len(), preceding + 1, "decoded frame count");
-			let (latest, recovered) = (mean(&frames[preceding - 1]), mean(&frames[preceding]));
-			let line =
-				format!("after {preceding} frame(s): latest scene luma {latest:.1}, recovery luma {recovered:.1}");
-			eprintln!("{line}");
-			if (latest - recovered).abs() > 4.0 {
-				failures.push(line);
+			// Static scene: two recovery keyframes in a row, no new conversion.
+			for _ in 0..2 {
+				encoder.request_idr();
+				let restore = |_: &mut Encoder, target| match converter.copy_last_output(target) {
+					Ok(true) => Ok(()),
+					Ok(false) => panic!("a conversion completed"),
+					Err(e) => Err(pixelforge::PixelForgeError::Vulkan(e)),
+				};
+				let recovery = block_on(super::super::encode_static_recovery(&mut encoder, restore).unwrap()).unwrap();
+				assert!(recovery.is_key_frame, "the recovery frame is an IDR");
+				stream.extend(recovery.data);
+			}
+			let frames = decode_luma(&stream, codec.demuxer, (w, h));
+			assert_eq!(frames.len(), preceding + 2, "decoded frame count");
+			let latest = mean(&frames[preceding - 1]);
+			for recovered in [mean(&frames[preceding]), mean(&frames[preceding + 1])] {
+				let line = format!(
+					"{:?} {:?}: after {preceding} frame(s): latest scene luma {latest:.1}, recovery luma {recovered:.1}",
+					codec.codec, codec.depth
+				);
+				eprintln!("{line}");
+				if (latest - recovered).abs() > 4.0 {
+					failures.push(line);
+				}
 			}
 		}
+		assert!(checked > 0, "no conventional codec could be checked");
 		assert!(
 			failures.is_empty(),
 			"review 2026-10-05 BUG-002: static recovery did not decode to the latest scene: {failures:#?}"
