@@ -101,11 +101,3 @@ batch = "G"
 test = "session::stream::video::pipeline::convert::tests::static_recovery_decodes_to_the_latest_frame_on_gpu"
 marker = "review 2026-10-05 BUG-002: static recovery did not decode to the latest scene"
 gpu = true
-
-[[native]]
-finding = "BUG-001"
-batch = "B"
-ctest = "ps5-feature-reports-unsupported"
-command = ["ps5-feature-report-test", "unsupported"]
-# AddressSanitizer names the overread; without sanitizers the process faults.
-marker = "AddressSanitizer: stack-buffer-overflow"

@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Security
+
+- Answer an unsupported feature-report query on a virtual DualSense or DualSense Edge with an error instead of reading past the reply buffer. A local HID reader (for example a game or Steam probing the controller) could otherwise crash the server; only the calibration, pairing and firmware reports are answered, and output reports too short to contain their rumble/LED data are ignored.
+
 ## [v0.17.0-beta.15] - 2026-10-05
 
 ### Added

@@ -1,15 +1,18 @@
-// Hardware-independent checks of the DualSense UHID feature-report handler.
+// Hardware-independent checks of the DualSense UHID event handler.
 // `on_uhid_event` is file-static, so this test compiles its translation unit
-// and reads the reply it writes to a pipe instead of /dev/uhid.
+// and reads the replies it writes to a pipe instead of /dev/uhid.
 //
 //   ps5-feature-report-test supported    byte-exact supported replies (USB and
 //                                        Bluetooth, including the CRC trailer)
-//   ps5-feature-report-test unsupported  every other report number yields an
-//                                        error reply without a payload
+//   ps5-feature-report-test unsupported  every other report number and type
+//                                        gets an error reply without a payload
+//   ps5-feature-report-test output       output reports are parsed only when
+//                                        they contain the whole common block
+//   ps5-feature-report-test fuzz         seeded random requests and output
+//                                        reports (meaningful under ASan/UBSan)
 //
-// The unsupported mode is a known defect (review 2026-10-05 BUG-001): the
-// Bluetooth error path still computes a CRC over `size - 4` with size 0 and
-// overreads the stack. Build with -fsanitize=address,undefined to see it.
+// Review 2026-10-05 BUG-001: the Bluetooth error path used to compute a CRC
+// over `size - 4` with size 0 and overread the stack.
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -24,7 +27,7 @@
 
 namespace {
 
-uhid_event query(bool bluetooth, uint8_t rnum, uint32_t id) {
+uhid_event query(bool bluetooth, uint8_t rnum, uint8_t rtype, uint32_t id) {
   int fds[2];
   assert(pipe(fds) == 0);
   auto state = std::make_shared<inputtino::PS5JoypadState>();
@@ -33,7 +36,7 @@ uhid_event query(bool bluetooth, uint8_t rnum, uint32_t id) {
   request.type = UHID_GET_REPORT;
   request.u.get_report.id = id;
   request.u.get_report.rnum = rnum;
-  request.u.get_report.rtype = UHID_FEATURE_REPORT;
+  request.u.get_report.rtype = rtype;
   inputtino::on_uhid_event(state, request, fds[1]);
   uhid_event reply{};
   // One uhid_event is far below the pipe capacity, so the write never blocked.
@@ -71,7 +74,7 @@ void check_supported() {
   const inputtino::PS5JoypadState defaults{};
   for (bool bluetooth : {false, true}) {
     for (const auto &report : SUPPORTED) {
-      auto reply = query(bluetooth, report.rnum, 0x1200 + report.rnum);
+      auto reply = query(bluetooth, report.rnum, UHID_FEATURE_REPORT, 0x1200 + report.rnum);
       assert(reply.u.get_report_reply.err == 0);
       assert(reply.u.get_report_reply.size == report.size);
       std::vector<unsigned char> expected(report.table, report.table + report.size);
@@ -91,18 +94,124 @@ void check_supported() {
 void check_unsupported() {
   // USB first: a Bluetooth failure must not hide the USB result.
   for (bool bluetooth : {false, true}) {
-    for (unsigned rnum = 0; rnum < 256; ++rnum) {
-      if (is_supported(rnum))
-        continue;
-      auto reply = query(bluetooth, static_cast<uint8_t>(rnum), 0x3400 + rnum);
-      if (reply.u.get_report_reply.err == 0 || reply.u.get_report_reply.size != 0) {
-        std::fprintf(stderr,
-                     "review 2026-10-05 BUG-001: unsupported %s report 0x%02x replied err=%u size=%u\n",
-                     bluetooth ? "Bluetooth" : "USB", rnum, reply.u.get_report_reply.err,
-                     reply.u.get_report_reply.size);
+    for (uint8_t rtype : {UHID_FEATURE_REPORT, UHID_OUTPUT_REPORT, UHID_INPUT_REPORT}) {
+      for (unsigned rnum = 0; rnum < 256; ++rnum) {
+        if (rtype == UHID_FEATURE_REPORT && is_supported(rnum))
+          continue;
+        auto reply = query(bluetooth, static_cast<uint8_t>(rnum), rtype, 0x3400 + rnum);
+        if (reply.u.get_report_reply.err == 0 || reply.u.get_report_reply.size != 0) {
+          std::fprintf(stderr,
+                       "review 2026-10-05 BUG-001: unsupported %s report 0x%02x (type %u) replied err=%u size=%u\n",
+                       bluetooth ? "Bluetooth" : "USB", rnum, rtype, reply.u.get_report_reply.err,
+                       reply.u.get_report_reply.size);
+          std::abort();
+        }
+        // The error reply carries no payload bytes either.
+        for (size_t b = 0; b < UHID_DATA_MAX; ++b)
+          assert(reply.u.get_report_reply.data[b] == 0);
+      }
+    }
+  }
+}
+
+struct Feedback {
+  std::vector<std::pair<int, int>> rumble;
+  std::vector<std::array<int, 3>> led;
+};
+
+std::shared_ptr<inputtino::PS5JoypadState> recording_state(Feedback &feedback) {
+  auto state = std::make_shared<inputtino::PS5JoypadState>();
+  state->on_rumble = [&feedback](int left, int right) { feedback.rumble.emplace_back(left, right); };
+  state->on_led = [&feedback](int r, int g, int b) { feedback.led.push_back({r, g, b}); };
+  return state;
+}
+
+/// An output report whose common block (at `offset`) asks for rumble 255/128
+/// and lightbar 1/2/3, truncated to `size` bytes.
+uhid_event output_event(uint8_t report_id, uint8_t bt_flags, size_t offset, size_t size) {
+  uhid_event ev{};
+  ev.type = UHID_OUTPUT;
+  ev.u.output.size = static_cast<__u16>(size);
+  ev.u.output.data[0] = report_id;
+  if (report_id == uhid::DS_OUTPUT_REPORT_BT)
+    ev.u.output.data[1] = bt_flags;
+  uhid::dualsense_output_report_common common{};
+  common.valid_flag0 = uhid::MOTOR_OR_COMPATIBLE_VIBRATION;
+  common.valid_flag1 = uhid::LIGHTBAR_ENABLE;
+  common.motor_left = 255;
+  common.motor_right = 128;
+  common.lightbar_red = 1;
+  common.lightbar_green = 2;
+  common.lightbar_blue = 3;
+  std::memcpy(&ev.u.output.data[offset], &common, sizeof(common));
+  return ev;
+}
+
+void check_output() {
+  constexpr size_t COMMON = sizeof(uhid::dualsense_output_report_common);
+  static_assert(COMMON == 47);
+  struct Case {
+    const char *name;
+    uint8_t report_id;
+    uint8_t bt_flags;
+    size_t offset;
+  };
+  // USB (hid-playstation and SDL), SDL Bluetooth (EnableHID set) and kernel
+  // Bluetooth (EnableHID clear, followed by a tag byte).
+  const Case cases[] = {
+      {"usb", uhid::DS_OUTPUT_REPORT_USB, 0, 1},
+      {"bt-sdl", uhid::DS_OUTPUT_REPORT_BT, 0x02, 2},
+      {"bt-kernel", uhid::DS_OUTPUT_REPORT_BT, 0x00, 3},
+  };
+  for (const auto &c : cases) {
+    for (size_t size : {c.offset + COMMON, size_t{78}, c.offset + COMMON - 1, size_t{1}, size_t{0}}) {
+      Feedback feedback;
+      inputtino::on_uhid_event(recording_state(feedback), output_event(c.report_id, c.bt_flags, c.offset, size), -1);
+      const bool complete = size >= c.offset + COMMON;
+      if (complete) {
+        assert(feedback.rumble.size() == 1);
+        assert(feedback.rumble[0].first == 0xFFFF);
+        assert(feedback.rumble[0].second == static_cast<int>((128 / 255.0f) * 0xFFFF));
+        assert(feedback.led.size() == 1 && feedback.led[0] == (std::array<int, 3>{1, 2, 3}));
+      } else if (!feedback.rumble.empty() || !feedback.led.empty()) {
+        std::fprintf(stderr, "%s: truncated %zu-byte output report was parsed\n", c.name, size);
         std::abort();
       }
     }
+  }
+  // Unknown output report ids are ignored.
+  Feedback feedback;
+  inputtino::on_uhid_event(recording_state(feedback), output_event(0x7f, 0, 1, 78), -1);
+  assert(feedback.rumble.empty() && feedback.led.empty());
+}
+
+struct Rng {
+  uint64_t state;
+  uint32_t next() {
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    return static_cast<uint32_t>(state >> 33);
+  }
+};
+
+void fuzz() {
+  Rng rng{0x5eed};
+  for (int i = 0; i < 20000; ++i) {
+    const bool bluetooth = rng.next() & 1;
+    const uint8_t rnum = rng.next();
+    const uint8_t rtype = rng.next() % 4;
+    auto reply = query(bluetooth, rnum, rtype, i);
+    const bool supported = rtype == UHID_FEATURE_REPORT && is_supported(rnum);
+    assert(supported == (reply.u.get_report_reply.err == 0));
+    assert(reply.u.get_report_reply.size <= UHID_DATA_MAX);
+
+    uhid_event ev{};
+    ev.type = UHID_OUTPUT;
+    ev.u.output.size = static_cast<__u16>(rng.next() % (UHID_DATA_MAX + 64)); // including oversized claims
+    ev.u.output.data[0] = (rng.next() & 1) ? uhid::DS_OUTPUT_REPORT_BT : uhid::DS_OUTPUT_REPORT_USB;
+    for (size_t b = 1; b < 128; ++b)
+      ev.u.output.data[b] = rng.next();
+    Feedback feedback;
+    inputtino::on_uhid_event(recording_state(feedback), ev, -1);
   }
 }
 
@@ -114,10 +223,14 @@ int main(int argc, char **argv) {
     check_supported();
   } else if (mode == "unsupported") {
     check_unsupported();
+  } else if (mode == "output") {
+    check_output();
+  } else if (mode == "fuzz") {
+    fuzz();
   } else {
-    std::fprintf(stderr, "usage: %s supported|unsupported\n", argv[0]);
+    std::fprintf(stderr, "usage: %s supported|unsupported|output|fuzz\n", argv[0]);
     return 2;
   }
-  std::printf("ps5 feature reports (%s): ok\n", mode.c_str());
+  std::printf("ps5 uhid events (%s): ok\n", mode.c_str());
   return 0;
 }

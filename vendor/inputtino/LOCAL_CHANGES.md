@@ -73,17 +73,38 @@ adapter. It uses Linux UHID and the existing gamepad Tokio runtime. This avoids
 changing the pinned public Inputtino crate or adding C/Rust ABI extensions.
 Keep both local patches in comparisons when updating Inputtino.
 
+## DualSense UHID report bounds
+
+Review 2026-10-05 BUG-001: an unsupported Bluetooth feature query used to take
+the success path's CRC step with an empty payload (`size - 4` underflow), so
+the CRC read past the reply buffer.
+
+- `src/uhid/joypad_ps5.cpp`: `feature_report` builds only valid replies:
+  feature report type, a supported number (calibration 0x05, pairing 0x09,
+  firmware 0x20), payload within `UHID_DATA_MAX`, and a Bluetooth CRC only
+  for a payload longer than its 4-byte trailer. Every other `UHID_GET_REPORT`
+  gets `err = EIO` with no payload (previously `-EINVAL` truncated to the u16
+  field; the kernel reports any nonzero `err` as EIO). Non-feature report types
+  for a supported number are now errors as well.
+- `output_report` parses a `UHID_OUTPUT` event only when it contains the whole
+  47-byte common block after the USB, SDL Bluetooth or kernel Bluetooth (tag
+  byte) header: at least 48, 49 or 50 bytes. Shorter reports and unknown report
+  ids are ignored instead of reading stale event bytes. Supported replies and
+  full-size output reports are unchanged.
+
+Checked with the virtual device through `/dev/uhid`: the kernel's
+`hid-playstation` driver registers both DualSense (054c:0ce6) and Edge
+(054c:0df2), and `HIDIOCGFEATURE` returns 41/20/64 bytes for 0x05/0x09/0x20 and
+EIO for other numbers. SDL and Steam on physical clients remain a release check.
+
 ## Native regression tests
 
 - `tests/ps5_feature_reports.cpp`, `CMakeLists.txt`: opt-in
   `INPUTTINO_PS5_FEATURE_TESTS` compiles the DualSense UHID handler's
   translation unit and reads its replies from a pipe, without `/dev/uhid`.
   `supported` checks byte-exact USB and Bluetooth calibration, pairing and
-  firmware replies, including golden CRC trailers. `unsupported` checks that
-  every other report number gets an error reply without a payload; it is a
-  known defect (review 2026-10-05 BUG-001: the Bluetooth error path computes a
-  CRC over `size - 4` with size 0 and overreads the stack), so its CTest case
-  is `DISABLED` until fixed.
+  firmware replies, including golden CRC trailers; `unsupported` every other
+  report number and type; `output` complete and truncated USB/Bluetooth output
+  reports; `fuzz` seeded random requests and output reports.
 - `scripts/known_defects.py` in the Pyroshine root builds these and the Edge and
-  Elite tests with AddressSanitizer/UBSan and runs them in CI. No source of the
-  native library itself changed for these tests.
+  Elite tests with AddressSanitizer/UBSan and runs them with CTest in CI.

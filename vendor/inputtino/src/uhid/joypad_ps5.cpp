@@ -1,12 +1,15 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <crc32.hpp>
 #include <endian.h>
 #include <filesystem>
 #include <fstream>
 #include <inputtino/input.hpp>
 #include <iomanip>
+#include <optional>
 #include <random>
 #include <uhid/protected_types.hpp>
 #include <uhid/ps5.hpp>
@@ -74,53 +77,114 @@ static void send_report(PS5JoypadState &state) {
   state.dev->send(ev);
 }
 
+/**
+ * Build the reply payload for a supported feature report into `out`.
+ *
+ * Returns the payload size, or 0 when the request must be answered with an
+ * error: an unsupported report number, or a report type other than feature.
+ * Only a valid payload carries the Bluetooth CRC trailer; the size checks
+ * below are what make `size - 4` and every copy in-bounds.
+ */
+static size_t feature_report(const PS5JoypadState &state,
+                             uint8_t rnum,
+                             uint8_t rtype,
+                             unsigned char (&out)[UHID_DATA_MAX]) {
+  if (rtype != UHID_FEATURE_REPORT) {
+    return 0;
+  }
+  const unsigned char *table = nullptr;
+  size_t size = 0;
+  switch (rnum) {
+  case uhid::PS5_REPORT_TYPES::CALIBRATION:
+    table = uhid::ps5_calibration_info;
+    size = sizeof(uhid::ps5_calibration_info);
+    break;
+  case uhid::PS5_REPORT_TYPES::PAIRING_INFO:
+    table = uhid::ps5_pairing_info;
+    size = sizeof(uhid::ps5_pairing_info);
+    break;
+  case uhid::PS5_REPORT_TYPES::FIRMWARE_INFO:
+    table = uhid::ps5_firmware_info;
+    size = sizeof(uhid::ps5_firmware_info);
+    break;
+  default:
+    return 0;
+  }
+  static_assert(sizeof(uhid::ps5_calibration_info) <= UHID_DATA_MAX &&
+                    sizeof(uhid::ps5_pairing_info) <= UHID_DATA_MAX &&
+                    sizeof(uhid::ps5_firmware_info) <= UHID_DATA_MAX,
+                "feature replies fit a UHID event");
+  std::copy(table, table + size, &out[0]);
+
+  if (rnum == uhid::PS5_REPORT_TYPES::PAIRING_INFO) {
+    static_assert(sizeof(uhid::ps5_pairing_info) >= 1 + sizeof(state.mac_address), "pairing reply holds the MAC");
+    std::reverse_copy(&state.mac_address[0], &state.mac_address[0] + sizeof(state.mac_address), &out[1]);
+  }
+
+  if (state.is_bluetooth) {
+    // The last 4 bytes of every Bluetooth feature reply hold its CRC32.
+    if (size <= 4) {
+      return 0;
+    }
+    auto end_of_msg = size - 4;
+    auto crc = sign_crc32(uhid::PS_FEATURE_CRC32, &out[0], end_of_msg);
+    std::copy(reinterpret_cast<unsigned char *>(&crc), reinterpret_cast<unsigned char *>(&crc) + 4, &out[end_of_msg]);
+  }
+  return size;
+}
+
+/**
+ * The common output-report block of a UHID_OUTPUT event, or nullopt when the
+ * report is of another type or too short to contain it.
+ */
+static std::optional<uhid::dualsense_output_report_common> output_report(const uhid_event &ev) {
+  const auto size = std::min<size_t>(ev.u.output.size, sizeof(ev.u.output.data));
+  const auto *data = ev.u.output.data;
+  size_t offset = 0;
+  if (size >= 1 && data[0] == uhid::DS_OUTPUT_REPORT_USB) {
+    offset = offsetof(uhid::dualsense_output_report_usb, common);
+  } else if (size >= 2 && data[0] == uhid::DS_OUTPUT_REPORT_BT) {
+    offset = offsetof(uhid::dualsense_output_report_bt, common);
+    /*
+     * SDL2 sets the EnableHID flag and will send the output report straight after
+     * https://github.com/libsdl-org/SDL/blob/c8c4c9772758de2ae466d27f13eb3ed4233e3f32/src/joystick/hidapi/SDL_hidapi_ps5.c#L788-L789
+     *
+     * The Linux kernel instead, sets this as 0, properly set the SeqNo and adds a hardcoded `tag` field before the
+     * actual output report
+     * https://github.com/torvalds/linux/blob/305230142ae0637213bf6e04f6d9f10bbcb74af8/drivers/hid/hid-playstation.c#L1184-L1192
+     */
+    auto report_bt = reinterpret_cast<const uhid::dualsense_output_report_bt *>(data);
+    if (report_bt->EnableHID == 0) {
+      offset += 1; // Skip the tag field
+    }
+  } else {
+    return std::nullopt;
+  }
+  if (size < offset + sizeof(uhid::dualsense_output_report_common)) {
+    return std::nullopt;
+  }
+  uhid::dualsense_output_report_common report;
+  std::memcpy(&report, data + offset, sizeof(report));
+  return report;
+}
+
 static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, int fd) {
   switch (ev.type) {
   case UHID_GET_REPORT: {
     uhid_event answer{};
     answer.type = UHID_GET_REPORT_REPLY;
     answer.u.get_report_reply.id = ev.u.get_report.id;
-    answer.u.get_report_reply.err = 0;
-    switch (ev.u.get_report.rnum) {
-    case uhid::PS5_REPORT_TYPES::CALIBRATION: {
-      std::copy(&uhid::ps5_calibration_info[0],
-                &uhid::ps5_calibration_info[0] + sizeof(uhid::ps5_calibration_info),
-                &answer.u.get_report_reply.data[0]);
-      answer.u.get_report_reply.size = sizeof(uhid::ps5_calibration_info);
-      break;
-    }
-    case uhid::PS5_REPORT_TYPES::PAIRING_INFO: {
-      std::copy(&uhid::ps5_pairing_info[0],
-                &uhid::ps5_pairing_info[0] + sizeof(uhid::ps5_pairing_info),
-                &answer.u.get_report_reply.data[0]);
-
-      // Copy MAC address data
-      std::reverse_copy(&state->mac_address[0],
-                        &state->mac_address[0] + sizeof(state->mac_address),
-                        &answer.u.get_report_reply.data[1]);
-
-      answer.u.get_report_reply.size = sizeof(uhid::ps5_pairing_info);
-      break;
-    }
-    case uhid::PS5_REPORT_TYPES::FIRMWARE_INFO: {
-      std::copy(&uhid::ps5_firmware_info[0],
-                &uhid::ps5_firmware_info[0] + sizeof(uhid::ps5_firmware_info),
-                &answer.u.get_report_reply.data[0]);
-      answer.u.get_report_reply.size = sizeof(uhid::ps5_firmware_info);
-      break;
-    }
-    default:
-      answer.u.get_report_reply.err = -EINVAL;
-      break;
-    }
-
-    if (state->is_bluetooth) {
-      // CRC32 encode the data and append it to the reply
-      auto end_of_msg = answer.u.get_report_reply.size - 4; // (Last 4 bytes contains crc32)
-      auto crc = sign_crc32(uhid::PS_FEATURE_CRC32, &answer.u.get_report_reply.data[0], end_of_msg);
-      std::copy(reinterpret_cast<unsigned char *>(&crc),
-                reinterpret_cast<unsigned char *>(&crc) + 4,
-                &answer.u.get_report_reply.data[end_of_msg]);
+    // `uhid_event` is packed; build the payload unaligned-safe, then copy it in.
+    unsigned char payload[UHID_DATA_MAX] = {};
+    auto size = feature_report(*state, ev.u.get_report.rnum, ev.u.get_report.rtype, payload);
+    std::memcpy(answer.u.get_report_reply.data, payload, size);
+    if (size == 0) {
+      // An error reply carries no payload; the kernel reports EIO to the reader.
+      answer.u.get_report_reply.err = EIO;
+      answer.u.get_report_reply.size = 0;
+    } else {
+      answer.u.get_report_reply.err = 0;
+      answer.u.get_report_reply.size = static_cast<__u16>(size);
     }
 
     auto res = uhid::uhid_write(fd, &answer);
@@ -129,27 +193,11 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
   }
   case UHID_OUTPUT: { // This is sent if the HID device driver wants to send raw data to the device
     // Here is where we'll get Rumble and LED events
-    // Check the first byte to see if it's a USB or BT report
-    uint8_t report_type = ev.u.output.data[0];
-    uhid::dualsense_output_report_common report;
-    if (report_type == uhid::DS_OUTPUT_REPORT_USB) {
-      auto report_usb = (uhid::dualsense_output_report_usb *)ev.u.output.data;
-      report = report_usb->common;
-    } else {
-      uhid::dualsense_output_report_bt *report_bt = (uhid::dualsense_output_report_bt *)ev.u.output.data;
-      /*
-       * SDL2 sets the EnableHID flag and will send the output report straight after
-       * https://github.com/libsdl-org/SDL/blob/c8c4c9772758de2ae466d27f13eb3ed4233e3f32/src/joystick/hidapi/SDL_hidapi_ps5.c#L788-L789
-       *
-       * The Linux kernel instead, sets this as 0, properly set the SeqNo and adds a hardcoded `tag` field before the
-       * actual output report
-       * https://github.com/torvalds/linux/blob/305230142ae0637213bf6e04f6d9f10bbcb74af8/drivers/hid/hid-playstation.c#L1184-L1192
-       */
-      if (report_bt->EnableHID == 0) {
-        report_bt = (uhid::dualsense_output_report_bt *)&ev.u.output.data[1]; // Skip the tag field
-      }
-      report = report_bt->common;
+    auto parsed = output_report(ev);
+    if (!parsed) {
+      break;
     }
+    const auto &report = *parsed;
 
     /*
      * RUMBLE

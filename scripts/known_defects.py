@@ -107,11 +107,10 @@ def build_native(build):
 
 def run_native(entries, build):
     results = []
-    if not entries:
-        return results
     build_native(build)
-    # The enabled native tests are current behavior to retain; they must pass.
-    subprocess.run(["ctest", "--output-on-failure"], cwd=build, check=True)
+    # The enabled native tests are behavior to retain; they must pass.
+    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")
+    subprocess.run(["ctest", "--output-on-failure"], cwd=build, check=True, env=env)
     for entry in entries:
         command = [str(build / entry["command"][0]), *entry["command"][1:]]
         env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0", UBSAN_OPTIONS="print_stacktrace=1")
