@@ -144,7 +144,7 @@ fn emulation(mode: GamepadEmulation) -> (&'static str, &'static str) {
 	match mode {
 		GamepadEmulation::Auto => (
 			"Automatic",
-			"Keep the client's controller family; Xbox for Steam and unknown controllers.",
+			"Preserve supported native controller models; Xbox for unknown or older model metadata.",
 		),
 		GamepadEmulation::Xbox => ("Xbox", "Always emulate Xbox controllers."),
 		GamepadEmulation::Playstation => (

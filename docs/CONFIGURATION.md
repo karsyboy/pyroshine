@@ -212,7 +212,7 @@ packet limit, including encryption and FEC overhead; high-quality surround at
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `emulation` | string, `"auto"` | Virtual controller family: `auto`, `xbox`, `playstation`, or `nintendo`. Auto preserves recognized client families and uses Xbox for Steam/unknown kinds. Advanced motion, touch, and feedback features depend on the selected family. |
+| `emulation` | string, `"auto"` | Virtual controller family: `auto`, `xbox`, `playstation`, or `nintendo`. Auto preserves supported native models (Elite, DualSense/Edge, Switch, classic Steam Controller and Steam Deck) and uses Xbox when native model metadata is unavailable. See [native controllers](NATIVE_CONTROLLERS.md). Advanced motion, touch, and feedback features depend on the selected family. |
 | `home_button` | table | Intentional Home/Guide shortcut below. |
 
 ### `[stream.control.gamepad.home_button]`

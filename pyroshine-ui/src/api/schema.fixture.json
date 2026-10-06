@@ -429,7 +429,7 @@
         "kind": {
           "options": [
             {
-              "description": "Keep the client's controller family; Xbox for Steam and unknown controllers.",
+              "description": "Preserve supported native controller models; Xbox for unknown or older model metadata.",
               "label": "Automatic",
               "value": "auto"
             },

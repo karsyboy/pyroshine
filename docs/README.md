@@ -30,7 +30,7 @@ the guide for the area being changed:
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |
 | Cross-fork framing and authenticated calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
 | Native Wayland/XWayland presentation, HDR and Wine/Proton | [Native presentation](NATIVE_PRESENTATION.md) |
-| Native controller identity/report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
+| Native controller identity/report mapping | [Native controllers](NATIVE_CONTROLLERS.md), [DualSense Edge](DUALSENSE_EDGE.md) |
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
 | Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |
 | Mode changes, epochs and teardown | [Reconnect validation](reconnect-validation.md) |

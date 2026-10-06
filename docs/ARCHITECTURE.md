@@ -439,7 +439,7 @@ peer authorization it decrypts AES-GCM control messages and dispatches:
 | Message class | Destination |
 | --- | --- |
 | Keyboard, text, mouse, scroll, touch, pen | Compositor input channel, injected into the Smithay seat with the compositor's focus |
-| Controller arrival, state, touchpad, motion, battery | `control/input/gamepad.rs` → Inputtino virtual devices on the `gamepad-input` thread |
+| Controller arrival, state, touchpad, motion, battery | `control/input/gamepad.rs` → Inputtino or native Valve UHID devices on the `gamepad-input` thread |
 | `StartB`, IDR requests, reference-frame invalidation, FEC status | Stream start latches and the video stream handle |
 | Ping | Active-peer liveness (`[stream].timeout`) |
 
@@ -448,10 +448,10 @@ motion-enable requests from virtual controllers, and HDR mode and metadata from
 the video stream.
 
 Virtual controller family follows `[stream.control.gamepad] emulation`:
-Xbox, PlayStation (including the DualSense Edge subtype) or Nintendo. Steam
+Xbox/Elite, PlayStation (including DualSense Edge), Nintendo or native Valve models. Steam
 Input routing on the host is separate from virtual-device delivery. See
 [Compositor](COMPOSITOR.md#steam-classification-and-input) and
-[DualSense Edge](DUALSENSE_EDGE.md).
+[native controllers](NATIVE_CONTROLLERS.md) and [DualSense Edge](DUALSENSE_EDGE.md).
 
 ## Configuration and persistent state
 

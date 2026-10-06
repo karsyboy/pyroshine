@@ -39,9 +39,11 @@ emulation = "auto" # auto | xbox | playstation | nintendo
 whole visible output. `composited` uses the existing GLES output DMA-BUF pool for
 compatibility diagnosis. There is no forced direct mode.
 
-Automatic gamepad emulation preserves Xbox, PlayStation/PS5, and Nintendo/Switch
-families. Steam/Valve (`LI_CTYPE_STEAM = 0x04`), unknown, and future kinds use the
-Xbox compatibility target. Forced policies choose the requested virtual family.
+Automatic gamepad emulation preserves Xbox/Elite, PlayStation/PS5, Nintendo/Switch,
+and explicitly identified classic Steam Controller/Steam Deck models. Missing Valve
+model metadata, unknown and future kinds use the Xbox compatibility target.
+Forced policies choose the requested virtual family; explicit Xbox selects a
+generic Xbox. See [native controllers](NATIVE_CONTROLLERS.md).
 The existing motion, touch, battery, feedback, hotplug, and active-mask paths
 remain in place; advanced features depend on the virtual family selected.
 

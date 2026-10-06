@@ -1,3 +1,5 @@
+mod valve;
+
 use inputtino::{
 	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
 	SwitchJoypad, XboxOneJoypad,
@@ -85,20 +87,6 @@ pub enum GamepadEmulation {
 	Nintendo,
 }
 
-impl GamepadEmulation {
-	fn target(self, incoming: GamepadKind) -> GamepadKind {
-		match self {
-			Self::Auto => match incoming {
-				GamepadKind::Unknown | GamepadKind::Steam => GamepadKind::Xbox,
-				kind => kind,
-			},
-			Self::Xbox => GamepadKind::Xbox,
-			Self::Playstation => GamepadKind::PlayStation,
-			Self::Nintendo => GamepadKind::Nintendo,
-		}
-	}
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromRepr)]
 #[repr(u8)]
 pub(crate) enum GamepadKind {
@@ -138,6 +126,10 @@ enum GamepadCapability {
 
 	/// LI_CCAP_DUALSENSE_EDGE; subtype, never a new controller family.
 	DualSenseEdge = 0x200,
+	XboxElite = 0x400,
+	SteamController = 0x800,
+	SteamDeck = 0x1000,
+	XboxEliteSeries2 = 0x2000,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,30 +195,78 @@ impl GamepadInfo {
 
 	/// The virtual device this arrival produces under `policy`.
 	pub fn virtual_identity(&self, policy: GamepadEmulation) -> VirtualIdentity {
-		let kind = match policy.target(self.kind) {
-			GamepadKind::Unknown | GamepadKind::Steam => GamepadKind::Xbox,
-			kind => kind,
-		};
-		VirtualIdentity {
-			kind,
-			dualsense_edge: kind == GamepadKind::PlayStation && self.is_dualsense_edge(),
+		match policy {
+			GamepadEmulation::Xbox => VirtualIdentity::Xbox,
+			GamepadEmulation::Nintendo => VirtualIdentity::Switch,
+			GamepadEmulation::Playstation => {
+				if self.is_dualsense_edge() {
+					VirtualIdentity::DualSenseEdge
+				} else {
+					VirtualIdentity::DualSense
+				}
+			},
+			GamepadEmulation::Auto => match self.kind {
+				GamepadKind::Xbox if self.has_capability(&GamepadCapability::XboxElite) => {
+					if self.has_capability(&GamepadCapability::XboxEliteSeries2) {
+						VirtualIdentity::XboxEliteSeries2
+					} else {
+						VirtualIdentity::XboxElite
+					}
+				},
+				GamepadKind::PlayStation => {
+					if self.is_dualsense_edge() {
+						VirtualIdentity::DualSenseEdge
+					} else {
+						VirtualIdentity::DualSense
+					}
+				},
+				GamepadKind::Nintendo => VirtualIdentity::Switch,
+				GamepadKind::Steam => match self.capabilities
+					& (GamepadCapability::SteamController as u16 | GamepadCapability::SteamDeck as u16)
+				{
+					0x800 => VirtualIdentity::SteamController,
+					0x1000 => VirtualIdentity::SteamDeck,
+					// Missing or contradictory metadata must not select native hardware.
+					_ => VirtualIdentity::Xbox,
+				},
+				_ => VirtualIdentity::Xbox,
+			},
 		}
 	}
 }
 
-/// Everything that determines the native device a slot exposes to the game:
-/// the emulated family and, for PlayStation, the Edge subtype. Arrivals with
-/// the same identity reuse the existing device; any difference recreates it.
+/// Models that determine native hardware identity and slot recreation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct VirtualIdentity {
-	kind: GamepadKind,
-	dualsense_edge: bool,
+pub(crate) enum VirtualIdentity {
+	Xbox,
+	XboxElite,
+	XboxEliteSeries2,
+	DualSense,
+	DualSenseEdge,
+	Switch,
+	SteamController,
+	SteamDeck,
 }
 
 impl VirtualIdentity {
-	/// Whether the device reports motion, which each owner must enable.
 	pub fn has_motion(self) -> bool {
-		self.kind == GamepadKind::PlayStation
+		matches!(
+			self,
+			Self::DualSense | Self::DualSenseEdge | Self::SteamController | Self::SteamDeck
+		)
+	}
+
+	fn is_valve(self) -> bool {
+		matches!(self, Self::SteamController | Self::SteamDeck)
+	}
+
+	fn kind(self) -> GamepadKind {
+		match self {
+			Self::Xbox | Self::XboxElite | Self::XboxEliteSeries2 => GamepadKind::Xbox,
+			Self::DualSense | Self::DualSenseEdge => GamepadKind::PlayStation,
+			Self::Switch => GamepadKind::Nintendo,
+			Self::SteamController | Self::SteamDeck => GamepadKind::Steam,
+		}
 	}
 }
 
@@ -247,8 +287,9 @@ pub(crate) trait VirtualGamepad {
 #[derive(Debug)]
 pub(crate) struct GamepadTouch {
 	pub index: u8,
-	_event_type: u8,
-	// zero: [u8; 2], // Alignment/reserved
+	event_type: u8,
+	touchpad: u8,
+	// payload byte 2 is reserved; byte 3 is touchpad index.
 	pointer_id: u32,
 	pub x: f32,
 	pub y: f32,
@@ -275,9 +316,24 @@ impl GamepadTouch {
 			return Err(());
 		}
 
-		let x = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
-		let y = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
-		let pressure = f32::from_le_bytes(buffer[16..20].try_into().unwrap());
+		// Cancellation ignores coordinates/pressure by protocol contract. A
+		// non-finite unused coordinate must not prevent releasing a contact.
+		let cancelled = matches!(buffer[1], 4 | 7);
+		let x = if cancelled {
+			0.0
+		} else {
+			f32::from_le_bytes(buffer[8..12].try_into().unwrap())
+		};
+		let y = if cancelled {
+			0.0
+		} else {
+			f32::from_le_bytes(buffer[12..16].try_into().unwrap())
+		};
+		let pressure = if cancelled {
+			0.0
+		} else {
+			f32::from_le_bytes(buffer[16..20].try_into().unwrap())
+		};
 		// `clamp` keeps NaN, which would otherwise reach the touchpad conversion.
 		if !x.is_finite() || !y.is_finite() || !pressure.is_finite() {
 			tracing::warn!(?x, ?y, ?pressure, "Ignoring gamepad touch with non-finite values");
@@ -286,8 +342,8 @@ impl GamepadTouch {
 
 		Ok(Self {
 			index: buffer[0],
-			_event_type: buffer[1],
-			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
+			event_type: buffer[1],
+			touchpad: buffer[3],
 			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 			x: x.clamp(0.0, 1.0),
 			y: y.clamp(0.0, 1.0),
@@ -460,10 +516,15 @@ impl GamepadBattery {
 	}
 }
 
+enum NativeGamepad {
+	Inputtino(Joypad),
+	Valve(valve::ValveGamepad),
+}
+
 pub(crate) struct Gamepad {
-	/// The underlying inputtino joypad, used to inject button presses, stick
+	/// The selected native backend, used to inject button presses, stick
 	/// positions, triggers, touchpad events, and motion data.
-	gamepad: inputtino::Joypad,
+	gamepad: NativeGamepad,
 	/// Touchpad contacts currently placed, released when ownership is lost.
 	fingers: std::collections::BTreeSet<u32>,
 }
@@ -472,17 +533,35 @@ impl Gamepad {
 	/// Create the native device. Its feedback callbacks hold `route`, never a
 	/// particular peer's channel, so the device can outlive its first owner.
 	pub fn new(info: &GamepadInfo, route: FeedbackRoute, policy: GamepadEmulation) -> Result<Self, ()> {
-		let kind = policy.target(info.kind);
-		tracing::debug!(index = info.index, incoming = ?info.kind, ?policy, virtual_kind = ?kind,
+		let identity = info.virtual_identity(policy);
+		let kind = identity.kind();
+		tracing::debug!(index = info.index, incoming = ?info.kind, ?policy, virtual_identity = ?identity,
 			edge = info.is_dualsense_edge(), supported_buttons = format_args!("{:#010x}", info.supported_buttons),
 			capabilities = format_args!("{:#06x}", info.capabilities),
 			"Creating virtual controller");
+		if identity.is_valve() {
+			return Ok(Self {
+				gamepad: NativeGamepad::Valve(
+					valve::ValveGamepad::new(identity, info.index, route)
+						.map_err(|e| tracing::warn!("Failed to create Valve controller: {e}"))?,
+				),
+				fingers: Default::default(),
+			});
+		}
 		let id = format!("00:11:22:33:44:{:02x}", info.index);
 		let definition = match kind {
 			GamepadKind::Unknown | GamepadKind::Steam | GamepadKind::Xbox => DeviceDefinition::new(
-				"Moonshine XOne controller",
+				match identity {
+					VirtualIdentity::XboxElite => "Moonshine Xbox Elite controller",
+					VirtualIdentity::XboxEliteSeries2 => "Moonshine Xbox Elite Series 2 controller",
+					_ => "Moonshine XOne controller",
+				},
 				0x045e,
-				0x02dd,
+				match identity {
+					VirtualIdentity::XboxElite => 0x02e3,
+					VirtualIdentity::XboxEliteSeries2 => 0x0b00,
+					_ => 0x02dd,
+				},
 				0x0100,
 				id.as_str(),
 				id.as_str(),
@@ -588,7 +667,7 @@ impl Gamepad {
 		});
 
 		Ok(Self {
-			gamepad,
+			gamepad: NativeGamepad::Inputtino(gamepad),
 			fingers: Default::default(),
 		})
 	}
@@ -599,11 +678,18 @@ impl VirtualGamepad for Gamepad {
 	/// The accelerometer keeps its last (orientation) sample: zero would read
 	/// as free fall rather than rest.
 	fn neutralize(&mut self) {
+		if let NativeGamepad::Valve(valve) = &self.gamepad {
+			valve.neutralize();
+			return;
+		}
+		let NativeGamepad::Inputtino(gamepad) = &self.gamepad else {
+			return;
+		};
 		self.set_pressed(0);
-		self.gamepad.set_stick(JoypadStickPosition::LS, 0, 0);
-		self.gamepad.set_stick(JoypadStickPosition::RS, 0, 0);
-		self.gamepad.set_triggers(0, 0);
-		if let Joypad::PS5(gamepad) = &self.gamepad {
+		gamepad.set_stick(JoypadStickPosition::LS, 0, 0);
+		gamepad.set_stick(JoypadStickPosition::RS, 0, 0);
+		gamepad.set_triggers(0, 0);
+		if let NativeGamepad::Inputtino(Joypad::PS5(gamepad)) = &self.gamepad {
 			for finger in std::mem::take(&mut self.fingers) {
 				gamepad.release_finger(finger);
 			}
@@ -612,22 +698,35 @@ impl VirtualGamepad for Gamepad {
 	}
 
 	fn set_pressed(&self, button_flags: u32) {
-		self.gamepad.set_pressed(button_flags as i32);
+		if let NativeGamepad::Valve(valve) = &self.gamepad {
+			valve.set_pressed(button_flags);
+		}
+		if let NativeGamepad::Inputtino(gamepad) = &self.gamepad {
+			gamepad.set_pressed(button_flags as i32);
+		}
 	}
 
 	/// Apply a gamepad update (sticks, triggers) to the device.
 	fn apply_update(&self, update: &GamepadUpdate) {
+		if let NativeGamepad::Valve(valve) = &self.gamepad {
+			valve.apply_update(update);
+			return;
+		}
+		let NativeGamepad::Inputtino(gamepad) = &self.gamepad else {
+			return;
+		};
 		// Send analog triggers.
-		self.gamepad
-			.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
-		self.gamepad
-			.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
-		self.gamepad
-			.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
+		gamepad.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
+		gamepad.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
+		gamepad.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
 	}
 
 	fn touch(&mut self, touch: &GamepadTouch) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
+		if let NativeGamepad::Valve(valve) = &self.gamepad {
+			valve.touch(touch);
+			return;
+		}
+		if let NativeGamepad::Inputtino(Joypad::PS5(gamepad)) = &self.gamepad {
 			if touch.pressure > 0.5 {
 				self.fingers.insert(touch.pointer_id);
 				gamepad.place_finger(
@@ -643,7 +742,11 @@ impl VirtualGamepad for Gamepad {
 	}
 
 	fn set_motion(&self, motion: &GamepadMotion) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
+		if let NativeGamepad::Valve(valve) = &self.gamepad {
+			valve.set_motion(motion);
+			return;
+		}
+		if let NativeGamepad::Inputtino(Joypad::PS5(gamepad)) = &self.gamepad {
 			gamepad.set_motion(
 				motion.motion_type,
 				motion.x.to_radians(),
@@ -654,7 +757,11 @@ impl VirtualGamepad for Gamepad {
 	}
 
 	fn set_battery(&self, gamepad_battery: &GamepadBattery) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
+		if let NativeGamepad::Valve(valve) = &self.gamepad {
+			valve.set_battery(gamepad_battery);
+			return;
+		}
+		if let NativeGamepad::Inputtino(Joypad::PS5(gamepad)) = &self.gamepad {
 			let state = match gamepad_battery.battery_state {
 				BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
 				BatteryState::Charging => InputtinoBatterState::BATTERY_CHARGHING,
@@ -699,20 +806,67 @@ mod compatibility_tests {
 			GamepadKind::Nintendo,
 			GamepadKind::Steam,
 		] {
-			assert_eq!(GamepadEmulation::Xbox.target(kind), GamepadKind::Xbox);
-			assert_eq!(GamepadEmulation::Playstation.target(kind), GamepadKind::PlayStation);
-			assert_eq!(GamepadEmulation::Nintendo.target(kind), GamepadKind::Nintendo);
+			assert_eq!(
+				GamepadInfo {
+					kind,
+					..GamepadInfo::default_for_index(0)
+				}
+				.virtual_identity(GamepadEmulation::Xbox)
+				.kind(),
+				GamepadKind::Xbox
+			);
+			assert_eq!(
+				GamepadInfo {
+					kind,
+					..GamepadInfo::default_for_index(0)
+				}
+				.virtual_identity(GamepadEmulation::Playstation)
+				.kind(),
+				GamepadKind::PlayStation
+			);
+			assert_eq!(
+				GamepadInfo {
+					kind,
+					..GamepadInfo::default_for_index(0)
+				}
+				.virtual_identity(GamepadEmulation::Nintendo)
+				.kind(),
+				GamepadKind::Nintendo
+			);
 		}
 		assert_eq!(
-			GamepadEmulation::Auto.target(GamepadKind::PlayStation),
+			GamepadInfo {
+				kind: GamepadKind::PlayStation,
+				..GamepadInfo::default_for_index(0)
+			}
+			.virtual_identity(GamepadEmulation::Auto)
+			.kind(),
 			GamepadKind::PlayStation
 		);
 		assert_eq!(
-			GamepadEmulation::Auto.target(GamepadKind::Nintendo),
+			GamepadInfo {
+				kind: GamepadKind::Nintendo,
+				..GamepadInfo::default_for_index(0)
+			}
+			.virtual_identity(GamepadEmulation::Auto)
+			.kind(),
 			GamepadKind::Nintendo
 		);
-		assert_eq!(GamepadEmulation::Auto.target(GamepadKind::Steam), GamepadKind::Xbox);
-		assert_eq!(GamepadEmulation::Auto.target(GamepadKind::Unknown), GamepadKind::Xbox);
+		assert_eq!(
+			GamepadInfo {
+				kind: GamepadKind::Steam,
+				..GamepadInfo::default_for_index(0)
+			}
+			.virtual_identity(GamepadEmulation::Auto)
+			.kind(),
+			GamepadKind::Xbox
+		);
+		assert_eq!(
+			GamepadInfo::default_for_index(0)
+				.virtual_identity(GamepadEmulation::Auto)
+				.kind(),
+			GamepadKind::Xbox
+		);
 	}
 	#[test]
 	fn edge_identity_requires_playstation_and_explicit_capability() {
@@ -727,12 +881,74 @@ mod compatibility_tests {
 				assert_eq!(info.is_dualsense_edge(), edge);
 				assert_eq!(info.playstation_product(), if edge { 0x0df2 } else { 0x0ce6 });
 				assert_eq!(
-					GamepadEmulation::Playstation.target(info.kind),
+					info.virtual_identity(GamepadEmulation::Playstation).kind(),
 					GamepadKind::PlayStation
 				);
 			}
 		}
 		assert!(!GamepadInfo::default_for_index(0).is_dualsense_edge());
+	}
+
+	#[test]
+	fn explicit_models_preserve_auto_identity_without_button_count_heuristics() {
+		use VirtualIdentity::*;
+		for (kind, caps, model) in [
+			(1, 0, Xbox),
+			(1, 0x400, XboxElite),
+			(1, 0x2400, XboxEliteSeries2),
+			(1, 0x2000, Xbox),
+			(2, 0, DualSense),
+			(2, 0x200, DualSenseEdge),
+			(3, 0, Switch),
+			(4, 0x800, SteamController),
+			(4, 0x1000, SteamDeck),
+			(4, 0, Xbox),
+			(4, 0x1800, Xbox),
+			(255, 0xffff, Xbox),
+			(1, 0x1800, Xbox),
+			(4, 0x200, Xbox),
+			(2, 0x2400, DualSense),
+		] {
+			for buttons in [0u32, 0xf0000] {
+				let mut packet = [0u8; 8];
+				packet[1] = kind;
+				packet[2..4].copy_from_slice(&(caps as u16).to_le_bytes());
+				packet[4..8].copy_from_slice(&buttons.to_le_bytes());
+				let info = GamepadInfo::from_bytes(&packet).unwrap();
+				assert_eq!(info.virtual_identity(GamepadEmulation::Auto), model);
+				assert_eq!(info.virtual_identity(GamepadEmulation::Xbox), Xbox);
+				assert_eq!(info.virtual_identity(GamepadEmulation::Nintendo), Switch);
+				assert_eq!(
+					info.virtual_identity(GamepadEmulation::Playstation),
+					if model == DualSenseEdge {
+						DualSenseEdge
+					} else {
+						DualSense
+					}
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn touch_wire_uses_the_pad_index_after_the_reserved_byte() {
+		let mut bytes = [0u8; 20];
+		bytes[1] = 3; // MOVE
+		bytes[2] = 0; // Reserved, not the pad index.
+		bytes[3] = 1; // Right pad.
+		bytes[8..12].copy_from_slice(&0.25f32.to_le_bytes());
+		bytes[12..16].copy_from_slice(&0.75f32.to_le_bytes());
+		let touch = GamepadTouch::from_bytes(&bytes).unwrap();
+		assert_eq!(touch.touchpad, 1);
+		assert_eq!(touch.event_type, 3);
+		assert_eq!(touch.x, 0.25);
+		assert_eq!(touch.y, 0.75);
+		for event in [4, 7] {
+			bytes[1] = event;
+			bytes[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+			let cancelled = GamepadTouch::from_bytes(&bytes).unwrap();
+			assert_eq!(cancelled.pressure, 0.0);
+		}
 	}
 
 	#[test]

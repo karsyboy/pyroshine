@@ -48,7 +48,7 @@ struct BaseJoypadState {
   std::optional<std::function<void(int low_freq, int high_freq)>> on_rumble = std::nullopt;
 };
 
-struct XboxOneJoypadState : BaseJoypadState {};
+struct XboxOneJoypadState : BaseJoypadState { bool is_elite = false; };
 struct SwitchJoypadState : BaseJoypadState {};
 
 struct KeyboardState {

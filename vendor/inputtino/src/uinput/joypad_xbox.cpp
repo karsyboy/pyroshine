@@ -1,4 +1,5 @@
 #include "joypad_utils.hpp"
+#include <inputtino/xbox_elite.hpp>
 #include <cstring>
 #include <inputtino/input.hpp>
 #include <inputtino/protected_types.hpp>
@@ -20,9 +21,8 @@ std::vector<std::string> XboxOneJoypad::get_nodes() const {
   return nodes;
 }
 
-Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &device) {
+libevdev *xbox_evdev_definition(const DeviceDefinition &device) {
   libevdev *dev = libevdev_new();
-  libevdev_uinput *uidev;
 
   libevdev_set_name(dev, device.name.c_str());
   libevdev_set_id_vendor(dev, device.vendor_id);
@@ -42,6 +42,11 @@ Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &devic
   libevdev_enable_event_code(dev, EV_KEY, BTN_SELECT, nullptr);
   libevdev_enable_event_code(dev, EV_KEY, BTN_MODE, nullptr);
   libevdev_enable_event_code(dev, EV_KEY, BTN_START, nullptr);
+
+  if (is_xbox_elite(device.vendor_id, device.product_id)) {
+    for (auto key : elite_keys)
+      libevdev_enable_event_code(dev, EV_KEY, key, nullptr);
+  }
 
   libevdev_enable_event_type(dev, EV_ABS);
 
@@ -67,6 +72,12 @@ Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &devic
   libevdev_enable_event_code(dev, EV_FF, FF_RAMP, nullptr);
   libevdev_enable_event_code(dev, EV_FF, FF_GAIN, nullptr);
 
+  return dev;
+}
+
+Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &device) {
+  libevdev *dev = xbox_evdev_definition(device);
+  libevdev_uinput *uidev;
   auto err = libevdev_uinput_create_from_device(dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &uidev);
   libevdev_free(dev);
   if (err != 0) {
@@ -95,6 +106,7 @@ Result<XboxOneJoypad> XboxOneJoypad::create(const DeviceDefinition &device) {
 
   XboxOneJoypad joypad;
   joypad._state->joy = std::move(*joy_el);
+  joypad._state->is_elite = is_xbox_elite(device.vendor_id, device.product_id);
 
   auto event_thread = std::thread(event_listener, joypad._state);
   joypad._state->events_thread = std::move(event_thread);
@@ -146,6 +158,10 @@ void XboxOneJoypad::set_pressed_buttons(unsigned int newly_pressed) {
         libevdev_uinput_write_event(controller, EV_KEY, BTN_WEST, bf_new & Y ? 1 : 0);
     }
 
+    emit_elite_changes(bf_new, this->_state->currently_pressed_btns, this->_state->is_elite,
+                       [controller](unsigned int key, int value) {
+                         libevdev_uinput_write_event(controller, EV_KEY, key, value);
+                       });
     libevdev_uinput_write_event(controller, EV_SYN, SYN_REPORT, 0);
   }
   this->_state->currently_pressed_btns = bf_new;

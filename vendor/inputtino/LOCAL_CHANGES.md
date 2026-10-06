@@ -42,3 +42,33 @@ Sources:
 When updating inputtino, compare these specific changes against upstream first.
 If upstream implements the same mapping, remove this patch and update the pinned
 Git dependency and Nix packaging together. Preserve `LICENSE` when redistributing.
+
+## Xbox Elite uinput extension
+
+Upstream HEAD remains `d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8` when
+checked for this implementation. Upstream has neither Elite paddle emission nor
+a Valve backend; no dependency revision was upgraded.
+
+- `src/uinput/include/inputtino/xbox_elite.hpp`: native USB identity guard,
+  canonical SDL paddle to Linux grip mapping, shared press/release iterator.
+- `src/uinput/joypad_xbox.cpp`: advertise grip capabilities only for Microsoft
+  `045e:02e3` / `045e:0b00`; emit changed grip states using the same complete
+  button mask and SYN_REPORT as standard controls. Generic Xbox ignores paddles.
+- `src/uinput/include/inputtino/protected_types.hpp`: retain the native Elite
+  identity in device state. The public Rust/C interfaces are unchanged.
+- `tests/xbox_elite.cpp`, `CMakeLists.txt`: opt-in `INPUTTINO_ELITE_TESTS`
+  checks actual libevdev capabilities without creating uinput, all 256 paddle
+  transitions, ordinary-button isolation and generic-device suppression.
+
+[Linux xpad](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c)
+uses BTN_GRIPR/BTN_GRIPL/BTN_GRIPR2/BTN_GRIPL2 for Elite paddles.
+Older build headers receive the stable Linux UAPI code values, not substitutes.
+This reproduces the driver's evdev device, not GIP packets or a hidraw node.
+Steam recognition must be checked with the physical acceptance procedure in
+[native controllers](../../docs/NATIVE_CONTROLLERS.md); no proprietary Steam
+implementation was available to establish that result from source inspection.
+
+Valve support lives in Pyroshine's `gamepad/valve.rs` beside the host input
+adapter. It uses Linux UHID and the existing gamepad Tokio runtime. This avoids
+changing the pinned public Inputtino crate or adding C/Rust ABI extensions.
+Keep both local patches in comparisons when updating Inputtino.

@@ -1008,6 +1008,79 @@ mod tests {
 		}
 
 		#[tokio::test]
+		async fn native_model_changes_recreate_and_paddles_release_across_owners() {
+			let mut harness = Harness::new(GamepadConfig::default());
+			let (owner, _rx) = mpsc::channel(64);
+			for (device, (kind, caps)) in [
+				(1u8, 0u16),
+				(1, 0x400),
+				(1, 0x2400),
+				(4, 0x800),
+				(4, 0x1000),
+				(2, 0x200),
+				(2, 0),
+				(3, 0),
+			]
+			.into_iter()
+			.enumerate()
+			{
+				let mut bytes = [0u8; 8];
+				bytes[1] = kind;
+				bytes[2..4].copy_from_slice(&caps.to_le_bytes());
+				bytes[4..].copy_from_slice(&0xf0000u32.to_le_bytes());
+				let info = GamepadInfo::from_bytes(&bytes).unwrap();
+				harness.send(InputEvent::GamepadInfo(info), &owner).await;
+				let events = harness.settle(if device == 0 { 1 } else { 3 }).await;
+				if device > 0 {
+					assert_eq!(
+						&events[..2],
+						&[format!("neutralize {}", device - 1), format!("destroy {}", device - 1)]
+					);
+				}
+				assert_eq!(events.last().unwrap(), &format!("create {device} index 0"));
+				// Same native identity reuses the device, even if capability bits change.
+				bytes[2] |= 0x40;
+				harness
+					.send(
+						InputEvent::GamepadInfo(GamepadInfo::from_bytes(&bytes).unwrap()),
+						&owner,
+					)
+					.await;
+				let mut packet = [0u8; 26];
+				packet[4..6].copy_from_slice(&1u16.to_le_bytes());
+				packet[22..24].copy_from_slice(&15u16.to_le_bytes());
+				harness
+					.send(
+						InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&packet).unwrap()),
+						&owner,
+					)
+					.await;
+				assert_eq!(harness.settle(1).await, vec![format!("pressed {device} 0xf0000")]);
+				packet[22..24].fill(0);
+				harness
+					.send(
+						InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&packet).unwrap()),
+						&owner,
+					)
+					.await;
+				assert_eq!(harness.settle(1).await, vec![format!("pressed {device} 0x0")]);
+			}
+			harness.revoke().await;
+			assert_eq!(harness.log.take(), vec!["neutralize 7"]);
+			let (replacement, _rx) = mpsc::channel(64);
+			harness.send(arrival(0, 3), &replacement).await;
+			harness.send(update(0, 1, 0), &replacement).await;
+			assert_eq!(harness.settle(1).await, vec!["pressed 7 0x0"]);
+			// Active-mask removal neutralizes and destroys; reconnect makes a new device.
+			harness.send(update(0, 0, 0), &replacement).await;
+			let events = harness.settle(3).await;
+			assert_eq!(events, vec!["pressed 7 0x0", "neutralize 7", "destroy 7"]);
+			harness.send(arrival(0, XBOX), &replacement).await;
+			assert_eq!(harness.settle(1).await, vec!["create 8 index 0"]);
+			assert_eq!(harness.stop().await, vec!["neutralize 8", "destroy 8"]);
+		}
+
+		#[tokio::test]
 		async fn peer_replacement_keeps_the_device_but_revokes_state_and_feedback() {
 			let mut harness = Harness::new(GamepadConfig::default());
 			let (old, mut old_rx) = mpsc::channel(10);
