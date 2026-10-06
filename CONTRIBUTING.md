@@ -242,6 +242,20 @@ use `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` sections
 The [upstream history](docs/UPSTREAM_CHANGELOG.md) is an archive and should not
 receive new fork release entries.
 
+The release workflow validates the exact tagged commit before building it:
+formatting, Clippy, rustdoc, the workspace tests, the pinned PyroWave FFI
+check (it must run, not be skipped), `scripts/known_defects.py` with the
+native sanitizer tests, and the desktop app checks. It records the commit,
+`Cargo.lock` hash, Git and native pins, toolchain and every suite's result in
+`release-validation.json`, published with the release and included in
+`SHA256SUMS`. Building and publishing then waits for approval in the GitHub
+`release` environment: configure required reviewers for it, and approve only
+after the hardware acceptance (GPU tests with `MOONSHINE_TEST_GPU=1`,
+`scripts/known_defects.py --gpu --native-devices`, benchmark lifecycle and
+reconnect cycles, and the [reconnect checks](docs/reconnect-validation.md) with
+real clients) passed on that commit. A skipped or unexecuted hardware check is
+not a pass; list it in the release notes instead.
+
 Before releasing, update `[workspace.package].version` in `Cargo.toml`. It is the
 only version to edit: `prepare` (below) writes it to every other copy — both
 `Cargo.lock` files, the desktop app's `src-tauri/Cargo.toml`, `package.json` and
