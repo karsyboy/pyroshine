@@ -80,6 +80,7 @@ jobs:
         npm ci
         npm run typecheck
         npm test
+        npm run build
         cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
         cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
         cargo test --locked --manifest-path src-tauri/Cargo.toml
