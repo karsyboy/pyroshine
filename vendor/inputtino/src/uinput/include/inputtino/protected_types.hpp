@@ -1,6 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <cstring>
+#include <mutex>
+#include <optional>
+#include <functional>
 #include <inputtino/input.hpp>
 #include <iostream>
 #include <libevdev/libevdev-uinput.h>
@@ -42,9 +46,16 @@ struct BaseJoypadState {
   libevdev_uinput_ptr joy = nullptr;
   int currently_pressed_btns = 0;
 
-  bool stop_listening_events = false;
+  /// Set before waking `wake_fd`; the force-feedback listener then exits.
+  std::atomic<bool> stop_listening_events = false;
+  /// eventfd that interrupts the listener's poll for a prompt join.
+  int wake_fd = -1;
+  /// Owned by the joypad, joined by its destructor.
   std::thread events_thread;
 
+  /// Guards `on_rumble`: set on the caller's thread, invoked (as a copy, without
+  /// the lock) on the listener thread.
+  std::mutex callback_mutex;
   std::optional<std::function<void(int low_freq, int high_freq)>> on_rumble = std::nullopt;
 };
 

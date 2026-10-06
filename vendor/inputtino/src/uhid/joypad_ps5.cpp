@@ -24,8 +24,16 @@ static uint32_t sign_crc32(uint32_t seed, const unsigned char *buffer, size_t le
   return crc;
 }
 
+/**
+ * Write one input report. The state is advanced and copied under the state
+ * mutex; the (possibly slow) device write happens without it. Called from the
+ * report thread and from setters, never with the mutex held.
+ */
 static void send_report(PS5JoypadState &state) {
-  { // setup timestamp and increase seq_number
+  uhid::dualsense_input_report report;
+  {
+    std::lock_guard lock(state.mutex);
+    // setup timestamp and increase seq_number
     state.current_state.seq_number++;
     if (state.current_state.seq_number >= 255) {
       state.current_state.seq_number = 0;
@@ -37,6 +45,7 @@ static void send_report(PS5JoypadState &state) {
     auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
                    .count();
     state.current_state.sensor_timestamp = htole32(now / 333);
+    report = state.current_state;
   }
 
   struct uhid_event ev{};
@@ -58,10 +67,10 @@ static void send_report(PS5JoypadState &state) {
                 &ev.u.input2.data[0]);
     }
 
-    unsigned char *data = (unsigned char *)&state.current_state;
-    std::copy(data, data + sizeof(state.current_state), &ev.u.input2.data[header_size]);
+    unsigned char *data = (unsigned char *)&report;
+    std::copy(data, data + sizeof(report), &ev.u.input2.data[header_size]);
 
-    ev.u.input2.size = header_size + sizeof(state.current_state);
+    ev.u.input2.size = header_size + sizeof(report);
   }
 
   if (state.is_bluetooth) { // CRC32 encode the data and append it to the reply
@@ -204,16 +213,26 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
      * The PS5 joypad seems to report values in the range 0-255,
      * we'll turn those into 0-0xFFFF
      */
+    // Callbacks are copied under the state mutex and run without it.
+    decltype(state->on_rumble) on_rumble;
+    decltype(state->on_led) on_led;
+    decltype(state->on_trigger_effect) on_trigger_effect;
+    {
+      std::lock_guard lock(state->mutex);
+      on_rumble = state->on_rumble;
+      on_led = state->on_led;
+      on_trigger_effect = state->on_trigger_effect;
+    }
     if (report.valid_flag0 & uhid::MOTOR_OR_COMPATIBLE_VIBRATION || report.valid_flag2 & uhid::COMPATIBLE_VIBRATION) {
       auto left = (report.motor_left / 255.0f) * 0xFFFF;
       auto right = (report.motor_right / 255.0f) * 0xFFFF;
-      if (state->on_rumble) {
-        (*state->on_rumble)(left, right);
+      if (on_rumble) {
+        (*on_rumble)(left, right);
       }
     } else if (report.valid_flag0 == 0 && report.valid_flag1 == 0 && report.valid_flag2 == 0) {
       // Seems to be a special stop rumble event, let's propagate it
-      if (state->on_rumble) {
-        (*state->on_rumble)(0, 0);
+      if (on_rumble) {
+        (*on_rumble)(0, 0);
       }
     }
 
@@ -222,7 +241,7 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
      */
     bool right_trigger = report.valid_flag0 & uhid::RIGHT_TRIGGER_EFFECT;
     bool left_trigger = report.valid_flag0 & uhid::LEFT_TRIGGER_EFFECT;
-    if ((right_trigger || left_trigger) && state->on_trigger_effect) {
+    if ((right_trigger || left_trigger) && on_trigger_effect) {
       auto left_array_start = std::begin(report.left_trigger_effect);
       auto left_array_end = std::end(report.left_trigger_effect);
       auto right_array_start = std::begin(report.right_trigger_effect);
@@ -230,14 +249,18 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
       // We have to cache these values because these flags will be set as long as the effect is active
       uint32_t left_trigger_hash = std::accumulate(left_array_start, left_array_end, 0ul);
       uint32_t right_trigger_hash = std::accumulate(right_array_start, right_array_end, 0ul);
-      if ((left_trigger && state->last_left_trigger_event != left_trigger_hash) ||
-          (right_trigger && state->last_right_trigger_event != right_trigger_hash)) {
+      bool changed = false;
+      {
+        std::lock_guard lock(state->mutex);
+        changed = (left_trigger && state->last_left_trigger_event != left_trigger_hash) ||
+                  (right_trigger && state->last_right_trigger_event != right_trigger_hash);
         // First, update the cache
-        if (left_trigger)
+        if (changed && left_trigger)
           state->last_left_trigger_event = left_trigger_hash;
-        if (right_trigger)
+        if (changed && right_trigger)
           state->last_right_trigger_event = right_trigger_hash;
-
+      }
+      if (changed) {
         // Then, trigger the event
         uint8_t event_flags = (report.valid_flag0 & uhid::LEFT_TRIGGER_EFFECT) |
                               (report.valid_flag0 & uhid::RIGHT_TRIGGER_EFFECT);
@@ -246,7 +269,7 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
                                            .type_right = report.right_trigger_effect_type};
         std::copy(left_array_start, left_array_end, std::begin(effect.left));
         std::copy(right_array_start, right_array_end, std::begin(effect.right));
-        (*state->on_trigger_effect)(effect);
+        (*on_trigger_effect)(effect);
       }
     }
 
@@ -254,9 +277,9 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
      * LED
      */
     if (report.valid_flag1 & uhid::LIGHTBAR_ENABLE) {
-      if (state->on_led) {
+      if (on_led) {
         // TODO: should we blend brightness?
-        (*state->on_led)(report.lightbar_red, report.lightbar_green, report.lightbar_blue);
+        (*on_led)(report.lightbar_red, report.lightbar_green, report.lightbar_blue);
       }
     }
   }
@@ -278,13 +301,18 @@ PS5Joypad::PS5Joypad(uint16_t vendor_id, std::array<unsigned char, 6> mac_addres
 }
 
 PS5Joypad::~PS5Joypad() {
-  if (this->_state && this->_state->dev) {
+  if (this->_state) {
+    // Owned threads are joined before the device they use disappears: first
+    // the report thread, then the UHID event thread (no callback runs after
+    // `stop_thread` returns), then the device itself.
     this->_state->stop_repeat_thread = true;
     if (this->_send_input_thread.joinable()) {
       this->_send_input_thread.join();
     }
-    this->_state->dev->stop_thread();
-    this->_state->dev.reset(); // Will trigger ~Device and ultimately destroy the device
+    if (this->_state->dev) {
+      this->_state->dev->stop_thread();
+      this->_state->dev.reset(); // Will trigger ~Device and ultimately destroy the device
+    }
   }
 }
 
@@ -331,10 +359,11 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
     def.uniq = joypad.get_mac_address();
   }
 
+  // Set before the event thread can serve feature reports.
+  joypad._state->is_bluetooth = use_bluetooth;
   auto dev =
       uhid::Device::create(def, [state = joypad._state](uhid_event ev, int fd) { on_uhid_event(state, ev, fd); });
   if (dev) {
-    joypad._state->is_bluetooth = use_bluetooth;
     joypad._state->dev = std::make_shared<uhid::Device>(std::move(*dev));
 
     // Readers will expect frequent events event if the state hasn't changed
@@ -344,7 +373,6 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     });
-    joypad._send_input_thread.detach();
 
     return joypad;
   }
@@ -440,6 +468,7 @@ std::vector<std::string> PS5Joypad::get_nodes() const {
 }
 
 void PS5Joypad::set_pressed_buttons(unsigned int pressed) {
+  std::unique_lock lock(this->_state->mutex);
   { // First reset everything to non-pressed
     this->_state->current_state.buttons[0] = 0;
     // Don't reset L2 and R2, these are handled in set_triggers
@@ -514,9 +543,11 @@ void PS5Joypad::set_pressed_buttons(unsigned int pressed) {
       this->_state->current_state.buttons[2] |= uhid::MIC_MUTE;
     this->_state->current_state.buttons[2] |= uhid::edge_buttons(pressed, this->_state->is_edge);
   }
+  lock.unlock();
   send_report(*this->_state);
 }
 void PS5Joypad::set_triggers(int16_t left, int16_t right) {
+  std::unique_lock lock(this->_state->mutex);
   this->_state->current_state.z = scale_value(left, 0, 255, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
   this->_state->current_state.rz = scale_value(right, 0, 255, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
 
@@ -530,25 +561,30 @@ void PS5Joypad::set_triggers(int16_t left, int16_t right) {
   else
     this->_state->current_state.buttons[1] |= uhid::R2;
 
+  lock.unlock();
   send_report(*this->_state);
 }
 void PS5Joypad::set_stick(Joypad::STICK_POSITION stick_type, short x, short y) {
+  std::unique_lock lock(this->_state->mutex);
   switch (stick_type) {
   case RS: {
     this->_state->current_state.rx = scale_value(x, -32768, 32767, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
     this->_state->current_state.ry = scale_value(-y, -32768, 32767, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
-    send_report(*this->_state);
+    lock.unlock();
+  send_report(*this->_state);
     break;
   }
   case LS: {
     this->_state->current_state.x = scale_value(x, -32768, 32767, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
     this->_state->current_state.y = scale_value(-y, -32768, 32767, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
-    send_report(*this->_state);
+    lock.unlock();
+  send_report(*this->_state);
     break;
   }
   }
 }
 void PS5Joypad::set_on_rumble(const std::function<void(int, int)> &callback) {
+  std::lock_guard lock(this->_state->mutex);
   this->_state->on_rumble = callback;
 }
 
@@ -561,13 +597,15 @@ static __le16 to_le_signed(float original, float value) {
 }
 
 void PS5Joypad::set_motion(PS5Joypad::MOTION_TYPE type, float x, float y, float z) {
+  std::unique_lock lock(this->_state->mutex);
   switch (type) {
   case ACCELERATION: {
     this->_state->current_state.accel[0] = to_le_signed(x, (x * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
     this->_state->current_state.accel[1] = to_le_signed(y, (y * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
     this->_state->current_state.accel[2] = to_le_signed(z, (z * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
 
-    send_report(*this->_state);
+    lock.unlock();
+  send_report(*this->_state);
     break;
   }
   case GYROSCOPE: {
@@ -575,31 +613,37 @@ void PS5Joypad::set_motion(PS5Joypad::MOTION_TYPE type, float x, float y, float 
     this->_state->current_state.gyro[1] = to_le_signed(y, y * uhid::gyro_resolution);
     this->_state->current_state.gyro[2] = to_le_signed(z, z * uhid::gyro_resolution);
 
-    send_report(*this->_state);
+    lock.unlock();
+  send_report(*this->_state);
     break;
   }
   }
 }
 
 void PS5Joypad::set_battery(PS5Joypad::BATTERY_STATE state, int percentage) {
+  std::unique_lock lock(this->_state->mutex);
   /*
    * Each unit of battery data corresponds to 10%
    * 0 = 0-9%, 1 = 10-19%, .. and 10 = 100%
    */
   this->_state->current_state.battery_charge = std::lround((percentage / 10));
   this->_state->current_state.battery_status = state;
+  lock.unlock();
   send_report(*this->_state);
 }
 
 void PS5Joypad::set_on_led(const std::function<void(int, int, int)> &callback) {
+  std::lock_guard lock(this->_state->mutex);
   this->_state->on_led = callback;
 }
 
 void PS5Joypad::set_on_trigger_effect(const std::function<void(const TriggerEffect &)> &callback) {
+  std::lock_guard lock(this->_state->mutex);
   this->_state->on_trigger_effect = callback;
 }
 
 void PS5Joypad::place_finger(int finger_nr, uint16_t x, uint16_t y) {
+  std::unique_lock lock(this->_state->mutex);
   if (finger_nr <= 1) {
     // If this finger was previously unpressed, we should increase the touch id
     if (this->_state->current_state.points[finger_nr].contact == 1) {
@@ -613,18 +657,21 @@ void PS5Joypad::place_finger(int finger_nr, uint16_t x, uint16_t y) {
     this->_state->current_state.points[finger_nr].y_lo = static_cast<uint8_t>(y & 0x000F);
     this->_state->current_state.points[finger_nr].y_hi = static_cast<uint8_t>((y & 0x0FF0) >> 4);
 
-    send_report(*this->_state);
+    lock.unlock();
+  send_report(*this->_state);
   }
 }
 
 void PS5Joypad::release_finger(int finger_nr) {
+  std::unique_lock lock(this->_state->mutex);
   if (finger_nr <= 1) {
     // if it goes above 0x7F we should reset it to 0
     if (this->_state->last_touch_id >= 0x7E) {
       this->_state->last_touch_id = 0;
     }
     this->_state->current_state.points[finger_nr].contact = 1;
-    send_report(*this->_state);
+    lock.unlock();
+  send_report(*this->_state);
   }
 }
 

@@ -282,6 +282,17 @@ identity, a controller missing from the client's active mask, or teardown
 destroys the device. A delayed disconnect from a replaced generation cannot
 release the new owner's input.
 
+Feedback delivery never blocks: the control loop drains the owner's bounded
+feedback channel while it may itself wait to queue gamepad commands, so a
+blocking producer could stall input, reconnect and shutdown. When the channel is
+full, the route coalesces per kind (the latest rumble supersedes an undelivered
+one, so a stop is never lost; LED, trigger and motion-enable state is re-sent
+from current state) and the gamepad timer task retries until the owner accepts
+it or is revoked. Native controller threads (report, UHID event, force-feedback
+listener) are owned and joined by the device's destructor, which therefore
+returns only after no callback can run and the kernel device is gone; see
+`vendor/inputtino/LOCAL_CHANGES.md`.
+
 ## Session ownership and shutdown
 
 The manager's lifecycle is explicit; absence of state never means idle:

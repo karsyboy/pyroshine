@@ -208,6 +208,18 @@ if(INPUTTINO_PS5_FEATURE_TESTS AND USE_UHID)
     endforeach()
 endif()
 
+# Thread/lifetime checks on real devices; needs read/write access to /dev/uhid
+# and /dev/uinput. Configure with -fsanitize=thread (or address) to be useful.
+option(INPUTTINO_DEVICE_TESTS "Test native joypad threads and destruction on /dev/uhid and /dev/uinput" OFF)
+if(INPUTTINO_DEVICE_TESTS)
+    enable_testing()
+    add_executable(joypad-lifetime-test tests/joypad_lifetimes.cpp)
+    target_link_libraries(joypad-lifetime-test PRIVATE inputtino::libinputtino)
+    add_test(NAME joypad-lifetimes COMMAND joypad-lifetime-test 5)
+    # Exit status 77: the devices are not accessible on this host.
+    set_tests_properties(joypad-lifetimes PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 option(INPUTTINO_ELITE_TESTS "Test Xbox Elite evdev capabilities without uinput" OFF)
 if(INPUTTINO_ELITE_TESTS)
     enable_testing()

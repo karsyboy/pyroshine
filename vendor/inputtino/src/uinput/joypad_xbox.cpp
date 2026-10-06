@@ -91,10 +91,8 @@ XboxOneJoypad::XboxOneJoypad() : _state(std::make_shared<XboxOneJoypadState>()) 
 
 XboxOneJoypad::~XboxOneJoypad() {
   if (_state) {
-    _state->stop_listening_events = true;
-    if (_state->joy.get() != nullptr && _state->events_thread.joinable()) {
-      _state->events_thread.join();
-    }
+    // Joined before the uinput device (kept alive by the state) can go away.
+    stop_event_listener(*_state);
   }
 }
 
@@ -108,9 +106,7 @@ Result<XboxOneJoypad> XboxOneJoypad::create(const DeviceDefinition &device) {
   joypad._state->joy = std::move(*joy_el);
   joypad._state->is_elite = is_xbox_elite(device.vendor_id, device.product_id);
 
-  auto event_thread = std::thread(event_listener, joypad._state);
-  joypad._state->events_thread = std::move(event_thread);
-  joypad._state->events_thread.detach();
+  start_event_listener(joypad._state);
   return joypad;
 }
 
@@ -200,6 +196,7 @@ void XboxOneJoypad::set_triggers(int16_t left, int16_t right) {
 }
 
 void XboxOneJoypad::set_on_rumble(const std::function<void(int, int)> &callback) {
+  std::lock_guard lock(this->_state->callback_mutex);
   this->_state->on_rumble = callback;
 }
 

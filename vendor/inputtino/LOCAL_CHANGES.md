@@ -97,6 +97,35 @@ Checked with the virtual device through `/dev/uhid`: the kernel's
 (054c:0df2), and `HIDIOCGFEATURE` returns 41/20/64 bytes for 0x05/0x09/0x20 and
 EIO for other numbers. SDL and Steam on physical clients remain a release check.
 
+## Native thread ownership
+
+Review 2026-10-05 STAB-005: upstream detaches its worker threads and shares
+plain fields with them. The DualSense report thread and UHID event thread, and
+the uinput force-feedback listeners (Xbox/Elite, Switch, non-UHID PlayStation),
+could run after their joypad's destructor, race with setters and callback
+installation, and read a closed (possibly reused) UHID descriptor.
+
+- `src/uhid/include/uhid/uhid.hpp`: the event thread is owned, polls an eventfd
+  beside the UHID fd and exits at once on stop; `~Device` joins it before
+  writing `UHID_DESTROY` and closing the fd. Stop flags are atomic.
+- `src/uhid/joypad_ps5.cpp`, `src/uhid/include/uhid/protected_types.hpp`,
+  `include/inputtino/input.hpp`: a mutex guards the input report, touch id,
+  trigger caches and callbacks. `send_report` copies the report under it and
+  writes without it; callbacks are copied under it and invoked without it. The
+  report thread is owned and joined (the move constructor now moves it);
+  `is_bluetooth` is set before the event thread starts.
+- `src/uinput/joypad_utils.hpp`, `src/uinput/include/inputtino/protected_types.hpp`,
+  `src/uinput/joypad_{xbox,nintendo,ps}.cpp`: `start_event_listener` /
+  `stop_event_listener` own the listener with an eventfd wake (including the
+  initial 100 ms settle wait); destructors join it before the uinput device can
+  be released. `on_rumble` is guarded the same way.
+
+Destruction therefore returns only after every worker and callback of the
+joypad has finished; no callback runs afterwards and the kernel device is gone.
+Pyroshine's callbacks never block (see `control/input/ownership.rs`), so these
+joins cannot wait on its feedback queue. The public C/C++ and Rust APIs are
+unchanged.
+
 ## Native regression tests
 
 - `tests/ps5_feature_reports.cpp`, `CMakeLists.txt`: opt-in
@@ -106,5 +135,15 @@ EIO for other numbers. SDL and Steam on physical clients remain a release check.
   firmware replies, including golden CRC trailers; `unsupported` every other
   report number and type; `output` complete and truncated USB/Bluetooth output
   reports; `fuzz` seeded random requests and output reports.
-- `scripts/known_defects.py` in the Pyroshine root builds these and the Edge and
-  Elite tests with AddressSanitizer/UBSan and runs them with CTest in CI.
+- `tests/joypad_lifetimes.cpp`, `CMakeLists.txt`: opt-in `INPUTTINO_DEVICE_TESTS`
+  creates DualSense (UHID), Xbox, Elite and Switch (uinput) devices, runs
+  setters and callback replacement on two threads while kernel feedback arrives,
+  destroys them and requires prompt destruction, no callback afterwards, no
+  surviving kernel node and the thread/fd counts back at baseline. It needs
+  `/dev/uhid` and `/dev/uinput` access (exit 77 otherwise). The pre-fix source
+  produced TSan data races in `send_report`, setters, `on_uhid_event` and the
+  destructor, and an Xbox device that outlived its destructor.
+- `scripts/known_defects.py` in the Pyroshine root builds the hardware-independent
+  tests with AddressSanitizer/UBSan and runs them with CTest in CI;
+  `--native-devices` adds the device test under ThreadSanitizer on a host with
+  device access.

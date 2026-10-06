@@ -12,12 +12,6 @@
 # error until then. Do not weaken a test to make it pass.
 
 [[rust]]
-finding = "STAB-004"
-batch = "E"
-test = "session::stream::control::input::tests::ownership_tests::full_feedback_queue_cannot_block_gamepad_shutdown"
-marker = "review 2026-10-05 STAB-004: gamepad shutdown waited on a full, undrained feedback queue"
-
-[[rust]]
 finding = "BUG-002"
 batch = "G"
 test = "session::stream::video::pipeline::tests::static_recovery_encodes_the_latest_converted_frame"

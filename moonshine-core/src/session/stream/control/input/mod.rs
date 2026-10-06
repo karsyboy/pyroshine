@@ -397,7 +397,7 @@ impl<D: VirtualGamepad> GamepadSlot<D> {
 		create_gamepad: &impl Fn(&GamepadInfo, FeedbackRoute, GamepadEmulation) -> Result<D, ()>,
 	) -> Result<Self, ()> {
 		let identity = info.virtual_identity(config.emulation);
-		let route = FeedbackRoute::new(info.index, identity.has_motion());
+		let route = FeedbackRoute::new(info.index, identity.has_motion(), timer_wake.clone());
 		let device = create_gamepad(info, route.clone(), config.emulation)?;
 		Ok(Self {
 			info: *info,
@@ -413,12 +413,12 @@ impl<D: VirtualGamepad> GamepadSlot<D> {
 		})
 	}
 
-	/// Bind the device to the peer whose input is being applied. Returns the
-	/// order-independent feedback (motion enables) to send to that owner.
-	fn claim(&mut self, owner: &mpsc::Sender<FeedbackCommand>) -> Option<Vec<FeedbackCommand>> {
-		let enables = self.route.claim(owner)?;
-		tracing::debug!(index = self.index, "Gamepad bound to the controlling peer");
-		Some(enables)
+	/// Bind the device to the peer whose input is being applied; the route
+	/// replays persistent state and motion enables without blocking.
+	fn claim(&mut self, owner: &mpsc::Sender<FeedbackCommand>) {
+		if self.route.claim(owner) {
+			tracing::debug!(index = self.index, "Gamepad bound to the controlling peer");
+		}
 	}
 
 	/// Ownership was lost: stop the shortcut pulse at the old owner, cancel
@@ -494,7 +494,7 @@ impl<D: VirtualGamepad> GamepadSlot<D> {
 	}
 
 	fn send_rumble(&self, low_frequency: u16, high_frequency: u16) {
-		self.route.try_deliver(FeedbackCommand::Rumble(
+		self.route.deliver(FeedbackCommand::Rumble(
 			crate::session::stream::control::feedback::RumbleCommand {
 				id: self.index as u16,
 				low_frequency,
@@ -547,11 +547,11 @@ fn ensure_slot<D: VirtualGamepad>(
 	}
 }
 
-/// Claim slot `idx` for `owner` and send it any motion enables.
+/// Claim slot `idx` for `owner`. Never waits on the owner's feedback channel,
+/// so a full channel cannot stall gamepad commands or shutdown.
 async fn claim_slot<D: VirtualGamepad>(slots: &Slots<D>, idx: usize, owner: &mpsc::Sender<FeedbackCommand>) {
-	let enables = slots.lock().await[idx].as_mut().and_then(|slot| slot.claim(owner));
-	for command in enables.into_iter().flatten() {
-		let _ = owner.send(command).await;
+	if let Some(slot) = slots.lock().await[idx].as_mut() {
+		slot.claim(owner);
 	}
 }
 
@@ -746,14 +746,23 @@ async fn run_gamepad_handler<D, F>(
 	tracing::debug!("Input handler stopped.");
 }
 
+/// Retry interval for feedback an owner's full channel could not take.
+const FEEDBACK_RETRY: Duration = Duration::from_millis(5);
+
 async fn run_timer_task<D: VirtualGamepad>(gamepads: Slots<D>, wake: Arc<Notify>) {
 	loop {
-		// Find the soonest deadline across all gamepads.
+		// Find the soonest deadline across all gamepads, retrying pending
+		// feedback (see `FeedbackRoute::deliver`) until it is accepted.
 		let next_deadline = {
 			let gamepads = gamepads.lock().await;
+			let pending = gamepads
+				.iter()
+				.flatten()
+				.fold(false, |pending, slot| slot.route.flush_pending() | pending);
 			gamepads
 				.iter()
 				.filter_map(|s| s.as_ref().and_then(|s| s.next_deadline()))
+				.chain(pending.then(|| Instant::now() + FEEDBACK_RETRY))
 				.min()
 		};
 
@@ -1002,9 +1011,7 @@ mod tests {
 		/// Inputtino invokes feedback callbacks on its own native threads.
 		fn native_feedback(route: &FeedbackRoute, command: FeedbackCommand) {
 			let route = route.clone();
-			std::thread::spawn(move || route.deliver_blocking(command))
-				.join()
-				.unwrap();
+			std::thread::spawn(move || route.deliver(command)).join().unwrap();
 		}
 
 		/// Review 2026-10-05 STAB-004: a full feedback queue must not block
@@ -1012,8 +1019,57 @@ mod tests {
 		/// with an awaited send outside the handler's cancellation, so a
 		/// production-capacity (ten-entry) feedback receiver that is not being
 		/// drained holds the gamepad worker, and the session, open.
+		/// Review 2026-10-05 STAB-004 at production capacity: sixteen
+		/// PlayStation slots claimed while the owner's ten-entry feedback queue
+		/// is full, plus a native rumble storm, never block the gamepad thread.
+		/// Once the owner drains, the timer task delivers every pending motion
+		/// enable and each slot's latest rumble; a stop is prompt throughout.
+		#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+		async fn sixteen_saturated_slots_progress_and_stop_promptly() {
+			let mut h = Harness::new(GamepadConfig::default());
+			let (owner, mut rx) = mpsc::channel(10);
+			while owner.try_send(rumble(1)).is_ok() {}
+			for index in 0..16 {
+				h.send(arrival(index, PLAYSTATION), &owner).await;
+			}
+			assert_eq!(h.settle(16).await.len(), 16, "all sixteen devices created");
+			let rumble_for = |device: usize, level: u16| {
+				FeedbackCommand::Rumble(RumbleCommand {
+					id: device as u16,
+					low_frequency: level,
+					high_frequency: level,
+				})
+			};
+			for device in 0..16 {
+				for level in 2..20 {
+					native_feedback(&h.log.route(device), rumble_for(device, level));
+				}
+				native_feedback(&h.log.route(device), rumble_for(device, 0));
+			}
+			let mut enables = 0;
+			let mut stops = std::collections::HashSet::new();
+			tokio::time::timeout(Duration::from_secs(5), async {
+				while enables < 32 || stops.len() < 16 {
+					match rx.recv().await.unwrap() {
+						FeedbackCommand::EnableMotionEvent(_) => enables += 1,
+						FeedbackCommand::Rumble(command) if command.low_frequency == 0 => {
+							stops.insert(command.id);
+						},
+						_ => {},
+					}
+				}
+			})
+			.await
+			.expect("pending feedback must reach the owner once it drains");
+			let stopped = tokio::time::Instant::now();
+			h.stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+			tokio::time::timeout(Duration::from_secs(5), h.stop.wait_shutdown_complete())
+				.await
+				.unwrap();
+			assert!(stopped.elapsed() < Duration::from_secs(1));
+		}
+
 		#[tokio::test]
-		#[ignore = "known defect: review 2026-10-05 STAB-004 (batch E)"]
 		async fn full_feedback_queue_cannot_block_gamepad_shutdown() {
 			let mut h = Harness::new(GamepadConfig::default());
 			let (owner, mut rx) = mpsc::channel(10);

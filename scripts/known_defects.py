@@ -90,16 +90,17 @@ def run_rust(entries, gpu):
     return results
 
 
-def build_native(build):
+def build_native(build, sanitize=SANITIZE, options=("PS5_FEATURE", "EDGE", "ELITE")):
     source = ROOT / "vendor" / "inputtino"
-    # CMake's default (or CC/CXX) compiler; GCC and Clang both report the overread.
+    link = sanitize.split()[0]
+    # CMake's default (or CC/CXX) compiler; GCC and Clang both support these sanitizers.
     configure = [
         "cmake", "-S", str(source), "-B", str(build),
         "-DCMAKE_BUILD_TYPE=Debug", "-DBUILD_TESTING=OFF",
-        "-DINPUTTINO_PS5_FEATURE_TESTS=ON", "-DINPUTTINO_EDGE_TESTS=ON", "-DINPUTTINO_ELITE_TESTS=ON",
-        f"-DCMAKE_CXX_FLAGS={SANITIZE}",
-        "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined",
-        "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined",
+        *[f"-DINPUTTINO_{option}_TESTS=ON" for option in options],
+        f"-DCMAKE_CXX_FLAGS={sanitize}",
+        f"-DCMAKE_EXE_LINKER_FLAGS={link}",
+        f"-DCMAKE_SHARED_LINKER_FLAGS={link}",
     ]
     subprocess.run(configure, check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["cmake", "--build", str(build), "--parallel"], check=True, stdout=subprocess.DEVNULL)
@@ -121,12 +122,28 @@ def run_native(entries, build):
     return results
 
 
+def run_native_devices(build):
+    """Native joypad threads on real /dev/uhid and /dev/uinput under TSan."""
+    build_native(build, "-fsanitize=thread -fno-omit-frame-pointer", ("DEVICE",))
+    env = dict(os.environ, TSAN_OPTIONS="halt_on_error=1")
+    run = subprocess.run([str(build / "joypad-lifetime-test"), "5"], env=env, capture_output=True, text=True, timeout=900)
+    output = run.stdout + run.stderr
+    if run.returncode == 77:
+        status, detail = "not-run", "no /dev/uhid or /dev/uinput access"
+    elif run.returncode == 0:
+        status, detail = "passed", "TSan-clean; threads joined and devices removed on destruction"
+    else:
+        status, detail = "failed", "native joypad lifetime test failed"
+    return {"finding": "STAB-005", "batch": "E", "ctest": "joypad-lifetimes (TSan)", "status": status, "detail": detail, "output": output[-4000:]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--gpu", action="store_true", help="also run GPU entries (MOONSHINE_TEST_GPU=1)")
     parser.add_argument("--skip-rust", action="store_true", help="skip Rust entries")
     parser.add_argument("--skip-native", action="store_true", help="skip native entries")
     parser.add_argument("--native-build", type=Path, default=ROOT / "target" / "known-defects" / "inputtino")
+    parser.add_argument("--native-devices", action="store_true", help="also run the native device lifetime test under TSan")
     parser.add_argument("--json", type=Path, help="write the results to this file")
     args = parser.parse_args()
 
@@ -137,11 +154,15 @@ def main():
         results += run_rust(manifest.get("rust", []), args.gpu)
     if not args.skip_native:
         results += run_native(manifest.get("native", []), args.native_build)
+    if args.native_devices:
+        results.append(run_native_devices(args.native_build.with_name("inputtino-devices-tsan")))
 
     for result in results:
         name = result.get("test") or result.get("ctest")
         print(f"{result['status']:>16}  {result['finding']:<8} batch {result['batch']}  {name}: {result['detail']}")
-        if result["status"] not in ("expected-failure", "not-run"):
+        if result["status"] not in ("expected-failure", "not-run", "passed") or (
+            result["status"] == "passed" and "test" in result
+        ):
             errors.append(f"{result['finding']} {name}: {result['detail']}")
             print(result.get("output", ""), file=sys.stderr)
     skipped = sum(result["status"] == "not-run" for result in results)

@@ -648,10 +648,12 @@ async fn run_control_loop(
 		// including those that ended in `continue`.
 		publish_presence(&context.presence, &peers, &mut presence);
 
-		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv()
-			&& let Some(peer_id) = peers.active()
-		{
+		// Forward all queued feedback (bounded by the channel), so producers that
+		// coalesce on a full channel catch up within one pass.
+		while let Ok(command) = feedback_rx.try_recv() {
+			let Some(peer_id) = peers.active() else {
+				continue;
+			};
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
 			let keys = context.keys_rx.borrow().clone();

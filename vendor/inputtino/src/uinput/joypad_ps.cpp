@@ -84,10 +84,8 @@ PS5Joypad::PS5Joypad(uint16_t vendor_id, std::array<unsigned char, 6> mac_addres
 
 PS5Joypad::~PS5Joypad() {
   if (_state) {
-    _state->stop_listening_events = true;
-    if (_state->joy.get() != nullptr && _state->events_thread.joinable()) {
-      _state->events_thread.join();
-    }
+    // Joined before the uinput device (kept alive by the state) can go away.
+    stop_event_listener(*_state);
   }
 }
 
@@ -100,9 +98,7 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
   PS5Joypad joypad(0);
   joypad._state->joy = std::move(*joy_el);
 
-  auto event_thread = std::thread(event_listener, joypad._state);
-  joypad._state->events_thread = std::move(event_thread);
-  joypad._state->events_thread.detach();
+  start_event_listener(joypad._state);
 
   return joypad;
 }
@@ -189,6 +185,7 @@ void PS5Joypad::set_triggers(int16_t left, int16_t right) {
 }
 
 void PS5Joypad::set_on_rumble(const std::function<void(int, int)> &callback) {
+  std::lock_guard lock(this->_state->callback_mutex);
   this->_state->on_rumble = callback;
 }
 

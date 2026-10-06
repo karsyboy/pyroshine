@@ -213,6 +213,15 @@ MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core \
   -- --ignored --exact --nocapture
 ```
 
+With access to `/dev/uhid` and `/dev/uinput` (the installed udev rules grant
+it to the seat user), native controller thread lifetimes under ThreadSanitizer
+and through the Rust wrapper:
+
+```sh
+python3 scripts/known_defects.py --skip-rust --native-devices
+MOONSHINE_TEST_DEVICES=1 cargo test -p moonshine-core native_devices_join -- --ignored --nocapture
+```
+
 Repeated-session acceptance on real hardware uses the benchmark's
 [lifecycle cycles](docs/BENCHMARKING.md#lifecycle-cycles).
 
