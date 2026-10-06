@@ -105,6 +105,15 @@ rather than freeing it at enqueue. RAII also covers queued encoder messages,
 packetization errors, sender failure, cancellation and discarded epochs.
 The three credits retain the existing encode/send overlap on healthy links.
 
+A requested IDR on a static scene (no new capture within a frame interval) is
+replayed from the converter, not from the encoder's input image: Pixelforge
+rotates two input slots and advances on every encode, so the current slot
+holds an older frame or none. The packed converter's output buffer (or
+Pixelforge's converter's, for unaligned extents) still holds the last
+completed conversion and is copied into the current slot before it is encoded.
+The IDR stays pending across loop iterations until a recovery or a new frame is
+actually submitted, including while network credits are exhausted.
+
 Network output storage is bounded by three frames. For a negotiated wire shard
 size `S`, the protocol's maximum four unprotected blocks of 1023 data shards
 bound it by `3 * 4092 * S` bytes; protected blocks have at most 255 total shards.
@@ -147,6 +156,20 @@ value is a preference, not proof of the native library's final queue choice.
 Normal queue priority and external-memory synchronization remain in place.
 Measure real-game contention before drawing conclusions from cube benchmarks.
 
+Capture follows client demand. A pause (client detached or reconnecting)
+clears the stream's media demand until the next epoch is activated: the encoder
+then requests no captures and replays nothing, so capture, conversion, encoding
+and packetization stop once in-flight work drains, and the audio encoder
+returns PCM to the Pulse server without encoding it. The compositor keeps
+presenting to the application and Pulse keeps serving it. After demand
+returns, a replay of the last frame (static-scene IDR, PyroWave resend) waits
+two frame intervals so a fresh capture can arrive first.
+
+Conventional packetization of frames of 128 KiB or more runs inside
+`tokio::task::block_in_place`, so its FEC and encryption work (about 1 ms for
+a 1 MB encrypted 4K frame) does not delay other tasks queued on that runtime
+worker. Frames are still packetized one at a time in order.
+
 ## Transport ownership and outcomes
 
 Packetization plans every FEC block first and writes into disjoint views of one
@@ -172,6 +195,16 @@ Ethernet load with IPv6/UDP and framing overhead. Pipeline enqueue summaries
 measure earlier handoff separately and do not report transmission throughput.
 
 ## Measurement and changes needing more proof
+
+Composited capture waits for its render fence on the compositor thread. On an
+RX 9070 XT at 4K60 the wait averaged 0.15–0.5 ms per capture alone and about
+10.7 ms (maximum about 14.5 ms) while a GPU-bound 4K game ran, so input and
+presentation dispatch can be delayed by most of a frame under contention.
+Direct export avoids it. A completion handoff (publishing the frame when an
+exported render fence signals, from the event loop) would remove that stall
+but must keep the pool slot owned until the fence signals and handle device
+loss and teardown; it is not implemented. Measure with
+`render_fence_wait_*` in the capture summary.
 
 [Benchmarking](BENCHMARKING.md) defines latency/GPU/throughput denominators;
 [runtime diagnostics](LONG_SESSION_PERFORMANCE.md) explains stall signatures.

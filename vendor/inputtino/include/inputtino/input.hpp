@@ -383,6 +383,7 @@ public:
              .name = "Wolf DualSense (virtual) pad", .vendor_id = 0x054C, .product_id = 0x0CE6, .version = 0x8111});
   PS5Joypad(PS5Joypad &&j) noexcept : _state(nullptr) {
     std::swap(j._state, _state);
+    std::swap(j._send_input_thread, _send_input_thread);
   }
   ~PS5Joypad() override;
 

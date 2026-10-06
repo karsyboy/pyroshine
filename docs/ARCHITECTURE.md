@@ -199,11 +199,12 @@ application while resetting or replacing encoders and transport state.
 | --- | --- |
 | HTTP launch | Authenticated GameStream API initializes and launches the application and compositor |
 | RTSP ANNOUNCE | Validates negotiated formats and numeric domains; for an active session, pauses the live epoch, then publishes pending video/audio contexts |
-| RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition |
+| RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition. The first PLAY applies the ANNOUNCE output mode (resolution, refresh rate, HDR) to the running compositor before starting streams, or fails; the session context then reports the negotiated mode, as after a reconnect |
 | Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
 | HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
 | Unchanged reconnect | Pauses both streams, keeps the video pipeline and Pulse sockets, resets client-visible sequencing and encoder state (IDR), and activates transport before PLAY completes |
 | Changed reconnect | Pauses both epochs, reconfigures compositor output only for resolution, refresh rate or HDR changes, and commits new video/audio resources before activating delivery |
+| Failed ANNOUNCE pause | One medium may already be paused and a worker no longer answers; the session is handed to teardown |
 | Cancel, application exit or failure | One teardown stops the application unit and joins every worker; only then can a new launch start |
 
 Negotiation invariants:
@@ -218,6 +219,22 @@ Negotiation invariants:
   32-bit rate control, implemented audio durations), not quality caps.
 - **No silent fallback.** An unsupported codec, chroma, bit depth or range fails
   negotiation; the server never substitutes another format.
+- **Epochs belong to one generation.** PLAY snapshots its authorization
+  generation and the keys published for it under the manager lock; the start
+  request or reconnect plan carries that snapshot to every worker, and each new
+  epoch (`BeginEpoch`) is activated for that generation. The video and audio
+  senders deliver only after `StartB`, to an endpoint discovered by the active
+  epoch's generation, while that generation is the current authorization. A
+  `/resume` therefore ends delivery to the replaced client immediately, without
+  waiting for ANNOUNCE, and interrupts a paced send in progress; a PING of the
+  new generation discovers an endpoint but delivers nothing until its PLAY
+  activates an epoch. A PLAY whose generation a newer `/resume` replaced while
+  it reconfigured fails; the manager records the contexts the workers now run so
+  the next reconnect is planned against reality.
+- **Lifecycle commands do not wait for `StartB`.** The start latch gates
+  capture, encoding and sending only. Pause, reset, reconfiguration and epoch
+  activation are served before it, so a client that completed PLAY and
+  disappeared before `StartB` can be resumed (unchanged or changed mode).
 - **Audio follows the same barrier.** Every reconnect, including unchanged
   settings, runs Pause → producer reset → begin epoch for audio as for video.
   Opus and RTP/FEC state are recreated and Pulse discards queued PCM before
@@ -265,6 +282,17 @@ identity, a controller missing from the client's active mask, or teardown
 destroys the device. A delayed disconnect from a replaced generation cannot
 release the new owner's input.
 
+Feedback delivery never blocks: the control loop drains the owner's bounded
+feedback channel while it may itself wait to queue gamepad commands, so a
+blocking producer could stall input, reconnect and shutdown. When the channel is
+full, the route coalesces per kind (the latest rumble supersedes an undelivered
+one, so a stop is never lost; LED, trigger and motion-enable state is re-sent
+from current state) and the gamepad timer task retries until the owner accepts
+it or is revoked. Native controller threads (report, UHID event, force-feedback
+listener) are owned and joined by the device's destructor, which therefore
+returns only after no callback can run and the kernel device is gone; see
+`vendor/inputtino/LOCAL_CHANGES.md`.
+
 ## Session ownership and shutdown
 
 The manager's lifecycle is explicit; absence of state never means idle:
@@ -289,10 +317,11 @@ rejected without touching the retained application or streams.
 **Workers** (compositor, video pipeline thread and packet task, audio encoder
 and packet task, PulseAudio server, control stream, gamepad thread) register a
 `lifecycle::WorkerGuard` before they are spawned and drop it last, after their
-sockets, threads, GPU objects and frames. Stream workers wait for `StartB`
-through a persistent `lifecycle::StartLatch`: it may open before, during or
-after workers wait, duplicate opens are no-ops, and a stop before `StartB`
-cancels the wait and releases the worker's socket.
+sockets, threads, GPU objects and frames. Stream workers produce and send media
+only after `StartB`, through a persistent `lifecycle::StartLatch`: it may open
+before, during or after workers wait, duplicate opens are no-ops, and a stop
+before `StartB` cancels the wait and releases the worker's socket. While waiting
+they keep serving pause, reset and reconfiguration commands.
 
 **XWayland** is owned by the compositor (`compositor/xwayland_process.rs`),
 which holds a pidfd for the child it spawned. Teardown closes its Wayland
@@ -311,11 +340,24 @@ unit name is recorded before a launch starts, so a launch cancelled after
 systemd accepted the unit is still stopped. `Application` drop never blocks;
 stopping the unit is an awaited, bounded D-Bus job.
 
-**Deadlines.** Application stop is bounded to 6 s and worker exit to the rest of
-a 16 s end-to-end deadline (`SESSION_TEARDOWN_DEADLINE`). A failed unit stop is
-logged without wedging the manager. Exceeding the deadline is terminal: the
-session stays `Stopping`, new sessions are refused, and the service shuts down
-for its supervisor to restart it. Service shutdown (SIGTERM/SIGINT) completes
+`Idle` requires established application termination: after the stop job,
+systemd must report the unit unloaded, or inactive/failed with no process left
+in its cgroup (a unit awaiting garbage collection counts as stopped). The stop
+job's own result is not trusted on its own. The client waits as long as
+systemd's stop policy allows (5 s SIGTERM allowance for the application and
+again for `ExecStopPost` hooks, then SIGKILL; `application.rs` derives the
+deadline and the manager uses it). If termination cannot be established, the
+session follows the terminal teardown policy below instead of becoming idle.
+A launch first stops a leftover unit of the same name and refuses to start
+until it is unloaded.
+
+**Deadlines.** Application stop is bounded to 15 s (`APPLICATION_STOP_DEADLINE`:
+the 12 s stop-job wait plus the 2 s termination check and bus connection) and
+worker exit to the rest of a 25 s end-to-end deadline
+(`SESSION_TEARDOWN_DEADLINE`). Exceeding the deadline, or failing to establish
+that the application terminated, is terminal: the session stays `Stopping`, new
+sessions are refused, and the service shuts down for its supervisor to restart
+it. Service shutdown (SIGTERM/SIGINT) completes
 only after session teardown finishes or fails within the same deadline.
 
 Tests: `session/manager/lifecycle_tests.rs` drives the manager through a fake
@@ -431,6 +473,13 @@ GameStream audio FEC and optional AES-CBC encryption, and the packet task sends
 them over UDP. Opus bitrate is bounded by Moonlight's 1400-byte audio packet
 limit. Reconnects follow the epoch barrier described under negotiation.
 
+The server's single thread serves every client, the capture clock and
+reconfiguration, so no client may hold it: a receive pass reads at most
+256 KiB before others get a turn (the client is rescheduled explicitly, since
+its edge-triggered readiness will not fire again), a zero-byte read ends the
+client after handling its complete requests, and unread replies above 64 MiB
+drop the client while it is being served.
+
 ## Control and input path
 
 `stream/control/` runs the GameStream control protocol over ENet (UDP). After
@@ -494,6 +543,14 @@ pyroshine-ui (desktop session)              pyroshine (service)
             └──── session bus: methods, signals ───┘       ── config store (config.toml)
                                                             ── frame stats broadcast
 ```
+
+The desktop app follows ownership of the bus name and supervises each
+attachment (`pyroshine-ui/src-tauri/src/attach.rs`): while the same owner
+stays, a failed subscription or snapshot is retried with backoff from 0.5 s
+doubling to 30 s; an incompatible or denied daemon is reported and waits for a
+new owner; a new owner abandons the pending attempt. Each attempt carries a
+generation and publishes only while it is current, so an abandoned attempt
+cannot overwrite the new owner's state.
 
 The interface is a control surface over the existing owners, never a parallel
 implementation:

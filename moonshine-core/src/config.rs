@@ -94,9 +94,13 @@ impl Config {
 	}
 
 	/// Reject settings that would otherwise fail only once a client connects:
-	/// listeners that cannot bind together, or a bind address the stream
-	/// listeners cannot parse. Values with a documented fallback (for example
-	/// an undersized `max_packet_size`, which is ignored) are left to it.
+	/// listeners that cannot bind together or that clients cannot be told
+	/// about, a bind address the stream listeners cannot parse, or a client
+	/// timeout outside its safe domain. Values with a documented fallback (for
+	/// example an undersized `max_packet_size`, which is ignored) are left to it.
+	///
+	/// Startup and the management interface both apply this check, so a setting
+	/// is rejected with the same reason wherever it is entered.
 	pub fn validate(&self) -> Result<(), String> {
 		self.address
 			.parse::<std::net::IpAddr>()
@@ -113,11 +117,23 @@ impl Config {
 		];
 		for (protocol, ports) in [("TCP", tcp), ("UDP", udp)] {
 			for (index, (name, port)) in ports.iter().enumerate() {
-				// Port 0 asks the OS for distinct ephemeral ports.
-				if let Some((other, _)) = ports[index + 1..].iter().find(|(_, other)| *port != 0 && other == port) {
+				// Clients are told these ports (RTSP SETUP, serverinfo); an
+				// ephemeral port would be advertised as 0 and be unreachable.
+				if *port == 0 {
+					return Err(format!("{name} must be a fixed port between 1 and 65535, not 0"));
+				}
+				if let Some((other, _)) = ports[index + 1..].iter().find(|(_, other)| other == port) {
 					return Err(format!("{name} and {other} both use {protocol} port {port}"));
 				}
 			}
+		}
+		if !STREAM_TIMEOUT_SECS.contains(&self.stream.timeout) {
+			return Err(format!(
+				"stream.timeout must be between {} and {} seconds, not {}",
+				STREAM_TIMEOUT_SECS.start(),
+				STREAM_TIMEOUT_SECS.end(),
+				self.stream.timeout
+			));
 		}
 		Ok(())
 	}
@@ -136,6 +152,12 @@ impl Config {
 		Ok(())
 	}
 }
+
+/// Safe domain of `[stream].timeout`, the active client's liveness deadline.
+/// Zero would retire every authenticated client immediately; the upper bound
+/// (one day) keeps deadline arithmetic far from overflow and matches the
+/// management editor's range.
+pub const STREAM_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 1..=86_400;
 
 impl Default for Config {
 	fn default() -> Self {
@@ -180,6 +202,51 @@ mod tests {
 		assert_eq!(Config::default().validate(), Ok(()));
 	}
 
+	/// Review 2026-10-05 CFG-001: a hand-written file is held to the same
+	/// safety domains as the management editor: advertised listener ports are
+	/// fixed and nonzero, and the client timeout is within 1..=86400 seconds.
+	#[test]
+	fn unsafe_file_values_fail_with_the_setting_name() {
+		let parse = |toml: &str| toml::from_str::<Config>(toml).unwrap().validate();
+		for (toml, reason) in [
+			("[stream]\ntimeout = 0", "stream.timeout"),
+			("[stream]\ntimeout = 86401", "stream.timeout"),
+			("[stream]\ntimeout = 9223372036854775807", "stream.timeout"),
+			("[stream]\nport = 0", "stream.port"),
+			("[stream.video]\nport = 0", "stream.video.port"),
+			("[stream.audio]\nport = 0", "stream.audio.port"),
+			("[stream.control]\nport = 0", "stream.control.port"),
+			(
+				"[webserver]\nport = 0\nport_https = 47984\ncertificate = \"c\"\nprivate_key = \"k\"",
+				"webserver.port",
+			),
+		] {
+			let error = parse(toml).unwrap_err();
+			assert!(error.starts_with(reason), "{toml}: {error}");
+		}
+		for timeout in [1, 60, 86_400] {
+			assert_eq!(parse(&format!("[stream]\ntimeout = {timeout}")), Ok(()), "{timeout}");
+		}
+	}
+
+	/// The management editor's range for the timeout is the runtime domain.
+	#[test]
+	fn timeout_domain_matches_the_editor_schema() {
+		let schema = crate::management::schema::config_schema();
+		let field = schema
+			.fields
+			.iter()
+			.find(|field| field.path == "stream.timeout")
+			.unwrap();
+		let moonshine_management::dto::FieldKind::Integer { min, max, .. } = field.kind else {
+			panic!("stream.timeout is an integer field");
+		};
+		assert_eq!(
+			(min as u64, max as u64),
+			(*STREAM_TIMEOUT_SECS.start(), *STREAM_TIMEOUT_SECS.end())
+		);
+	}
+
 	#[test]
 	fn conflicting_listeners_and_bad_addresses_are_rejected() {
 		let mut config = Config::default();
@@ -190,11 +257,9 @@ mod tests {
 		config.stream.audio.port = config.stream.control.port;
 		assert!(config.validate().unwrap_err().contains("UDP port"));
 
-		// TCP and UDP listeners may share a number; ephemeral ports may repeat.
+		// TCP and UDP listeners may share a number.
 		let mut config = Config::default();
 		config.stream.video.port = config.stream.port;
-		config.stream.audio.port = 0;
-		config.stream.control.port = 0;
 		assert_eq!(config.validate(), Ok(()));
 
 		for address in ["", "localhost", "0.0.0.0:47989", "300.1.1.1"] {

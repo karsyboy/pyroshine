@@ -308,6 +308,10 @@ pub(crate) struct MoonshineCompositor {
 	stale_after_render: u64,
 	direct_frames: u64,
 	composited_frames: u64,
+	/// CPU time this thread spent waiting for composited renders to complete
+	/// (review 2026-10-05 PERF-003): total and longest in the window.
+	render_wait: std::time::Duration,
+	render_wait_max: std::time::Duration,
 	direct_rejections: [u64; DirectReject::COUNT],
 	gpu_timer: super::gpu_timing::GpuTimer,
 	pub pen_tablet_descriptor: TabletDescriptor,
@@ -827,6 +831,8 @@ impl MoonshineCompositor {
 				stale_after_render: 0,
 				direct_frames: 0,
 				composited_frames: 0,
+				render_wait: std::time::Duration::ZERO,
+				render_wait_max: std::time::Duration::ZERO,
 				direct_rejections: [0; DirectReject::COUNT],
 				gpu_timer: super::gpu_timing::GpuTimer::default(),
 				pen_tablet_descriptor,
@@ -1676,6 +1682,8 @@ impl MoonshineCompositor {
 				late_cursor_frames = self.late_cursor_frames,
 				late_notification_frames = self.late_notification_frames,
 				composited_frames = self.composited_frames, capture_requested = self.frame_tx.requested(), capture_occupied = self.frame_tx.occupied(),
+				render_fence_wait_us_per_composited_capture = (self.composited_frames != 0).then(|| self.render_wait.as_micros() as u64 / self.composited_frames),
+				render_fence_wait_max_us = self.render_wait_max.as_micros() as u64,
 				screen_dirty = self.screen_dirty,
 				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
 				held_scanout_buffers = self.held_scanout_buffers.len(),
@@ -1737,6 +1745,8 @@ impl MoonshineCompositor {
 				"Video direct-export rejections"
 			);
 			self.gpu_timer.reset_window();
+			self.render_wait = std::time::Duration::ZERO;
+			self.render_wait_max = std::time::Duration::ZERO;
 			self.captured_frames = 0;
 			self.pre_render_rejected = 0;
 			self.stale_after_render = 0;
@@ -2079,7 +2089,14 @@ impl MoonshineCompositor {
 		// Block until the render has actually completed. `finish()` only flushes
 		// the GL blit, so without waiting the encoder can read a stale buffer
 		// from the round-robin pool (frames arrive out of order).
-		if let Err(e) = sync.wait() {
+		let wait_started = std::time::Instant::now();
+		let waited = sync.wait();
+		if self.log_stats {
+			let wait = wait_started.elapsed();
+			self.render_wait += wait;
+			self.render_wait_max = self.render_wait_max.max(wait);
+		}
+		if let Err(e) = waited {
 			tracing::error!("Failed to wait for render fence: {e}; stopping capture");
 			// Never publish or recycle a buffer whose GPU completion is unknown.
 			self.capture_failed = true;

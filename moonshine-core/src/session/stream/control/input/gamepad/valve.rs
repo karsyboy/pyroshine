@@ -515,7 +515,7 @@ async fn read_features(
 					features.set(&bytes[12..12 + size])
 				};
 				if let Ok(Some((low_frequency, high_frequency))) = result {
-					route.try_deliver(FeedbackCommand::Rumble(RumbleCommand {
+					route.deliver(FeedbackCommand::Rumble(RumbleCommand {
 						id: u16::from(features.index),
 						low_frequency,
 						high_frequency,
@@ -792,9 +792,16 @@ mod tests {
 				host.set_nonblocking(true).unwrap();
 				let host = tokio::net::UnixDatagram::from_std(host).unwrap();
 				let file = std::fs::File::from(OwnedFd::from(device));
-				let route = FeedbackRoute::new(0, true);
+				let route = FeedbackRoute::new(0, true, std::sync::Arc::new(tokio::sync::Notify::new()));
 				let (owner, mut feedback) = tokio::sync::mpsc::channel(10);
-				route.claim(&owner);
+				assert!(route.claim(&owner));
+				// A motion-capable owner first receives its two motion enables.
+				for _ in 0..2 {
+					assert!(matches!(
+						feedback.recv().await,
+						Some(FeedbackCommand::EnableMotionEvent(_))
+					));
+				}
 				let pad = ValveGamepad::from_file(VirtualIdentity::SteamDeck, 0, route.clone(), file).unwrap();
 				let create = receive_kind(&host, UHID_CREATE2).await;
 				assert_eq!(&create[284..], DESCRIPTOR);

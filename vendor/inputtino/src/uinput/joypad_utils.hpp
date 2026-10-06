@@ -11,6 +11,7 @@
 #include <linux/uinput.h>
 #include <optional>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <thread>
 
 namespace inputtino {
@@ -148,7 +149,15 @@ static ActiveRumbleEffect create_rumble_effect(const ff_effect &effect) {
  *   You can test the virtual devices that we create by simply using the utility `fftest`
  */
 static void event_listener(const std::shared_ptr<BaseJoypadState> &state) {
-  std::this_thread::sleep_for(100ms); // We have to sleep in order to be able to read from the newly created device
+  // We have to wait in order to be able to read from the newly created device;
+  // a stop during the wait ends it at once.
+  {
+    pollfd wake{.fd = state->wake_fd, .events = POLLIN};
+    poll(&wake, 1, 100);
+    if (state->stop_listening_events) {
+      return;
+    }
+  }
 
   auto uinput_fd = libevdev_uinput_get_fd(state->joy.get());
   if (uinput_fd < 0) {
@@ -167,13 +176,20 @@ static void event_listener(const std::shared_ptr<BaseJoypadState> &state) {
   /* This can only be set globally when receiving FF_GAIN */
   unsigned int current_gain = MAX_GAIN;
 
-  std::array<pollfd, 1> pfds = {pollfd{.fd = uinput_fd, .events = POLLIN}};
+  std::array<pollfd, 2> pfds = {pollfd{.fd = uinput_fd, .events = POLLIN},
+                                pollfd{.fd = state->wake_fd, .events = POLLIN}};
   int poll_rs = 0;
 
   while (!state->stop_listening_events) {
     poll_rs = poll(pfds.data(), pfds.size(), RUMBLE_POLL_TIMEOUT);
     if (poll_rs < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       std::cerr << "Failed polling uinput fd; ret=" << strerror(errno);
+      return;
+    }
+    if (pfds[1].revents & POLLIN || state->stop_listening_events) {
       return;
     }
 
@@ -235,11 +251,37 @@ static void event_listener(const std::shared_ptr<BaseJoypadState> &state) {
       prev_rumble.first = current_rumble.first;
       prev_rumble.second = current_rumble.second;
 
-      if (auto callback = state->on_rumble) {
+      std::optional<std::function<void(int, int)>> callback;
+      {
+        std::lock_guard lock(state->callback_mutex);
+        callback = state->on_rumble;
+      }
+      if (callback) {
         callback.value()(static_cast<int>((current_rumble.second * current_gain / MAX_GAIN)),
                          static_cast<int>((current_rumble.first * current_gain / MAX_GAIN)));
       }
     }
+  }
+}
+
+/// Start the force-feedback listener for a created joypad (owned, not detached).
+inline void start_event_listener(const std::shared_ptr<BaseJoypadState> &state) {
+  state->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  state->events_thread = std::thread(event_listener, state);
+}
+
+/// Stop and join the listener; afterwards no rumble callback runs. Idempotent.
+inline void stop_event_listener(BaseJoypadState &state) {
+  state.stop_listening_events = true;
+  if (state.wake_fd >= 0) {
+    eventfd_write(state.wake_fd, 1);
+  }
+  if (state.events_thread.joinable() && state.events_thread.get_id() != std::this_thread::get_id()) {
+    state.events_thread.join();
+  }
+  if (state.wake_fd >= 0) {
+    close(state.wake_fd);
+    state.wake_fd = -1;
   }
 }
 

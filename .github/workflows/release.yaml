@@ -17,8 +17,108 @@ permissions:
   contents: write
 
 jobs:
+  # Every gate runs on the exact commit being released; a release never relies
+  # on CI having passed for some other commit. Results and provenance are
+  # recorded in release-validation.json and shipped with the release.
+  validate:
+    name: Validate release commit
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.record.outputs.sha }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ github.event.inputs.tag || github.ref }}
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - name: Install dependencies
+      uses: ./.github/actions/install-dependencies
+
+    - name: Install desktop app dependencies
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: pyroshine-ui/package-lock.json
+
+    - name: Server checks
+      run: |
+        set -o pipefail
+        mkdir -p "$RUNNER_TEMP/validation"
+        python3 -m unittest discover -s scripts -p 'test_changelog.py'
+        python3 scripts/changelog.py check --tag "${{ github.event.inputs.tag || github.ref_name }}"
+        cargo fmt --all -- --check
+        cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+        RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --all-features
+        cargo test --locked --workspace --all-features 2>&1 | tee "$RUNNER_TEMP/validation/tests.log"
+
+    - name: Pinned PyroWave FFI check (must run, not be skipped)
+      run: |
+        set -o pipefail
+        ./scripts/build-pyrowave.sh "$RUNNER_TEMP/pyrowave" "$RUNNER_TEMP/pyrowave-install"
+        MOONSHINE_TEST_PYROWAVE=1 \
+        MOONSHINE_PYROWAVE_LIBRARY="$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0" \
+          cargo test --locked -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api \
+          -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/validation/pyrowave-ffi.log"
+        grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/validation/pyrowave-ffi.log"
+        grep -q 'pyrowave-ffi: loaded' "$RUNNER_TEMP/validation/pyrowave-ffi.log"
+
+    - name: Known defects and native sanitizer tests
+      run: python3 scripts/known_defects.py --json "$RUNNER_TEMP/validation/known-defects.json"
+
+    - name: Desktop app checks
+      working-directory: pyroshine-ui
+      run: |
+        npm ci
+        npm run typecheck
+        npm test
+        cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+        cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+    - name: Record validation
+      id: record
+      run: |
+        python3 scripts/record_baseline.py --out "$RUNNER_TEMP/validation/provenance" --metadata-only
+        python3 - "$RUNNER_TEMP/validation" <<'PY'
+        import json, pathlib, re, sys
+        root = pathlib.Path(sys.argv[1])
+        provenance = json.loads((root / "provenance" / "manifest.json").read_text())
+        tests = re.findall(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored", (root / "tests.log").read_text())
+        record = {
+            "checkout": provenance["checkout"],
+            "toolchain": provenance["toolchain"],
+            "runner": provenance["host"],
+            "workspace_tests": [dict(zip(("result", "passed", "failed", "ignored"), t)) for t in tests],
+            "pyrowave_ffi": "loaded and passed",
+            "known_defects": json.loads((root / "known-defects.json").read_text()),
+            "hardware_acceptance": "not run by CI; approved through the 'release' environment for this sha",
+        }
+        (root / "release-validation.json").write_text(json.dumps(record, indent=2) + "\n")
+        assert all(t[0] == "ok" and t[2] == "0" for t in tests), "a test suite failed"
+        PY
+        echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: release-validation
+        path: ${{ runner.temp }}/validation/release-validation.json
+
   build:
     name: Build and package
+    needs: validate
+    # Publishing requires approval in the 'release' environment: the reviewer
+    # confirms the documented hardware acceptance (docs/reconnect-validation.md,
+    # REPORT section 9) was run for exactly this commit.
+    environment: release
     # Pin to ubuntu-24.04 (glibc 2.39) so the release binary runs on
     # Ubuntu 24.04+, Fedora 40+, Arch, ...
     runs-on: ubuntu-24.04
@@ -40,6 +140,15 @@ jobs:
     - uses: actions/checkout@v7
       with:
         ref: ${{ github.event.inputs.tag || github.ref }}
+
+    - name: Build the validated commit only
+      env:
+        VALIDATED: ${{ needs.validate.outputs.sha }}
+      run: test "$(git rev-parse HEAD)" = "$VALIDATED"
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: release-validation
 
     - name: Validate changelog and extract release notes
       env:
@@ -138,6 +247,7 @@ jobs:
           ./pyroshine-*.rpm \
           ./pyroshine-*.pkg.tar.zst \
           ./dist/pyroshine-install.sh \
+          ./release-validation.json \
           > SHA256SUMS
 
     - name: Create GitHub release
@@ -153,4 +263,5 @@ jobs:
           ./pyroshine-*.rpm
           ./pyroshine-*.pkg.tar.zst
           ./dist/pyroshine-install.sh
+          ./release-validation.json
           ./SHA256SUMS

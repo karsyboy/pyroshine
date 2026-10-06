@@ -49,15 +49,17 @@ use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
-/// Bound for stopping the application unit (bus connection, stop job and
-/// unit removal, each internally bounded).
-const APPLICATION_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Bound for stopping the application unit: the systemd stop policy (SIGTERM
+/// allowance, post hooks, SIGKILL) plus the termination check, as derived in
+/// `application.rs`.
+const APPLICATION_STOP_TIMEOUT: Duration = crate::session::application::APPLICATION_STOP_DEADLINE;
 /// Bound for every session worker to exit and release its resources.
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// End-to-end teardown deadline, from the stop request through application
-/// cleanup and every worker's exit. Exceeding it is a terminal failure: the
-/// session stays `Stopping` (it may still own resources) and the service
-/// shuts down so its supervisor can restart it.
+/// cleanup and every worker's exit. Exceeding it, or failing to establish that
+/// the application terminated, is a terminal failure: the session stays
+/// `Stopping` (it may still own resources) and the service shuts down so its
+/// supervisor can restart it.
 pub(crate) const SESSION_TEARDOWN_DEADLINE: Duration =
 	Duration::from_secs(APPLICATION_STOP_TIMEOUT.as_secs() + WORKER_SHUTDOWN_TIMEOUT.as_secs());
 
@@ -122,19 +124,32 @@ pub enum SessionShutdownReason {
 }
 
 /// Inputs for spawning the stream workers of a launched session.
+///
+/// `generation` is the authorization the PLAY was accepted under. Workers
+/// activate their first media epoch for exactly this generation; delivery
+/// stops as soon as a later `/resume` replaces it.
 pub(crate) struct StartRequest {
 	pub video: VideoStreamContext,
 	pub audio: AudioStreamContext,
+	pub generation: u64,
 	pub authorization_rx: AuthorizationReceiver,
 	pub stop: ShutdownManager<SessionShutdownReason>,
 }
 
 /// Every reconnect resets both media epochs. `video: None` retains the costly
 /// pipeline and resets counters + IDR; audio always commits its negotiated context.
+///
+/// The plan is an immutable snapshot taken under the manager lock when PLAY is
+/// accepted: the authorization generation and the keys published for it. A
+/// newer `/resume` during the reconfiguration cannot mix its keys or
+/// generation into this epoch, and the epoch it activates cannot deliver
+/// media once that generation is no longer current.
 #[derive(Debug)]
 pub(crate) struct ResumePlan {
 	pub video: Option<VideoStreamContext>,
 	pub audio: AudioStreamContext,
+	pub generation: u64,
+	pub keys: crate::session::keys::ActiveKeys,
 }
 
 /// The resource-owning work behind each manager transition.
@@ -176,7 +191,9 @@ pub(crate) trait SessionBackend: Send + Sync + 'static {
 
 	fn resume(&self, session: &mut Self::Active, plan: ResumePlan) -> impl Future<Output = Result<(), ()>> + Send;
 
-	/// Stop the application unit. Must be idempotent.
+	/// Stop the application unit and establish that it terminated. Must be
+	/// idempotent; `Ok` for an absent unit. `Err` keeps the session from being
+	/// reported idle.
 	fn stop_application(&self, unit_name: &str) -> impl Future<Output = Result<(), ()>> + Send;
 }
 
@@ -721,13 +738,14 @@ impl<B: SessionBackend> SessionCore<B> {
 		let deadline = tokio::time::Instant::now() + SESSION_TEARDOWN_DEADLINE;
 		let result = tokio::time::timeout_at(deadline, async {
 			let mut application = record.application_unit;
+			let mut application_stopped = true;
 			// Stop the application while the compositor and audio server still
 			// serve it, so it can exit cleanly. A transition in flight is cancelled
 			// first instead; its application is stopped after it handed back.
 			if transition.is_none()
 				&& let Some(unit) = application.take()
 			{
-				self.stop_application(unit).await;
+				application_stopped = self.stop_application(unit).await;
 			}
 			let _ = record.stop.trigger_shutdown(reason);
 			drop(state);
@@ -744,8 +762,11 @@ impl<B: SessionBackend> SessionCore<B> {
 			};
 			drop(orphans);
 			if let Some(unit) = application {
-				self.stop_application(unit).await;
+				application_stopped = self.stop_application(unit).await;
 			}
+			// Workers are released either way; only an established application
+			// termination lets the session become idle.
+			application_stopped
 		})
 		.await;
 
@@ -756,6 +777,11 @@ impl<B: SessionBackend> SessionCore<B> {
 			completed: result.is_ok(),
 			at: SystemTime::now(),
 		});
+		let result = match result {
+			Ok(true) => Ok(()),
+			Ok(false) => Err("the application unit's termination could not be established"),
+			Err(_) => Err("teardown exceeded its deadline"),
+		};
 		match result {
 			Ok(()) => {
 				guard.lifecycle = Lifecycle::Idle;
@@ -763,15 +789,17 @@ impl<B: SessionBackend> SessionCore<B> {
 				tracing::info!(epoch, "Session stopped; ready for a new session.");
 				done.send_replace(TeardownStatus::Completed);
 			},
-			Err(_) => {
-				// Workers may still own ports, the Pulse socket or GPU objects: never
-				// report idle. Restarting the service is the only safe recovery.
+			Err(failure) => {
+				// Workers may still own ports, the Pulse socket or GPU objects, or the
+				// application may still run: never report idle. Restarting the service
+				// is the only safe recovery.
 				guard.teardown_failed = true;
 				drop(guard);
 				tracing::error!(
 					epoch,
+					failure,
 					deadline_secs = SESSION_TEARDOWN_DEADLINE.as_secs(),
-					"Session teardown exceeded its deadline; refusing new sessions and stopping the service"
+					"Session teardown failed; refusing new sessions and stopping the service"
 				);
 				let _ = self.shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
 				done.send_replace(TeardownStatus::Failed);
@@ -779,17 +807,22 @@ impl<B: SessionBackend> SessionCore<B> {
 		}
 	}
 
-	async fn stop_application(&self, unit: &'static str) {
+	/// Whether the application unit's termination was established.
+	async fn stop_application(&self, unit: &'static str) -> bool {
 		match tokio::time::timeout(APPLICATION_STOP_TIMEOUT, self.backend.stop_application(unit)).await {
-			Ok(Ok(())) => {},
-			// The unit name is fixed; the next launch also replaces a leftover
-			// unit, so a failed stop is reported but does not wedge the manager.
-			Ok(Err(())) => tracing::error!(unit, "Failed to stop the application unit"),
-			Err(_) => tracing::error!(
-				unit,
-				timeout_secs = APPLICATION_STOP_TIMEOUT.as_secs(),
-				"Timed out stopping the application unit"
-			),
+			Ok(Ok(())) => true,
+			Ok(Err(())) => {
+				tracing::error!(unit, "Failed to stop the application unit");
+				false
+			},
+			Err(_) => {
+				tracing::error!(
+					unit,
+					timeout_secs = APPLICATION_STOP_TIMEOUT.as_secs(),
+					"Timed out stopping the application unit"
+				);
+				false
+			},
 		}
 	}
 
@@ -1166,7 +1199,17 @@ impl<B: SessionBackend> SessionCore<B> {
 					tracing::warn!("Discarding ANNOUNCE contexts from a replaced generation or stopping session");
 					Err(())
 				},
-				Ok(Err(())) | Err(_) => Err(()),
+				// A failed pause may have paused one medium and not the other, and
+				// means a media worker no longer answers. Neither the old epoch nor
+				// a new negotiation can be trusted: hand the session to teardown.
+				Ok(Err(())) => {
+					if committable {
+						tracing::error!(epoch = ticket.epoch, "Reconnect pause failed; stopping the session");
+						core.begin_teardown(&mut guard, Some(ticket.epoch), SessionShutdownReason::TransitionFailed);
+					}
+					Err(())
+				},
+				Err(_) => Err(()),
 			};
 			drop(guard);
 			drop(ticket);
@@ -1203,6 +1246,11 @@ impl<B: SessionBackend> SessionCore<B> {
 				.as_ref()
 				.map(watch::Sender::subscribe)
 				.expect("a current grant implies an authorization channel");
+			let generation = grant.generation();
+			let Some(keys) = guard.keys_tx.as_ref().map(|keys_tx| keys_tx.borrow().clone()) else {
+				tracing::warn!("StartSession rejected: the session has no published keys");
+				return Err(());
+			};
 			let Some(live) = guard.live() else {
 				tracing::warn!("StartSession rejected: no active session");
 				return Err(());
@@ -1229,6 +1277,7 @@ impl<B: SessionBackend> SessionCore<B> {
 					StartRequest {
 						video: video.clone(),
 						audio: audio.clone(),
+						generation,
 						authorization_rx,
 						stop: live.record.stop.clone(),
 					},
@@ -1257,6 +1306,8 @@ impl<B: SessionBackend> SessionCore<B> {
 							ResumePlan {
 								video: None,
 								audio: audio.clone(),
+								generation,
+								keys: keys.clone(),
 							}
 						},
 						ReconnectDecision::Reconfigure {
@@ -1272,6 +1323,8 @@ impl<B: SessionBackend> SessionCore<B> {
 							ResumePlan {
 								video: (!video_changed_fields.is_empty()).then(|| video.clone()),
 								audio: audio.clone(),
+								generation,
+								keys: keys.clone(),
 							}
 						},
 					};
@@ -1284,6 +1337,7 @@ impl<B: SessionBackend> SessionCore<B> {
 		};
 
 		let core = self.clone();
+		let grant = grant.clone();
 		let task = tokio::spawn(async move {
 			let outcome = match work {
 				Work::Start(launched, request) => {
@@ -1295,6 +1349,9 @@ impl<B: SessionBackend> SessionCore<B> {
 							let state = SessionState::Active(active);
 							match guard.committable(&ticket) {
 								Some(live) => {
+									// The backend applied the authoritative RTSP output mode
+									// before starting streams; publish it like a reconnect.
+									record_negotiated_mode(&mut live.record.context, &video, &audio);
 									live.record.streams = Some((video, audio));
 									live.record.start_latches = latches;
 									live.state = Some(state);
@@ -1320,20 +1377,30 @@ impl<B: SessionBackend> SessionCore<B> {
 					let result = ticket.stop.wrap_cancel(core.backend.resume(&mut active, plan)).await;
 					let mut guard = core.lock().await;
 					let state = SessionState::Active(active);
+					let current = guard.is_current(&grant);
 					match result {
 						Ok(Ok(())) => match guard.committable(&ticket) {
 							Some(live) => {
-								let context = &mut live.record.context;
-								context.resolution = (video.width, video.height);
-								context.refresh_rate = video.fps;
-								context.hdr = video.format.hdr;
-								context.audio_channels = audio.audio_config.channels;
-								context.audio_channel_mask = audio.audio_config.channel_mask;
+								// Record what the workers now run either way, so the next
+								// reconnect compares against reality.
+								record_negotiated_mode(&mut live.record.context, &video, &audio);
 								live.record.streams = Some((video, audio));
 								live.state = Some(state);
 								live.transition = None;
 								guard.progress_at = Instant::now();
-								Ok(())
+								if current {
+									Ok(())
+								} else {
+									// A newer `/resume` replaced this PLAY's generation while it
+									// reconfigured. Its epoch was activated for the old
+									// generation, which the media senders no longer serve;
+									// the new client's ANNOUNCE/PLAY activates its own epoch.
+									tracing::warn!(
+										generation = grant.generation(),
+										"Reconnect PLAY was superseded by a newer resume; not activating its epoch"
+									);
+									Err(())
+								}
 							},
 							None => {
 								guard.orphan(&ticket, state);
@@ -1401,6 +1468,15 @@ impl<B: SessionBackend> SessionCore<B> {
 
 		Ok(())
 	}
+}
+
+/// Publish the negotiated output/audio mode an epoch actually runs with.
+fn record_negotiated_mode(context: &mut SessionContext, video: &VideoStreamContext, audio: &AudioStreamContext) {
+	context.resolution = (video.width, video.height);
+	context.refresh_rate = video.fps;
+	context.hdr = video.format.hdr;
+	context.audio_channels = audio.audio_config.channels;
+	context.audio_channel_mask = audio.audio_config.channel_mask;
 }
 
 fn publish_pending<B: SessionBackend>(

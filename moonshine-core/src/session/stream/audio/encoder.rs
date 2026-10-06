@@ -48,6 +48,7 @@ impl AudioEncoder {
 		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 		generation: u64,
+		demand: crate::session::stream::MediaDemand,
 	) -> Result<(), ()> {
 		let stream_config = &context.audio_config.stream_config;
 		tracing::debug!("Starting audio encoder.");
@@ -83,6 +84,7 @@ impl AudioEncoder {
 					start,
 					reconfigure_rx,
 					generation,
+					demand,
 				)
 			})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
@@ -144,18 +146,20 @@ impl AudioEncoderInner {
 		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 		mut generation: u64,
+		demand: crate::session::stream::MediaDemand,
 	) {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for audio encoder");
-		// Wait for the start signal before entering the encode loop.
-		if rt.block_on(start.wait(&stop)).is_err() {
-			tracing::debug!("Audio encoder stopped before start signal.");
-			return;
-		}
-
+		// The keys published with the starting generation. Captured now rather
+		// than at `StartB`, which may arrive after a newer resume published other
+		// keys; that resume's PLAY then reconfigures with its own snapshot.
 		let mut keys = keys_rx.borrow().clone();
+		// Reconfiguration is served before `StartB` (a reconnect may negotiate
+		// with a session whose client never sent it); encoding is not.
+		let mut started = false;
+		let not_started = crossbeam_channel::never::<AudioFrame>();
 		let mut sequence_number = 0u16;
 		let mut stream_start_time = std::time::Instant::now();
 
@@ -182,17 +186,21 @@ impl AudioEncoderInner {
 		// surround bitrate is constrained by this budget at the negotiated duration.
 		let mut encoded_audio = vec![0u8; MAX_OPUS_PAYLOAD_SIZE];
 
-		// Pre-seed the recycling pipeline with empty frames.
-		for _ in 0..3 {
-			let _ = frame_recycle_tx.send(AudioFrame {
-				buf: Vec::new(),
-				capture_ts_ms: 0,
-				generation,
-			});
-		}
-
 		while !stop.is_shutdown_triggered() {
 			let frame = loop {
+				if !started && start.is_open() {
+					started = true;
+					stream_start_time = std::time::Instant::now();
+					// Pre-seed the recycling pipeline with empty frames.
+					for _ in 0..3 {
+						let _ = frame_recycle_tx.send(AudioFrame {
+							buf: Vec::new(),
+							capture_ts_ms: 0,
+							generation,
+						});
+					}
+				}
+				let frames = if started { &frame_rx } else { &not_started };
 				crossbeam_channel::select! {
 					recv(reconfigure_rx) -> command => {
 						let command = match command {
@@ -233,15 +241,26 @@ impl AudioEncoderInner {
 						}
 						let _ = command.applied.send(Ok(()));
 					},
-					recv(frame_rx) -> frame => match frame {
+					recv(frames) -> frame => match frame {
 						Ok(frame) => {
-							if frame.generation == generation { break frame; }
+							// While no client receives audio (PERF-001), the PCM is
+							// returned unencoded; Pulse keeps serving the application.
+							if frame.generation == generation && demand.wanted() { break frame; }
 							let _ = frame_recycle_tx.try_send(frame);
 						},
 						Err(_) => {
 							tracing::debug!("PulseServer channel closed.");
 							return;
 						},
+					},
+					// Polls the start latch before `StartB` and the stop afterwards.
+					default(std::time::Duration::from_millis(if started { 100 } else { 5 })) => {
+						if stop.is_shutdown_triggered() {
+							if !started {
+								tracing::debug!("Audio encoder stopped before start signal.");
+							}
+							return;
+						}
 					},
 				}
 			};
@@ -415,6 +434,161 @@ impl AudioEncoderInner {
 mod tests {
 	use super::*;
 
+	/// Review 2026-10-05 PERF-001: while no client receives audio, PCM is
+	/// recycled without being encoded; encoding resumes with demand.
+	#[tokio::test]
+	async fn no_encoding_without_media_demand() {
+		use crate::session::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+		use std::time::Duration;
+		let stop = ShutdownManager::new();
+		let start = crate::session::lifecycle::StartLatch::new();
+		let keys = crate::session::keys::KeyLedger::default().publish(SessionKeyData::new(
+			RemoteInputKey::from_bytes([1; 16]),
+			RemoteInputKeyId::new(1),
+		));
+		let (_keys_tx, keys_rx) = tokio::sync::watch::channel(keys);
+		let (frames, frame_rx) = crossbeam_channel::bounded(16);
+		let (recycle, recycled) = crossbeam_channel::bounded(16);
+		let (packets, mut packet_rx) = mpsc::channel(32);
+		let (_commands, command_rx) = crossbeam_channel::unbounded();
+		let demand = crate::session::stream::MediaDemand::new();
+		demand.set(false);
+		AudioEncoder::spawn(
+			48_000,
+			AudioStreamContext {
+				packet_duration_ms: 5,
+				..Default::default()
+			},
+			frame_rx,
+			recycle,
+			keys_rx,
+			packets,
+			stop.clone(),
+			start.waiter(),
+			command_rx,
+			1,
+			demand.clone(),
+		)
+		.unwrap();
+		start.open();
+		let frame = || AudioFrame {
+			buf: vec![0.5; 240],
+			capture_ts_ms: 0,
+			generation: 1,
+		};
+		for _ in 0..4 {
+			frames.send(frame()).unwrap();
+		}
+		assert!(
+			tokio::time::timeout(Duration::from_millis(200), packet_rx.recv())
+				.await
+				.is_err()
+		);
+		// The frames went back to the Pulse server (three pre-seeded plus four).
+		let returned =
+			tokio::task::spawn_blocking(move || (0..7).all(|_| recycled.recv_timeout(Duration::from_secs(1)).is_ok()))
+				.await
+				.unwrap();
+		assert!(returned);
+		demand.set(true);
+		frames.send(frame()).unwrap();
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(2), packet_rx.recv()).await,
+			Ok(Some(AudioPacketMessage::Packet { generation: 1, .. }))
+		));
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
+	/// Review 2026-10-05 STAB-002: a reconnect can reconfigure audio before
+	/// the first `StartB`. The encoder applies it and activates the epoch for
+	/// the PLAY's generation, but encodes nothing until `StartB`.
+	#[tokio::test]
+	async fn reconfiguration_is_served_before_start() {
+		use crate::session::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+		use std::time::Duration;
+		let stop = ShutdownManager::new();
+		let start = crate::session::lifecycle::StartLatch::new();
+		let mut ledger = crate::session::keys::KeyLedger::default();
+		let initial = ledger.publish(SessionKeyData::new(
+			RemoteInputKey::from_bytes([1; 16]),
+			RemoteInputKeyId::new(1),
+		));
+		let (_keys_tx, keys_rx) = tokio::sync::watch::channel(initial);
+		let (frames, frame_rx) = crossbeam_channel::bounded(16);
+		let (recycle, _recycle_rx) = crossbeam_channel::bounded(16);
+		let (packets, mut packet_rx) = mpsc::channel(32);
+		let (commands, command_rx) = crossbeam_channel::unbounded();
+		let context = AudioStreamContext {
+			packet_duration_ms: 5,
+			..Default::default()
+		};
+		AudioEncoder::spawn(
+			48_000,
+			context.clone(),
+			frame_rx,
+			recycle,
+			keys_rx,
+			packets,
+			stop.clone(),
+			start.waiter(),
+			command_rx,
+			1,
+			crate::session::stream::MediaDemand::new(),
+		)
+		.unwrap();
+		let resumed = ledger.publish(SessionKeyData::new(
+			RemoteInputKey::from_bytes([2; 16]),
+			RemoteInputKeyId::new(2),
+		));
+		let (applied, waiting) = tokio::sync::oneshot::channel();
+		commands
+			.send(AudioEncoderReconfigure {
+				generation: 2,
+				keys: resumed,
+				context: context.clone(),
+				applied,
+			})
+			.unwrap();
+		let Some(AudioPacketMessage::BeginEpoch {
+			generation: 2, ready, ..
+		}) = tokio::time::timeout(Duration::from_secs(5), packet_rx.recv())
+			.await
+			.expect("reconfiguration before StartB must activate its epoch")
+		else {
+			panic!("expected the generation 2 epoch activation");
+		};
+		ready.send(()).unwrap();
+		waiting.await.unwrap().unwrap();
+		frames
+			.send(AudioFrame {
+				buf: vec![0.5; 240],
+				capture_ts_ms: 0,
+				generation: 2,
+			})
+			.unwrap();
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), packet_rx.recv())
+				.await
+				.is_err(),
+			"no audio is encoded before StartB"
+		);
+		start.open();
+		let Some(AudioPacketMessage::Packet { generation: 2, .. }) =
+			tokio::time::timeout(Duration::from_secs(5), packet_rx.recv())
+				.await
+				.unwrap()
+		else {
+			panic!("expected a generation 2 packet after StartB");
+		};
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
 	#[tokio::test]
 	async fn reconnect_resets_encoder_keys_pcm_sequence_and_fec_together() {
 		use crate::session::stream::audio::{AudioChannels, AudioConfig};
@@ -447,6 +621,7 @@ mod tests {
 			start.waiter(),
 			command_rx,
 			1,
+			crate::session::stream::MediaDemand::new(),
 		)
 		.unwrap();
 		start.open();

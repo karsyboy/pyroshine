@@ -196,6 +196,30 @@ if(INPUTTINO_EDGE_TESTS)
     add_test(NAME dualsense-edge-report COMMAND dualsense-edge-test)
 endif()
 
+# Hardware-independent DualSense UHID feature/output report handling. Configure
+# with CMAKE_CXX_FLAGS="-fsanitize=address,undefined" for the sanitizer lane.
+option(INPUTTINO_PS5_FEATURE_TESTS "Test DualSense UHID report handling without UHID" OFF)
+if(INPUTTINO_PS5_FEATURE_TESTS AND USE_UHID)
+    enable_testing()
+    add_executable(ps5-feature-report-test tests/ps5_feature_reports.cpp)
+    target_link_libraries(ps5-feature-report-test PRIVATE inputtino::libinputtino)
+    foreach(mode supported unsupported output fuzz)
+        add_test(NAME ps5-reports-${mode} COMMAND ps5-feature-report-test ${mode})
+    endforeach()
+endif()
+
+# Thread/lifetime checks on real devices; needs read/write access to /dev/uhid
+# and /dev/uinput. Configure with -fsanitize=thread (or address) to be useful.
+option(INPUTTINO_DEVICE_TESTS "Test native joypad threads and destruction on /dev/uhid and /dev/uinput" OFF)
+if(INPUTTINO_DEVICE_TESTS)
+    enable_testing()
+    add_executable(joypad-lifetime-test tests/joypad_lifetimes.cpp)
+    target_link_libraries(joypad-lifetime-test PRIVATE inputtino::libinputtino)
+    add_test(NAME joypad-lifetimes COMMAND joypad-lifetime-test 5)
+    # Exit status 77: the devices are not accessible on this host.
+    set_tests_properties(joypad-lifetimes PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 option(INPUTTINO_ELITE_TESTS "Test Xbox Elite evdev capabilities without uinput" OFF)
 if(INPUTTINO_ELITE_TESTS)
     enable_testing()

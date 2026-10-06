@@ -30,7 +30,7 @@ Protect pairing credentials and other private data before sharing logs.
 | Message | Useful evidence |
 | --- | --- |
 | `Video runtime health` | CPU (100% = one core), open fds, resident KiB, packet occupancy and independent timer lateness; unavailable values are `None` |
-| `Video capture resources` | Capture path/age, dirty state, busy/held buffers, releases, retired pools, admission/rejection and GLES timing counters |
+| `Video capture resources` | Capture path/age, dirty state, busy/held buffers, releases, retired pools, admission/rejection and GLES timing counters; `render_fence_wait_us_per_composited_capture` and `render_fence_wait_max_us` are how long the compositor thread (input and presentation included) waited for composited renders |
 | `Video pipeline summary` | Completed FPS, stage timings, stale drops, in-flight/packet occupancy and PyroWave import-cache size |
 | `Video direct-export rejections` | First blocking reason for direct eligibility, counted per attempt |
 | `PyroWave DMA-BUF import summary` | Import-cache hit/miss/recreate/evict counters |

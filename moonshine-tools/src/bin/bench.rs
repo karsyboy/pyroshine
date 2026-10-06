@@ -106,6 +106,17 @@ struct Args {
 	#[arg(long)]
 	verbose: bool,
 
+	/// Measure tokio runtime scheduling delay during the run with a 1 ms timer
+	/// task on the session runtime (packetization and transport share it).
+	#[arg(long)]
+	runtime_probe: bool,
+
+	/// After the measured run, compare N seconds attached with N seconds
+	/// detached (both media epochs paused by a reconnecting client's ANNOUNCE,
+	/// no PLAY), then PLAY again and report the time to the first frame.
+	#[arg(long, default_value_t = 0)]
+	detach_seconds: u64,
+
 	/// Run N launch → stream → stop → relaunch sessions through one session
 	/// manager, changing one negotiated setting per cycle.
 	#[arg(long, default_value_t = 0)]
@@ -115,6 +126,12 @@ struct Args {
 	/// retained application, changing one negotiated setting per cycle.
 	#[arg(long, default_value_t = 0)]
 	reconnect_cycles: u32,
+
+	/// Before the first `StartB` of `--reconnect-cycles`, reconnect twice (once
+	/// unchanged, once with a new resolution) as a client that completed PLAY and
+	/// disappeared would, then start. Each reconnect must finish within 10 s.
+	#[arg(long)]
+	reconnect_before_start: bool,
 
 	/// Seconds of streaming verified in each cycle.
 	#[arg(long, default_value_t = 2)]
@@ -861,6 +878,7 @@ async fn run_benchmark(
 		return Err(boxed_error("Session has no stream authorization"));
 	};
 
+	let (video_ctx_for_detach, audio_ctx_for_detach) = (video_ctx.clone(), audio_ctx.clone());
 	tracing::info!("Setting stream contexts...");
 	if let Err(err) = session_manager
 		.set_stream_context(&grant, video_ctx, audio_ctx, false)
@@ -894,13 +912,35 @@ async fn run_benchmark(
 	let ping_sock = UdpSocket::bind("127.0.0.1:0")?;
 	ping_sock.send_to(b"PING", ping_addr)?;
 	ping_sock.set_nonblocking(true)?;
-	let receiver = tokio::net::UdpSocket::from_std(ping_sock)?;
-	let _udp_receiver = DrainGuard(tokio::spawn(async move {
-		let mut buffer = [0u8; 65536];
-		while receiver.recv_from(&mut buffer).await.is_ok() {}
+	let receiver = std::sync::Arc::new(tokio::net::UdpSocket::from_std(ping_sock)?);
+	let _udp_receiver = DrainGuard(tokio::spawn({
+		let receiver = receiver.clone();
+		async move {
+			let mut buffer = [0u8; 65536];
+			while receiver.recv_from(&mut buffer).await.is_ok() {}
+		}
 	}));
+	let detach_contexts = (video_ctx_for_detach, audio_ctx_for_detach);
 
 	tracing::info!("Session active. Collecting stats...");
+	let probe = args.runtime_probe.then(|| {
+		let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+		let task = tokio::spawn({
+			let samples = samples.clone();
+			let warmup = Instant::now() + Duration::from_secs(args.warmup);
+			async move {
+				loop {
+					let started = Instant::now();
+					tokio::time::sleep(Duration::from_millis(1)).await;
+					let late = started.elapsed().saturating_sub(Duration::from_millis(1));
+					if Instant::now() >= warmup {
+						samples.lock().unwrap().push(late.as_micros() as u64);
+					}
+				}
+			}
+		});
+		(samples, DrainGuard(task))
+	});
 
 	let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
 	let mut accum = StatsAccumulator::new();
@@ -988,6 +1028,33 @@ async fn run_benchmark(
 	} else {
 		total.print_summary("Session")
 	};
+	if let Some((samples, _task)) = probe {
+		let mut samples = samples.lock().unwrap().clone();
+		samples.sort_unstable();
+		if !samples.is_empty() {
+			let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+			tracing::info!(
+				"Runtime probe: {} samples, timer lateness p50={}us p99={}us p99.9={}us max={}us",
+				samples.len(),
+				at(0.5),
+				at(0.99),
+				at(0.999),
+				samples[samples.len() - 1]
+			);
+		}
+	}
+
+	if args.detach_seconds > 0 && !interrupted {
+		detach_measurement(
+			&session_manager,
+			&mut stats_rx,
+			&receiver,
+			ping_addr,
+			detach_contexts,
+			Duration::from_secs(args.detach_seconds),
+		)
+		.await;
+	}
 
 	tracing::info!("Stopping session...");
 	let _ = session_manager.stop_session().await;
@@ -1001,6 +1068,156 @@ async fn run_benchmark(
 		summary,
 		interrupted,
 	})
+}
+
+/// CPU seconds used by this process and busy nanoseconds per DRM engine of
+/// its own GPU clients (`/proc/self/fdinfo`, deduplicated by client id). The
+/// application runs in its own unit and is not included.
+fn process_usage() -> (f64, std::collections::BTreeMap<String, u64>) {
+	let cpu = std::fs::read_to_string("/proc/self/stat")
+		.ok()
+		.and_then(|stat| {
+			// Fields after the parenthesized command; utime and stime are 14 and 15.
+			let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+			let ticks = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+			// USER_HZ is 100 on Linux.
+			Some(ticks as f64 / 100.0)
+		})
+		.unwrap_or(0.0);
+	let mut clients = std::collections::BTreeMap::<String, std::collections::BTreeMap<String, u64>>::new();
+	if let Ok(entries) = std::fs::read_dir("/proc/self/fdinfo") {
+		for entry in entries.flatten() {
+			let Ok(info) = std::fs::read_to_string(entry.path()) else {
+				continue;
+			};
+			let mut client = None;
+			let mut engines = std::collections::BTreeMap::new();
+			for line in info.lines() {
+				if let Some(id) = line.strip_prefix("drm-client-id:") {
+					client = Some(id.trim().to_string());
+				} else if let Some(rest) = line.strip_prefix("drm-engine-")
+					&& let Some((engine, value)) = rest.split_once(':')
+					&& let Some(ns) = value.trim().strip_suffix(" ns").and_then(|ns| ns.trim().parse().ok())
+				{
+					engines.insert(engine.to_string(), ns);
+				}
+			}
+			if let Some(client) = client {
+				clients.insert(client, engines);
+			}
+		}
+	}
+	let mut engines = std::collections::BTreeMap::new();
+	for client in clients.into_values() {
+		for (engine, ns) in client {
+			*engines.entry(engine).or_insert(0) += ns;
+		}
+	}
+	(cpu, engines)
+}
+
+/// Frames and resources used during `window`.
+struct Window {
+	frames: u64,
+	cpu_percent: f64,
+	gpu_ms_per_s: std::collections::BTreeMap<String, f64>,
+}
+
+async fn measure_window(stats_rx: &mut tokio::sync::broadcast::Receiver<FrameStats>, window: Duration) -> Window {
+	let (cpu_before, gpu_before) = process_usage();
+	let started = Instant::now();
+	let mut frames = 0;
+	let _ = tokio::time::timeout(window, async {
+		loop {
+			match stats_rx.recv().await {
+				Ok(_) => frames += 1,
+				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => frames += n,
+				Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+			}
+		}
+	})
+	.await;
+	let elapsed = started.elapsed().as_secs_f64();
+	let (cpu_after, gpu_after) = process_usage();
+	Window {
+		frames,
+		cpu_percent: (cpu_after - cpu_before) / elapsed * 100.0,
+		gpu_ms_per_s: gpu_after
+			.into_iter()
+			.map(|(engine, ns)| {
+				let before = gpu_before.get(&engine).copied().unwrap_or(0);
+				(engine, ns.saturating_sub(before) as f64 / 1e6 / elapsed)
+			})
+			.collect(),
+	}
+}
+
+/// Compare an attached window with a detached one (review 2026-10-05
+/// PERF-001): after a reconnecting client's ANNOUNCE pauses both media epochs
+/// and before its PLAY, no media should be produced. Then PLAY and time the
+/// first frame of the resumed epoch.
+async fn detach_measurement(
+	session_manager: &SessionManager,
+	stats_rx: &mut tokio::sync::broadcast::Receiver<FrameStats>,
+	receiver: &tokio::net::UdpSocket,
+	ping_addr: std::net::SocketAddr,
+	(video_ctx, audio_ctx): (VideoStreamContext, AudioStreamContext),
+	window: Duration,
+) {
+	let attached = measure_window(stats_rx, window).await;
+	let detached = async {
+		session_manager
+			.bench_resume(
+				SessionKeyData::new(RemoteInputKey::from_bytes([1; 16]), RemoteInputKeyId::new(1)),
+				std::net::Ipv4Addr::LOCALHOST.into(),
+			)
+			.await
+			.ok()?;
+		let grant = session_manager
+			.authorize_stream(std::net::Ipv4Addr::LOCALHOST.into())
+			.await?;
+		session_manager
+			.set_stream_context(&grant, video_ctx, audio_ctx, false)
+			.await
+			.ok()?;
+		// Let in-flight work drain before measuring.
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		while stats_rx.try_recv().is_ok() {}
+		let detached = measure_window(stats_rx, window).await;
+		let resumed = Instant::now();
+		session_manager.start_session(&grant).await.ok()?;
+		let _ = receiver.send_to(b"PING", ping_addr).await;
+		let first = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv()).await;
+		let first_frame = match first {
+			Ok(Ok(stats)) => Some((resumed.elapsed(), stats.is_key_frame)),
+			_ => None,
+		};
+		Some((detached, first_frame))
+	}
+	.await;
+	let Some((detached, first_frame)) = detached else {
+		tracing::error!("Detach measurement failed to pause or resume the session");
+		return;
+	};
+	for (label, w) in [("attached", &attached), ("detached", &detached)] {
+		tracing::info!(
+			"Detach measurement {label}: {} frames in {}s, process CPU {:.1}%, GPU ms/s {:?}",
+			w.frames,
+			window.as_secs(),
+			w.cpu_percent,
+			w.gpu_ms_per_s
+				.iter()
+				.map(|(engine, ms)| format!("{engine}={ms:.2}"))
+				.collect::<Vec<_>>()
+		);
+	}
+	match first_frame {
+		Some((latency, key)) => tracing::info!(
+			"Detach measurement resume: first frame after {:.1} ms (key frame: {key})",
+			latency.as_secs_f64() * 1000.0
+		),
+		None => tracing::error!("Detach measurement resume: no frame within 5 s"),
+	}
 }
 
 fn print_matrix_summary(reports: &[MatrixReport]) {

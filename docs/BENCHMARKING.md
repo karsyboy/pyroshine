@@ -53,6 +53,8 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
+| `--detach-seconds <N>` | `0` | After the run, measure N s attached, then N s with both media epochs paused by a reconnecting client's ANNOUNCE (no PLAY), then PLAY and time the first frame; reports frames, process CPU and per-engine GPU time of the benchmark process |
+| `--runtime-probe` | off | Run a 1 ms timer task on the session runtime and report its lateness percentiles (scheduling delay caused by packetization and transport) |
 
 ### Examples
 
@@ -89,6 +91,29 @@ Avoid concurrent compilation or other GPU work unless contention is the subject.
 A low-entropy cube cannot establish game quality or maximum-link throughput.
 The benchmark exercises server encoding/loopback sending, not Moonlight decode,
 display latency or physical network congestion.
+
+### Recording an identified baseline
+
+`scripts/record_baseline.py` records the provenance a comparison needs and a
+fixed workload set in one directory outside the checkout:
+
+```sh
+python3 scripts/record_baseline.py --out ~/pyroshine-baselines/$(git rev-parse --short HEAD) --netns
+```
+
+`manifest.json` identifies the commit (refusing an uncommitted tree unless
+`--allow-dirty`), Cargo.lock hash, Git-pinned crates, PyroWave and Inputtino
+pins, toolchain, kernel, CPU, memory, governor, GPU/driver and the PyroWave
+library found. The script rebuilds `moonshine-bench` immediately before
+measuring and records its hash, so a stale binary is never measured. It then
+runs each named workload `--repeats` times (default three) and 10 lifecycle and
+reconnect cycles, keeping raw logs, parsed final summaries, exit codes and the
+benchmark process's CPU time and peak RSS (the application runs in its own unit).
+The recorded PyroWave library is the one loaded. A workload that cannot run is listed under `not_run`.
+`--metadata-only` records provenance without running anything. It refuses to
+start while `moonshine-session.service` is active, because the benchmark would
+replace a live session; `--netns` keeps its ports and mDNS off the host network.
+Workload names are stable: add new ones rather than changing existing entries.
 
 ### Output
 
@@ -158,6 +183,10 @@ moonshine-bench --cycles 100 --cycle-log full.jsonl /usr/bin/vkcube
 # Authenticated resume → ANNOUNCE → PLAY epochs on one retained application.
 moonshine-bench --reconnect-cycles 100 --cycle-log reconnect.jsonl /usr/bin/vkcube
 ```
+
+`--reconnect-before-start` first reconnects twice (unchanged, then a new
+resolution) before the initial `StartB`, as for a client that disappeared
+after PLAY; each must complete within 10 s.
 
 Each cycle changes one property, in order: none (unchanged resume), resolution
 (1920x1080/1280x720), FPS (60/120), bitrate, codec (`--cycle-codecs`, default

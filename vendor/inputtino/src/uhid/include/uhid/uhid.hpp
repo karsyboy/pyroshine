@@ -1,4 +1,7 @@
 #pragma once
+#include <atomic>
+#include <sys/eventfd.h>
+#include <thread>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -21,8 +24,10 @@
 namespace uhid {
 struct ThreadState {
   int fd;
+  /// eventfd that interrupts the event thread's poll for a prompt stop.
+  int wake_fd = -1;
   std::function<void(const uhid_event &ev, int fd)> on_event;
-  bool stop_repeat_thread = false;
+  std::atomic<bool> stop_repeat_thread = false;
 };
 
 struct DeviceDefinition {
@@ -73,24 +78,32 @@ public:
     return uhid_write(state->fd, &ev);
   }
 
+  /// Stop the event thread and wait for it, so no `on_event` callback runs
+  /// afterwards. Idempotent. Never called from the event thread itself.
   inline void stop_thread() {
+    if (!state) {
+      return;
+    }
     state->stop_repeat_thread = true;
-    if (ev_thread->joinable()) {
-      ev_thread->join(); // let's wait for the thread to finish
+    if (state->wake_fd >= 0) {
+      eventfd_write(state->wake_fd, 1);
+    }
+    if (ev_thread && ev_thread->joinable() && ev_thread->get_id() != std::this_thread::get_id()) {
+      ev_thread->join();
     }
   }
 
   ~Device() {
     if (state) {
+      // Join before destroying and closing: the thread reads `fd`, and a
+      // closed descriptor number can be reused by an unrelated open.
+      stop_thread();
       struct uhid_event ev{};
       ev.type = UHID_DESTROY;
       uhid_write(state->fd, &ev);
-
-      close(state->fd); // This should also close the thread by causing a POLLHUP
-
-      state->stop_repeat_thread = true;
-      if (ev_thread->joinable()) {
-        ev_thread->join(); // let's wait for the thread to finish
+      close(state->fd);
+      if (state->wake_fd >= 0) {
+        close(state->wake_fd);
       }
     }
   }
@@ -125,15 +138,29 @@ inputtino::Result<Device> Device::create(const DeviceDefinition &definition,
   if (res) {
     auto state = std::make_shared<ThreadState>();
     state->fd = fd;
+    state->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (state->wake_fd < 0) {
+      auto error = inputtino::Error(strerror(errno));
+      close(fd);
+      return error;
+    }
     state->on_event = on_event;
+    // Owned (not detached): the device joins it before closing `fd`.
     auto thread = std::make_shared<std::thread>([state]() {
-      std::array<pollfd, 1> pfds = {pollfd{.fd = state->fd, .events = POLLIN}};
+      std::array<pollfd, 2> pfds = {pollfd{.fd = state->fd, .events = POLLIN},
+                                    pollfd{.fd = state->wake_fd, .events = POLLIN}};
       int poll_rs = 0;
 
       while (!state->stop_repeat_thread) {
         poll_rs = poll(pfds.data(), pfds.size(), UHID_POLL_TIMEOUT);
         if (poll_rs < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
           std::cerr << "Failed polling uhid fd; ret=" << strerror(errno) << std::endl;
+          break;
+        }
+        if (pfds[1].revents & POLLIN || state->stop_repeat_thread) {
           break;
         }
         if (pfds[0].revents & POLLHUP) {
@@ -157,7 +184,7 @@ inputtino::Result<Device> Device::create(const DeviceDefinition &definition,
         }
       }
     });
-    thread->detach();
+
     return inputtino::Result<Device>({std::move(thread), std::move(state)});
   } else {
     close(fd);

@@ -11,6 +11,7 @@
 #[cfg(all(dev, not(debug_assertions)))]
 compile_error!("release builds must enable the default `custom-protocol` feature");
 
+mod attach;
 mod commands;
 mod daemon;
 mod icons;

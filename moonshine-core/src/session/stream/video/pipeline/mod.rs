@@ -171,6 +171,57 @@ fn encoder_failure(stage: EncodeStage, error: &PixelForgeError) -> EncodeFailure
 	EncodeFailure::new(stage, recovery, SourceAccess::Completed, error.to_string())
 }
 
+/// The encoder-input contract of the conventional loop. The pinned Pixelforge
+/// encoder owns two input slots (`ENCODE_PIPELINE_DEPTH`): `input_image` is the
+/// current slot and every `encode` advances to the next one. Each captured
+/// frame is converted into `input_image` and encoded from it immediately, so a
+/// per-frame encode always reads the slot it just converted.
+trait EncoderInput {
+	type Future;
+	type Error;
+	fn input_image(&self) -> vk::Image;
+	fn encode(&mut self, image: vk::Image) -> Result<Self::Future, Self::Error>;
+}
+
+impl EncoderInput for Encoder {
+	type Future = EncodeFuture;
+	type Error = PixelForgeError;
+
+	fn input_image(&self) -> vk::Image {
+		Encoder::input_image(self)
+	}
+
+	fn encode(&mut self, image: vk::Image) -> Result<EncodeFuture, PixelForgeError> {
+		Encoder::encode(self, image)
+	}
+}
+
+/// Encode a recovery keyframe for a static scene: an IDR is pending (already
+/// requested from the encoder) and no new frame arrived.
+///
+/// After an `encode`, `input_image` is the *next* slot, which holds an older
+/// frame or none (review 2026-10-05 BUG-002). `restore` therefore first writes
+/// the latest converted frame into that slot (from the converter's output
+/// buffer, which still holds it) and only then is the slot encoded. A failed
+/// restore submits nothing.
+fn encode_static_recovery<E: EncoderInput>(
+	encoder: &mut E,
+	restore: impl FnOnce(&mut E, vk::Image) -> Result<(), E::Error>,
+) -> Result<E::Future, E::Error> {
+	let image = encoder.input_image();
+	restore(encoder, image)?;
+	encoder.encode(image)
+}
+
+/// Which converter's output buffer holds the latest converted frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastOutput {
+	/// The packed converter.
+	Packed,
+	/// Pixelforge's converter for this input format key.
+	Fallback(u32),
+}
+
 /// Apply a frame failure: release the source only if no GPU work can still
 /// read it, and return the recovery, or `Err` when the stream must stop.
 fn apply_failure(
@@ -337,8 +388,20 @@ enum ConsumerMessage {
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset.
-	ResetCounters(tokio::sync::oneshot::Sender<Result<(), ()>>),
+	ResetCounters(EpochActivation),
 }
+
+/// A request to activate the next client epoch: the authorization generation
+/// it is for and the acknowledgment the session manager awaits. The packet
+/// handler delivers that epoch only while its generation is current.
+pub(crate) struct EpochActivation {
+	pub generation: u64,
+	pub applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
+}
+
+/// Encoded frames at least this large are packetized with
+/// `tokio::task::block_in_place`; see `run_packet_consumer`.
+const PACKETIZE_OFFLOAD_BYTES: usize = 128 * 1024;
 
 /// An owned useful-work credit travels from submission through transport release.
 use super::shard_batch::NetworkCredit as InFlightGuard;
@@ -395,13 +458,14 @@ async fn run_packet_consumer(
 			fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 		}
 		let (frame_context, future, credit) = match msg {
-			ConsumerMessage::ResetCounters(applied) => {
+			ConsumerMessage::ResetCounters(EpochActivation { generation, applied }) => {
 				frame_number = 0;
 				sequence_number = 0;
 				let (ready, waiting) = tokio::sync::oneshot::channel();
 				if packet_tx
 					.send(VideoPacketMessage::BeginEpoch {
 						context: ctx.clone(),
+						generation,
 						ready,
 					})
 					.await
@@ -467,17 +531,31 @@ async fn run_packet_consumer(
 		let processing_latency = t_start.duration_since(frame_context.created_at);
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
-		let mut shards = match packetizer.packetize(
-			&packet.data,
-			is_key_frame,
-			ctx.packet_size,
-			fec_controller.minimum_packets(ctx.minimum_fec_packets),
-			fec_controller.percentage(),
-			frame_number,
-			&mut sequence_number,
-			rtp_timestamp,
-			latency_100us,
-		) {
+		let mut packetize = || {
+			packetizer.packetize(
+				&packet.data,
+				is_key_frame,
+				ctx.packet_size,
+				fec_controller.minimum_packets(ctx.minimum_fec_packets),
+				fec_controller.percentage(),
+				frame_number,
+				&mut sequence_number,
+				rtp_timestamp,
+				latency_100us,
+			)
+		};
+		// Large frames (FEC and encryption scale with size) can occupy a runtime
+		// worker for about a millisecond; let the runtime move its other tasks
+		// off this worker meanwhile. Ordering is unchanged: this task still
+		// packetizes one frame at a time (review 2026-10-05 PERF-002).
+		let offload = packet.data.len() >= PACKETIZE_OFFLOAD_BYTES
+			&& tokio::runtime::Handle::current().runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread;
+		let packetized = if offload {
+			tokio::task::block_in_place(packetize)
+		} else {
+			packetize()
+		};
+		let mut shards = match packetized {
 			Ok(shards) => shards,
 			// Drop just this frame rather than tearing down the session: the
 			// client sees a gap (the frame number was already consumed) and
@@ -649,13 +727,14 @@ impl VideoPipeline {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		reset_request_rx: std::sync::mpsc::Receiver<EpochActivation>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
+		demand: crate::session::stream::MediaDemand,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -668,6 +747,7 @@ impl VideoPipeline {
 			context,
 			keys_rx,
 			fec_feedback_rx,
+			demand: DemandTracker::new(demand),
 		};
 
 		// Capture the main (multi-threaded) runtime handle so the OS-threaded
@@ -711,6 +791,43 @@ struct VideoPipelineInner {
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
 	fec_feedback_rx: watch::Receiver<FrameFecStatus>,
+	demand: DemandTracker,
+}
+
+/// [`crate::session::stream::MediaDemand`] as the encoding loops see it: whether to produce,
+/// and whether a replay of the last frame may stand in for a fresh capture.
+struct DemandTracker {
+	demand: crate::session::stream::MediaDemand,
+	/// When demand last became wanted; `None` while it is clear. Only the
+	/// encoding thread touches it.
+	wanted_since: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl DemandTracker {
+	fn new(demand: crate::session::stream::MediaDemand) -> Self {
+		Self {
+			wanted_since: std::cell::Cell::new(demand.wanted().then(std::time::Instant::now)),
+			demand,
+		}
+	}
+
+	/// Whether media is wanted now; records the moment it resumed.
+	fn wanted(&self) -> bool {
+		let wanted = self.demand.wanted();
+		match (wanted, self.wanted_since.get()) {
+			(true, None) => self.wanted_since.set(Some(std::time::Instant::now())),
+			(false, Some(_)) => self.wanted_since.set(None),
+			_ => {},
+		}
+		wanted
+	}
+
+	/// A replay of the last produced frame (static-scene IDR, PyroWave resend)
+	/// is allowed only once a fresh capture had `grace` to arrive after media
+	/// resumed: the last frame may predate a detach.
+	fn may_replay(&self, grace: std::time::Duration) -> bool {
+		self.wanted() && self.wanted_since.get().is_some_and(|since| since.elapsed() >= grace)
+	}
 }
 
 impl VideoPipelineInner {
@@ -718,15 +835,16 @@ impl VideoPipelineInner {
 		&self,
 		runtime: &tokio::runtime::Handle,
 		packet_tx: &mpsc::Sender<VideoPacketMessage>,
-		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		activation: Option<EpochActivation>,
 	) -> Result<(), String> {
-		let Some(applied) = applied else {
+		let Some(EpochActivation { generation, applied }) = activation else {
 			return Ok(());
 		};
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		packet_tx
 			.blocking_send(VideoPacketMessage::BeginEpoch {
 				context: self.context.clone(),
+				generation,
 				ready,
 			})
 			.map_err(|_| "video packet channel closed during reconfiguration".to_string())?;
@@ -747,7 +865,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		mut reset_request_rx: std::sync::mpsc::Receiver<EpochActivation>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
@@ -756,17 +874,41 @@ impl VideoPipelineInner {
 	) {
 		tracing::debug!("Starting video pipeline.");
 
-		// Wait for the start signal before entering the encode loop.
-		if start.wait_blocking(&stop_session_manager).is_err() {
-			tracing::debug!("Video pipeline stopped before start signal.");
-			return;
-		}
-
-		let mut pending_applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>> = None;
+		// Encoding waits for `StartB`, but reconnect commands must not: a client
+		// can complete PLAY and disappear before sending it. Nothing has been
+		// produced yet, so a reset or reconfiguration only records the context
+		// and activates the transport epoch for its generation.
 		loop {
 			if stop_session_manager.is_shutdown_triggered() {
-				if let Some(applied) = pending_applied.take() {
-					let _ = applied.send(Err(()));
+				tracing::debug!("Video pipeline stopped before start signal.");
+				return;
+			}
+			if start.is_open() {
+				break;
+			}
+			let mut activations = Vec::new();
+			while let Ok(command) = reconfigure_rx.try_recv() {
+				self.context = command.context;
+				activations.push(EpochActivation {
+					generation: command.generation,
+					applied: command.applied,
+				});
+			}
+			activations.extend(std::iter::from_fn(|| reset_request_rx.try_recv().ok()));
+			for activation in activations {
+				if let Err(error) = self.activate_reconfigured_epoch(&runtime, &packet_tx, Some(activation)) {
+					tracing::error!(%error, "Video epoch activation before start failed");
+					return;
+				}
+			}
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+
+		let mut pending_applied: Option<EpochActivation> = None;
+		loop {
+			if stop_session_manager.is_shutdown_triggered() {
+				if let Some(activation) = pending_applied.take() {
+					let _ = activation.applied.send(Err(()));
 				}
 				break;
 			}
@@ -810,12 +952,15 @@ impl VideoPipelineInner {
 			match result {
 				Ok(Some(command)) => {
 					self.context = command.context;
-					pending_applied = Some(command.applied);
+					pending_applied = Some(EpochActivation {
+						generation: command.generation,
+						applied: command.applied,
+					});
 				},
 				Ok(None) => break,
 				Err(error) => {
-					if let Some(applied) = pending_applied.take() {
-						let _ = applied.send(Err(()));
+					if let Some(activation) = pending_applied.take() {
+						let _ = activation.applied.send(Err(()));
 					}
 					tracing::error!(%error, "Video encoding loop failed");
 					break;
@@ -895,12 +1040,12 @@ impl VideoPipelineInner {
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: &mut std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<EpochActivation>,
 		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		applied: Option<EpochActivation>,
 		runtime: &tokio::runtime::Handle,
 	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
@@ -987,6 +1132,8 @@ impl VideoPipelineInner {
 		let mut gpu_window_frames = 0u64;
 		let mut gpu_window_encodes = 0u64;
 		let mut failures = FailurePolicy::default();
+		// A requested replay of the last frame, kept until a frame is sent.
+		let mut resend_last = false;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			if let Ok(command) = reconfigure_rx.try_recv() {
@@ -996,12 +1143,11 @@ impl VideoPipelineInner {
 			if fec_feedback_rx.has_changed().unwrap_or(false) {
 				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 			}
-			let mut resend_last = false;
-			while let Ok(applied) = reset_request_rx.try_recv() {
+			while let Ok(activation) = reset_request_rx.try_recv() {
 				frame_rx.reset();
 				frame_number = 0;
 				sequence_number = 0;
-				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(applied))?;
+				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
 			}
@@ -1015,7 +1161,8 @@ impl VideoPipelineInner {
 			// encoder-state invalidation. Drain the channel so it cannot lag.
 			while invalidate_request_rx.try_recv().is_ok() {}
 
-			let mut received = match frame_rx.recv_timeout(frame_interval) {
+			// No captures while no client can receive them (PERF-001).
+			let mut received = match frame_rx.recv_timeout_if(frame_interval, self.demand.wanted()) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1034,6 +1181,7 @@ impl VideoPipelineInner {
 					continue;
 				}
 				gpu_window_encodes += 1;
+				resend_last = false;
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
 				let pacing_origin = frame.pacing_origin();
@@ -1077,10 +1225,11 @@ impl VideoPipelineInner {
 					buffer_index,
 					received_at.saturating_duration_since(created_at),
 				)
-			} else if resend_last {
+			} else if resend_last && self.demand.may_replay(2 * frame_interval) {
 				let Some(encoded) = last_encoded.take() else {
 					continue;
 				};
+				resend_last = false;
 				(
 					encoded,
 					std::time::Instant::now(),
@@ -1089,7 +1238,10 @@ impl VideoPipelineInner {
 					std::time::Duration::ZERO,
 				)
 			} else {
-				if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+				if !self.demand.wanted() {
+					// No client: captures are not requested, so none arrive.
+					last_frame_time = std::time::Instant::now();
+				} else if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
 					tracing::warn!("No frames received for 5 seconds");
 					last_frame_time = std::time::Instant::now();
 				}
@@ -1229,12 +1381,12 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: &mut std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<EpochActivation>,
 		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		applied: Option<EpochActivation>,
 	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
 		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
@@ -1363,6 +1515,11 @@ impl VideoPipelineInner {
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
+		// The converter output holding the latest frame, for static recovery.
+		let mut last_output: Option<LastOutput> = None;
+		// A requested IDR not yet submitted. Persistent across iterations so a
+		// recovery that cannot be admitted yet (network credits) is retried.
+		let mut pending_idr = false;
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
@@ -1403,7 +1560,6 @@ impl VideoPipelineInner {
 				consumer.join()?;
 				return Ok(reconfigure);
 			}
-			let mut pending_idr = false;
 
 			// Drain any pending stream-reset requests (client reconnect/resume).
 			//
@@ -1415,12 +1571,12 @@ impl VideoPipelineInner {
 			// ("Your network connection isn't performing well"). Reset the frame and RTP
 			// sequence counters and force an IDR so the resumed client sees a clean stream
 			// starting from frame 1.
-			while let Ok(applied) = reset_request_rx.try_recv() {
+			while let Ok(activation) = reset_request_rx.try_recv() {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				frame_rx.reset();
 				// The consumer orders activation after every old encoder future/batch.
 				frame_ctx_tx
-					.blocking_send(ConsumerMessage::ResetCounters(applied))
+					.blocking_send(ConsumerMessage::ResetCounters(activation))
 					.map_err(|_| "video consumer stopped during resume".to_string())?;
 				frame_number_base = submitted_count;
 				encoder.request_idr();
@@ -1468,19 +1624,57 @@ impl VideoPipelineInner {
 			}
 
 			// Try to receive a frame from compositor (with timeout).
-			let received_frame = match frame_rx.recv_timeout_if(frame_interval, conventional_can_admit(&in_flight)) {
+			// No captures while no client can receive them (PERF-001).
+			let received_frame = match frame_rx.recv_timeout_if(
+				frame_interval,
+				conventional_can_admit(&in_flight) && self.demand.wanted(),
+			) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
-					// re-encode the encoder's input image (still contains
-					// the last frame's data after color conversion).
-					if pending_idr && has_encoded && conventional_can_admit(&in_flight) {
+					// re-encode the static scene from the latest converted frame
+					// (see `encode_static_recovery`).
+					if pending_idr
+						&& has_encoded && last_output.is_some()
+						&& conventional_can_admit(&in_flight)
+						&& self.demand.may_replay(2 * frame_interval)
+					{
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
-						match encoder.encode(encoder.input_image()) {
+						let restore = |_: &mut Encoder, target: vk::Image| -> Result<(), PixelForgeError> {
+							let restored = match last_output {
+								Some(LastOutput::Packed) => input_converter
+									.as_ref()
+									.map_or(Ok(false), |converter| converter.copy_last_output(target)),
+								Some(LastOutput::Fallback(key)) => match color_converters.get(&key) {
+									Some((converter, _)) => convert::copy_output_to_input(
+										&context,
+										context.compute_queue(),
+										context.compute_queue_family(),
+										converter.output_buffer(),
+										output_format,
+										ctx.width,
+										ctx.height,
+										target,
+									)
+									.map(|()| true),
+									None => Ok(false),
+								},
+								None => Ok(false),
+							};
+							match restored {
+								Ok(true) => Ok(()),
+								Ok(false) => Err(PixelForgeError::CommandBuffer(
+									"no converted frame to recover from".to_string(),
+								)),
+								Err(e) => Err(PixelForgeError::Vulkan(e)),
+							}
+						};
+						match encode_static_recovery(&mut encoder, restore) {
 							Ok(future) => {
+								pending_idr = false;
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
@@ -1509,7 +1703,10 @@ impl VideoPipelineInner {
 							},
 						}
 					}
-					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+					if !self.demand.wanted() {
+						// No client: captures are not requested, so none arrive.
+						last_frame_time = std::time::Instant::now();
+					} else if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
 						tracing::warn!("No frames received for 5 seconds");
 						last_frame_time = std::time::Instant::now();
 					}
@@ -1802,6 +1999,9 @@ impl VideoPipelineInner {
 				};
 
 				// Convert to YUV.
+				if converted.is_err() {
+					last_output = None;
+				}
 				if let Err(e) = converted {
 					// Both converters submit the conversion and wait for its fence; an
 					// error may follow a submission whose reads are still pending.
@@ -1842,6 +2042,11 @@ impl VideoPipelineInner {
 				// The DMA-BUF content has been read into the encoder's input
 				// image — signal the compositor that this GBM buffer is free.
 				frame.consumed.store(true, Ordering::Release);
+				last_output = Some(if input_converter.is_some() {
+					LastOutput::Packed
+				} else {
+					LastOutput::Fallback(frame.format)
+				});
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
@@ -1882,6 +2087,8 @@ impl VideoPipelineInner {
 				match encode_result {
 					Ok(future) => {
 						failures.record_success();
+						// Any requested IDR applies to this submitted frame.
+						pending_idr = false;
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
@@ -1991,7 +2198,7 @@ mod tests {
 		BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost,
 		rtp_timestamp_for_frame,
 	};
-	use ash::vk;
+	use ash::vk::{self, Handle};
 	use pixelforge::{InputFormat, PixelForgeError};
 
 	#[tokio::test]
@@ -2020,9 +2227,16 @@ mod tests {
 				fec_rx,
 			));
 			let (applied, mut waiting) = tokio::sync::oneshot::channel();
-			consumer_tx.send(ConsumerMessage::ResetCounters(applied)).await.unwrap();
+			consumer_tx
+				.send(ConsumerMessage::ResetCounters(EpochActivation {
+					generation: 7,
+					applied,
+				}))
+				.await
+				.unwrap();
 			let Some(VideoPacketMessage::BeginEpoch {
 				context: activated,
+				generation: 7,
 				ready,
 			}) = packet_rx.recv().await
 			else {
@@ -2200,6 +2414,114 @@ mod tests {
 		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
 		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
 		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
+	}
+
+	/// Review 2026-10-05 PERF-001: replays wait for a fresh capture's chance
+	/// after media resumes, and never happen while it is not wanted.
+	#[test]
+	fn replays_need_demand_and_a_grace_after_resuming() {
+		let demand = crate::session::stream::MediaDemand::new();
+		let tracker = super::DemandTracker::new(demand.clone());
+		let grace = std::time::Duration::from_millis(30);
+		std::thread::sleep(grace);
+		assert!(tracker.wanted() && tracker.may_replay(grace));
+		demand.set(false);
+		assert!(!tracker.wanted() && !tracker.may_replay(grace));
+		demand.set(true);
+		assert!(tracker.wanted());
+		assert!(!tracker.may_replay(grace), "the last frame may predate the pause");
+		std::thread::sleep(grace);
+		assert!(tracker.may_replay(grace));
+	}
+
+	/// A model of the pinned Pixelforge input-slot contract: two slots,
+	/// `input_image` returns the current one and `encode` advances. It records
+	/// which converted content each encode read. The real encoder is pinned to
+	/// this model by `convert::tests::encoder_input_slots_rotate_on_gpu`.
+	#[derive(Default)]
+	struct FakeSlots {
+		slots: [Option<char>; 2],
+		current: usize,
+		encoded: Vec<Option<char>>,
+		/// The converter's output buffer: the latest converted content.
+		converted: Option<char>,
+	}
+
+	impl FakeSlots {
+		/// The conventional loop's per-frame step: convert into the current
+		/// input image, then encode that image.
+		fn convert_and_encode(&mut self, content: char) {
+			use super::EncoderInput;
+			let target = self.input_image();
+			self.slots[target.as_raw() as usize - 1] = Some(content);
+			self.converted = Some(content);
+			let image = self.input_image();
+			self.encode(image).unwrap();
+		}
+	}
+
+	impl super::EncoderInput for FakeSlots {
+		type Future = ();
+		type Error = ();
+
+		fn input_image(&self) -> vk::Image {
+			vk::Image::from_raw(self.current as u64 + 1)
+		}
+
+		fn encode(&mut self, image: vk::Image) -> Result<(), ()> {
+			self.encoded.push(self.slots[image.as_raw() as usize - 1]);
+			self.current = (self.current + 1) % self.slots.len();
+			Ok(())
+		}
+	}
+
+	/// Current behavior to retain: a captured frame is encoded from the slot
+	/// it was just converted into.
+	#[test]
+	fn per_frame_encodes_read_the_slot_just_converted() {
+		let mut encoder = FakeSlots::default();
+		for content in ['A', 'B', 'C', 'D', 'E'] {
+			encoder.convert_and_encode(content);
+		}
+		assert_eq!(encoder.encoded, ['A', 'B', 'C', 'D', 'E'].map(Some).to_vec());
+	}
+
+	/// The pipeline's restore step: copy the converter output into the slot.
+	fn restore(encoder: &mut FakeSlots, target: vk::Image) -> Result<(), ()> {
+		encoder.slots[target.as_raw() as usize - 1] = Some(encoder.converted.ok_or(())?);
+		Ok(())
+	}
+
+	/// Review 2026-10-05 BUG-002: with no new frame, a recovery keyframe must
+	/// encode the latest converted scene, after one, two or many frames, and
+	/// repeated recoveries keep encoding it.
+	#[test]
+	fn static_recovery_encodes_the_latest_converted_frame() {
+		for preceding in [1usize, 2, 5] {
+			let mut encoder = FakeSlots::default();
+			let frames: Vec<char> = ('A'..).take(preceding).collect();
+			for &content in &frames {
+				encoder.convert_and_encode(content);
+			}
+			super::encode_static_recovery(&mut encoder, restore).unwrap();
+			let latest = *frames.last().unwrap();
+			assert_eq!(
+				encoder.encoded.last().copied().flatten(),
+				Some(latest),
+				"review 2026-10-05 BUG-002: after {preceding} frame(s), static recovery encoded {:?} instead of the latest frame {latest:?}",
+				encoder.encoded.last().copied().flatten()
+			);
+			super::encode_static_recovery(&mut encoder, restore).unwrap();
+			assert_eq!(
+				encoder.encoded.last().copied().flatten(),
+				Some(latest),
+				"repeated recovery"
+			);
+		}
+		// Without a converted frame nothing is submitted.
+		let mut encoder = FakeSlots::default();
+		assert!(super::encode_static_recovery(&mut encoder, restore).is_err());
+		assert!(encoder.encoded.is_empty());
 	}
 
 	#[test]

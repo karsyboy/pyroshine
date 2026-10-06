@@ -1,5 +1,7 @@
 #pragma once
+#include <atomic>
 #include <functional>
+#include <mutex>
 #include <inputtino/input.hpp>
 #include <optional>
 #include <uhid/ps5.hpp>
@@ -7,6 +9,11 @@
 
 namespace inputtino {
 struct PS5JoypadState {
+  /// Guards `current_state`, `last_touch_id`, the callbacks and the trigger
+  /// caches: setters run on the caller's thread, reports on the report thread
+  /// and feedback parsing on the UHID event thread. Never held while a
+  /// callback runs or a report is written.
+  std::mutex mutex;
   std::shared_ptr<uhid::Device> dev;
   /**
    * This will be the MAC address of the device
@@ -31,7 +38,7 @@ struct PS5JoypadState {
   uint32_t last_left_trigger_event = 0;
   uint32_t last_right_trigger_event = 0;
 
-  bool stop_repeat_thread = false;
+  std::atomic<bool> stop_repeat_thread = false;
   bool is_bluetooth = true;
 };
 } // namespace inputtino

@@ -142,7 +142,7 @@ impl ControlPeers {
 	pub(super) fn keep_alive(&mut self, peer: PeerId, now: Instant) -> bool {
 		match &mut self.active {
 			Some(active) if active.id == peer => {
-				active.deadline = now + self.liveness;
+				active.deadline = liveness_deadline(now, self.liveness);
 				true
 			},
 			_ => false,
@@ -230,11 +230,20 @@ impl ControlPeers {
 			self.candidates.retain(|candidate| *candidate != peer);
 			self.active = Some(ActivePeer {
 				id: peer,
-				deadline: Instant::now() + self.liveness,
+				deadline: liveness_deadline(Instant::now(), self.liveness),
 			});
 		}
 		Ok(plaintext)
 	}
+}
+
+/// `now + liveness`, saturating instead of panicking for a liveness the
+/// clock cannot represent. Configuration bounds the timeout; this keeps the
+/// arithmetic safe for any `Duration`.
+fn liveness_deadline(now: Instant, liveness: Duration) -> Instant {
+	now.checked_add(liveness)
+		.or_else(|| now.checked_add(Duration::from_secs(u64::from(u32::MAX))))
+		.unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -290,6 +299,41 @@ mod tests {
 		}
 		for sequence in 3 * REPLAY_WINDOW + 1..4 * REPLAY_WINDOW {
 			assert!(!window.accept(sequence), "sequence {sequence}");
+		}
+	}
+
+	/// Review 2026-10-05 CFG-001: `[stream].timeout` is the active peer's
+	/// liveness deadline and is not range-checked at startup. Zero would
+	/// retire every authenticated client at once, so validation must reject it;
+	/// any value validation accepts must not overflow the deadline arithmetic
+	/// once a peer authenticates.
+	#[test]
+	fn configured_liveness_cannot_expire_immediately_or_overflow() {
+		let parse =
+			|timeout: u64| toml::from_str::<crate::config::Config>(&format!("[stream]\ntimeout = {timeout}")).unwrap();
+		assert_eq!(
+			parse(60).stream.timeout,
+			60,
+			"fixture: the file sets the stream timeout"
+		);
+		assert!(
+			parse(0).validate().is_err(),
+			"review 2026-10-05 CFG-001: stream.timeout = 0 passed startup validation"
+		);
+		// The largest integer a TOML file can hold.
+		let largest = i64::MAX as u64;
+		if parse(largest).validate().is_ok() {
+			let auth = authorization(1);
+			let mut peers = ControlPeers::new(1, Duration::from_secs(largest));
+			assert!(peers.connect(peer(0), local(1), auth.control_connect_data(), &auth));
+			let request_idr = encode_client_control(&KEY, 0, &plaintext_control(0x0302, &[]));
+			let authenticated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				peers.authenticate(peer(0), &request_idr, &KEY)
+			}));
+			assert!(
+				authenticated.is_ok_and(|result| result.is_ok()),
+				"review 2026-10-05 CFG-001: an accepted stream.timeout overflowed the liveness deadline"
+			);
 		}
 	}
 

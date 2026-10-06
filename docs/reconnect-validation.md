@@ -94,6 +94,14 @@ new-epoch activation. Repeat disconnect/reconnect several times and inspect
 resource counts for accumulating buffers, imports, fds or input devices. Check
 input release/recreation and HDR metadata alongside visible video/audio.
 
+Resume a session whose client completed PLAY but never sent `StartB` (quit
+the client right after the stream window appears), once with unchanged and
+once with changed settings; both must complete without waiting for the old
+client. `moonshine-bench --reconnect-cycles N --reconnect-before-start`
+automates this against the real pipeline. After a `/resume` from another
+client, the previous client must stop receiving video and audio before the
+new client's ANNOUNCE.
+
 Exercise cancellation while waiting for negotiation/start and during active
 sending. Unsupported negotiations must fail cleanly rather than silently change
 codec/format; confirm the host can recover through the normal lifecycle. Record
@@ -112,7 +120,7 @@ Teardown is ordered and complete ([session ownership](ARCHITECTURE.md#session-ow
   compositor cannot apply) ends the session, application included, rather than
   continuing with partially changed settings;
 - stop the service during streaming: it exits only after the unit stopped, within
-  the 16 s teardown deadline.
+  the 25 s teardown deadline.
 
 Unit tests of reconnect decisions and epoch barriers do not prove remote-client
 resume. Include relevant [compositor checks](COMPOSITOR.md#validation-and-runtime-checks)

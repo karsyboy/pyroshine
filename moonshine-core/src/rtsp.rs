@@ -350,7 +350,7 @@ impl RtspServer {
 		cseq: i32,
 		grant: &StreamAuthorization,
 	) -> rtsp_types::Response<Vec<u8>> {
-		let sdp_session = match sdp_types::Session::parse(request.body()) {
+		let sdp_session = match parse_sdp(request.body()) {
 			Ok(sdp_session) => sdp_session,
 			Err(e) => {
 				tracing::warn!("Failed to parse ANNOUNCE request as SDP session: {e}");
@@ -974,6 +974,24 @@ fn negotiated_video_axes(
 	Ok((dynamic, chroma, depth))
 }
 
+/// Parse an ANNOUNCE body as SDP.
+///
+/// `sdp-types` 0.1.8 panics on some malformed bodies: its session loop stops
+/// at a line that is not `<type>=<value>` and hands the following line to the
+/// media parser, which asserts it is an `m=` line. Every line is checked for
+/// that form first, as the parser's own tokenizer would, so such a body is an
+/// error instead.
+fn parse_sdp(body: &[u8]) -> Result<sdp_types::Session, String> {
+	let malformed = body
+		.split(|byte| *byte == b'\n')
+		.map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+		.position(|line| !line.is_empty() && line.iter().position(|byte| *byte == b'=') != Some(1));
+	if let Some(index) = malformed {
+		return Err(format!("line {} is not in <type>=<value> form", index + 1));
+	}
+	sdp_types::Session::parse(body).map_err(|error| error.to_string())
+}
+
 fn bitrate_bps_from_kbps(bitrate_kbps: u64) -> Option<usize> {
 	bitrate_kbps
 		.checked_mul(1000)
@@ -1107,6 +1125,118 @@ mod tests {
 			}
 			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 		}
+		/// A malformed line after the session lines made `sdp-types` panic
+		/// (found by the ANNOUNCE fuzz test); it is now a 400.
+		#[tokio::test]
+		async fn malformed_sdp_lines_are_a_bad_request() {
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let server = RtspServer::for_test(manager, RtspLimits::default());
+			for body in [
+				"v=0\r\nbad\r\na=x:1\r\n",
+				"v=0\r\ns=x\r\nab=c\r\na=x:1\r\n",
+				"v=0\r\n=x\r\na=x:1\r\n",
+			] {
+				assert!(parse_sdp(body.as_bytes()).is_err(), "{body:?}");
+				let (status, _) = announce(&server, &grant, body.to_string()).await;
+				assert_eq!(status, 400, "{body:?}");
+			}
+			// Well-formed bodies, including blank lines, still parse.
+			assert!(parse_sdp(b"v=0\r\n\r\ns=x\r\na=x:1\r\n").is_ok());
+			assert!(parse_sdp(sdp(&[]).as_bytes()).is_ok());
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+
+		/// Section 9 B: mutated SDP bodies (bad numbers, duplicated or cut
+		/// attributes, non-UTF-8) are refused with a defined status and never
+		/// panic; no session is launched, so none can be accepted.
+		#[tokio::test]
+		async fn mutated_announcements_are_rejected_without_panicking() {
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			server.supported_codecs = CODEC_HEVC;
+			server.video_config.encrypt = true;
+			let corpus = [
+				sdp(&[]),
+				sdp(&[
+					("x-nv-audio.surround.enable", "1"),
+					("x-nv-audio.surround.numChannels", "8"),
+				]),
+				sdp(&[
+					("x-ss-video[0].chromaSamplingType", "1"),
+					("x-nv-video[0].dynamicRangeMode", "1"),
+				]),
+			]
+			.map(String::into_bytes);
+			let mut fuzz = crate::test_fuzz::Mutator::new("rtsp-announce");
+			for _ in 0..crate::test_fuzz::iterations(2_000) {
+				let body = fuzz.mutate(&corpus);
+				let request = rtsp_types::Request::builder(Method::Announce, rtsp_types::Version::V1_0)
+					.header(headers::CSEQ, "6")
+					.build(body.clone());
+				let status: u16 = server
+					.handle_announce_request(&request, 6, &grant)
+					.await
+					.status()
+					.into();
+				// 400 invalid, 415 unsupported combination, 500 no session.
+				assert!(
+					matches!(status, 400 | 415 | 500),
+					"{status} for {:?}",
+					String::from_utf8_lossy(&body)
+				);
+			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+	}
+
+	/// Review 2026-10-05 CFG-001: SETUP advertises configured listener ports.
+	/// A configuration that passes startup validation must not make it hand a
+	/// client port 0: either validation rejects ephemeral advertised ports or
+	/// SETUP reports the ports actually bound.
+	mod advertised_ports {
+		use super::super::*;
+
+		#[tokio::test]
+		async fn validated_configuration_never_advertises_port_zero() {
+			let mut config = crate::config::Config::default();
+			config.stream.video.port = 0;
+			config.stream.audio.port = 0;
+			config.stream.control.port = 0;
+			if config.validate().is_err() {
+				return;
+			}
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			server.video_config = config.stream.video.clone();
+			server.audio_config = config.stream.audio.clone();
+			server.control_config = config.stream.control.clone();
+			for stream in ["video", "audio", "control"] {
+				let raw = normalize_request_target(
+					format!(
+						"SETUP streamid={stream}/0/0 RTSP/1.0\r\nCSeq: 3\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\n\r\n"
+					)
+					.into_bytes(),
+				);
+				let (rtsp_types::Message::Request(request), _) = rtsp_types::Message::<Vec<u8>>::parse(&raw).unwrap()
+				else {
+					panic!("SETUP fixture is a request");
+				};
+				let response = server.handle_setup_request(&request, 3, &grant);
+				assert_eq!(response.status(), rtsp_types::StatusCode::Ok, "{stream}");
+				let transport = response.header(&headers::TRANSPORT).unwrap().as_str().to_owned();
+				assert_ne!(
+					transport, "server_port=0",
+					"review 2026-10-05 CFG-001: SETUP advertised port 0 for {stream} from a validated configuration"
+				);
+			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
 	}
 
 	mod framing {
@@ -1172,6 +1302,43 @@ mod tests {
 				RtspRequestFramer::default().push(conflicting),
 				Err(RtspRequestError::InvalidContentLength)
 			);
+		}
+
+		/// Section 9 B: mutated requests delivered in arbitrary reads either
+		/// frame within the bounds (and then parse or fail cleanly) or are
+		/// rejected; the buffer never grows past the header bound unframed.
+		#[test]
+		fn mutated_requests_frame_within_bounds() {
+			let corpus = vec![
+				OPTIONS.to_vec(),
+				announce("v=0\r\ns=x\r\na=x-nv-video[0].maxFPS:60\r\n"),
+				b"SETUP streamid=video/0/0 RTSP/1.0\r\nCSeq: 3\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\n\r\n".to_vec(),
+				b"PLAY / RTSP/1.0\r\nCSeq: 7\r\n\r\n".to_vec(),
+				b"DESCRIBE rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 2\r\n\r\n".to_vec(),
+			];
+			let mut fuzz = crate::test_fuzz::Mutator::new("rtsp-framing");
+			let mut framed = 0;
+			for _ in 0..crate::test_fuzz::iterations(20_000) {
+				let input = fuzz.mutate(&corpus);
+				let mut framer = RtspRequestFramer::default();
+				for chunk in fuzz.chunks(&input) {
+					match framer.push(chunk) {
+						Ok(Some(request)) => {
+							assert!(request.len() <= MAX_RTSP_HEADER_BYTES + MAX_RTSP_BODY_BYTES);
+							assert!(input.starts_with(&request));
+							let request = normalize_request_target(request);
+							let _ = rtsp_types::Message::<Vec<u8>>::parse(&request);
+							framed += 1;
+							break;
+						},
+						Ok(None) => {
+							assert!(framer.total_length.is_some() || framer.buffer.len() <= MAX_RTSP_HEADER_BYTES)
+						},
+						Err(_) => break,
+					}
+				}
+			}
+			assert!(framed > 1_000, "the corpus still frames: {framed}");
 		}
 
 		#[tokio::test]
@@ -1337,6 +1504,60 @@ mod tests {
 			let mut response = Vec::new();
 			fragmented.read_to_end(&mut response).await.unwrap();
 			assert!(response.starts_with(b"RTSP/1.0 200 "));
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+
+		/// Section 9 B: mutated requests from the authorized client are each
+		/// answered or closed within the request deadline, concurrently, and a
+		/// valid request still succeeds afterwards.
+		#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+		async fn mutated_requests_are_answered_or_closed_in_time() {
+			let (server, grant, shutdown) = start().await;
+			let corpus = vec![
+				b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\n".to_vec(),
+				format!(
+					"SETUP streamid=video/0/0 RTSP/1.0\r\nCSeq: 3\r\nX-SS-Ping-Payload: {}\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\n\r\n",
+					grant.ping_payload(MediaStream::Video)
+				)
+				.into_bytes(),
+				b"ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nContent-length: 12\r\n\r\nv=0\r\ns=x\r\n\r\n".to_vec(),
+				b"PLAY / RTSP/1.0\r\nCSeq: 7\r\n\r\n".to_vec(),
+			];
+			let mut fuzz = crate::test_fuzz::Mutator::new("rtsp-server");
+			let deadline = LIMITS.request_timeout + LIMITS.response_timeout + Duration::from_secs(1);
+			for _ in 0..crate::test_fuzz::iterations(32) {
+				// Below the connection limit, so every request is admitted.
+				let mut exchanges = tokio::task::JoinSet::new();
+				for request in (0..8).map(|_| fuzz.mutate(&corpus)) {
+					exchanges.spawn(async move {
+						let mut stream = connect_from("127.0.0.1", server).await;
+						let started = Instant::now();
+						let _ = stream.write_all(&request).await;
+						let mut response = Vec::new();
+						let closed = tokio::time::timeout(deadline, stream.read_to_end(&mut response)).await;
+						assert!(
+							closed.is_ok(),
+							"held past {deadline:?}: {:?}",
+							String::from_utf8_lossy(&request)
+						);
+						assert!(started.elapsed() < deadline);
+						assert!(
+							response.is_empty() || response.starts_with(b"RTSP/"),
+							"{:?}",
+							String::from_utf8_lossy(&response)
+						);
+					});
+				}
+				while let Some(exchange) = exchanges.join_next().await {
+					exchange.unwrap();
+				}
+			}
+			let options = b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+			assert!(
+				exchange("127.0.0.1", server, options)
+					.await
+					.starts_with("RTSP/1.0 200 ")
+			);
 			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 		}
 	}

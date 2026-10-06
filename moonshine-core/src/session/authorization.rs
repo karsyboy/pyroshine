@@ -222,6 +222,37 @@ mod tests {
 		assert!(!auth.admits_media_ping(MediaStream::Video, from("192.168.1.20", 5), b"PING"));
 	}
 
+	/// Section 9 B: no mutation of a valid, legacy or other-stream ping is
+	/// admitted unless it still carries the stream's payload from the client's
+	/// address (only the counter may vary), with or without session IDs.
+	#[test]
+	fn mutated_pings_never_discover_an_endpoint() {
+		let mut fuzz = crate::test_fuzz::Mutator::new("media-ping");
+		for session_id in [false, true] {
+			let mut auth = authorization();
+			if session_id {
+				auth.require_session_id();
+			}
+			let corpus = [
+				session_ping(auth.ping_payload(MediaStream::Video), 1),
+				session_ping(auth.ping_payload(MediaStream::Audio), u32::MAX),
+				b"PING".to_vec(),
+			];
+			for _ in 0..crate::test_fuzz::iterations(20_000) {
+				let datagram = fuzz.mutate(&corpus);
+				let source = ["192.168.1.20", "::ffff:192.168.1.20", "192.168.1.21", "fd00::20"][fuzz.below(4)];
+				for stream in [MediaStream::Audio, MediaStream::Video] {
+					let admitted = auth.admits_media_ping(stream, from(source, 9), &datagram);
+					let expected = source.ends_with("192.168.1.20")
+						&& ((datagram.len() == SESSION_PING_LENGTH
+							&& datagram[..PING_PAYLOAD_LENGTH] == *auth.ping_payload(stream).as_bytes())
+							|| (datagram == LEGACY_PING && !session_id));
+					assert_eq!(admitted, expected, "{stream:?} from {source}: {datagram:02x?}");
+				}
+			}
+		}
+	}
+
 	#[test]
 	fn stale_generation_payload_is_rejected() {
 		let old = authorization();

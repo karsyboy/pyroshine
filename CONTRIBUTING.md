@@ -181,6 +181,59 @@ MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
   -- --ignored --exact --nocapture
 ```
 
+The Pixelforge encoder-input slot contract, and the decoded static-scene
+recovery check for every conventional codec (needs `ffmpeg`):
+
+```sh
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
+  session::stream::video::pipeline::convert::tests::encoder_input_slots_rotate_on_gpu \
+  -- --ignored --exact --nocapture
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
+  session::stream::video::pipeline::convert::tests::static_recovery_decodes_to_the_latest_frame_on_gpu \
+  -- --ignored --exact --nocapture
+```
+
+Parsers and protocol handlers for client input (RTSP framing, SDP, control,
+input, media PING and PulseAudio clients) have seeded, bounded fuzz tests in
+the ordinary suite. A longer campaign scales their iterations, and another
+seed gives a different reproducible input sequence:
+
+```sh
+MOONSHINE_FUZZ_ITERATIONS=50 MOONSHINE_FUZZ_SEED=7 \
+  cargo test -p moonshine-core --lib -- mutated_ arbitrary_bytes_never_panic
+```
+
+### Known-defect characterizations
+
+Confirmed findings that are not fixed yet have tests stating the corrected
+contract, ignored with a `known defect: review 2026-10-05 <ID>` reason and
+listed in [`scripts/known_defects.toml`](scripts/known_defects.toml). CI runs
+`python3 scripts/known_defects.py`, which requires each one to fail with its
+recorded message, builds the hardware-independent native controller tests in
+`vendor/inputtino` with AddressSanitizer/UBSan and runs them with CTest. A
+fix removes the test's `#[ignore]` (or the CTest `DISABLED` property) and its
+manifest entry in the same change; the checker reports a known-defect test
+that passes as an error. GPU entries run only with `--gpu` and are otherwise
+reported as not run.
+
+With a user systemd session, the application-unit stop cases (slow exit,
+ignored SIGTERM, descendants, failing post hook):
+
+```sh
+MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core \
+  session::application::tests::transient_unit_stop_establishes_termination \
+  -- --ignored --exact --nocapture
+```
+
+With access to `/dev/uhid` and `/dev/uinput` (the installed udev rules grant
+it to the seat user), native controller thread lifetimes under ThreadSanitizer
+and through the Rust wrapper:
+
+```sh
+python3 scripts/known_defects.py --skip-rust --native-devices
+MOONSHINE_TEST_DEVICES=1 cargo test -p moonshine-core native_devices_join -- --ignored --nocapture
+```
+
 Repeated-session acceptance on real hardware uses the benchmark's
 [lifecycle cycles](docs/BENCHMARKING.md#lifecycle-cycles).
 
@@ -200,6 +253,20 @@ as you make them. Keep entries concise and focused on user-visible behavior;
 use `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` sections.
 The [upstream history](docs/UPSTREAM_CHANGELOG.md) is an archive and should not
 receive new fork release entries.
+
+The release workflow validates the exact tagged commit before building it:
+formatting, Clippy, rustdoc, the workspace tests, the pinned PyroWave FFI
+check (it must run, not be skipped), `scripts/known_defects.py` with the
+native sanitizer tests, and the desktop app checks. It records the commit,
+`Cargo.lock` hash, Git and native pins, toolchain and every suite's result in
+`release-validation.json`, published with the release and included in
+`SHA256SUMS`. Building and publishing then waits for approval in the GitHub
+`release` environment: configure required reviewers for it, and approve only
+after the hardware acceptance (GPU tests with `MOONSHINE_TEST_GPU=1`,
+`scripts/known_defects.py --native-devices`, benchmark lifecycle and
+reconnect cycles, and the [reconnect checks](docs/reconnect-validation.md) with
+real clients) passed on that commit. A skipped or unexecuted hardware check is
+not a pass; list it in the release notes instead.
 
 Before releasing, update `[workspace.package].version` in `Cargo.toml`. It is the
 only version to edit: `prepare` (below) writes it to every other copy — both

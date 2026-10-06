@@ -608,7 +608,7 @@ impl Gamepad {
 					let route = route.clone();
 					let index = info.index;
 					move |r, g, b| {
-						route.deliver_blocking(FeedbackCommand::SetLed(SetLedCommand {
+						route.deliver(FeedbackCommand::SetLed(SetLedCommand {
 							id: index as u16,
 							rgb: (r as u8, g as u8, b as u8),
 						}));
@@ -635,7 +635,7 @@ impl Gamepad {
 
 						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
 
-						route.deliver_blocking(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
+						route.deliver(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
 							id: index as u16,
 							trigger_event_flags,
 							type_left,
@@ -658,7 +658,7 @@ impl Gamepad {
 		gamepad.set_on_rumble({
 			let index = info.index;
 			move |low_frequency, high_frequency| {
-				route.deliver_blocking(FeedbackCommand::Rumble(RumbleCommand {
+				route.deliver(FeedbackCommand::Rumble(RumbleCommand {
 					id: index as u16,
 					low_frequency: low_frequency as u16,
 					high_frequency: high_frequency as u16,
@@ -1018,5 +1018,54 @@ mod compatibility_tests {
 			assert!(toml::from_str::<GamepadConfig>(&format!("emulation = \"{value}\"")).is_ok());
 		}
 		assert!(toml::from_str::<GamepadConfig>("emulation = \"invalid\"").is_err());
+	}
+
+	/// Review 2026-10-05 STAB-005 through the production wrapper on real
+	/// devices: sixteen DualSense (UHID) slots plus Xbox and Switch (uinput)
+	/// pads receive input while their native threads run, then are destroyed. Native threads
+	/// are joined, so each destruction is prompt and the process returns to
+	/// its thread count. `MOONSHINE_TEST_DEVICES=1 cargo test -p moonshine-core
+	/// native_devices_join -- --ignored --nocapture`
+	#[test]
+	#[ignore = "needs /dev/uhid and /dev/uinput access: MOONSHINE_TEST_DEVICES=1"]
+	fn native_devices_join_their_threads_on_destruction() {
+		use super::super::ownership::FeedbackRoute;
+		use std::sync::Arc;
+		use std::time::{Duration, Instant};
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_DEVICES").is_some(),
+			"set MOONSHINE_TEST_DEVICES=1"
+		);
+		let threads = || std::fs::read_dir("/proc/self/task").unwrap().count();
+		let baseline = threads();
+		for round in 0..3 {
+			let mut pads = Vec::new();
+			for (index, kind) in (0..16u8).map(|index| (index, 2u8)).chain([(0, 1), (1, 3)]) {
+				let info = GamepadInfo::from_bytes(&[index, kind, 0xff, 0, 0, 0, 0, 0]).unwrap();
+				let route = FeedbackRoute::new(index, true, Arc::new(tokio::sync::Notify::new()));
+				pads.push(Gamepad::new(&info, route, GamepadEmulation::Auto).expect("device creation"));
+			}
+			// The gamepad thread is the only Rust caller; native report and event
+			// threads run concurrently with it.
+			for buttons in 0..200u32 {
+				for pad in &pads {
+					pad.set_pressed(buttons & 0xffff);
+				}
+			}
+			let started = Instant::now();
+			drop(pads);
+			let elapsed = started.elapsed();
+			eprintln!("round {round}: destroyed 18 devices in {elapsed:?}");
+			assert!(elapsed < Duration::from_secs(2), "destruction waited on native threads");
+			let deadline = Instant::now() + Duration::from_millis(500);
+			while threads() != baseline && Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			assert_eq!(
+				threads(),
+				baseline,
+				"round {round}: native threads outlived their devices"
+			);
+		}
 	}
 }

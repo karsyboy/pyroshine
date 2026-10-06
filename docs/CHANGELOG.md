@@ -14,6 +14,36 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Security
+
+- Stop sending video to a client as soon as another client's `/resume` replaces its authorization, including a send already in progress, instead of only after the new client's RTSP ANNOUNCE. A new client's discovery PING no longer redirects media before its PLAY activates the stream, and a reconnect PLAY overtaken by a newer `/resume` can no longer activate with mixed keys or settings.
+- Answer an unsupported feature-report query on a virtual DualSense or DualSense Edge with an error instead of reading past the reply buffer. A local HID reader (for example a game or Steam probing the controller) could otherwise crash the server; only the calibration, pairing and firmware reports are answered, and output reports too short to contain their rumble/LED data are ignored.
+
+### Fixed
+
+- Answer an RTSP ANNOUNCE whose SDP body contains a malformed line (not `<type>=<value>`) with 400 Bad Request. Such a body from the authorized client panicked the connection's handler inside the SDP parser.
+
+- Resume a retained session whose client completed PLAY but disconnected before starting the stream. The reconnect previously waited forever for media workers that had not started.
+- Apply the resolution, refresh rate and HDR mode negotiated in the first RTSP ANNOUNCE to the compositor when they differ from the launch request, or refuse the stream; capture previously kept the launch mode while encoding used the negotiated one.
+- End the session when a reconnect cannot pause its media, instead of reporting it as active with one stream possibly paused.
+- Report a stopped session as idle only once the application unit's processes are gone. An application that took longer than two seconds to exit (within systemd's five-second allowance), or a stop the session bus could not confirm, was reported as stopped while it still ran, and a new launch could overlap it. A stop that cannot be confirmed now fails the teardown and restarts the service, and a launch refuses to start over a previous unit that is still loaded.
+
+- Keep controller input and session shutdown responsive while a client is slow to accept controller feedback. Rumble, LED, trigger and motion-enable feedback no longer waits on a full queue: rumble coalesces to the latest command, persistent state is re-sent, and a stop can no longer wait forever on the feedback queue.
+- Stop virtual controllers' background threads before their devices are destroyed. Report, UHID and force-feedback threads could outlive a destroyed controller (an Xbox controller lingered for up to half a second), race with input updates and callbacks, and read a closed device descriptor.
+
+- Remove a PulseAudio client that closes its connection in the middle of a request. The audio server previously retried the closed socket forever, burning a CPU core and stopping capture, reconfiguration and session shutdown; requests completed before the close are still answered. A client that floods requests without reading replies can no longer starve other clients or the capture clock.
+
+- Send the current picture when a keyframe is requested on a static screen with H.264, HEVC or AV1 (after a reconnect, packet loss or a client request). The recovery keyframe re-encoded the encoder's next input slot, which held an older frame or nothing, so the client could show a stale or garbage picture until the scene changed; it now re-encodes the last converted frame and stays pending until it is actually submitted. PyroWave was not affected.
+
+- Reconnect the desktop app when its first attempt to attach to a running Pyroshine fails (for example while the service is still starting). It previously stayed disconnected until the service or app restarted; it now retries automatically and explains an incompatible or inaccessible service instead of reporting that Pyroshine isn't running.
+
+### Changed
+
+- Stop capturing, converting and encoding video and audio while no client is connected to a retained session; the game keeps running and is presented normally. On an RX 9070 XT a detached 1080p60 session previously used the same encode GPU time as a streaming one; it now uses none, and the first frame after reconnecting is a keyframe of the current scene.
+- Keep large encrypted frames' packetization from delaying other server tasks: frames of 128 KiB or more are packetized off the shared runtime worker.
+- Reject `pre_command`/`post_command` entries that are empty or whose executable cannot be found, instead of silently leaving them out of the application unit; the log names the stage and entry. Check custom application hooks after upgrading.
+- Reject a configuration with a listener port of 0 or a `[stream].timeout` outside 1–86400 seconds at startup, with the setting named, as the settings editor already did. A timeout of 0 previously disconnected every client immediately, and port 0 was advertised to clients as an unusable port.
+
 ## [v0.17.0-beta.15] - 2026-10-05
 
 ### Added

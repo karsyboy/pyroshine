@@ -83,10 +83,8 @@ SwitchJoypad::SwitchJoypad() : _state(std::make_shared<SwitchJoypadState>()) {}
 
 SwitchJoypad::~SwitchJoypad() {
   if (_state) {
-    _state->stop_listening_events = true;
-    if (_state->joy.get() != nullptr && _state->events_thread.joinable()) {
-      _state->events_thread.join();
-    }
+    // Joined before the uinput device (kept alive by the state) can go away.
+    stop_event_listener(*_state);
   }
 }
 
@@ -99,9 +97,7 @@ Result<SwitchJoypad> SwitchJoypad::create(const DeviceDefinition &device) {
   SwitchJoypad joypad;
   joypad._state->joy = std::move(*joy_el);
 
-  auto event_thread = std::thread(event_listener, joypad._state);
-  joypad._state->events_thread = std::move(event_thread);
-  joypad._state->events_thread.detach();
+  start_event_listener(joypad._state);
 
   return joypad;
 }
@@ -185,6 +181,7 @@ void SwitchJoypad::set_triggers(int16_t left, int16_t right) {
 }
 
 void SwitchJoypad::set_on_rumble(const std::function<void(int, int)> &callback) {
+  std::lock_guard lock(this->_state->callback_mutex);
   this->_state->on_rumble = callback;
 }
 } // namespace inputtino

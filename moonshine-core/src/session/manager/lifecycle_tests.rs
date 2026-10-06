@@ -92,8 +92,16 @@ struct FakeBackend {
 	/// The most recent session's stop, so tests can play a failing worker.
 	session_stop: std::sync::Mutex<Option<ShutdownManager<SessionShutdownReason>>>,
 	foreground_tx: std::sync::Mutex<Option<watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>>>,
-	/// Every committed reconnect plan: whether video was recreated, and audio.
-	plans: std::sync::Mutex<Vec<(bool, AudioStreamContext)>>,
+	/// Every reconnect plan the backend ran.
+	plans: std::sync::Mutex<Vec<PlanRecord>>,
+}
+
+/// What a reconnect plan asked the workers to do, and for which authorization.
+struct PlanRecord {
+	video_recreated: bool,
+	audio: AudioStreamContext,
+	generation: u64,
+	key_id: u32,
 }
 
 struct FakeSession {
@@ -232,7 +240,12 @@ impl SessionBackend for FakeBackend {
 
 	async fn resume(&self, _session: &mut FakeSession, plan: ResumePlan) -> Result<(), ()> {
 		assert!(matches!(plan.audio.packet_duration_ms, 5 | 10));
-		self.plans.lock().unwrap().push((plan.video.is_some(), plan.audio));
+		self.plans.lock().unwrap().push(PlanRecord {
+			video_recreated: plan.video.is_some(),
+			audio: plan.audio,
+			generation: plan.generation,
+			key_id: plan.keys.key_id().get(),
+		});
 		self.gate(Op::Resume).await
 	}
 
@@ -385,7 +398,11 @@ impl Harness {
 }
 
 fn keys() -> SessionKeyData {
-	SessionKeyData::new(RemoteInputKey::from_bytes([7; 16]), RemoteInputKeyId::new(1))
+	keys_with_id(1)
+}
+
+fn keys_with_id(id: u32) -> SessionKeyData {
+	SessionKeyData::new(RemoteInputKey::from_bytes([id as u8; 16]), RemoteInputKeyId::new(id))
 }
 
 fn context() -> SessionContext {
@@ -1011,16 +1028,224 @@ async fn teardown_deadline_is_a_terminal_failure() {
 }
 
 /// STAB-003: the application stop is bounded and does not wedge teardown.
+///
+/// Only the bound is asserted here. Whether an unconfirmed stop may report
+/// success and Idle is the separate contract in
+/// `hung_application_stop_is_not_reported_idle` (review 2026-10-05 STAB-003).
 #[tokio::test(start_paused = true)]
 async fn hung_application_stop_is_bounded() {
 	let h = Harness::new();
 	h.active().await;
 	h.hold(Op::StopApplication);
 	let started = tokio::time::Instant::now();
-	h.core.stop_session().await.unwrap();
+	let _ = h.core.stop_session().await;
 	assert!(started.elapsed() <= SESSION_TEARDOWN_DEADLINE);
-	assert_eq!(h.phase().await, "idle");
 	assert_eq!(h.counters().resources.load(Ordering::SeqCst), 0);
+}
+
+// Review 2026-10-05 characterizations. Each test states the corrected
+// contract and is ignored with a "known defect" reason until the batch that
+// fixes it; `scripts/known_defects.py` checks they still fail for the
+// recorded reason (see `scripts/known_defects.toml`).
+
+/// Review 2026-10-05 STAB-003: a failed application stop leaves the unit's
+/// termination unverified. Teardown must not report success or Idle, and a new
+/// session must not be initialized over that unresolved ownership.
+#[tokio::test]
+async fn failed_application_stop_is_not_reported_idle() {
+	let h = Harness::new();
+	h.active().await;
+	h.fail(Op::StopApplication);
+	let stopped = h.core.stop_session().await;
+	assert!(
+		h.counters().unit_created.load(Ordering::SeqCst),
+		"fixture: a failed stop leaves the fake unit live"
+	);
+	let phase = h.phase().await;
+	assert!(
+		stopped.is_err() && phase != "idle",
+		"review 2026-10-05 STAB-003: teardown reported {stopped:?} and phase {phase} with a live application unit"
+	);
+	let replacement = h.initialize().await;
+	assert!(
+		replacement.is_err() || !h.counters().overlapped.load(Ordering::SeqCst),
+		"review 2026-10-05 STAB-003: a new session was initialized over unresolved application ownership"
+	);
+}
+
+/// Review 2026-10-05 STAB-003: the same contract when the stop never answers
+/// (bus loss, a stop job outliving its wait): the bounded teardown ends in a
+/// failure state, not Idle.
+#[tokio::test(start_paused = true)]
+async fn hung_application_stop_is_not_reported_idle() {
+	let h = Harness::new();
+	h.active().await;
+	h.hold(Op::StopApplication);
+	let stopped = h.core.stop_session().await;
+	let phase = h.phase().await;
+	assert!(
+		stopped.is_err() && phase != "idle",
+		"review 2026-10-05 STAB-003: an unconfirmed application stop reported {stopped:?} and phase {phase}"
+	);
+	h.release(Op::StopApplication);
+}
+
+/// Review 2026-10-05 STAB-001: a reconnect PLAY whose authorization is
+/// replaced by another `/resume` while its reconfiguration is in flight must
+/// not commit. Either the replacing resume is refused until the transition
+/// finishes, or the superseded PLAY fails and the newest grant completes.
+#[tokio::test]
+async fn superseded_reconnect_play_cannot_commit() {
+	let h = Harness::new();
+	let old = h.resumed().await;
+	h.hold(Op::Resume);
+	let play = {
+		let core = h.core.clone();
+		let old = old.clone();
+		tokio::spawn(async move { core.start_session(&old).await })
+	};
+	h.entered(Op::Resume, 1).await;
+	let replaced = h
+		.core
+		.resume_session(keys(), ResumeRequest::default(), h.client)
+		.await
+		.is_ok();
+	h.release(Op::Resume);
+	let committed = play.await.unwrap().is_ok();
+	if replaced {
+		assert!(
+			!committed,
+			"review 2026-10-05 STAB-001: PLAY of generation {} committed after a newer /resume replaced it",
+			old.generation()
+		);
+		let current = h.grant().await;
+		assert_ne!(current.generation(), old.generation());
+		h.announce(&current).await.unwrap();
+		h.core.start_session(&current).await.unwrap();
+	} else {
+		assert!(committed, "a refused resume must leave the in-flight PLAY to finish");
+	}
+	assert_eq!(h.phase().await, "active");
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// Review 2026-10-05 STAB-001: every reconnect plan carries the generation
+/// and keys of the PLAY that produced it, snapshotted together; a superseded
+/// PLAY's plan never carries the newer resume's keys, and the replacing PLAY's
+/// plan carries its own.
+#[tokio::test]
+async fn reconnect_plans_snapshot_generation_and_keys_together() {
+	let h = Harness::new();
+	h.active().await;
+	h.core
+		.resume_session(keys_with_id(5), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	let first = h.grant().await;
+	h.announce(&first).await.unwrap();
+	h.hold(Op::Resume);
+	let play = {
+		let core = h.core.clone();
+		let first = first.clone();
+		tokio::spawn(async move { core.start_session(&first).await })
+	};
+	h.entered(Op::Resume, 1).await;
+	h.core
+		.resume_session(keys_with_id(6), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	h.release(Op::Resume);
+	assert!(play.await.unwrap().is_err(), "the superseded PLAY must not succeed");
+	let second = h.grant().await;
+	h.announce(&second).await.unwrap();
+	h.core.start_session(&second).await.unwrap();
+	let records: Vec<_> = h
+		.backend()
+		.plans
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|plan| (plan.generation, plan.key_id))
+		.collect();
+	assert_eq!(records, vec![(first.generation(), 5), (second.generation(), 6)]);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// A `/resume` cannot replace the authorization while the first PLAY is still
+/// starting streams: there is no retained stream to resume yet. The PLAY then
+/// completes normally.
+#[tokio::test]
+async fn resume_during_first_play_is_refused() {
+	let h = Harness::new();
+	let task = hold_at(&h, Op::Start).await;
+	assert!(
+		h.core
+			.resume_session(keys(), ResumeRequest::default(), h.client)
+			.await
+			.is_err()
+	);
+	h.release(Op::Start);
+	task.await.unwrap().unwrap();
+	assert_eq!(h.phase().await, "active");
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// Review 2026-10-05 STAB-007: a failed ANNOUNCE pause has side effects the
+/// manager cannot see through `Result<(), ()>`; one subsystem may already be
+/// paused. The session must not stay Active with a running-looking epoch:
+/// it is handed to teardown (or, once the backend reports a finer outcome,
+/// left in an explicitly defined state).
+#[tokio::test]
+async fn failed_announce_pause_has_a_defined_outcome() {
+	let h = Harness::new();
+	let grant = h.active().await;
+	h.fail(Op::Pause);
+	assert!(h.announce(&grant).await.is_err());
+	let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+	let phase = h.phase().await;
+	assert!(
+		stop.is_shutdown_triggered() || phase != "active",
+		"review 2026-10-05 STAB-007: failed ANNOUNCE pause left phase {phase} with no teardown"
+	);
+	h.wait_idle().await;
+	h.assert_released().await;
+}
+
+/// Review 2026-10-05 BUG-003: the first PLAY must leave one coherent output
+/// mode. If the authoritative RTSP mode differs from the HTTP launch mode it
+/// is either rejected before streams start or applied and published, as a
+/// reconnect PLAY already does.
+#[tokio::test]
+async fn first_play_publishes_the_negotiated_output_mode() {
+	let h = Harness::new();
+	h.launched().await;
+	assert_eq!(h.core.get_session_context().await.unwrap().resolution, (1920, 1080));
+	let grant = h.grant().await;
+	let negotiated = VideoStreamContext {
+		width: 2560,
+		height: 1440,
+		fps: 120,
+		..video()
+	};
+	let accepted =
+		h.core
+			.set_stream_context(&grant, negotiated, audio(), false)
+			.await
+			.is_ok() && h.core.start_session(&grant).await.is_ok();
+	if accepted {
+		let context = h.core.get_session_context().await.unwrap();
+		assert!(
+			context.resolution == (2560, 1440) && context.refresh_rate == 120,
+			"review 2026-10-05 BUG-003: first PLAY negotiated 2560x1440@120 but the session reports {:?}@{}",
+			context.resolution,
+			context.refresh_rate
+		);
+	}
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
 }
 
 /// One point of the repeated-session settings matrix. Each [`Self::step`]
@@ -1268,7 +1493,9 @@ async fn hundred_reconnect_cycles_alternate_every_negotiated_axis() {
 		let order = h.counters().order.lock().unwrap().clone();
 		assert!(order.iter().rposition(|op| *op == Op::Pause) < order.iter().rposition(|op| *op == Op::Resume));
 
-		let (video_recreated, audio) = h.backend().plans.lock().unwrap().pop().unwrap();
+		let PlanRecord {
+			video_recreated, audio, ..
+		} = h.backend().plans.lock().unwrap().pop().unwrap();
 		assert_eq!(
 			video_recreated,
 			settings.video() != next.video(),

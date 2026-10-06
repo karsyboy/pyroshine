@@ -1,0 +1,12 @@
+# Characterization tests for confirmed findings of the 2026-10-05
+# production-readiness review that still fail on purpose.
+#
+# Each test states the corrected contract. Rust entries are
+# `#[ignore = "known defect: review 2026-10-05 <ID> (batch <B>)"]` tests;
+# native entries are CTest cases marked DISABLED. `scripts/known_defects.py`
+# runs every entry and requires it to fail with `marker` in its output, so a
+# test cannot pass vacuously or start failing for a different reason.
+#
+# When a fix lands, remove the test's `#[ignore]` (or DISABLED property) and
+# its entry here in the same change; the checker reports a passing entry as an
+# error until then. Do not weaken a test to make it pass.
