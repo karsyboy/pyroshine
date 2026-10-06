@@ -251,7 +251,13 @@ impl WindowMetadata {
 		}
 	}
 
-	/// An opaque Steam focus identifier, not necessarily an X11 resource.
+	/// The window's `GAMESCOPE_FOCUSED_WINDOW` identity: its X11 window ID, or
+	/// a compositor-assigned ID for a native Wayland (XDG) window.
+	///
+	/// Gamescope gives XDG windows their own serial rather than an X11 ID. The
+	/// native ID here is fixed for the window's mapped lifetime (its map
+	/// sequence) and has bit 31 set, so it can never equal an X11 XID (XIDs fit
+	/// in 29 bits) or name an unrelated X11 window.
 	pub fn steam_window_id(&self) -> u32 {
 		self.x11_window_id
 			.unwrap_or(0x8000_0000 | (self.map_sequence as u32 & 0x7fff_ffff))
@@ -599,6 +605,88 @@ pub(crate) fn route_input<W: Clone>(focus: &W, focus_mode: u32, overlay: Option<
 	}
 }
 
+/// Display a focus target belongs to, published by name in Steam's
+/// `GAMESCOPE_*FOCUS_DISPLAY` properties. Gamescope: `get_win_display_name()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusDisplay {
+	/// The XWayland display (`:N`).
+	XWayland,
+	/// The compositor's own Wayland display (`wayland-N`).
+	Wayland,
+}
+
+impl FocusDisplay {
+	pub fn of(meta: &WindowMetadata) -> Self {
+		if meta.is_x11 { Self::XWayland } else { Self::Wayland }
+	}
+}
+
+/// The Steam focus contract derived from one resolved focus pass.
+/// Gamescope: the "Backchannel to Steam" block of `determine_and_apply_focus()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SteamFocusContract {
+	/// `GAMESCOPE_FOCUSED_APP`: the app receiving input (the Steam overlay
+	/// while it requests input).
+	pub app: u32,
+	/// `GAMESCOPE_FOCUSED_APP_GFX`: the app presented as the base layer.
+	pub app_gfx: u32,
+	/// `GAMESCOPE_FOCUSED_WINDOW`: the base-layer window.
+	pub window: u32,
+	/// `GAMESCOPE_FOCUS_DISPLAY`: display of the base-layer window.
+	pub display: FocusDisplay,
+	/// `GAMESCOPE_MOUSE_FOCUS_DISPLAY`: display of the pointer target.
+	pub mouse_display: FocusDisplay,
+	/// `GAMESCOPE_KEYBOARD_FOCUS_DISPLAY`: display of the keyboard target.
+	pub keyboard_display: FocusDisplay,
+}
+
+/// Describe the final targets of a focus pass to Steam. Each display follows
+/// its own target, so a native Wayland game below an XWayland Steam overlay
+/// legitimately publishes different displays (`STEAM_INPUT_FOCUS=2` keeps the
+/// keyboard on the game while the pointer is on the overlay).
+pub(crate) fn steam_focus_contract(
+	focus: &WindowMetadata,
+	pointer: &WindowMetadata,
+	keyboard: &WindowMetadata,
+) -> SteamFocusContract {
+	SteamFocusContract {
+		app: pointer.app_id,
+		app_gfx: focus.app_id,
+		window: focus.steam_window_id(),
+		display: FocusDisplay::of(focus),
+		mouse_display: FocusDisplay::of(pointer),
+		keyboard_display: FocusDisplay::of(keyboard),
+	}
+}
+
+/// The `[window, app id, pid]` triplet a focus candidate contributes to
+/// `GAMESCOPE_FOCUSABLE_WINDOWS`.
+///
+/// Gamescope lists XWayland windows only, but Steam hands the base layer to
+/// a launched game (`GAMESCOPECTRL_BASELAYER_APPID`) only once one of the
+/// game's windows appears here: without its entry a native Wayland game
+/// stays behind Steam's UI. Native windows are therefore listed with their
+/// compositor ID ([`WindowMetadata::steam_window_id`]) and Wayland client PID.
+pub(crate) fn focusable_window(meta: &WindowMetadata) -> [u32; 3] {
+	[meta.steam_window_id(), meta.app_id, meta.pid]
+}
+
+/// Whether a Wayland `xdg-activation` request may choose the focus window.
+///
+/// Steam names the base layer through `GAMESCOPECTRL_BASELAYER_*`; while it
+/// does, it alone decides (gamescope has no activation override). Wine's
+/// Wayland driver activates its window once at startup, and honoring that
+/// stale request kept a native game above Steam's own UI after Steam moved
+/// the base layer to itself.
+pub(crate) fn activation_may_choose_focus(
+	strategy: crate::session::compositor::VirtualConnectorStrategy,
+	focus_control_window: Option<u32>,
+	app_ids: &[u32],
+) -> bool {
+	strategy != crate::session::compositor::VirtualConnectorStrategy::SteamControlled
+		|| (focus_control_window.is_none() && app_ids.is_empty())
+}
+
 /// Clear every role `window` holds in `roles` and `decorations`.
 ///
 /// Unmap and destroy share this, so a window that disappears by either path
@@ -896,6 +984,142 @@ mod tests {
 		assert!(!notification.accepts_pointer_input());
 		assert!(!game.excluded_from_primary_focus());
 		assert!(!is_good_override_candidate(&notification, &game));
+	}
+
+	const STEAM_APP: u32 = crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID;
+	const NATIVE_GAME_APP: u32 = 1371980;
+
+	/// A native Wayland (XDG) game as `new_toplevel` records it.
+	fn native_game_meta() -> WindowMetadata {
+		WindowMetadata {
+			app_id: NATIVE_GAME_APP,
+			pid: 4242,
+			opacity: 255,
+			map_sequence: 3,
+			geometry: smithay::utils::Rectangle::from_size((1920, 1080).into()),
+			..Default::default()
+		}
+	}
+
+	/// Steam's full-width XWayland overlay, open with `STEAM_INPUT_FOCUS=mode`.
+	fn open_overlay_meta(mode: u32) -> WindowMetadata {
+		let mut meta = hidden_overlay_meta();
+		meta.app_id = STEAM_APP;
+		meta.pid = 77;
+		meta.is_x11 = true;
+		meta.opacity = 255;
+		meta.input_focus_mode = mode;
+		meta.classify_steam_surface(1920);
+		meta
+	}
+
+	/// The contract of one focus pass over `game` and an optional overlay.
+	fn contract_for(game: &WindowMetadata, overlay: Option<&WindowMetadata>) -> SteamFocusContract {
+		let (_, targets) = focus_pass(game, overlay);
+		let meta = |w: u32| if w == GAME { game } else { overlay.unwrap() };
+		steam_focus_contract(game, meta(targets.pointer), meta(targets.keyboard))
+	}
+
+	#[test]
+	fn xwayland_game_contract_is_unchanged() {
+		let game = WindowMetadata {
+			is_x11: true,
+			pid: 42,
+			..game_meta()
+		};
+		assert_eq!(
+			contract_for(&game, None),
+			SteamFocusContract {
+				app: 12345,
+				app_gfx: 12345,
+				window: GAME,
+				display: FocusDisplay::XWayland,
+				mouse_display: FocusDisplay::XWayland,
+				keyboard_display: FocusDisplay::XWayland,
+			}
+		);
+		assert_eq!(focusable_window(&game), [GAME, 12345, 42]);
+	}
+
+	#[test]
+	fn native_game_contract_names_the_wayland_display_and_its_client() {
+		let game = native_game_meta();
+		let contract = contract_for(&game, None);
+		assert_eq!(contract.app, NATIVE_GAME_APP);
+		assert_eq!(contract.app_gfx, NATIVE_GAME_APP);
+		assert_eq!(
+			(contract.display, contract.mouse_display, contract.keyboard_display),
+			(FocusDisplay::Wayland, FocusDisplay::Wayland, FocusDisplay::Wayland)
+		);
+		// A compositor ID that no X11 XID (29 bits) can equal, stable for the
+		// window's mapped lifetime. Steam needs the native window listed, with
+		// its client PID, before it hands the game the base layer.
+		assert_eq!(contract.window, 0x8000_0003);
+		assert_eq!(contract.window, native_game_meta().steam_window_id());
+		assert_eq!(focusable_window(&game), [0x8000_0003, NATIVE_GAME_APP, 4242]);
+	}
+
+	#[test]
+	fn native_game_below_overlay_publishes_each_target_display() {
+		let game = native_game_meta();
+
+		// STEAM_INPUT_FOCUS=1: pointer and keyboard on the XWayland overlay,
+		// graphics still the native game.
+		let contract = contract_for(&game, Some(&open_overlay_meta(1)));
+		assert_eq!((contract.app, contract.app_gfx), (STEAM_APP, NATIVE_GAME_APP));
+		assert_eq!(contract.window, game.steam_window_id());
+		assert_eq!(
+			(contract.display, contract.mouse_display, contract.keyboard_display),
+			(FocusDisplay::Wayland, FocusDisplay::XWayland, FocusDisplay::XWayland)
+		);
+
+		// STEAM_INPUT_FOCUS=2: the keyboard stays on the native game.
+		let contract = contract_for(&game, Some(&open_overlay_meta(2)));
+		assert_eq!((contract.app, contract.app_gfx), (STEAM_APP, NATIVE_GAME_APP));
+		assert_eq!(
+			(contract.display, contract.mouse_display, contract.keyboard_display),
+			(FocusDisplay::Wayland, FocusDisplay::XWayland, FocusDisplay::Wayland)
+		);
+	}
+
+	#[test]
+	fn overlay_cycles_return_the_native_game_contract() {
+		let game = native_game_meta();
+		let closed = contract_for(&game, None);
+		let mut overlay = open_overlay_meta(1);
+		for _ in 0..10 {
+			overlay.is_overlay = true;
+			overlay.opacity = 255;
+			overlay.input_focus_mode = 1;
+			overlay.classify_steam_surface(1920);
+			assert_eq!(contract_for(&game, Some(&overlay)).app, STEAM_APP);
+			// Steam's controller settings: it clears STEAM_OVERLAY and names
+			// itself as the base layer; the overlay holds no role any more.
+			overlay.is_overlay = false;
+			overlay.classify_steam_surface(1920);
+			assert_eq!(contract_for(&game, Some(&overlay)), closed);
+			// Hidden by opacity.
+			overlay.is_overlay = true;
+			overlay.opacity = 0;
+			overlay.classify_steam_surface(1920);
+			assert_eq!(contract_for(&game, Some(&overlay)), closed);
+		}
+	}
+
+	#[test]
+	fn steam_base_layer_control_overrides_wayland_activation() {
+		use crate::session::compositor::VirtualConnectorStrategy::*;
+		// Steam names its own UI (controller settings) or a game: it decides.
+		assert!(!activation_may_choose_focus(
+			SteamControlled,
+			None,
+			&[413091, 769, 1371980]
+		));
+		assert!(!activation_may_choose_focus(SteamControlled, Some(0x2000035), &[]));
+		// Without Steam's control (a desktop session) activation still works.
+		assert!(activation_may_choose_focus(SteamControlled, None, &[]));
+		assert!(activation_may_choose_focus(SingleApplication, None, &[]));
+		assert!(activation_may_choose_focus(PerWindow, None, &[769]));
 	}
 
 	fn make_meta(fields: &[(&str, &str)]) -> WindowMetadata {

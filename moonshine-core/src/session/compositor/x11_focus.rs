@@ -1437,19 +1437,28 @@ impl X11Focus {
 
 	/// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays)
 	/// so Steam's controller routing targets the focused window.
-	pub fn set_focus_contract(&self, input_app_id: u32, gfx_app_id: u32, window_id: u32) {
-		self.set_focused_app_split(input_app_id, gfx_app_id);
-		if window_id != 0 {
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_window, window_id);
+	/// `wayland_display` names the compositor's display for native targets.
+	pub fn set_focus_contract(&self, contract: &super::focus::SteamFocusContract, wayland_display: &str) {
+		self.set_focused_app_split(contract.app, contract.app_gfx);
+		if contract.window != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_window, contract.window);
 		} else {
 			self.delete_property(self.root, self.atoms.gamescope_focused_window);
 		}
-		self.write_utf8_prop(self.root, self.atoms.gamescope_focus_display, &self.display_name);
-		self.write_utf8_prop(self.root, self.atoms.gamescope_mouse_focus_display, &self.display_name);
+		let name = |display| match display {
+			super::focus::FocusDisplay::XWayland => self.display_name.as_str(),
+			super::focus::FocusDisplay::Wayland => wayland_display,
+		};
+		self.write_utf8_prop(self.root, self.atoms.gamescope_focus_display, name(contract.display));
+		self.write_utf8_prop(
+			self.root,
+			self.atoms.gamescope_mouse_focus_display,
+			name(contract.mouse_display),
+		);
 		self.write_utf8_prop(
 			self.root,
 			self.atoms.gamescope_keyboard_focus_display,
-			&self.display_name,
+			name(contract.keyboard_display),
 		);
 	}
 
