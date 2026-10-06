@@ -182,13 +182,25 @@ MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
 ```
 
 The Pixelforge encoder-input slot contract, and the decoded static-scene
-recovery check (needs `ffmpeg`; a known defect, see below):
+recovery check for every conventional codec (needs `ffmpeg`):
 
 ```sh
 MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
   session::stream::video::pipeline::convert::tests::encoder_input_slots_rotate_on_gpu \
   -- --ignored --exact --nocapture
-python3 scripts/known_defects.py --gpu --skip-native
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
+  session::stream::video::pipeline::convert::tests::static_recovery_decodes_to_the_latest_frame_on_gpu \
+  -- --ignored --exact --nocapture
+```
+
+Parsers and protocol handlers for client input (RTSP framing, SDP, control,
+input, media PING and PulseAudio clients) have seeded, bounded fuzz tests in
+the ordinary suite. A longer campaign scales their iterations, and another
+seed gives a different reproducible input sequence:
+
+```sh
+MOONSHINE_FUZZ_ITERATIONS=50 MOONSHINE_FUZZ_SEED=7 \
+  cargo test -p moonshine-core --lib -- mutated_ arbitrary_bytes_never_panic
 ```
 
 ### Known-defect characterizations
@@ -251,7 +263,7 @@ native sanitizer tests, and the desktop app checks. It records the commit,
 `SHA256SUMS`. Building and publishing then waits for approval in the GitHub
 `release` environment: configure required reviewers for it, and approve only
 after the hardware acceptance (GPU tests with `MOONSHINE_TEST_GPU=1`,
-`scripts/known_defects.py --gpu --native-devices`, benchmark lifecycle and
+`scripts/known_defects.py --native-devices`, benchmark lifecycle and
 reconnect cycles, and the [reconnect checks](docs/reconnect-validation.md) with
 real clients) passed on that commit. A skipped or unexecuted hardware check is
 not a pass; list it in the release notes instead.

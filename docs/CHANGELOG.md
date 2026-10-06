@@ -21,6 +21,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Answer an RTSP ANNOUNCE whose SDP body contains a malformed line (not `<type>=<value>`) with 400 Bad Request. Such a body from the authorized client panicked the connection's handler inside the SDP parser.
+
 - Resume a retained session whose client completed PLAY but disconnected before starting the stream. The reconnect previously waited forever for media workers that had not started.
 - Apply the resolution, refresh rate and HDR mode negotiated in the first RTSP ANNOUNCE to the compositor when they differ from the launch request, or refuse the stream; capture previously kept the launch mode while encoding used the negotiated one.
 - End the session when a reconnect cannot pause its media, instead of reporting it as active with one stream possibly paused.

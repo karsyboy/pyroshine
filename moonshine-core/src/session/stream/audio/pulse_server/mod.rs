@@ -1215,6 +1215,89 @@ mod receive_tests {
 		assert!(writer.join().unwrap() > 0);
 	}
 
+	/// Section 9 B/E: clients send mutated command and playback streams in
+	/// arbitrary fragments and then close, half-close or stall at random. The
+	/// event loop keeps reconfiguring and capturing, a well-formed client is
+	/// still answered after every round, and shutdown completes.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn mutated_client_streams_cannot_stall_the_server() {
+		let auth = command(
+			0,
+			&pulse::Command::Auth(pulse::AuthParams {
+				version: pulse::MAX_VERSION,
+				..Default::default()
+			}),
+		);
+		let mut name = pulse::Props::new();
+		name.set(pulse::Prop::ApplicationName, c"fuzz");
+		let name = command(1, &pulse::Command::SetClientName(name));
+		let create = command(
+			2,
+			&pulse::Command::CreatePlaybackStream(pulse::PlaybackStreamParams {
+				sample_spec: pulse::SampleSpec {
+					format: pulse::SampleFormat::S16Le,
+					sample_rate: 48_000,
+					channels: 2,
+				},
+				channel_map: pulse::ChannelMap::stereo(),
+				..Default::default()
+			}),
+		);
+		let audio = [descriptor(960, 0), vec![0x40; 960]].concat();
+		let info = command(3, &pulse::Command::GetServerInfo);
+		let corpus = vec![
+			[auth.clone(), name.clone(), info.clone()].concat(),
+			[auth.clone(), name.clone(), create.clone(), audio.clone(), audio.clone()].concat(),
+			[auth.clone(), create, audio.repeat(4), info.clone()].concat(),
+			[descriptor(u32::MAX, u32::MAX), info.clone()].concat(),
+		];
+		let mut fuzz = crate::test_fuzz::Mutator::new("pulse-client");
+		let mut server = Server::spawn();
+		for round in 0..crate::test_fuzz::iterations(24) {
+			let clients: Vec<_> = (0..4)
+				.map(|_| {
+					let input = fuzz.mutate(&corpus);
+					let reads: Vec<Vec<u8>> = fuzz.chunks(&input).into_iter().map(<[u8]>::to_vec).collect();
+					let ending = fuzz.below(3);
+					let path = server.path.clone();
+					tokio::task::spawn_blocking(move || {
+						let mut client = UnixStream::connect(path).unwrap();
+						client.set_write_timeout(Some(time::Duration::from_secs(1))).unwrap();
+						for read in reads {
+							if client.write_all(&read).is_err() {
+								return None;
+							}
+						}
+						match ending {
+							0 => None,
+							1 => {
+								let _ = client.shutdown(std::net::Shutdown::Write);
+								None
+							},
+							// Stay connected, unread, through the next checks.
+							_ => Some(client),
+						}
+					})
+				})
+				.collect();
+			let mut stalled = Vec::new();
+			for client in clients {
+				stalled.extend(client.await.unwrap());
+			}
+			assert!(server.responsive().await, "round {round}: event loop stalled");
+			let mut healthy = UnixStream::connect(&server.path).unwrap();
+			healthy.set_read_timeout(Some(time::Duration::from_secs(2))).unwrap();
+			healthy.write_all(&[auth.clone(), info.clone()].concat()).unwrap();
+			let mut reply = [0u8; pulse::DESCRIPTOR_SIZE];
+			assert!(
+				healthy.read_exact(&mut reply).is_ok(),
+				"round {round}: a well-formed client was not answered"
+			);
+			drop(stalled);
+		}
+		assert!(server.stop().await, "shutdown with fuzzed clients");
+	}
+
 	/// Real libpulse clients (`pacat`) play stereo, 5.1 and 7.1 into the
 	/// server; every channel reaches the capture frames. A second client is
 	/// killed mid-stream (its socket ends without any shutdown handshake) while

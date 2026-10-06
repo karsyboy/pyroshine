@@ -14,6 +14,8 @@ pub mod management;
 pub mod rtsp;
 pub mod session;
 pub(crate) mod state;
+#[cfg(test)]
+pub(crate) mod test_fuzz;
 pub mod tls;
 pub mod webserver;
 
