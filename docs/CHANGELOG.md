@@ -16,7 +16,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Security
 
+- Stop sending video to a client as soon as another client's `/resume` replaces its authorization, including a send already in progress, instead of only after the new client's RTSP ANNOUNCE. A new client's discovery PING no longer redirects media before its PLAY activates the stream, and a reconnect PLAY overtaken by a newer `/resume` can no longer activate with mixed keys or settings.
 - Answer an unsupported feature-report query on a virtual DualSense or DualSense Edge with an error instead of reading past the reply buffer. A local HID reader (for example a game or Steam probing the controller) could otherwise crash the server; only the calibration, pairing and firmware reports are answered, and output reports too short to contain their rumble/LED data are ignored.
+
+### Fixed
+
+- Resume a retained session whose client completed PLAY but disconnected before starting the stream. The reconnect previously waited forever for media workers that had not started.
+- Apply the resolution, refresh rate and HDR mode negotiated in the first RTSP ANNOUNCE to the compositor when they differ from the launch request, or refuse the stream; capture previously kept the launch mode while encoding used the negotiated one.
+- End the session when a reconnect cannot pause its media, instead of reporting it as active with one stream possibly paused.
 
 ## [v0.17.0-beta.15] - 2026-10-05
 

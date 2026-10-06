@@ -91,6 +91,12 @@ impl StartLatch {
 pub(crate) struct StartWaiter(watch::Receiver<bool>);
 
 impl StartWaiter {
+	/// Whether the latch has opened, without waiting. OS-thread workers that
+	/// must keep serving lifecycle commands before `StartB` poll this.
+	pub(crate) fn is_open(&self) -> bool {
+		*self.0.borrow()
+	}
+
 	/// Wait until the latch opens. Returns `Err` when the session stops first
 	/// (including when the stop was requested before this call) or the latch
 	/// owner disappears; the worker must then exit without starting.
@@ -102,15 +108,6 @@ impl StartWaiter {
 			Ok(Ok(_)) if !stop.is_shutdown_triggered() => Ok(()),
 			_ => Err(()),
 		}
-	}
-
-	/// [`Self::wait`] for an OS-thread worker without its own runtime.
-	pub(crate) fn wait_blocking(self, stop: &ShutdownManager<SessionShutdownReason>) -> Result<(), ()> {
-		let runtime = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.map_err(|e| tracing::error!("Failed to build start-latch runtime: {e}"))?;
-		runtime.block_on(self.wait(stop))
 	}
 }
 
@@ -191,14 +188,12 @@ mod tests {
 	}
 
 	#[test]
-	fn blocking_waiter_observes_an_earlier_open() {
+	fn polling_waiter_observes_an_earlier_open() {
 		let latch = StartLatch::new();
 		let waiter = latch.waiter();
+		assert!(!waiter.is_open());
 		latch.open();
-		std::thread::spawn(move || waiter.wait_blocking(&stop()))
-			.join()
-			.unwrap()
-			.unwrap();
+		assert!(std::thread::spawn(move || waiter.is_open()).join().unwrap());
 	}
 
 	#[tokio::test]

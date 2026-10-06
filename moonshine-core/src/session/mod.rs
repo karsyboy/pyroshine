@@ -171,9 +171,12 @@ impl SessionBackend for SystemSession {
 
 	async fn start(
 		&self,
-		session: LaunchedSession,
+		mut session: LaunchedSession,
 		request: StartRequest,
 	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
+		// RTSP ANNOUNCE is authoritative for the output mode. Apply it before
+		// any stream exists, exactly as a reconnect does, or refuse the PLAY.
+		session.apply_output_mode(&request.video).await?;
 		// Acquire before consuming the session: nothing is owned yet if this
 		// await is cancelled.
 		let sleep_inhibitor = if self.inhibit_sleep {
@@ -215,10 +218,12 @@ impl SessionBackend for SystemSession {
 
 	async fn resume(&self, session: &mut ActiveSession, plan: ResumePlan) -> Result<(), ()> {
 		match plan.video {
-			Some(context) => session.reconfigure_video(context).await?,
-			None => session.reset_video_stream().await?,
+			Some(context) => session.reconfigure_video(context, plan.generation).await?,
+			None => session.reset_video_stream(plan.generation).await?,
 		}
-		session.reconfigure_audio(plan.audio).await?;
+		session
+			.reconfigure_audio(plan.audio, plan.generation, plan.keys)
+			.await?;
 		Ok(())
 	}
 
@@ -356,6 +361,21 @@ pub(crate) struct LaunchedSession {
 }
 
 impl LaunchedSession {
+	/// Apply the negotiated output mode to the running compositor (a no-op when
+	/// it matches the launch mode) and verify the effective HDR state.
+	pub(crate) async fn apply_output_mode(&mut self, video: &VideoStreamContext) -> Result<(), ()> {
+		let effective_hdr = self.launched_compositor.reconfigure(video.output_mode()).await?;
+		if effective_hdr != video.format.hdr {
+			tracing::warn!(
+				requested_hdr = video.format.hdr,
+				effective_hdr,
+				"Compositor could not apply the negotiated HDR mode; refusing PLAY"
+			);
+			return Err(());
+		}
+		Ok(())
+	}
+
 	/// Spawn every stream worker. Each worker is registered with the session
 	/// before it is spawned and waits on its stream's start latch.
 	///
@@ -381,6 +401,7 @@ impl LaunchedSession {
 		let StartRequest {
 			video: video_ctx,
 			audio: audio_ctx,
+			generation,
 			authorization_rx,
 			stop,
 		} = request;
@@ -396,6 +417,7 @@ impl LaunchedSession {
 				video_config,
 				video_ctx.clone(),
 				keys_rx.clone(),
+				generation,
 				authorization_rx.clone(),
 				stop.clone(),
 			)
@@ -403,7 +425,7 @@ impl LaunchedSession {
 
 		// Start audio stream — gated, returns AudioStartHandle.
 		let audio_trigger = audio
-			.start(audio_ctx.clone(), keys_rx, authorization_rx.clone())
+			.start(audio_ctx.clone(), keys_rx, generation, authorization_rx.clone())
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
 		// Start latches for external triggering (e.g. bench binary).
@@ -457,11 +479,11 @@ pub(crate) struct ActiveSession {
 
 impl ActiveSession {
 	/// Reset the video stream's frame counters and force an IDR for a resuming client.
-	pub(crate) async fn reset_video_stream(&self) -> Result<(), ()> {
-		self.video_handle.request_reset().await
+	pub(crate) async fn reset_video_stream(&self, generation: u64) -> Result<(), ()> {
+		self.video_handle.request_reset(generation).await
 	}
 
-	pub(crate) async fn reconfigure_video(&mut self, context: VideoStreamContext) -> Result<(), ()> {
+	pub(crate) async fn reconfigure_video(&mut self, context: VideoStreamContext, generation: u64) -> Result<(), ()> {
 		let effective_hdr = self.compositor.reconfigure(context.output_mode()).await?;
 		if effective_hdr != context.format.hdr {
 			tracing::warn!(
@@ -471,16 +493,21 @@ impl ActiveSession {
 			);
 			return Err(());
 		}
-		self.video_handle.reconfigure(context.clone()).await?;
+		self.video_handle.reconfigure(context.clone(), generation).await?;
 		self.video_context = context;
 		Ok(())
 	}
 
-	pub(crate) async fn reconfigure_audio(&mut self, context: AudioStreamContext) -> Result<(), ()> {
+	pub(crate) async fn reconfigure_audio(
+		&mut self,
+		context: AudioStreamContext,
+		generation: u64,
+		keys: keys::ActiveKeys,
+	) -> Result<(), ()> {
 		let reconfigure_capture = self.audio_context.packet_duration_ms != context.packet_duration_ms
 			|| self.audio_context.audio_config.channels != context.audio_config.channels;
 		self.audio_handle
-			.reconfigure(context.clone(), reconfigure_capture)
+			.reconfigure(context.clone(), reconfigure_capture, generation, keys)
 			.await?;
 		self.audio_context = context;
 		Ok(())

@@ -335,7 +335,7 @@ pub(crate) struct VideoStreamHandle {
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
-	reset_tx: std::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+	reset_tx: std::sync::mpsc::Sender<pipeline::EpochActivation>,
 	fec_feedback_tx: watch::Sender<FrameFecStatus>,
 	packet_tx: mpsc::Sender<VideoPacketMessage>,
 	pause_tx: watch::Sender<u64>,
@@ -344,14 +344,19 @@ pub(crate) struct VideoStreamHandle {
 
 pub(super) struct VideoReconfigureCommand {
 	pub context: VideoStreamContext,
+	/// The authorization generation the reconfigured epoch is activated for.
+	pub generation: u64,
 	pub applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
 }
 
 pub(super) enum VideoPacketMessage {
 	Batch(ShardBatch),
 	Pause(tokio::sync::oneshot::Sender<()>),
+	/// Ordered after every batch of the previous epoch. Delivery resumes only
+	/// for `generation`, and only while it is the current authorization.
 	BeginEpoch {
 		context: VideoStreamContext,
+		generation: u64,
 		ready: tokio::sync::oneshot::Sender<()>,
 	},
 }
@@ -387,9 +392,11 @@ impl VideoStreamHandle {
 	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
 	/// the jump as massive frame loss and reports a poor connection. This also forces an
 	/// IDR so the resumed client has a decodable starting frame.
-	pub async fn request_reset(&self) -> Result<(), ()> {
+	pub async fn request_reset(&self, generation: u64) -> Result<(), ()> {
 		let (applied, waiting) = tokio::sync::oneshot::channel();
-		self.reset_tx.send(applied).map_err(|_| ())?;
+		self.reset_tx
+			.send(pipeline::EpochActivation { generation, applied })
+			.map_err(|_| ())?;
 		waiting.await.map_err(|_| ())?
 	}
 
@@ -407,10 +414,14 @@ impl VideoStreamHandle {
 	}
 
 	/// Replace the encoder/packetizer epoch and wait until it is ready.
-	pub async fn reconfigure(&self, context: VideoStreamContext) -> Result<(), ()> {
+	pub async fn reconfigure(&self, context: VideoStreamContext, generation: u64) -> Result<(), ()> {
 		let (applied, waiting) = tokio::sync::oneshot::channel();
 		self.reconfigure_tx
-			.send(VideoReconfigureCommand { context, applied })
+			.send(VideoReconfigureCommand {
+				context,
+				generation,
+				applied,
+			})
 			.map_err(|_| ())?;
 		waiting.await.map_err(|_| ())?
 	}
@@ -509,6 +520,7 @@ impl VideoStream {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
+		generation: u64,
 		authorization_rx: AuthorizationReceiver,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<VideoStreamHandle, ()> {
@@ -555,6 +567,7 @@ impl VideoStream {
 			pause_rx,
 			socket,
 			authorization_rx,
+			generation,
 			start.waiter(),
 			stop.clone(),
 			worker,
@@ -598,12 +611,21 @@ impl VideoStream {
 
 /// `worker` was registered by the caller before spawning, so a stop before
 /// `StartB` still waits for this task to drop its socket.
+///
+/// Delivery is bound to one authorization generation: the epoch the last
+/// `BeginEpoch` (or the initial start) activated. A batch is sent only after
+/// `StartB`, to an endpoint that generation discovered, while it is still the
+/// current authorization. A `/resume` therefore ends delivery to the replaced
+/// client at once, including a paced send in progress; datagrams already
+/// handed to the kernel cannot be recalled. Pause/epoch commands and endpoint
+/// discovery are served before `StartB` so a reconnect never waits on it.
 #[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
 	packet_rx: mpsc::Receiver<VideoPacketMessage>,
 	mut pause_rx: watch::Receiver<u64>,
 	socket: UdpGsoSocket,
-	authorization: AuthorizationReceiver,
+	mut authorization: AuthorizationReceiver,
+	initial_generation: u64,
 	start: StartWaiter,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	worker: WorkerGuard,
@@ -616,20 +638,32 @@ fn spawn_handle_video_packets(
 		let _worker = worker;
 		let mut socket = socket;
 		let mut packet_rx = packet_rx;
-		if start.wait(&stop_session_manager).await.is_err() {
+		if stop_session_manager.is_shutdown_triggered() {
 			tracing::debug!("Video packet handler stopped before start signal.");
 			return;
 		}
+		let start = start.wait(&stop_session_manager);
+		tokio::pin!(start);
+		let mut started = false;
 
 		let mut buf = [0; 1024];
-		let mut client_address = None;
+		// The discovered endpoint and the generation that discovered it.
+		let mut client_address: Option<(u64, std::net::SocketAddr)> = None;
 		let mut paused = false;
+		let mut active_generation = initial_generation;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 		let mut transport_window = diagnostics::TransportWindow::new(log_stats);
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
+				result = &mut start, if !started => {
+					if result.is_err() {
+						tracing::debug!("Video packet handler stopped before start signal.");
+						break;
+					}
+					started = true;
+				},
 				Ok(()) = pause_rx.changed() => {
 					if !paused { client_address = None; }
 					paused = true;
@@ -649,35 +683,53 @@ fn spawn_handle_video_packets(
 							paused = true;
 							let _ = ready.send(());
 						},
-						Ok(Some(VideoPacketMessage::BeginEpoch { context, ready })) => {
+						Ok(Some(VideoPacketMessage::BeginEpoch { context, generation, ready })) => {
 							pacing_bitrate = (context.format.codec == VideoCodec::PyroWave)
 								.then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
 							fps = context.fps;
+							active_generation = generation;
 							paused = false;
 							let tos = if context.qos { 160 } else { 0 };
 							let _ = socket.set_tos_v4(tos);
 							let _ = ready.send(());
 						},
 						Ok(Some(VideoPacketMessage::Batch(mut batch))) => {
-							if let Some(addr) = client_address.filter(|_| !paused) {
+							let current = authorization.borrow().generation();
+							if let Some(addr) = deliverable(client_address, started && !paused, active_generation, current) {
 								if batch.shard_count() == 0 {
 									continue;
 								}
 
 								batch.mark_send_started();
 								// Sends are wrapped in wrap_cancel so a socket that
-								// stops draining cannot block session shutdown.
-								match tokio::select! {
-									biased;
-									Ok(()) = pause_rx.changed() => {
-										paused = true;
-										client_address = None;
-										let completion = batch.finish(shard_batch::CompletionDisposition::Discarded);
-										transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len());
-										continue;
-									},
-									result = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing_bitrate)) => result,
-								}
+								// stops draining cannot block session shutdown. A pause
+								// or a replaced authorization stops the remaining shards.
+								let interrupted = {
+									let send = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing_bitrate));
+									tokio::pin!(send);
+									loop {
+										tokio::select! {
+											biased;
+											Ok(()) = pause_rx.changed() => {
+												paused = true;
+												client_address = None;
+												break None;
+											},
+											Ok(()) = authorization.changed() => {
+												if authorization.borrow_and_update().generation() != active_generation {
+													break None;
+												}
+											},
+											result = &mut send => break Some(result),
+										}
+									}
+								};
+								let Some(result) = interrupted else {
+									let completion = batch.finish(shard_batch::CompletionDisposition::Discarded);
+									transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len());
+									continue;
+								};
+								match result
 								{
 									Ok(send_stats) => {
 										transport_window.record(&send_stats, packet_rx.len());
@@ -738,7 +790,13 @@ fn spawn_handle_video_packets(
 									},
 								}
 							}
-							if client_address.is_some() && !paused { batch.notify_sent(); } else { let completion = batch.finish(shard_batch::CompletionDisposition::Discarded); transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len()); }
+							let current = authorization.borrow().generation();
+							if deliverable(client_address, started && !paused, active_generation, current).is_some() {
+								batch.notify_sent();
+							} else {
+								let completion = batch.finish(shard_batch::CompletionDisposition::Discarded);
+								transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len());
+							}
 						},
 						Ok(None) => {
 							tracing::debug!("Video packet channel closed.");
@@ -762,7 +820,7 @@ fn spawn_handle_video_packets(
 					// destination; the source port may change (NAT, client sockets).
 					if authorization.borrow().admits_media_ping(MediaStream::Video, address, &buf[..len]) {
 						tracing::trace!("Received video stream PING message from {address}.");
-						client_address = Some(address);
+						client_address = Some((authorization.borrow().generation(), address));
 					} else {
 						tracing::debug!(%address, len, "Ignoring unauthorized video endpoint discovery datagram");
 					}
@@ -772,6 +830,22 @@ fn spawn_handle_video_packets(
 
 		tracing::debug!("Video packet stream stopped.");
 	});
+}
+
+/// The endpoint a batch may be sent to: only once started and not paused, only
+/// to the endpoint the active epoch's generation discovered, and only while
+/// that generation is the current authorization.
+fn deliverable(
+	client_address: Option<(u64, std::net::SocketAddr)>,
+	enabled: bool,
+	active_generation: u64,
+	current_generation: u64,
+) -> Option<std::net::SocketAddr> {
+	client_address
+		.filter(|(discovered, _)| {
+			enabled && *discovered == active_generation && current_generation == active_generation
+		})
+		.map(|(_, address)| address)
 }
 
 #[cfg(test)]
@@ -803,6 +877,7 @@ mod tests {
 				pause_rx,
 				socket,
 				authorization_rx,
+				1,
 				handle.start.waiter(),
 				stop.clone(),
 				worker(&stop),
@@ -837,6 +912,7 @@ mod tests {
 					.unwrap();
 				let (ready, waiting) = tokio::sync::oneshot::channel();
 				tx.send(VideoPacketMessage::BeginEpoch {
+					generation: 1,
 					context: VideoStreamContext {
 						fps: 120,
 						bitrate: 750_000_000,
@@ -893,6 +969,7 @@ mod tests {
 			pause_rx,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -910,6 +987,7 @@ mod tests {
 			pause_tx.send_modify(|g| *g += 1);
 			tx.send(VideoPacketMessage::Pause(paused)).await.unwrap();
 			tx.send(VideoPacketMessage::BeginEpoch {
+				generation: 1,
 				context: VideoStreamContext::default(),
 				ready,
 			})
@@ -952,6 +1030,7 @@ mod tests {
 			pause_rx,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -982,6 +1061,7 @@ mod tests {
 			tx.send(VideoPacketMessage::Batch(old)).await.unwrap();
 			let (ready, waiting) = tokio::sync::oneshot::channel();
 			tx.send(VideoPacketMessage::BeginEpoch {
+				generation: 1,
 				context: VideoStreamContext {
 					fps: 120,
 					bitrate: 650_000_000,
@@ -1035,6 +1115,7 @@ mod tests {
 			watch::channel(0u64).1,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(stop),
@@ -1187,6 +1268,7 @@ mod tests {
 					..Default::default()
 				},
 				keys.1,
+				1,
 				authorization_rx.clone(),
 				stop.clone(),
 			);
@@ -1249,6 +1331,7 @@ mod tests {
 			watch::channel(0u64).1,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1291,17 +1374,28 @@ mod tests {
 		assert!(receives(&rebound, 0x44).await);
 		assert!(!receives(&attacker, 0x44).await);
 
-		// After a resume, the previous generation's payload is stale. Whether
-		// the old endpoint may still receive this frame is the separate
-		// contract in `authorization_replacement_stops_old_endpoint_delivery`.
+		// After a resume, the previous generation's payload is stale, and
+		// nothing reaches either endpoint until the new generation discovers its
+		// endpoint and its epoch is activated (see
+		// `authorization_replacement_stops_old_endpoint_delivery`).
 		let next = crate::session::authorization::StreamAuthorization::new(2, "127.0.0.1".parse().unwrap()).unwrap();
 		authorization_tx.send_replace(next.clone());
 		client.send_to(&session_ping(&current, 5), server).await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 		send_frame(&tx, 0x55).await;
 		assert!(!receives(&client, 0x55).await);
+		assert!(!receives(&rebound, 0x55).await);
 		client.send_to(&session_ping(&next, 1), server).await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		let (ready, activated) = tokio::sync::oneshot::channel();
+		tx.send(VideoPacketMessage::BeginEpoch {
+			context: VideoStreamContext::default(),
+			generation: next.generation(),
+			ready,
+		})
+		.await
+		.unwrap();
+		activated.await.unwrap();
 		send_frame(&tx, 0x66).await;
 		assert!(receives(&client, 0x66).await);
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
@@ -1313,7 +1407,6 @@ mod tests {
 	/// the old generation's endpoint, and a PING of the new generation alone
 	/// must not resume delivery before an ordered epoch activation.
 	#[tokio::test]
-	#[ignore = "known defect: review 2026-10-05 SEC-001 (batch C)"]
 	async fn authorization_replacement_stops_old_endpoint_delivery() {
 		use tokio::net::UdpSocket;
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
@@ -1328,6 +1421,7 @@ mod tests {
 			watch::channel(0u64).1,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -1370,6 +1464,7 @@ mod tests {
 
 		let (ready, activated) = tokio::sync::oneshot::channel();
 		tx.send(VideoPacketMessage::BeginEpoch {
+			generation: next.generation(),
 			context: VideoStreamContext::default(),
 			ready,
 		})
@@ -1386,12 +1481,83 @@ mod tests {
 		stop.wait_shutdown_complete().await;
 	}
 
+	/// Review 2026-10-05 SEC-001 under load: a resume that replaces the grant
+	/// while a paced send is blocked stops it, discards the batch and releases
+	/// its network credit; queued batches of the old epoch are discarded too.
+	/// A client on another address then needs its own discovery and epoch.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn authorization_replacement_interrupts_a_blocked_send() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		};
+		use std::time::Duration;
+		use tokio::net::UdpSocket;
+		let mut socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		socket.force_no_gso_for_test();
+		socket.faults.stall_after = Some(1);
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (tx, rx) = mpsc::channel(16);
+		let (authorization_tx, authorization_rx) = test_authorization("127.0.0.1");
+		spawn_handle_video_packets(
+			rx,
+			watch::channel(0u64).1,
+			socket,
+			authorization_rx,
+			1,
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+			None,
+			120,
+			false,
+		);
+		start.open();
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		client.send_to(b"PING", server).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		let credits = Arc::new(AtomicUsize::new(3));
+		let mut completions = Vec::new();
+		for _ in 0..3 {
+			let mut batch = shard_batch::ShardBuf::new(3, 64, 0).into_batch();
+			batch.hold_until_release(shard_batch::NetworkCredit(credits.clone()));
+			let (sent, completed) = std::sync::mpsc::sync_channel(1);
+			batch.set_send_completion(sent);
+			completions.push(completed);
+			tx.send(VideoPacketMessage::Batch(batch)).await.unwrap();
+		}
+		// The first datagram was submitted; the rest of the batch is blocked.
+		tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut [0; 64]))
+			.await
+			.unwrap()
+			.unwrap();
+		// A client on another address resumes.
+		let resumed_authorization =
+			crate::session::authorization::StreamAuthorization::new(2, "127.0.0.2".parse().unwrap()).unwrap();
+		authorization_tx.send_replace(resumed_authorization);
+		for completion in &completions {
+			let completion = completion.recv_timeout(Duration::from_secs(1)).unwrap();
+			assert_eq!(completion.disposition, shard_batch::CompletionDisposition::Discarded);
+		}
+		assert_eq!(credits.load(Ordering::Relaxed), 0, "every old-epoch credit is released");
+		assert!(
+			tokio::time::timeout(Duration::from_millis(50), client.recv_from(&mut [0; 64]))
+				.await
+				.is_err()
+		);
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
 	/// Review 2026-10-05 STAB-002: the one-shot media latch gates media, not
 	/// lifecycle commands. A client that completes PLAY and disappears before
 	/// `StartB` leaves workers that a reconnect ANNOUNCE must still be able to
 	/// pause; acknowledging must not open delivery or the latch.
 	#[tokio::test]
-	#[ignore = "known defect: review 2026-10-05 STAB-002 (batch C)"]
 	async fn pause_is_acknowledged_before_start() {
 		use std::time::Duration;
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
@@ -1408,6 +1574,7 @@ mod tests {
 			pause_rx,
 			socket,
 			authorization_rx,
+			1,
 			handle.start.waiter(),
 			stop.clone(),
 			worker(&stop),

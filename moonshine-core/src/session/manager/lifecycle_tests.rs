@@ -92,8 +92,16 @@ struct FakeBackend {
 	/// The most recent session's stop, so tests can play a failing worker.
 	session_stop: std::sync::Mutex<Option<ShutdownManager<SessionShutdownReason>>>,
 	foreground_tx: std::sync::Mutex<Option<watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>>>,
-	/// Every committed reconnect plan: whether video was recreated, and audio.
-	plans: std::sync::Mutex<Vec<(bool, AudioStreamContext)>>,
+	/// Every reconnect plan the backend ran.
+	plans: std::sync::Mutex<Vec<PlanRecord>>,
+}
+
+/// What a reconnect plan asked the workers to do, and for which authorization.
+struct PlanRecord {
+	video_recreated: bool,
+	audio: AudioStreamContext,
+	generation: u64,
+	key_id: u32,
 }
 
 struct FakeSession {
@@ -232,7 +240,12 @@ impl SessionBackend for FakeBackend {
 
 	async fn resume(&self, _session: &mut FakeSession, plan: ResumePlan) -> Result<(), ()> {
 		assert!(matches!(plan.audio.packet_duration_ms, 5 | 10));
-		self.plans.lock().unwrap().push((plan.video.is_some(), plan.audio));
+		self.plans.lock().unwrap().push(PlanRecord {
+			video_recreated: plan.video.is_some(),
+			audio: plan.audio,
+			generation: plan.generation,
+			key_id: plan.keys.key_id().get(),
+		});
 		self.gate(Op::Resume).await
 	}
 
@@ -385,7 +398,11 @@ impl Harness {
 }
 
 fn keys() -> SessionKeyData {
-	SessionKeyData::new(RemoteInputKey::from_bytes([7; 16]), RemoteInputKeyId::new(1))
+	keys_with_id(1)
+}
+
+fn keys_with_id(id: u32) -> SessionKeyData {
+	SessionKeyData::new(RemoteInputKey::from_bytes([id as u8; 16]), RemoteInputKeyId::new(id))
 }
 
 fn context() -> SessionContext {
@@ -1080,7 +1097,6 @@ async fn hung_application_stop_is_not_reported_idle() {
 /// not commit. Either the replacing resume is refused until the transition
 /// finishes, or the superseded PLAY fails and the newest grant completes.
 #[tokio::test]
-#[ignore = "known defect: review 2026-10-05 STAB-001 (batch C)"]
 async fn superseded_reconnect_play_cannot_commit() {
 	let h = Harness::new();
 	let old = h.resumed().await;
@@ -1116,13 +1132,75 @@ async fn superseded_reconnect_play_cannot_commit() {
 	h.assert_released().await;
 }
 
+/// Review 2026-10-05 STAB-001: every reconnect plan carries the generation
+/// and keys of the PLAY that produced it, snapshotted together; a superseded
+/// PLAY's plan never carries the newer resume's keys, and the replacing PLAY's
+/// plan carries its own.
+#[tokio::test]
+async fn reconnect_plans_snapshot_generation_and_keys_together() {
+	let h = Harness::new();
+	h.active().await;
+	h.core
+		.resume_session(keys_with_id(5), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	let first = h.grant().await;
+	h.announce(&first).await.unwrap();
+	h.hold(Op::Resume);
+	let play = {
+		let core = h.core.clone();
+		let first = first.clone();
+		tokio::spawn(async move { core.start_session(&first).await })
+	};
+	h.entered(Op::Resume, 1).await;
+	h.core
+		.resume_session(keys_with_id(6), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	h.release(Op::Resume);
+	assert!(play.await.unwrap().is_err(), "the superseded PLAY must not succeed");
+	let second = h.grant().await;
+	h.announce(&second).await.unwrap();
+	h.core.start_session(&second).await.unwrap();
+	let records: Vec<_> = h
+		.backend()
+		.plans
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|plan| (plan.generation, plan.key_id))
+		.collect();
+	assert_eq!(records, vec![(first.generation(), 5), (second.generation(), 6)]);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// A `/resume` cannot replace the authorization while the first PLAY is still
+/// starting streams: there is no retained stream to resume yet. The PLAY then
+/// completes normally.
+#[tokio::test]
+async fn resume_during_first_play_is_refused() {
+	let h = Harness::new();
+	let task = hold_at(&h, Op::Start).await;
+	assert!(
+		h.core
+			.resume_session(keys(), ResumeRequest::default(), h.client)
+			.await
+			.is_err()
+	);
+	h.release(Op::Start);
+	task.await.unwrap().unwrap();
+	assert_eq!(h.phase().await, "active");
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
 /// Review 2026-10-05 STAB-007: a failed ANNOUNCE pause has side effects the
 /// manager cannot see through `Result<(), ()>`; one subsystem may already be
 /// paused. The session must not stay Active with a running-looking epoch:
 /// it is handed to teardown (or, once the backend reports a finer outcome,
 /// left in an explicitly defined state).
 #[tokio::test]
-#[ignore = "known defect: review 2026-10-05 STAB-007 (batch C)"]
 async fn failed_announce_pause_has_a_defined_outcome() {
 	let h = Harness::new();
 	let grant = h.active().await;
@@ -1143,7 +1221,6 @@ async fn failed_announce_pause_has_a_defined_outcome() {
 /// is either rejected before streams start or applied and published, as a
 /// reconnect PLAY already does.
 #[tokio::test]
-#[ignore = "known defect: review 2026-10-05 BUG-003 (batch C)"]
 async fn first_play_publishes_the_negotiated_output_mode() {
 	let h = Harness::new();
 	h.launched().await;
@@ -1418,7 +1495,9 @@ async fn hundred_reconnect_cycles_alternate_every_negotiated_axis() {
 		let order = h.counters().order.lock().unwrap().clone();
 		assert!(order.iter().rposition(|op| *op == Op::Pause) < order.iter().rposition(|op| *op == Op::Resume));
 
-		let (video_recreated, audio) = h.backend().plans.lock().unwrap().pop().unwrap();
+		let PlanRecord {
+			video_recreated, audio, ..
+		} = h.backend().plans.lock().unwrap().pop().unwrap();
 		assert_eq!(
 			video_recreated,
 			settings.video() != next.video(),

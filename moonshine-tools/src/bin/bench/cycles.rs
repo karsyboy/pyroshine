@@ -570,6 +570,34 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 		let _ = manager.stop_session().await;
 		return Err(boxed_error("initial stream start"));
 	}
+	if args.reconnect_before_start {
+		// Workers that never received StartB must still serve reconnects: an
+		// unchanged one (pause, reset) and a changed one (pause, reconfigure).
+		for (cycle, step) in [(0, 0), (0, 1)] {
+			settings = settings.step(step, codecs.len());
+			let video = settings.video(&codecs, args.packet_size);
+			let reconnected = tokio::time::timeout(Duration::from_secs(10), async {
+				manager.bench_resume(keys(cycle), Ipv4Addr::LOCALHOST.into()).await?;
+				let grant = manager.authorize_stream(Ipv4Addr::LOCALHOST.into()).await.ok_or(())?;
+				manager
+					.set_stream_context(&grant, video.clone(), settings.audio(), false)
+					.await?;
+				manager.start_session(&grant).await
+			})
+			.await;
+			tracing::info!(
+				step = STEPS[step],
+				ok = matches!(reconnected, Ok(Ok(()))),
+				timed_out = reconnected.is_err(),
+				"Reconnect before StartB"
+			);
+			if !matches!(reconnected, Ok(Ok(()))) {
+				let _ = manager.stop_session().await;
+				return Err(boxed_error("reconnect before StartB"));
+			}
+		}
+	}
+	let video = settings.video(&codecs, args.packet_size);
 	manager.trigger_streams_start().await;
 	let initial = stream_window(&mut stats, &receiver, video_port, args.cycle_seconds).await?;
 	if streaming_checks(&initial, &video, args.cycle_seconds)

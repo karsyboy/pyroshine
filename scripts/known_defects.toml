@@ -12,42 +12,6 @@
 # error until then. Do not weaken a test to make it pass.
 
 [[rust]]
-finding = "SEC-001"
-batch = "C"
-test = "session::stream::video::tests::authorization_replacement_stops_old_endpoint_delivery"
-marker = "review 2026-10-05 SEC-001: the replaced generation's endpoint received a batch admitted after the grant changed"
-
-[[rust]]
-finding = "STAB-001"
-batch = "C"
-test = "session::manager::lifecycle_tests::superseded_reconnect_play_cannot_commit"
-marker = "review 2026-10-05 STAB-001: PLAY of generation"
-
-[[rust]]
-finding = "STAB-002"
-batch = "C"
-test = "session::stream::video::tests::pause_is_acknowledged_before_start"
-marker = "review 2026-10-05 STAB-002: video pause was not acknowledged before StartB"
-
-[[rust]]
-finding = "STAB-002"
-batch = "C"
-test = "session::stream::audio::tests::pause_is_acknowledged_before_start"
-marker = "review 2026-10-05 STAB-002: audio pause was not acknowledged before StartB"
-
-[[rust]]
-finding = "STAB-007"
-batch = "C"
-test = "session::manager::lifecycle_tests::failed_announce_pause_has_a_defined_outcome"
-marker = "review 2026-10-05 STAB-007: failed ANNOUNCE pause left phase active"
-
-[[rust]]
-finding = "BUG-003"
-batch = "C"
-test = "session::manager::lifecycle_tests::first_play_publishes_the_negotiated_output_mode"
-marker = "review 2026-10-05 BUG-003: first PLAY negotiated 2560x1440@120"
-
-[[rust]]
 finding = "STAB-003"
 batch = "D"
 test = "session::manager::lifecycle_tests::failed_application_stop_is_not_reported_idle"

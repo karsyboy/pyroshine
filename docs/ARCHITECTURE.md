@@ -199,11 +199,12 @@ application while resetting or replacing encoders and transport state.
 | --- | --- |
 | HTTP launch | Authenticated GameStream API initializes and launches the application and compositor |
 | RTSP ANNOUNCE | Validates negotiated formats and numeric domains; for an active session, pauses the live epoch, then publishes pending video/audio contexts |
-| RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition |
+| RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition. The first PLAY applies the ANNOUNCE output mode (resolution, refresh rate, HDR) to the running compositor before starting streams, or fails; the session context then reports the negotiated mode, as after a reconnect |
 | Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
 | HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
 | Unchanged reconnect | Pauses both streams, keeps the video pipeline and Pulse sockets, resets client-visible sequencing and encoder state (IDR), and activates transport before PLAY completes |
 | Changed reconnect | Pauses both epochs, reconfigures compositor output only for resolution, refresh rate or HDR changes, and commits new video/audio resources before activating delivery |
+| Failed ANNOUNCE pause | One medium may already be paused and a worker no longer answers; the session is handed to teardown |
 | Cancel, application exit or failure | One teardown stops the application unit and joins every worker; only then can a new launch start |
 
 Negotiation invariants:
@@ -218,6 +219,22 @@ Negotiation invariants:
   32-bit rate control, implemented audio durations), not quality caps.
 - **No silent fallback.** An unsupported codec, chroma, bit depth or range fails
   negotiation; the server never substitutes another format.
+- **Epochs belong to one generation.** PLAY snapshots its authorization
+  generation and the keys published for it under the manager lock; the start
+  request or reconnect plan carries that snapshot to every worker, and each new
+  epoch (`BeginEpoch`) is activated for that generation. The video and audio
+  senders deliver only after `StartB`, to an endpoint discovered by the active
+  epoch's generation, while that generation is the current authorization. A
+  `/resume` therefore ends delivery to the replaced client immediately, without
+  waiting for ANNOUNCE, and interrupts a paced send in progress; a PING of the
+  new generation discovers an endpoint but delivers nothing until its PLAY
+  activates an epoch. A PLAY whose generation a newer `/resume` replaced while
+  it reconfigured fails; the manager records the contexts the workers now run so
+  the next reconnect is planned against reality.
+- **Lifecycle commands do not wait for `StartB`.** The start latch gates
+  capture, encoding and sending only. Pause, reset, reconfiguration and epoch
+  activation are served before it, so a client that completed PLAY and
+  disappeared before `StartB` can be resumed (unchanged or changed mode).
 - **Audio follows the same barrier.** Every reconnect, including unchanged
   settings, runs Pause → producer reset → begin epoch for audio as for video.
   Opus and RTP/FEC state are recreated and Pulse discards queued PCM before
@@ -289,10 +306,11 @@ rejected without touching the retained application or streams.
 **Workers** (compositor, video pipeline thread and packet task, audio encoder
 and packet task, PulseAudio server, control stream, gamepad thread) register a
 `lifecycle::WorkerGuard` before they are spawned and drop it last, after their
-sockets, threads, GPU objects and frames. Stream workers wait for `StartB`
-through a persistent `lifecycle::StartLatch`: it may open before, during or
-after workers wait, duplicate opens are no-ops, and a stop before `StartB`
-cancels the wait and releases the worker's socket.
+sockets, threads, GPU objects and frames. Stream workers produce and send media
+only after `StartB`, through a persistent `lifecycle::StartLatch`: it may open
+before, during or after workers wait, duplicate opens are no-ops, and a stop
+before `StartB` cancels the wait and releases the worker's socket. While waiting
+they keep serving pause, reset and reconfiguration commands.
 
 **XWayland** is owned by the compositor (`compositor/xwayland_process.rs`),
 which holds a pidfd for the child it spawned. Teardown closes its Wayland

@@ -184,8 +184,6 @@ pub(crate) struct AudioStartHandle {
 	packet_tx: mpsc::Sender<AudioPacketMessage>,
 	encoder_reconfigure_tx: crossbeam_channel::Sender<AudioEncoderReconfigure>,
 	pulse_reconfigure_tx: crossbeam_channel::Sender<PulseReconfigure>,
-	keys_rx: SessionKeysReceiver,
-	authorization_rx: AuthorizationReceiver,
 }
 
 #[cfg(test)]
@@ -211,17 +209,6 @@ impl AudioStartHandle {
 			packet_tx,
 			encoder_reconfigure_tx: crossbeam_channel::unbounded().0,
 			pulse_reconfigure_tx: crossbeam_channel::unbounded().0,
-			keys_rx: tokio::sync::watch::channel(crate::session::keys::KeyLedger::default().publish(
-				crate::session::SessionKeyData::new(
-					crate::session::RemoteInputKey::from_bytes([1; 16]),
-					crate::session::RemoteInputKeyId::new(1),
-				),
-			))
-			.1,
-			authorization_rx: tokio::sync::watch::channel(
-				crate::session::authorization::StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap(),
-			)
-			.1,
 		};
 		(handle, pauses)
 	}
@@ -278,8 +265,17 @@ impl AudioStartHandle {
 		waiting.await.map_err(|_| ())
 	}
 
-	pub async fn reconfigure(&self, context: AudioStreamContext, reconfigure_capture: bool) -> Result<(), ()> {
-		let generation = self.authorization_rx.borrow().generation();
+	/// Reconfigure capture and encoding for the epoch of `generation`, using
+	/// the keys the manager snapshotted with it. Both come from one PLAY
+	/// transaction; neither is re-read from a watch that a newer `/resume` may
+	/// already have changed.
+	pub async fn reconfigure(
+		&self,
+		context: AudioStreamContext,
+		reconfigure_capture: bool,
+		generation: u64,
+		keys: crate::session::keys::ActiveKeys,
+	) -> Result<(), ()> {
 		{
 			let (pulse_applied, pulse_waiting) = tokio::sync::oneshot::channel();
 			self.pulse_reconfigure_tx
@@ -301,7 +297,7 @@ impl AudioStartHandle {
 		self.encoder_reconfigure_tx
 			.send(AudioEncoderReconfigure {
 				generation,
-				keys: self.keys_rx.borrow().clone(),
+				keys,
 				context,
 				applied,
 			})
@@ -370,11 +366,9 @@ impl AudioStream {
 		self,
 		context: AudioStreamContext,
 		keys_rx: SessionKeysReceiver,
+		generation: u64,
 		authorization_rx: AuthorizationReceiver,
 	) -> Result<AudioStartHandle, ()> {
-		let generation = authorization_rx.borrow().generation();
-		let authorization_for_handle = authorization_rx.clone();
-		let keys_for_handle = keys_rx.clone();
 		// Apply QoS to UDP socket.
 		if context.qos {
 			let _ = self.udp_socket.set_tos_v4(224);
@@ -390,6 +384,7 @@ impl AudioStream {
 			packet_rx,
 			self.udp_socket,
 			authorization_rx,
+			generation,
 			start.waiter(),
 			self.stop.clone(),
 			worker,
@@ -434,18 +429,22 @@ impl AudioStream {
 			packet_tx,
 			encoder_reconfigure_tx,
 			pulse_reconfigure_tx,
-			keys_rx: keys_for_handle,
-			authorization_rx: authorization_for_handle,
 		})
 	}
 }
 
 /// `worker` was registered by the caller before spawning, so a stop before
 /// `StartB` still waits for this task to drop its socket.
+///
+/// Lifecycle commands (pause, epoch activation) and endpoint discovery are
+/// served from the start, so a reconnect can negotiate with workers that never
+/// received `StartB`. Packets are sent only after `StartB`, to the endpoint the
+/// active generation discovered, while that generation is still current.
 fn spawn_handle_audio_packets(
 	packet_rx: mpsc::Receiver<AudioPacketMessage>,
 	socket: UdpSocket,
 	authorization: AuthorizationReceiver,
+	initial_generation: u64,
 	start: StartWaiter,
 	stop: ShutdownManager<SessionShutdownReason>,
 	worker: WorkerGuard,
@@ -455,18 +454,28 @@ fn spawn_handle_audio_packets(
 		let _worker = worker;
 		let socket = socket;
 		let mut packet_rx = packet_rx;
-		if start.wait(&stop).await.is_err() {
+		if stop.is_shutdown_triggered() {
 			tracing::debug!("Audio packet handler stopped before start signal.");
 			return;
 		}
+		let start = start.wait(&stop);
+		tokio::pin!(start);
+		let mut started = false;
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
 		let mut paused = false;
-		let mut active_generation = authorization.borrow().generation();
+		let mut active_generation = initial_generation;
 
 		while !stop.is_shutdown_triggered() {
 			tokio::select! {
+				result = &mut start, if !started => {
+					if result.is_err() {
+						tracing::debug!("Audio packet handler stopped before start signal.");
+						break;
+					}
+					started = true;
+				},
 				message = stop.wrap_cancel(packet_rx.recv()) => {
 					match message {
 						Ok(Some(AudioPacketMessage::Pause(ready))) => {
@@ -481,7 +490,7 @@ fn spawn_handle_audio_packets(
 							let _ = ready.send(());
 						},
 						Ok(Some(AudioPacketMessage::Packet { generation, data: packet })) => {
-							if let Some((_, client_address)) = client_address.filter(|(discovered, _)| !paused && *discovered == generation && generation == active_generation && generation == authorization.borrow().generation())
+							if let Some((_, client_address)) = client_address.filter(|(discovered, _)| started && !paused && *discovered == generation && generation == active_generation && generation == authorization.borrow().generation())
 								&& let Err(e) = stop.wrap_cancel(socket.send_to(packet.as_slice(), client_address)).await.unwrap_or(Ok(0)) {
 									tracing::warn!("Failed to send packet to client: {e}");
 								}
@@ -550,7 +559,7 @@ mod tests {
 		let mut auth = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
 		auth.require_session_id();
 		let (auth_tx, auth_rx) = watch::channel(auth.clone());
-		spawn_handle_audio_packets(rx, socket, auth_rx, start.waiter(), stop.clone(), worker(&stop));
+		spawn_handle_audio_packets(rx, socket, auth_rx, 1, start.waiter(), stop.clone(), worker(&stop));
 		start.open();
 		let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let new = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -621,7 +630,6 @@ mod tests {
 	/// acknowledge a reconnect pause before the first `StartB`, without
 	/// opening the latch or sending media.
 	#[tokio::test]
-	#[ignore = "known defect: review 2026-10-05 STAB-002 (batch C)"]
 	async fn pause_is_acknowledged_before_start() {
 		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let server = socket.local_addr().unwrap();
@@ -635,6 +643,7 @@ mod tests {
 			rx,
 			socket,
 			authorization_rx,
+			1,
 			handle.start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -677,6 +686,7 @@ mod tests {
 				rx,
 				socket,
 				authorization_rx,
+				1,
 				start.waiter(),
 				stop.clone(),
 				worker(&stop),
@@ -708,6 +718,7 @@ mod tests {
 			rx,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
@@ -780,7 +791,9 @@ mod tests {
 			let authorization = StreamAuthorization::new(u64::from(cycle) + 1, "127.0.0.1".parse().unwrap()).unwrap();
 			let (_keys_tx, keys_rx) = watch::channel(keys);
 			let (_authorization_tx, authorization_rx) = watch::channel(authorization.clone());
-			let handle = audio.start(context, keys_rx, authorization_rx).unwrap();
+			let handle = audio
+				.start(context, keys_rx, authorization.generation(), authorization_rx)
+				.unwrap();
 			let starts = cycle % 3;
 			for _ in 0..starts {
 				handle.trigger();
@@ -830,6 +843,7 @@ mod tests {
 			rx,
 			socket,
 			authorization_rx,
+			1,
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),

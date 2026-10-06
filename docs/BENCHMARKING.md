@@ -182,6 +182,10 @@ moonshine-bench --cycles 100 --cycle-log full.jsonl /usr/bin/vkcube
 moonshine-bench --reconnect-cycles 100 --cycle-log reconnect.jsonl /usr/bin/vkcube
 ```
 
+`--reconnect-before-start` first reconnects twice (unchanged, then a new
+resolution) before the initial `StartB`, as for a client that disappeared
+after PLAY; each must complete within 10 s.
+
 Each cycle changes one property, in order: none (unchanged resume), resolution
 (1920x1080/1280x720), FPS (60/120), bitrate, codec (`--cycle-codecs`, default
 `h264,hevc,av1,pyrowave`), encryption, SDR/HDR10, 4:2:0/4:4:4, audio

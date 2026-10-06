@@ -373,7 +373,15 @@ enum ConsumerMessage {
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset.
-	ResetCounters(tokio::sync::oneshot::Sender<Result<(), ()>>),
+	ResetCounters(EpochActivation),
+}
+
+/// A request to activate the next client epoch: the authorization generation
+/// it is for and the acknowledgment the session manager awaits. The packet
+/// handler delivers that epoch only while its generation is current.
+pub(crate) struct EpochActivation {
+	pub generation: u64,
+	pub applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
 }
 
 /// An owned useful-work credit travels from submission through transport release.
@@ -431,13 +439,14 @@ async fn run_packet_consumer(
 			fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 		}
 		let (frame_context, future, credit) = match msg {
-			ConsumerMessage::ResetCounters(applied) => {
+			ConsumerMessage::ResetCounters(EpochActivation { generation, applied }) => {
 				frame_number = 0;
 				sequence_number = 0;
 				let (ready, waiting) = tokio::sync::oneshot::channel();
 				if packet_tx
 					.send(VideoPacketMessage::BeginEpoch {
 						context: ctx.clone(),
+						generation,
 						ready,
 					})
 					.await
@@ -685,7 +694,7 @@ impl VideoPipeline {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		reset_request_rx: std::sync::mpsc::Receiver<EpochActivation>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
@@ -754,15 +763,16 @@ impl VideoPipelineInner {
 		&self,
 		runtime: &tokio::runtime::Handle,
 		packet_tx: &mpsc::Sender<VideoPacketMessage>,
-		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		activation: Option<EpochActivation>,
 	) -> Result<(), String> {
-		let Some(applied) = applied else {
+		let Some(EpochActivation { generation, applied }) = activation else {
 			return Ok(());
 		};
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		packet_tx
 			.blocking_send(VideoPacketMessage::BeginEpoch {
 				context: self.context.clone(),
+				generation,
 				ready,
 			})
 			.map_err(|_| "video packet channel closed during reconfiguration".to_string())?;
@@ -783,7 +793,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		mut reset_request_rx: std::sync::mpsc::Receiver<EpochActivation>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
@@ -792,17 +802,41 @@ impl VideoPipelineInner {
 	) {
 		tracing::debug!("Starting video pipeline.");
 
-		// Wait for the start signal before entering the encode loop.
-		if start.wait_blocking(&stop_session_manager).is_err() {
-			tracing::debug!("Video pipeline stopped before start signal.");
-			return;
-		}
-
-		let mut pending_applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>> = None;
+		// Encoding waits for `StartB`, but reconnect commands must not: a client
+		// can complete PLAY and disappear before sending it. Nothing has been
+		// produced yet, so a reset or reconfiguration only records the context
+		// and activates the transport epoch for its generation.
 		loop {
 			if stop_session_manager.is_shutdown_triggered() {
-				if let Some(applied) = pending_applied.take() {
-					let _ = applied.send(Err(()));
+				tracing::debug!("Video pipeline stopped before start signal.");
+				return;
+			}
+			if start.is_open() {
+				break;
+			}
+			let mut activations = Vec::new();
+			while let Ok(command) = reconfigure_rx.try_recv() {
+				self.context = command.context;
+				activations.push(EpochActivation {
+					generation: command.generation,
+					applied: command.applied,
+				});
+			}
+			activations.extend(std::iter::from_fn(|| reset_request_rx.try_recv().ok()));
+			for activation in activations {
+				if let Err(error) = self.activate_reconfigured_epoch(&runtime, &packet_tx, Some(activation)) {
+					tracing::error!(%error, "Video epoch activation before start failed");
+					return;
+				}
+			}
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+
+		let mut pending_applied: Option<EpochActivation> = None;
+		loop {
+			if stop_session_manager.is_shutdown_triggered() {
+				if let Some(activation) = pending_applied.take() {
+					let _ = activation.applied.send(Err(()));
 				}
 				break;
 			}
@@ -846,12 +880,15 @@ impl VideoPipelineInner {
 			match result {
 				Ok(Some(command)) => {
 					self.context = command.context;
-					pending_applied = Some(command.applied);
+					pending_applied = Some(EpochActivation {
+						generation: command.generation,
+						applied: command.applied,
+					});
 				},
 				Ok(None) => break,
 				Err(error) => {
-					if let Some(applied) = pending_applied.take() {
-						let _ = applied.send(Err(()));
+					if let Some(activation) = pending_applied.take() {
+						let _ = activation.applied.send(Err(()));
 					}
 					tracing::error!(%error, "Video encoding loop failed");
 					break;
@@ -931,12 +968,12 @@ impl VideoPipelineInner {
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: &mut std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<EpochActivation>,
 		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		applied: Option<EpochActivation>,
 		runtime: &tokio::runtime::Handle,
 	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
@@ -1033,11 +1070,11 @@ impl VideoPipelineInner {
 				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 			}
 			let mut resend_last = false;
-			while let Ok(applied) = reset_request_rx.try_recv() {
+			while let Ok(activation) = reset_request_rx.try_recv() {
 				frame_rx.reset();
 				frame_number = 0;
 				sequence_number = 0;
-				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(applied))?;
+				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
 			}
@@ -1265,12 +1302,12 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: &mut std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<EpochActivation>,
 		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		applied: Option<EpochActivation>,
 	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
 		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
@@ -1451,12 +1488,12 @@ impl VideoPipelineInner {
 			// ("Your network connection isn't performing well"). Reset the frame and RTP
 			// sequence counters and force an IDR so the resumed client sees a clean stream
 			// starting from frame 1.
-			while let Ok(applied) = reset_request_rx.try_recv() {
+			while let Ok(activation) = reset_request_rx.try_recv() {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				frame_rx.reset();
 				// The consumer orders activation after every old encoder future/batch.
 				frame_ctx_tx
-					.blocking_send(ConsumerMessage::ResetCounters(applied))
+					.blocking_send(ConsumerMessage::ResetCounters(activation))
 					.map_err(|_| "video consumer stopped during resume".to_string())?;
 				frame_number_base = submitted_count;
 				encoder.request_idr();
@@ -2058,9 +2095,16 @@ mod tests {
 				fec_rx,
 			));
 			let (applied, mut waiting) = tokio::sync::oneshot::channel();
-			consumer_tx.send(ConsumerMessage::ResetCounters(applied)).await.unwrap();
+			consumer_tx
+				.send(ConsumerMessage::ResetCounters(EpochActivation {
+					generation: 7,
+					applied,
+				}))
+				.await
+				.unwrap();
 			let Some(VideoPacketMessage::BeginEpoch {
 				context: activated,
+				generation: 7,
 				ready,
 			}) = packet_rx.recv().await
 			else {

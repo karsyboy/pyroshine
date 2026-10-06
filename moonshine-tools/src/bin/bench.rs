@@ -116,6 +116,12 @@ struct Args {
 	#[arg(long, default_value_t = 0)]
 	reconnect_cycles: u32,
 
+	/// Before the first `StartB` of `--reconnect-cycles`, reconnect twice (once
+	/// unchanged, once with a new resolution) as a client that completed PLAY and
+	/// disappeared would, then start. Each reconnect must finish within 10 s.
+	#[arg(long)]
+	reconnect_before_start: bool,
+
 	/// Seconds of streaming verified in each cycle.
 	#[arg(long, default_value_t = 2)]
 	cycle_seconds: u64,

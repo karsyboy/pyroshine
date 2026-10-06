@@ -122,19 +122,32 @@ pub enum SessionShutdownReason {
 }
 
 /// Inputs for spawning the stream workers of a launched session.
+///
+/// `generation` is the authorization the PLAY was accepted under. Workers
+/// activate their first media epoch for exactly this generation; delivery
+/// stops as soon as a later `/resume` replaces it.
 pub(crate) struct StartRequest {
 	pub video: VideoStreamContext,
 	pub audio: AudioStreamContext,
+	pub generation: u64,
 	pub authorization_rx: AuthorizationReceiver,
 	pub stop: ShutdownManager<SessionShutdownReason>,
 }
 
 /// Every reconnect resets both media epochs. `video: None` retains the costly
 /// pipeline and resets counters + IDR; audio always commits its negotiated context.
+///
+/// The plan is an immutable snapshot taken under the manager lock when PLAY is
+/// accepted: the authorization generation and the keys published for it. A
+/// newer `/resume` during the reconfiguration cannot mix its keys or
+/// generation into this epoch, and the epoch it activates cannot deliver
+/// media once that generation is no longer current.
 #[derive(Debug)]
 pub(crate) struct ResumePlan {
 	pub video: Option<VideoStreamContext>,
 	pub audio: AudioStreamContext,
+	pub generation: u64,
+	pub keys: crate::session::keys::ActiveKeys,
 }
 
 /// The resource-owning work behind each manager transition.
@@ -1166,7 +1179,17 @@ impl<B: SessionBackend> SessionCore<B> {
 					tracing::warn!("Discarding ANNOUNCE contexts from a replaced generation or stopping session");
 					Err(())
 				},
-				Ok(Err(())) | Err(_) => Err(()),
+				// A failed pause may have paused one medium and not the other, and
+				// means a media worker no longer answers. Neither the old epoch nor
+				// a new negotiation can be trusted: hand the session to teardown.
+				Ok(Err(())) => {
+					if committable {
+						tracing::error!(epoch = ticket.epoch, "Reconnect pause failed; stopping the session");
+						core.begin_teardown(&mut guard, Some(ticket.epoch), SessionShutdownReason::TransitionFailed);
+					}
+					Err(())
+				},
+				Err(_) => Err(()),
 			};
 			drop(guard);
 			drop(ticket);
@@ -1203,6 +1226,11 @@ impl<B: SessionBackend> SessionCore<B> {
 				.as_ref()
 				.map(watch::Sender::subscribe)
 				.expect("a current grant implies an authorization channel");
+			let generation = grant.generation();
+			let Some(keys) = guard.keys_tx.as_ref().map(|keys_tx| keys_tx.borrow().clone()) else {
+				tracing::warn!("StartSession rejected: the session has no published keys");
+				return Err(());
+			};
 			let Some(live) = guard.live() else {
 				tracing::warn!("StartSession rejected: no active session");
 				return Err(());
@@ -1229,6 +1257,7 @@ impl<B: SessionBackend> SessionCore<B> {
 					StartRequest {
 						video: video.clone(),
 						audio: audio.clone(),
+						generation,
 						authorization_rx,
 						stop: live.record.stop.clone(),
 					},
@@ -1257,6 +1286,8 @@ impl<B: SessionBackend> SessionCore<B> {
 							ResumePlan {
 								video: None,
 								audio: audio.clone(),
+								generation,
+								keys: keys.clone(),
 							}
 						},
 						ReconnectDecision::Reconfigure {
@@ -1272,6 +1303,8 @@ impl<B: SessionBackend> SessionCore<B> {
 							ResumePlan {
 								video: (!video_changed_fields.is_empty()).then(|| video.clone()),
 								audio: audio.clone(),
+								generation,
+								keys: keys.clone(),
 							}
 						},
 					};
@@ -1284,6 +1317,7 @@ impl<B: SessionBackend> SessionCore<B> {
 		};
 
 		let core = self.clone();
+		let grant = grant.clone();
 		let task = tokio::spawn(async move {
 			let outcome = match work {
 				Work::Start(launched, request) => {
@@ -1295,6 +1329,9 @@ impl<B: SessionBackend> SessionCore<B> {
 							let state = SessionState::Active(active);
 							match guard.committable(&ticket) {
 								Some(live) => {
+									// The backend applied the authoritative RTSP output mode
+									// before starting streams; publish it like a reconnect.
+									record_negotiated_mode(&mut live.record.context, &video, &audio);
 									live.record.streams = Some((video, audio));
 									live.record.start_latches = latches;
 									live.state = Some(state);
@@ -1320,20 +1357,30 @@ impl<B: SessionBackend> SessionCore<B> {
 					let result = ticket.stop.wrap_cancel(core.backend.resume(&mut active, plan)).await;
 					let mut guard = core.lock().await;
 					let state = SessionState::Active(active);
+					let current = guard.is_current(&grant);
 					match result {
 						Ok(Ok(())) => match guard.committable(&ticket) {
 							Some(live) => {
-								let context = &mut live.record.context;
-								context.resolution = (video.width, video.height);
-								context.refresh_rate = video.fps;
-								context.hdr = video.format.hdr;
-								context.audio_channels = audio.audio_config.channels;
-								context.audio_channel_mask = audio.audio_config.channel_mask;
+								// Record what the workers now run either way, so the next
+								// reconnect compares against reality.
+								record_negotiated_mode(&mut live.record.context, &video, &audio);
 								live.record.streams = Some((video, audio));
 								live.state = Some(state);
 								live.transition = None;
 								guard.progress_at = Instant::now();
-								Ok(())
+								if current {
+									Ok(())
+								} else {
+									// A newer `/resume` replaced this PLAY's generation while it
+									// reconfigured. Its epoch was activated for the old
+									// generation, which the media senders no longer serve;
+									// the new client's ANNOUNCE/PLAY activates its own epoch.
+									tracing::warn!(
+										generation = grant.generation(),
+										"Reconnect PLAY was superseded by a newer resume; not activating its epoch"
+									);
+									Err(())
+								}
 							},
 							None => {
 								guard.orphan(&ticket, state);
@@ -1401,6 +1448,15 @@ impl<B: SessionBackend> SessionCore<B> {
 
 		Ok(())
 	}
+}
+
+/// Publish the negotiated output/audio mode an epoch actually runs with.
+fn record_negotiated_mode(context: &mut SessionContext, video: &VideoStreamContext, audio: &AudioStreamContext) {
+	context.resolution = (video.width, video.height);
+	context.refresh_rate = video.fps;
+	context.hdr = video.format.hdr;
+	context.audio_channels = audio.audio_config.channels;
+	context.audio_channel_mask = audio.audio_config.channel_mask;
 }
 
 fn publish_pending<B: SessionBackend>(
