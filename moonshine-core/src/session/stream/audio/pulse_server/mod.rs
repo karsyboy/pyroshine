@@ -31,6 +31,14 @@ const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
 /// because its edge-triggered readiness does not fire again for unread data.
 const READ_BUDGET: usize = 256 * 1024;
 
+/// Whether a read error means the client went away rather than misbehaved.
+fn ends_stream(error: &std::io::Error) -> bool {
+	matches!(
+		error.kind(),
+		std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted
+	)
+}
+
 /// How a receive pass ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Received {
@@ -690,6 +698,12 @@ impl PulseServer {
 						client.incoming.truncate(off);
 						continue;
 					},
+					// The peer closed with unread replies queued: an ordinary
+					// disconnect, ended like EOF rather than reported as an error.
+					Err(e) if ends_stream(&e) => {
+						client.incoming.truncate(off);
+						return Ok(Received::Closed);
+					},
 					v => v.map_err(|e| -> Error { format!("recv error: {e}").into() })?,
 				};
 				client.incoming.truncate(off + n);
@@ -1108,6 +1122,35 @@ mod receive_tests {
 			},
 		);
 		bytes.to_vec()
+	}
+
+	/// A client that disconnects with replies unread (the server then sees a
+	/// connection reset) is an ordinary disconnect, not a client error.
+	#[test]
+	fn connection_resets_end_the_stream() {
+		for kind in [
+			std::io::ErrorKind::ConnectionReset,
+			std::io::ErrorKind::BrokenPipe,
+			std::io::ErrorKind::ConnectionAborted,
+		] {
+			assert!(super::ends_stream(&std::io::Error::from(kind)), "{kind:?}");
+		}
+		assert!(!super::ends_stream(&std::io::Error::from(
+			std::io::ErrorKind::InvalidData
+		)));
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_client_vanishing_with_unread_replies_is_removed() {
+		let mut server = Server::spawn();
+		let mut client = UnixStream::connect(&server.path).unwrap();
+		client
+			.write_all(&command(1, &pulse::Command::GetServerInfo).repeat(64))
+			.unwrap();
+		assert!(server.responsive().await);
+		drop(client);
+		assert!(server.responsive().await, "the server keeps serving after the reset");
+		assert!(server.stop().await);
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]

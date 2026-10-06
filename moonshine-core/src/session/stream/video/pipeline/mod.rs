@@ -1238,7 +1238,10 @@ impl VideoPipelineInner {
 					std::time::Duration::ZERO,
 				)
 			} else {
-				if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+				if !self.demand.wanted() {
+					// No client: captures are not requested, so none arrive.
+					last_frame_time = std::time::Instant::now();
+				} else if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
 					tracing::warn!("No frames received for 5 seconds");
 					last_frame_time = std::time::Instant::now();
 				}
@@ -1700,7 +1703,10 @@ impl VideoPipelineInner {
 							},
 						}
 					}
-					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+					if !self.demand.wanted() {
+						// No client: captures are not requested, so none arrive.
+						last_frame_time = std::time::Instant::now();
+					} else if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
 						tracing::warn!("No frames received for 5 seconds");
 						last_frame_time = std::time::Instant::now();
 					}
