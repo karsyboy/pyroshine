@@ -1155,7 +1155,14 @@ impl MoonshineCompositor {
 		let mut focus: Option<Window> = None;
 		let mut local_game_focused = false;
 
-		// Wayland `xdg-activation` request (moonshine-only).
+		// Wayland `xdg-activation` request (moonshine-only), unless Steam names
+		// the base layer: a request it overrides is dropped, not deferred.
+		if !focus::activation_may_choose_focus(strategy, focus_control_window, app_ids)
+			&& self.focus_state.peek_requested_focus_surface().is_some()
+		{
+			tracing::debug!(target: "focus", "xdg-activation: Steam controls focus; dropping request");
+			self.focus_state.clear_requested_focus_surface();
+		}
 		if let Some(requested_surface) = self.focus_state.peek_requested_focus_surface().cloned() {
 			if let Some(w) = candidates
 				.iter()
@@ -1531,18 +1538,6 @@ impl MoonshineCompositor {
 		}
 		self.focused_window = Some(best.clone());
 
-		if let Some(xf) = &self.x11_focus {
-			let gfx_app = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
-			let input_app = self
-				.input_focus_window
-				.as_ref()
-				.and_then(|w| self.window_metadata.get(w))
-				.map(|m| m.app_id)
-				.unwrap_or(gfx_app);
-			let window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
-			xf.set_focus_contract(input_app, gfx_app, window_id);
-		}
-
 		// Focus changed if either the X11 window ID or the actual window changed.
 		let focus_changed = old_focused_x11 != self.focused_x11_window
 			|| old_focused_window.as_ref().and_then(|w| w.wl_surface()) != best.wl_surface();
@@ -1565,6 +1560,16 @@ impl MoonshineCompositor {
 				.as_ref()
 				.map(|overlay| (overlay, mode_of(overlay))),
 		);
+		// Steam's focus contract describes these final targets. Unchanged
+		// values are not rewritten (see `X11Focus`), so this runs every pass.
+		if let Some(xf) = &self.x11_focus {
+			let unknown = WindowMetadata::default();
+			let meta = |w: &Window| self.window_metadata.get(w).unwrap_or(&unknown);
+			let contract =
+				super::focus::steam_focus_contract(meta(best), meta(&targets.pointer), meta(&targets.keyboard));
+			xf.set_focus_contract(&contract, &self.wayland_display);
+		}
+
 		let input_focus = targets.pointer.clone();
 		let input_focus_mode = targets.mode;
 		let keyboard_target: Option<Window> = Some(targets.keyboard);
@@ -1597,10 +1602,10 @@ impl MoonshineCompositor {
 		if let Some(old_target) = self.seat.get_keyboard().and_then(|k| k.current_focus())
 			&& keyboard_target.as_ref() != Some(old_target.window())
 		{
-			old_target.window().set_activated(false);
+			set_window_activated(old_target.window(), false);
 		}
 		if let Some(target) = &keyboard_target {
-			target.set_activated(true);
+			set_window_activated(target, true);
 		}
 
 		// Keyboard focus persistence.
@@ -1784,7 +1789,8 @@ impl MoonshineCompositor {
 		// are focusable (controller routing). Gamescope: writes
 		// GAMESCOPE_FOCUSABLE_APPS and GAMESCOPE_FOCUSABLE_WINDOWS to the root
 		// window so Steam can route controller input to the correct app.
-		// GAMESCOPE_FOCUSABLE_WINDOWS uses [window_id, app_id, pid] triplets.
+		// GAMESCOPE_FOCUSABLE_WINDOWS uses [window_id, app_id, pid] triplets
+		// (see `focus::focusable_window` for native Wayland windows).
 		// When the overlay is raised, BPM (769) is excluded — it's the active
 		// overlay, not a focusable target.
 		if let Some(ref x11_focus) = self.x11_focus {
@@ -1799,16 +1805,9 @@ impl MoonshineCompositor {
 				.collect();
 			let focusable_triplets: Vec<[u32; 3]> = candidates
 				.iter()
-				.filter_map(|w| {
-					let meta = self.window_metadata.get(w)?;
-					let window_id = meta.steam_window_id();
-					let app_id = meta.app_id;
-					if !is_focusable(app_id) {
-						return None;
-					}
-					let pid = meta.pid;
-					Some([window_id, app_id, pid])
-				})
+				.filter_map(|w| self.window_metadata.get(w))
+				.filter(|meta| is_focusable(meta.app_id))
+				.map(super::focus::focusable_window)
 				.collect();
 			if !focusable_app_ids.is_empty() {
 				x11_focus.set_focusable_apps(&focusable_app_ids);
@@ -1963,6 +1962,18 @@ impl MoonshineCompositor {
 	}
 }
 
+/// Set a window's activated state and deliver it. Smithay only stages the
+/// XDG `activated` state, so a native toplevel would otherwise learn it with
+/// whatever configure happens to follow; X11 windows apply it directly.
+fn set_window_activated(window: &Window, activated: bool) {
+	if window.set_activated(activated)
+		&& let Some(toplevel) = window.toplevel()
+		&& toplevel.is_initial_configure_sent()
+	{
+		toplevel.send_pending_configure();
+	}
+}
+
 // -- XDG Shell Handler --
 
 impl XdgShellHandler for MoonshineCompositor {
@@ -1984,15 +1995,12 @@ impl XdgShellHandler for MoonshineCompositor {
 		surface.send_configure();
 
 		// Resolve app_id from Wayland client PID (matches gamescope: wlserver.cpp:1870)
-		let app_id = if let Some(client) = surface.wl_surface().client() {
-			if let Ok(creds) = client.get_credentials(&self.display_handle) {
-				get_appid_from_pid(creds.pid as u32)
-			} else {
-				0
-			}
-		} else {
-			0
-		};
+		let pid = surface
+			.wl_surface()
+			.client()
+			.and_then(|client| client.get_credentials(&self.display_handle).ok())
+			.map_or(0, |creds| creds.pid as u32);
+		let app_id = if pid != 0 { get_appid_from_pid(pid) } else { 0 };
 
 		// Read fullscreen state before surface is consumed by new_wayland_window.
 		let fullscreen = surface.with_committed_state(|state| {
@@ -2012,6 +2020,7 @@ impl XdgShellHandler for MoonshineCompositor {
 		self.map_sequence_counter += 1;
 		let meta = WindowMetadata {
 			app_id,
+			pid,
 			map_sequence: self.map_sequence_counter,
 			geometry: self.output_rect(),
 			fullscreen,

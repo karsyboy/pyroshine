@@ -172,6 +172,37 @@ keyboard on the game; closing the overlay restores the game target and unified
 focused-app contract. These match the inspected
 [gamescope focus logic](https://github.com/ValveSoftware/gamescope/blob/master/src/steamcompmgr.cpp).
 
+The Steam focus contract is published from the final targets of each focus
+pass (unchanged values are not rewritten):
+
+| Property | Value |
+| --- | --- |
+| `GAMESCOPE_FOCUSED_APP` | App of the pointer target: the overlay while it requests input, else the focus window |
+| `GAMESCOPE_FOCUSED_APP_GFX` | App of the focus (base-layer) window |
+| `GAMESCOPE_FOCUSED_WINDOW` | Focus window: its X11 ID, or a native ID for an XDG window |
+| `GAMESCOPE_FOCUSABLE_APPS` / `_WINDOWS` | Focus candidates; windows as `[window, app, pid]` |
+| `GAMESCOPE_FOCUS_DISPLAY` | Display of the focus window |
+| `GAMESCOPE_MOUSE_FOCUS_DISPLAY` | Display of the pointer target |
+| `GAMESCOPE_KEYBOARD_FOCUS_DISPLAY` | Display of the keyboard target |
+
+A display is the XWayland name (`:N`) for an X11 target and the compositor's
+Wayland socket (`wayland-N`) for a native one, so a native Wayland game below
+the XWayland overlay publishes different displays (mode 2 keeps the keyboard
+display on the game). A native window's ID is its map sequence with bit 31
+set: stable while mapped and never a valid XID. Unlike gamescope, native
+windows stay in `GAMESCOPE_FOCUSABLE_WINDOWS`, with their Wayland client PID:
+Steam moves a launched game to the front of `GAMESCOPECTRL_BASELAYER_APPID`
+only once one of its windows is listed there. Steam cannot read X11
+properties of the native ID and logs a non-fatal `BadWindow`.
+
+While Steam names the base layer (`GAMESCOPECTRL_BASELAYER_*` set), it alone
+chooses the focus window: a Wayland `xdg-activation` request is dropped
+rather than kept. Wine's Wayland driver activates its window once at startup;
+honoring that request on later passes kept a native game above Steam's own UI
+when Steam put itself first for its controller settings. Without Steam's
+control (for example a desktop session) activation still chooses the focus.
+Activation state changes are delivered to native toplevels with a configure.
+
 Steam closes its overlay by making it transparent; a transparent Steam surface
 holds no role. A window that is unmapped or destroyed (with or without a prior
 unmap) is retired by one idempotent path: it leaves the space, its metadata and
@@ -278,8 +309,11 @@ and dropdown exclusion, unchanged focus-contract suppression, and controller
 kind/policy parsing. Native color tests cover transactional surface declarations,
 PQ/scRGB distinction, metadata isolation, SDR transitions and cleanup.
 `focus` tests cover the overlay open/close
-cycle (modes 2, 1 and 0, opacity 0), input routing back to the game, and role
-cleanup for an overlay destroyed without being hidden or unmapped; `cursor` tests
+cycle (modes 2, 1 and 0, opacity 0), input routing back to the game, role
+cleanup for an overlay destroyed without being hidden or unmapped, the Steam
+focus contract for XWayland and native Wayland games alone and below the
+overlay (modes 1 and 2, repeated cycles), and Steam's base-layer control
+overriding Wayland activation; `cursor` tests
 cover the hide hold (reverted hides never presented, sustained hides presented
 after one frame, no exposure of an inactive or destroyed cursor). They do not
 prove Steam or game behavior on hardware.
@@ -335,7 +369,10 @@ with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
    continue uninterrupted, and no focus-contract rewrites may occur.
 4. **Overlay and menus.** Open and close the Steam overlay and small interactive
    menus. Confirm visibility, pointer/controller routing, the mode-2 keyboard
-   split and immediate restoration. Repeat with Steam Input enabled and
+   split and immediate restoration. With a native Wayland Proton game, also
+   open the game's controller settings from the overlay, return and close it:
+   Steam's settings must stay visible and the controller must return to the
+   game. Repeat with Steam Input enabled and
    disabled to separate Steam routing from virtual-device delivery. Include a
    fullscreen Proton game that minimizes on focus loss (for example Grim Dawn):
    open and close the overlay at least ten times, in `capture_mode = "auto"` and

@@ -110,6 +110,18 @@ release. Choose a build documenting native Wayland support and check its
 [current options](https://github.com/GloriousEggroll/proton-ge-custom#options).
 Pyroshine does not force these variables or change the installed runtime.
 
+Check Steam Input with the Wayland driver. Some Proton builds (for example
+proton-cachyos 11.0-20261005) set `PROTON_NO_STEAMINPUT=1` whenever
+`PROTON_ENABLE_WAYLAND=1`, so a game whose Steam controller configuration
+emulates a gamepad receives only the raw controller; a PlayStation controller
+then does nothing in such a game while an Xbox controller still works. Current
+GE-Proton keeps Steam Input when the game's Steam Input setting is enabled. For
+an affected build, re-enable it per game:
+
+```text
+PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 PROTON_NO_STEAMINPUT=0 %command%
+```
+
 The application/runtime and Mesa's normal Wayland presentation implementation
 must emit color-management requests. Mesa can translate native Vulkan color
 spaces and HDR metadata to these standard requests; Pyroshine does not hook

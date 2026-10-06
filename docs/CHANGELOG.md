@@ -20,6 +20,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Keep Steam's controller settings visible over a native Wayland Proton game (`PROTON_ENABLE_WAYLAND=1`). Wine's one-time Wayland activation request was honored on every focus pass, so when Steam put its own UI first, the game stayed focused and painted above it while Steam's UI kept running unseen. Steam's base-layer control now decides focus.
+- Describe native Wayland windows accurately to Steam: their client PID in `GAMESCOPE_FOCUSABLE_WINDOWS`, the Wayland display in the focus-display properties for native targets (per graphics, pointer and keyboard target), and delivered XDG activation state. Some Proton builds disable Steam Input with their Wayland driver; see [native presentation](NATIVE_PRESENTATION.md#wine-and-proton) to re-enable it.
 - Update the desktop dashboard and tray client address when a different client resumes a retained session, following the current authorized client without restarting the application or session.
 
 ## [v0.17.0-beta.14] - 2026-10-05
