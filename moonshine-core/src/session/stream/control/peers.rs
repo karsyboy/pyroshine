@@ -293,6 +293,42 @@ mod tests {
 		}
 	}
 
+	/// Review 2026-10-05 CFG-001: `[stream].timeout` is the active peer's
+	/// liveness deadline and is not range-checked at startup. Zero would
+	/// retire every authenticated client at once, so validation must reject it;
+	/// any value validation accepts must not overflow the deadline arithmetic
+	/// once a peer authenticates.
+	#[test]
+	#[ignore = "known defect: review 2026-10-05 CFG-001 (batch D)"]
+	fn configured_liveness_cannot_expire_immediately_or_overflow() {
+		let parse =
+			|timeout: u64| toml::from_str::<crate::config::Config>(&format!("[stream]\ntimeout = {timeout}")).unwrap();
+		assert_eq!(
+			parse(60).stream.timeout,
+			60,
+			"fixture: the file sets the stream timeout"
+		);
+		assert!(
+			parse(0).validate().is_err(),
+			"review 2026-10-05 CFG-001: stream.timeout = 0 passed startup validation"
+		);
+		// The largest integer a TOML file can hold.
+		let largest = i64::MAX as u64;
+		if parse(largest).validate().is_ok() {
+			let auth = authorization(1);
+			let mut peers = ControlPeers::new(1, Duration::from_secs(largest));
+			assert!(peers.connect(peer(0), local(1), auth.control_connect_data(), &auth));
+			let request_idr = encode_client_control(&KEY, 0, &plaintext_control(0x0302, &[]));
+			let authenticated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				peers.authenticate(peer(0), &request_idr, &KEY)
+			}));
+			assert!(
+				authenticated.is_ok_and(|result| result.is_ok()),
+				"review 2026-10-05 CFG-001: an accepted stream.timeout overflowed the liveness deadline"
+			);
+		}
+	}
+
 	#[test]
 	fn connection_requires_address_and_connect_data() {
 		let auth = authorization(1);

@@ -196,6 +196,21 @@ if(INPUTTINO_EDGE_TESTS)
     add_test(NAME dualsense-edge-report COMMAND dualsense-edge-test)
 endif()
 
+# Hardware-independent DualSense feature-report replies. Configure with
+# CMAKE_CXX_FLAGS="-fsanitize=address,undefined" for the sanitizer lane.
+option(INPUTTINO_PS5_FEATURE_TESTS "Test DualSense UHID feature replies without UHID" OFF)
+if(INPUTTINO_PS5_FEATURE_TESTS AND USE_UHID)
+    enable_testing()
+    add_executable(ps5-feature-report-test tests/ps5_feature_reports.cpp)
+    target_link_libraries(ps5-feature-report-test PRIVATE inputtino::libinputtino)
+    add_test(NAME ps5-feature-reports-supported COMMAND ps5-feature-report-test supported)
+    add_test(NAME ps5-feature-reports-unsupported COMMAND ps5-feature-report-test unsupported)
+    # Known defect (review 2026-10-05 BUG-001): unsupported Bluetooth queries
+    # overread the stack. CTest reports this case as "Not Run (Disabled)" until
+    # the fix; scripts/known_defects.py checks it still fails for that reason.
+    set_tests_properties(ps5-feature-reports-unsupported PROPERTIES DISABLED TRUE)
+endif()
+
 option(INPUTTINO_ELITE_TESTS "Test Xbox Elite evdev capabilities without uinput" OFF)
 if(INPUTTINO_ELITE_TESTS)
     enable_testing()

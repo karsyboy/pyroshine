@@ -156,8 +156,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 ```
 
 CI also runs `cargo machete` (install with `cargo install cargo-machete`),
-`python3 scripts/changelog.py check`, and
-`python3 -m unittest discover -s scripts -p 'test_changelog.py'`.
+`python3 scripts/changelog.py check`,
+`python3 -m unittest discover -s scripts -p 'test_changelog.py'`, and
+`python3 scripts/known_defects.py` (known-defect characterizations must still
+fail for their recorded reason; native controller tests under ASan/UBSan).
+When fixing a listed finding, un-ignore its tests and remove their entries in
+`scripts/known_defects.toml` in the same change; never weaken them to pass.
 Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs the
 `#[ignore]`d `session::stream::video::pyrowave::tests::ffi_loads_pinned_api` in
 `moonshine-core` with `--ignored`, `MOONSHINE_TEST_PYROWAVE=1` and

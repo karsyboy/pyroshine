@@ -1109,6 +1109,53 @@ mod tests {
 		}
 	}
 
+	/// Review 2026-10-05 CFG-001: SETUP advertises configured listener ports.
+	/// A configuration that passes startup validation must not make it hand a
+	/// client port 0: either validation rejects ephemeral advertised ports or
+	/// SETUP reports the ports actually bound.
+	mod advertised_ports {
+		use super::super::*;
+
+		#[tokio::test]
+		#[ignore = "known defect: review 2026-10-05 CFG-001 (batch D)"]
+		async fn validated_configuration_never_advertises_port_zero() {
+			let mut config = crate::config::Config::default();
+			config.stream.video.port = 0;
+			config.stream.audio.port = 0;
+			config.stream.control.port = 0;
+			if config.validate().is_err() {
+				return;
+			}
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			server.video_config = config.stream.video.clone();
+			server.audio_config = config.stream.audio.clone();
+			server.control_config = config.stream.control.clone();
+			for stream in ["video", "audio", "control"] {
+				let raw = normalize_request_target(
+					format!(
+						"SETUP streamid={stream}/0/0 RTSP/1.0\r\nCSeq: 3\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\n\r\n"
+					)
+					.into_bytes(),
+				);
+				let (rtsp_types::Message::Request(request), _) = rtsp_types::Message::<Vec<u8>>::parse(&raw).unwrap()
+				else {
+					panic!("SETUP fixture is a request");
+				};
+				let response = server.handle_setup_request(&request, 3, &grant);
+				assert_eq!(response.status(), rtsp_types::StatusCode::Ok, "{stream}");
+				let transport = response.header(&headers::TRANSPORT).unwrap().as_str().to_owned();
+				assert_ne!(
+					transport, "server_port=0",
+					"review 2026-10-05 CFG-001: SETUP advertised port 0 for {stream} from a validated configuration"
+				);
+			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+	}
+
 	mod framing {
 		use super::super::*;
 

@@ -90,6 +90,29 @@ A low-entropy cube cannot establish game quality or maximum-link throughput.
 The benchmark exercises server encoding/loopback sending, not Moonlight decode,
 display latency or physical network congestion.
 
+### Recording an identified baseline
+
+`scripts/record_baseline.py` records the provenance a comparison needs and a
+fixed workload set in one directory outside the checkout:
+
+```sh
+python3 scripts/record_baseline.py --out ~/pyroshine-baselines/$(git rev-parse --short HEAD) --netns
+```
+
+`manifest.json` identifies the commit (refusing an uncommitted tree unless
+`--allow-dirty`), Cargo.lock hash, Git-pinned crates, PyroWave and Inputtino
+pins, toolchain, kernel, CPU, memory, governor, GPU/driver and the PyroWave
+library found. The script rebuilds `moonshine-bench` immediately before
+measuring and records its hash, so a stale binary is never measured. It then
+runs each named workload `--repeats` times (default three) and 10 lifecycle and
+reconnect cycles, keeping raw logs, parsed final summaries, exit codes and the
+benchmark process's CPU time and peak RSS (the application runs in its own unit).
+The recorded PyroWave library is the one loaded. A workload that cannot run is listed under `not_run`.
+`--metadata-only` records provenance without running anything. It refuses to
+start while `moonshine-session.service` is active, because the benchmark would
+replace a live session; `--netns` keeps its ports and mDNS off the host network.
+Workload names are stable: add new ones rather than changing existing entries.
+
 ### Output
 
 Every 5 seconds, a summary is printed with:

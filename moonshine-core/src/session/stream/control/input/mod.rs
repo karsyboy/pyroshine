@@ -1007,6 +1007,33 @@ mod tests {
 				.unwrap();
 		}
 
+		/// Review 2026-10-05 STAB-004: a full feedback queue must not block
+		/// shutdown. The PlayStation claim on arrival publishes motion enables
+		/// with an awaited send outside the handler's cancellation, so a
+		/// production-capacity (ten-entry) feedback receiver that is not being
+		/// drained holds the gamepad worker, and the session, open.
+		#[tokio::test]
+		#[ignore = "known defect: review 2026-10-05 STAB-004 (batch E)"]
+		async fn full_feedback_queue_cannot_block_gamepad_shutdown() {
+			let mut h = Harness::new(GamepadConfig::default());
+			let (owner, mut rx) = mpsc::channel(10);
+			while owner.try_send(rumble(1)).is_ok() {}
+			h.send(arrival(0, PLAYSTATION), &owner).await;
+			// The device exists, so the handler has taken the arrival and is
+			// in (or past) the claim that follows creation.
+			assert_eq!(h.settle(1).await, vec!["create 0 index 0".to_string()]);
+			h.stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+			let completed = tokio::time::timeout(Duration::from_secs(5), h.stop.wait_shutdown_complete())
+				.await
+				.is_ok();
+			// Unblock the worker either way so a failure does not leak the thread.
+			rx.close();
+			assert!(
+				completed,
+				"review 2026-10-05 STAB-004: gamepad shutdown waited on a full, undrained feedback queue"
+			);
+		}
+
 		#[tokio::test]
 		async fn native_model_changes_recreate_and_paddles_release_across_owners() {
 			let mut harness = Harness::new(GamepadConfig::default());

@@ -181,6 +181,29 @@ MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
   -- --ignored --exact --nocapture
 ```
 
+The Pixelforge encoder-input slot contract, and the decoded static-scene
+recovery check (needs `ffmpeg`; a known defect, see below):
+
+```sh
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
+  session::stream::video::pipeline::convert::tests::encoder_input_slots_rotate_on_gpu \
+  -- --ignored --exact --nocapture
+python3 scripts/known_defects.py --gpu --skip-native
+```
+
+### Known-defect characterizations
+
+Confirmed findings that are not fixed yet have tests stating the corrected
+contract, ignored with a `known defect: review 2026-10-05 <ID>` reason and
+listed in [`scripts/known_defects.toml`](scripts/known_defects.toml). CI runs
+`python3 scripts/known_defects.py`, which requires each one to fail with its
+recorded message, builds the hardware-independent native controller tests in
+`vendor/inputtino` with AddressSanitizer/UBSan and runs them with CTest. A
+fix removes the test's `#[ignore]` (or the CTest `DISABLED` property) and its
+manifest entry in the same change; the checker reports a known-defect test
+that passes as an error. GPU entries run only with `--gpu` and are otherwise
+reported as not run.
+
 Repeated-session acceptance on real hardware uses the benchmark's
 [lifecycle cycles](docs/BENCHMARKING.md#lifecycle-cycles).
 

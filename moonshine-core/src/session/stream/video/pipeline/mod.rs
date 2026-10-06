@@ -171,6 +171,42 @@ fn encoder_failure(stage: EncodeStage, error: &PixelForgeError) -> EncodeFailure
 	EncodeFailure::new(stage, recovery, SourceAccess::Completed, error.to_string())
 }
 
+/// The encoder-input contract of the conventional loop. The pinned Pixelforge
+/// encoder owns two input slots (`ENCODE_PIPELINE_DEPTH`): `input_image` is the
+/// current slot and every `encode` advances to the next one. Each captured
+/// frame is converted into `input_image` and encoded from it immediately, so a
+/// per-frame encode always reads the slot it just converted.
+trait EncoderInput {
+	type Future;
+	type Error;
+	fn input_image(&self) -> vk::Image;
+	fn encode(&mut self, image: vk::Image) -> Result<Self::Future, Self::Error>;
+}
+
+impl EncoderInput for Encoder {
+	type Future = EncodeFuture;
+	type Error = PixelForgeError;
+
+	fn input_image(&self) -> vk::Image {
+		Encoder::input_image(self)
+	}
+
+	fn encode(&mut self, image: vk::Image) -> Result<EncodeFuture, PixelForgeError> {
+		Encoder::encode(self, image)
+	}
+}
+
+/// Encode a recovery keyframe for a static scene: an IDR is pending (already
+/// requested from the encoder) and no new frame arrived.
+///
+/// Known defect (review 2026-10-05 BUG-002): after an `encode`, `input_image`
+/// is the next slot rather than the last converted frame, so this submits a
+/// never-written or older image. See the `static_recovery_*` tests.
+fn encode_static_recovery<E: EncoderInput>(encoder: &mut E) -> Result<E::Future, E::Error> {
+	let image = encoder.input_image();
+	encoder.encode(image)
+}
+
 /// Apply a frame failure: release the source only if no GPU work can still
 /// read it, and return the recovery, or `Err` when the stream must stop.
 fn apply_failure(
@@ -1473,13 +1509,15 @@ impl VideoPipelineInner {
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
-					// re-encode the encoder's input image (still contains
-					// the last frame's data after color conversion).
+					// re-encode the static scene. This assumes the encoder's
+					// input image still holds the last converted frame, which
+					// the slot contract does not provide (review 2026-10-05
+					// BUG-002; see `encode_static_recovery`).
 					if pending_idr && has_encoded && conventional_can_admit(&in_flight) {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
-						match encoder.encode(encoder.input_image()) {
+						match encode_static_recovery(&mut encoder) {
 							Ok(future) => {
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
@@ -1991,7 +2029,7 @@ mod tests {
 		BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost,
 		rtp_timestamp_for_frame,
 	};
-	use ash::vk;
+	use ash::vk::{self, Handle};
 	use pixelforge::{InputFormat, PixelForgeError};
 
 	#[tokio::test]
@@ -2200,6 +2238,77 @@ mod tests {
 		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
 		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
 		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
+	}
+
+	/// A model of the pinned Pixelforge input-slot contract: two slots,
+	/// `input_image` returns the current one and `encode` advances. It records
+	/// which converted content each encode read. The real encoder is pinned to
+	/// this model by `convert::tests::encoder_input_slots_rotate_on_gpu`.
+	#[derive(Default)]
+	struct FakeSlots {
+		slots: [Option<char>; 2],
+		current: usize,
+		encoded: Vec<Option<char>>,
+	}
+
+	impl FakeSlots {
+		/// The conventional loop's per-frame step: convert into the current
+		/// input image, then encode that image.
+		fn convert_and_encode(&mut self, content: char) {
+			use super::EncoderInput;
+			let target = self.input_image();
+			self.slots[target.as_raw() as usize - 1] = Some(content);
+			let image = self.input_image();
+			self.encode(image).unwrap();
+		}
+	}
+
+	impl super::EncoderInput for FakeSlots {
+		type Future = ();
+		type Error = ();
+
+		fn input_image(&self) -> vk::Image {
+			vk::Image::from_raw(self.current as u64 + 1)
+		}
+
+		fn encode(&mut self, image: vk::Image) -> Result<(), ()> {
+			self.encoded.push(self.slots[image.as_raw() as usize - 1]);
+			self.current = (self.current + 1) % self.slots.len();
+			Ok(())
+		}
+	}
+
+	/// Current behavior to retain: a captured frame is encoded from the slot
+	/// it was just converted into.
+	#[test]
+	fn per_frame_encodes_read_the_slot_just_converted() {
+		let mut encoder = FakeSlots::default();
+		for content in ['A', 'B', 'C', 'D', 'E'] {
+			encoder.convert_and_encode(content);
+		}
+		assert_eq!(encoder.encoded, ['A', 'B', 'C', 'D', 'E'].map(Some).to_vec());
+	}
+
+	/// Review 2026-10-05 BUG-002: with no new frame, a recovery keyframe must
+	/// encode the latest converted scene, after one, two or many frames.
+	#[test]
+	#[ignore = "known defect: review 2026-10-05 BUG-002 (batch G)"]
+	fn static_recovery_encodes_the_latest_converted_frame() {
+		for preceding in [1usize, 2, 5] {
+			let mut encoder = FakeSlots::default();
+			let frames: Vec<char> = ('A'..).take(preceding).collect();
+			for &content in &frames {
+				encoder.convert_and_encode(content);
+			}
+			super::encode_static_recovery(&mut encoder).unwrap();
+			let latest = *frames.last().unwrap();
+			assert_eq!(
+				encoder.encoded.last().copied().flatten(),
+				Some(latest),
+				"review 2026-10-05 BUG-002: after {preceding} frame(s), static recovery encoded {:?} instead of the latest frame {latest:?}",
+				encoder.encoded.last().copied().flatten()
+			);
+		}
 	}
 
 	#[test]

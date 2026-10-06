@@ -91,6 +91,9 @@ const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 
 const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2);
+/// systemd's `TimeoutStopUSec` for the application unit: how long a stop job
+/// may legitimately take before systemd escalates to SIGKILL.
+const UNIT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Start-job wait (includes `ExecStartPre`), decoupled from `launch_timeout_secs` so a `pre_command` isn't cut off.
@@ -623,7 +626,10 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		),
 		// ExecStart: a(sasb)
 		("ExecStart".to_string(), build_exec_array(&[main_entry])?),
-		("TimeoutStopUSec".to_string(), zvariant::Value::U64(5_000_000)),
+		(
+			"TimeoutStopUSec".to_string(),
+			zvariant::Value::U64(UNIT_STOP_TIMEOUT.as_micros() as u64),
+		),
 		(
 			"CollectMode".to_string(),
 			zvariant::Value::Str("inactive-or-failed".into()),
@@ -809,6 +815,62 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
+	/// Review 2026-10-05 CFG-002: every configured pre/post hook must reach the
+	/// unit in order, or unit preparation must fail with a diagnostic. Today an
+	/// empty or unresolvable entry is silently dropped, so systemd never sees it.
+	#[test]
+	#[ignore = "known defect: review 2026-10-05 CFG-002 (batch D)"]
+	fn unresolvable_hooks_are_not_silently_dropped() {
+		let commands = vec![
+			vec!["true".to_string()],
+			vec!["pyroshine-review-missing-hook".to_string(), "--flag".to_string()],
+			Vec::new(),
+			vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+		];
+		let entries = super::build_exec_entries(&commands);
+		assert!(
+			entries.iter().all(|(path, argv, _)| argv.first() == Some(path)),
+			"fixture: resolved entries keep argv[0] as the resolved path"
+		);
+		assert_eq!(
+			entries.len(),
+			commands.len(),
+			"review 2026-10-05 CFG-002: {} of {} configured hooks were silently omitted from the unit",
+			commands.len() - entries.len(),
+			commands.len()
+		);
+	}
+
+	/// Valid hooks keep their order and arguments (current behavior to retain).
+	#[test]
+	fn resolvable_hooks_keep_order_and_arguments() {
+		let commands = vec![
+			vec!["true".to_string()],
+			vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+		];
+		let entries = super::build_exec_entries(&commands);
+		assert_eq!(entries.len(), 2);
+		assert!(entries[0].0.ends_with("/true") && entries[0].1.len() == 1);
+		assert!(entries[1].0.ends_with("/sh"));
+		assert_eq!(entries[1].1[1..], ["-c".to_string(), "exit 0".to_string()]);
+		assert!(entries.iter().all(|(_, _, ignore_errors)| !ignore_errors));
+	}
+
+	/// Review 2026-10-05 STAB-003: the client-side wait for the stop job must
+	/// cover the stop allowance the unit is created with; otherwise a process
+	/// that exits within systemd's allowance (for example after three seconds)
+	/// is reported as a failed stop and teardown proceeds while it still runs.
+	#[test]
+	#[ignore = "known defect: review 2026-10-05 STAB-003 (batch D)"]
+	fn stop_job_wait_covers_the_unit_stop_allowance() {
+		assert!(
+			super::STOP_JOB_TIMEOUT > super::UNIT_STOP_TIMEOUT,
+			"review 2026-10-05 STAB-003: the stop job wait ({:?}) is shorter than the unit's TimeoutStopUSec ({:?})",
+			super::STOP_JOB_TIMEOUT,
+			super::UNIT_STOP_TIMEOUT
+		);
+	}
+
 	#[test]
 	fn launch_environment_exposes_real_displays_without_presentation_injection() {
 		let context = super::ApplicationContext {

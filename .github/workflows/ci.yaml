@@ -79,6 +79,14 @@ jobs:
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}
 
+      # Characterizations of open review findings must keep failing for their
+      # recorded reason (scripts/known_defects.toml), and the hardware-independent
+      # native controller tests run under AddressSanitizer/UBSan. GPU entries
+      # are reported as not run here.
+      - name: Known defects and native sanitizer tests
+        if: matrix.name == 'Test Suite'
+        run: python3 scripts/known_defects.py --json "$RUNNER_TEMP/known-defects.json"
+
   desktop:
     name: Desktop app
     runs-on: ubuntu-24.04

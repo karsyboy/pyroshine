@@ -617,6 +617,51 @@ mod tests {
 		stop.wait_shutdown_complete().await;
 	}
 
+	/// Review 2026-10-05 STAB-002: like video, the audio packet handler must
+	/// acknowledge a reconnect pause before the first `StartB`, without
+	/// opening the latch or sending media.
+	#[tokio::test]
+	#[ignore = "known defect: review 2026-10-05 STAB-002 (batch C)"]
+	async fn pause_is_acknowledged_before_start() {
+		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let (mut handle, _pauses) = AudioStartHandle::for_test();
+		let (tx, rx) = mpsc::channel(4);
+		handle.packet_tx = tx.clone();
+		let authorization = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
+		let (_authorization_tx, authorization_rx) = watch::channel(authorization.clone());
+		spawn_handle_audio_packets(
+			rx,
+			socket,
+			authorization_rx,
+			handle.start.waiter(),
+			stop.clone(),
+			worker(&stop),
+		);
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let mut ping = authorization.ping_payload(MediaStream::Audio).as_bytes().to_vec();
+		ping.extend(1u32.to_be_bytes());
+		client.send_to(&ping, server).await.unwrap();
+		let paused = tokio::time::timeout(Duration::from_secs(5), handle.pause_for_reconfigure()).await;
+		assert!(
+			matches!(paused, Ok(Ok(()))),
+			"review 2026-10-05 STAB-002: audio pause was not acknowledged before StartB ({paused:?})"
+		);
+		assert!(!handle.start.is_open(), "pausing must not open the media latch");
+		tx.send(AudioPacketMessage::Packet {
+			generation: 1,
+			data: vec![0xab; 8],
+		})
+		.await
+		.unwrap();
+		assert!(!receives(&client, &[0xab; 8]).await, "no media before StartB");
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
 	/// STAB-001: audio has the same pre-start ownership contract as video.
 	#[tokio::test]
 	async fn stop_before_start_releases_the_audio_socket_before_completion() {

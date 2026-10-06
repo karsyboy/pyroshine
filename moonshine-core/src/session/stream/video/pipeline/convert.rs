@@ -1259,6 +1259,35 @@ mod tests {
 		gpu_fixture::run();
 	}
 
+	/// Pins the Pixelforge input-slot contract modelled by `FakeSlots` in the
+	/// pipeline tests: two slots, `encode` advances to the next one. A change in
+	/// the pinned encoder must fail here rather than silently change recovery.
+	/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encoder_input_slots -- --ignored`
+	#[test]
+	#[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
+	fn encoder_input_slots_rotate_on_gpu() {
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
+			"set MOONSHINE_TEST_GPU=1"
+		);
+		gpu_fixture::slot_rotation();
+	}
+
+	/// Review 2026-10-05 BUG-002 on real hardware: encode one, two or five
+	/// distinct solid scenes, then a static-scene recovery keyframe through the
+	/// production `encode_static_recovery`, decode the stream with `ffmpeg` and
+	/// compare the recovered picture with the latest scene.
+	/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core static_recovery_decodes -- --ignored --nocapture`
+	#[test]
+	#[ignore = "known defect: review 2026-10-05 BUG-002 (batch G); needs a Vulkan Video GPU and ffmpeg: MOONSHINE_TEST_GPU=1"]
+	fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
+			"set MOONSHINE_TEST_GPU=1"
+		);
+		gpu_fixture::static_recovery_decode();
+	}
+
 	#[test]
 	fn embedded_shader_is_spirv() {
 		let words = ash::util::read_spv(&mut std::io::Cursor::new(CONVERT_SPIRV)).unwrap();
@@ -1621,6 +1650,120 @@ mod gpu_fixture {
 			device.bind_image_memory(image, memory, 0).unwrap();
 			PlainTarget(image, memory, context.clone())
 		}
+	}
+
+	/// A small encoder for the slot/recovery fixtures.
+	fn recovery_encoder() -> (VideoContext, Encoder, (u32, u32)) {
+		let context = VideoContextBuilder::new()
+			.app_name("recovery-fixture")
+			.require_encode(Codec::H265)
+			.build()
+			.expect("Vulkan Video context");
+		let size = (256u32, 128u32);
+		let encoder = Encoder::new(context.clone(), EncodeConfig::h265(size.0, size.1)).unwrap();
+		(context, encoder, size)
+	}
+
+	fn block_on<F: std::future::Future>(future: F) -> F::Output {
+		tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap()
+			.block_on(future)
+	}
+
+	pub(super) fn slot_rotation() {
+		let (_context, mut encoder, _) = recovery_encoder();
+		let mut inputs = vec![encoder.input_image()];
+		for _ in 0..4 {
+			let image = encoder.input_image();
+			block_on(encoder.encode(image).unwrap()).unwrap();
+			inputs.push(encoder.input_image());
+		}
+		assert_ne!(inputs[0], inputs[1], "encode advances the input slot");
+		assert_eq!(inputs[0], inputs[2], "the pinned encoder has two input slots");
+		assert_eq!(inputs[1], inputs[3]);
+		assert_eq!(inputs[2], inputs[4]);
+	}
+
+	/// Decode an H.265 Annex-B stream to one 8-bit luma plane per frame.
+	fn decode_luma(stream: &[u8], (w, h): (u32, u32)) -> Vec<Vec<u8>> {
+		let path = std::env::temp_dir().join(format!("pyroshine-static-recovery-{}.h265", std::process::id()));
+		std::fs::write(&path, stream).unwrap();
+		let output = std::process::Command::new("ffmpeg")
+			.args(["-hide_banner", "-loglevel", "error", "-f", "hevc", "-i"])
+			.arg(&path)
+			.args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+			.output();
+		let _ = std::fs::remove_file(&path);
+		let output = output.expect("ffmpeg is required for the decode check");
+		assert!(
+			output.status.success(),
+			"ffmpeg failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		output
+			.stdout
+			.chunks_exact((w * h) as usize)
+			.map(<[u8]>::to_vec)
+			.collect()
+	}
+
+	fn mean(plane: &[u8]) -> f64 {
+		plane.iter().map(|&v| f64::from(v)).sum::<f64>() / plane.len() as f64
+	}
+
+	pub(super) fn static_recovery_decode() {
+		// Distinct grey levels; each run's last level differs from every slot
+		// a stale recovery could read.
+		const LEVELS: [u8; 5] = [200, 40, 120, 160, 80];
+		let mut failures = Vec::new();
+		for preceding in [1usize, 2, 5] {
+			let (context, mut encoder, (w, h)) = recovery_encoder();
+			let mut converter = InputConverter::new(
+				context.clone(),
+				ConversionQueueMode::Auto,
+				w,
+				h,
+				OutputFormat::NV12,
+				ColorSpace::Bt709,
+				true,
+			)
+			.unwrap();
+			let mut stream = Vec::new();
+			for &level in &LEVELS[..preceding] {
+				let pixels: Vec<u8> = (0..w * h).flat_map(|_| [level, level, level, 255]).collect();
+				let source = source_image(&context, w, h, vk::Format::R8G8B8A8_UNORM, &pixels);
+				// The conventional loop's per-frame step.
+				converter
+					.convert(
+						&source,
+						vk::Format::R8G8B8A8_UNORM,
+						false,
+						&[None, None],
+						encoder.input_image(),
+					)
+					.unwrap();
+				let image = encoder.input_image();
+				stream.extend(block_on(encoder.encode(image).unwrap()).unwrap().data);
+			}
+			encoder.request_idr();
+			let recovery = block_on(super::super::encode_static_recovery(&mut encoder).unwrap()).unwrap();
+			assert!(recovery.is_key_frame, "the recovery frame is an IDR");
+			stream.extend(recovery.data);
+			let frames = decode_luma(&stream, (w, h));
+			assert_eq!(frames.len(), preceding + 1, "decoded frame count");
+			let (latest, recovered) = (mean(&frames[preceding - 1]), mean(&frames[preceding]));
+			let line =
+				format!("after {preceding} frame(s): latest scene luma {latest:.1}, recovery luma {recovered:.1}");
+			eprintln!("{line}");
+			if (latest - recovered).abs() > 4.0 {
+				failures.push(line);
+			}
+		}
+		assert!(
+			failures.is_empty(),
+			"review 2026-10-05 BUG-002: static recovery did not decode to the latest scene: {failures:#?}"
+		);
 	}
 
 	pub(super) fn run() {

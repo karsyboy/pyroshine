@@ -1291,19 +1291,144 @@ mod tests {
 		assert!(receives(&rebound, 0x44).await);
 		assert!(!receives(&attacker, 0x44).await);
 
-		// After a resume, the previous generation's payload is stale.
+		// After a resume, the previous generation's payload is stale. Whether
+		// the old endpoint may still receive this frame is the separate
+		// contract in `authorization_replacement_stops_old_endpoint_delivery`.
 		let next = crate::session::authorization::StreamAuthorization::new(2, "127.0.0.1".parse().unwrap()).unwrap();
 		authorization_tx.send_replace(next.clone());
 		client.send_to(&session_ping(&current, 5), server).await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 		send_frame(&tx, 0x55).await;
-		assert!(receives(&rebound, 0x55).await);
 		assert!(!receives(&client, 0x55).await);
 		client.send_to(&session_ping(&next, 1), server).await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 		send_frame(&tx, 0x66).await;
 		assert!(receives(&client, 0x66).await);
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+	}
+
+	/// Review 2026-10-05 SEC-001: admitting a discovery PING is not authority
+	/// to keep transmitting. Once the grant is replaced (an HTTP `/resume`,
+	/// before any ANNOUNCE pause), batches admitted afterwards must not reach
+	/// the old generation's endpoint, and a PING of the new generation alone
+	/// must not resume delivery before an ordered epoch activation.
+	#[tokio::test]
+	#[ignore = "known defect: review 2026-10-05 SEC-001 (batch C)"]
+	async fn authorization_replacement_stops_old_endpoint_delivery() {
+		use tokio::net::UdpSocket;
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (tx, rx) = mpsc::channel(16);
+		let (authorization_tx, authorization_rx) = test_authorization("127.0.0.1");
+		authorization_tx.send_modify(crate::session::authorization::StreamAuthorization::require_session_id);
+		spawn_handle_video_packets(
+			rx,
+			watch::channel(0u64).1,
+			socket,
+			authorization_rx,
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+			None,
+			60,
+			false,
+		);
+		start.open();
+		let old = authorization_tx.borrow().clone();
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		client.send_to(&session_ping(&old, 1), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x11).await;
+		assert!(
+			receives(&client, 0x11).await,
+			"fixture: the current generation receives video"
+		);
+
+		let mut next =
+			crate::session::authorization::StreamAuthorization::new(2, "127.0.0.1".parse().unwrap()).unwrap();
+		next.require_session_id();
+		authorization_tx.send_replace(next.clone());
+		send_frame(&tx, 0x22).await;
+		assert!(
+			!receives(&client, 0x22).await,
+			"review 2026-10-05 SEC-001: the replaced generation's endpoint received a batch admitted after the grant changed"
+		);
+
+		// The new client (same host, new port) discovers the endpoint; that
+		// alone must not activate media for the new generation.
+		let resumed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		resumed.send_to(&session_ping(&next, 1), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x33).await;
+		assert!(
+			!receives(&resumed, 0x33).await,
+			"review 2026-10-05 SEC-001: a new-generation PING resumed delivery before epoch activation"
+		);
+		assert!(!receives(&client, 0x33).await);
+
+		let (ready, activated) = tokio::sync::oneshot::channel();
+		tx.send(VideoPacketMessage::BeginEpoch {
+			context: VideoStreamContext::default(),
+			ready,
+		})
+		.await
+		.unwrap();
+		activated.await.unwrap();
+		send_frame(&tx, 0x44).await;
+		assert!(
+			receives(&resumed, 0x44).await,
+			"the activated current generation receives video"
+		);
+		assert!(!receives(&client, 0x44).await);
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		stop.wait_shutdown_complete().await;
+	}
+
+	/// Review 2026-10-05 STAB-002: the one-shot media latch gates media, not
+	/// lifecycle commands. A client that completes PLAY and disappears before
+	/// `StartB` leaves workers that a reconnect ANNOUNCE must still be able to
+	/// pause; acknowledging must not open delivery or the latch.
+	#[tokio::test]
+	#[ignore = "known defect: review 2026-10-05 STAB-002 (batch C)"]
+	async fn pause_is_acknowledged_before_start() {
+		use std::time::Duration;
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let (mut handle, _probe) = VideoStreamHandle::for_test();
+		let (tx, rx) = mpsc::channel(16);
+		handle.packet_tx = tx.clone();
+		let (pause_tx, pause_rx) = watch::channel(0u64);
+		handle.pause_tx = pause_tx;
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		spawn_handle_video_packets(
+			rx,
+			pause_rx,
+			socket,
+			authorization_rx,
+			handle.start.waiter(),
+			stop.clone(),
+			worker(&stop),
+			None,
+			60,
+			false,
+		);
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		client.send_to(b"PING", server).await.unwrap();
+		let paused = tokio::time::timeout(Duration::from_secs(5), handle.pause_for_reconfigure()).await;
+		assert!(
+			matches!(paused, Ok(Ok(()))),
+			"review 2026-10-05 STAB-002: video pause was not acknowledged before StartB ({paused:?})"
+		);
+		assert!(!handle.start.is_open(), "pausing must not open the media latch");
+		send_frame(&tx, 0x5a).await;
+		assert!(!receives(&client, 0x5a).await, "no media before StartB");
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
 	}
 
 	#[test]

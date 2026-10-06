@@ -72,3 +72,18 @@ Valve support lives in Pyroshine's `gamepad/valve.rs` beside the host input
 adapter. It uses Linux UHID and the existing gamepad Tokio runtime. This avoids
 changing the pinned public Inputtino crate or adding C/Rust ABI extensions.
 Keep both local patches in comparisons when updating Inputtino.
+
+## Native regression tests
+
+- `tests/ps5_feature_reports.cpp`, `CMakeLists.txt`: opt-in
+  `INPUTTINO_PS5_FEATURE_TESTS` compiles the DualSense UHID handler's
+  translation unit and reads its replies from a pipe, without `/dev/uhid`.
+  `supported` checks byte-exact USB and Bluetooth calibration, pairing and
+  firmware replies, including golden CRC trailers. `unsupported` checks that
+  every other report number gets an error reply without a payload; it is a
+  known defect (review 2026-10-05 BUG-001: the Bluetooth error path computes a
+  CRC over `size - 4` with size 0 and overreads the stack), so its CTest case
+  is `DISABLED` until fixed.
+- `scripts/known_defects.py` in the Pyroshine root builds these and the Edge and
+  Elite tests with AddressSanitizer/UBSan and runs them in CI. No source of the
+  native library itself changed for these tests.
