@@ -33,6 +33,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Send the current picture when a keyframe is requested on a static screen with H.264, HEVC or AV1 (after a reconnect, packet loss or a client request). The recovery keyframe re-encoded the encoder's next input slot, which held an older frame or nothing, so the client could show a stale or garbage picture until the scene changed; it now re-encodes the last converted frame and stays pending until it is actually submitted. PyroWave was not affected.
 
+- Reconnect the desktop app when its first attempt to attach to a running Pyroshine fails (for example while the service is still starting). It previously stayed disconnected until the service or app restarted; it now retries automatically and explains an incompatible or inaccessible service instead of reporting that Pyroshine isn't running.
+
 ### Changed
 
 - Stop capturing, converting and encoding video and audio while no client is connected to a retained session; the game keeps running and is presented normally. On an RX 9070 XT a detached 1080p60 session previously used the same encode GPU time as a streaming one; it now uses none, and the first frame after reconnecting is a keyframe of the current scene.

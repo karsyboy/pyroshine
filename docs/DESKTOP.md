@@ -155,6 +155,7 @@ blank windows there; set `WEBKIT_DISABLE_DMABUF_RENDERER=0` to override.
 | Symptom | Check |
 | --- | --- |
 | "Pyroshine isn't running" | `systemctl status "pyroshine@$USER"`; the app reconnects by itself once the service runs. |
+| "Pyroshine is running, but this app can't connect to it" | A transient error (for example the session bus or a service still starting) is retried automatically with growing delays up to 30 s. If it says retrying won't help, the app and the service are different versions or access is denied: update both, then restart the app. |
 | Service runs, app cannot reach it | The service log line "Desktop management interface unavailable" explains why, for example a different user or session bus. |
 | No tray icon | The table above; the app logs "System tray unavailable" when no host exists. |
 | App diagnostics | Run `PYROSHINE_UI_LOG=info pyroshine-ui` from a terminal. |

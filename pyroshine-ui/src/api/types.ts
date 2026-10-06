@@ -172,8 +172,15 @@ export interface ServerEvent {
   at_ms: number;
 }
 
+export interface AttachError {
+  kind: string;
+  message: string;
+}
+
 export interface Overview {
   connected: boolean;
+  /** Set when Pyroshine runs but this app cannot attach to it. */
+  attach_error?: AttachError | null;
   server: ServerInfo | null;
   session: SessionSnapshot | null;
   pairing: PairingSnapshot | null;

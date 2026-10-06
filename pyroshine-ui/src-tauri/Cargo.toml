@@ -40,6 +40,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zbus = { version = "5.16.0", features = ["tokio"] }
 
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+
 [profile.release]
 lto = "thin"
 strip = true

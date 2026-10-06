@@ -544,6 +544,14 @@ pyroshine-ui (desktop session)              pyroshine (service)
                                                             ── frame stats broadcast
 ```
 
+The desktop app follows ownership of the bus name and supervises each
+attachment (`pyroshine-ui/src-tauri/src/attach.rs`): while the same owner
+stays, a failed subscription or snapshot is retried with backoff from 0.5 s
+doubling to 30 s; an incompatible or denied daemon is reported and waits for a
+new owner; a new owner abandons the pending attempt. Each attempt carries a
+generation and publishes only while it is current, so an abandoned attempt
+cannot overwrite the new owner's state.
+
 The interface is a control surface over the existing owners, never a parallel
 implementation:
 
