@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.1] - 2026-10-07
+
 ### Fixed
 
 - Resize the running application's windows when a resuming client requests a different resolution. Previously only the compositor output changed: Steam Big Picture and fullscreen X11 games kept rendering at the previous client's resolution and were scaled into the new stream.

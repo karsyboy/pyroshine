@@ -1,7 +1,7 @@
 {
   "name": "pyroshine-ui",
   "private": true,
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "Optional Pyroshine desktop app: system tray, pairing, dashboard and settings",
   "license": "BSD-2-Clause",
   "type": "module",
