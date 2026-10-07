@@ -1215,6 +1215,55 @@ mod xwayland_tests {
 		shut_down(stop);
 	}
 
+	/// A resuming client with another resolution reconfigures the live output.
+	/// Windows held at the output size must follow it, or the application keeps
+	/// rendering at the previous client's resolution and is scaled into the
+	/// stream; a windowed application keeps its own size.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn live_output_reconfiguration_resizes_windows_held_at_output_size() {
+		let (stop, _handles, mut launched) = launch();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let size = |window| {
+			let geometry = conn.get_geometry(window).unwrap().reply().unwrap();
+			(geometry.width, geometry.height)
+		};
+		let big_picture = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 769)]);
+		let windowed = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 219990)]);
+		conn.configure_window(
+			windowed,
+			&x11rb::protocol::xproto::ConfigureWindowAux::new()
+				.width(640)
+				.height(480),
+		)
+		.unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(|| size(windowed) == (640, 480)));
+		assert_eq!(size(big_picture), (WIDTH, HEIGHT));
+
+		let effective_hdr = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap()
+			.block_on(launched.reconfigure(super::OutputMode {
+				width: 1920,
+				height: 1080,
+				refresh_rate: 60,
+				hdr: false,
+			}))
+			.expect("live reconfiguration");
+		assert!(!effective_hdr);
+		assert!(
+			wait_until(|| size(big_picture) == (1920, 1080)),
+			"Big Picture kept {:?} after the output became 1920x1080",
+			size(big_picture)
+		);
+		assert_eq!(size(windowed), (640, 480));
+
+		drop(conn);
+		shut_down(stop);
+	}
+
 	/// A focus target destroyed while the compositor selects its events yields
 	/// an asynchronous BadWindow. It must be ignored: Xlib's default handler
 	/// exits the process, which took the whole server down on hardware.

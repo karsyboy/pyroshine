@@ -621,6 +621,7 @@ impl MoonshineCompositor {
 
 		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
 		self.screen_dirty = true;
+		self.resize_windows_to_output();
 		tracing::info!(width, height, refresh_rate, hdr, "Reconfigured live compositor output");
 		Ok(())
 	}

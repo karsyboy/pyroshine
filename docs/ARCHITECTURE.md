@@ -203,7 +203,7 @@ application while resetting or replacing encoders and transport state.
 | Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
 | HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
 | Unchanged reconnect | Pauses both streams, keeps the video pipeline and Pulse sockets, resets client-visible sequencing and encoder state (IDR), and activates transport before PLAY completes |
-| Changed reconnect | Pauses both epochs, reconfigures compositor output only for resolution, refresh rate or HDR changes, and commits new video/audio resources before activating delivery |
+| Changed reconnect | Pauses both epochs, reconfigures compositor output only for resolution, refresh rate or HDR changes (configuring existing windows held at the output size to the new size), and commits new video/audio resources before activating delivery |
 | Failed ANNOUNCE pause | One medium may already be paused and a worker no longer answers; the session is handed to teardown |
 | Cancel, application exit or failure | One teardown stops the application unit and joins every worker; only then can a new launch start |
 
