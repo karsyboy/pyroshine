@@ -40,7 +40,9 @@ For every changed-mode reconnect, verify:
 - no black screen occurs and the first displayed frame is independently decodable;
 - the Moonlight statistics/decoder report the newly requested resolution, FPS,
   codec, bit depth, chroma, HDR state, and bitrate as applicable;
-- the compositor advertises the new resolution and refresh rate to the app;
+- the compositor advertises the new resolution and refresh rate to the app, and
+  the application's main window (for example Steam Big Picture or a fullscreen
+  game) is resized to the new resolution rather than scaled from the previous one;
 - audio resumes, including a stereo/surround change when tested;
 - final cancellation stops encoder, compositor and UDP tasks and releases input
   devices/resources; a new launch then succeeds.

@@ -1960,6 +1960,39 @@ impl MoonshineCompositor {
 			tracing::warn!("Failed to resize game window to output size: {e}");
 		}
 	}
+
+	/// Re-apply the output size to existing windows after the output mode
+	/// changed.
+	///
+	/// Windows are otherwise only sized when they map, request a configure,
+	/// commit or win focus, so a live reconfiguration for a resuming client
+	/// would leave the application rendering at the previous client's
+	/// resolution, scaled into the new stream. Native toplevels follow the
+	/// `new_toplevel`/`commit` rule (every toplevel at the output size); X11
+	/// windows follow `configure_request` (only windows that fill the output).
+	pub(crate) fn resize_windows_to_output(&mut self) {
+		let output = self.output_rect();
+		let windows: Vec<_> = self.space.elements().cloned().collect();
+		for window in &windows {
+			if let Some(toplevel) = window.toplevel() {
+				if !toplevel.is_initial_configure_sent() {
+					continue;
+				}
+				toplevel.with_pending_state(|state| {
+					state.size = Some(output.size);
+				});
+				toplevel.send_pending_configure();
+				if let Some(meta) = self.window_metadata.get_mut(window) {
+					meta.geometry = output;
+				}
+			} else {
+				self.enforce_output_geometry(window);
+			}
+		}
+		// Overlay interactivity and dropdown placement compare against the
+		// output size, so the focus decision itself may change.
+		self.reevaluate_focus();
+	}
 }
 
 /// Set a window's activated state and deliver it. Smithay only stages the
