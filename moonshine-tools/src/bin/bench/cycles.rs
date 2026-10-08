@@ -442,6 +442,7 @@ fn context(args: &Args, settings: Settings, cycle: u32) -> SessionContext {
 		audio_channel_mask,
 		hdr: settings.hdr,
 		client_ip: Ipv4Addr::LOCALHOST.into(),
+		vrr_requested: args.vrr,
 	}
 }
 
@@ -577,7 +578,9 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 			settings = settings.step(step, codecs.len());
 			let video = settings.video(&codecs, args.packet_size);
 			let reconnected = tokio::time::timeout(Duration::from_secs(10), async {
-				manager.bench_resume(keys(cycle), Ipv4Addr::LOCALHOST.into()).await?;
+				manager
+					.bench_resume(keys(cycle), Ipv4Addr::LOCALHOST.into(), args.vrr)
+					.await?;
 				let grant = manager.authorize_stream(Ipv4Addr::LOCALHOST.into()).await.ok_or(())?;
 				manager
 					.set_stream_context(&grant, video.clone(), settings.audio(), false)
@@ -618,8 +621,10 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 		let mut checks = Vec::new();
 		let mut window = None;
 		let result: Result<(), &str> = async {
+			// With --vrr, alternate the client's VRR request so reconnects
+			// also change capture pacing (fast and reconfiguring paths).
 			manager
-				.bench_resume(keys(cycle), Ipv4Addr::LOCALHOST.into())
+				.bench_resume(keys(cycle), Ipv4Addr::LOCALHOST.into(), args.vrr && cycle % 2 == 0)
 				.await
 				.map_err(|()| "resume")?;
 			let grant = manager

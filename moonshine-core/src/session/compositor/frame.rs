@@ -220,6 +220,11 @@ pub(crate) struct ExportedFrame {
 	pub height: u32,
 	/// Timestamp when the frame was produced by the compositor.
 	pub created_at: Instant,
+	/// When the frame's content became current: the sampled refresh deadline
+	/// under fixed pacing, or the latch time of the newest content under VRR
+	/// pacing. The RTP timestamp is derived from it, so a client can recover
+	/// the source cadence; it is never later than `created_at`.
+	pub source_time: Instant,
 	/// GLES preparation/submission start, retained across the fence wait.
 	/// Direct exports have no compositor render and use `created_at` for pacing.
 	pub composition_started_at: Option<Instant>,
@@ -274,6 +279,7 @@ impl ExportedFrame {
 				stride,
 			})
 			.collect();
+		let created_at = Instant::now();
 		Self {
 			source: SourceLease(Some(dmabuf.clone())),
 			planes,
@@ -282,7 +288,8 @@ impl ExportedFrame {
 			modifier: Into::<u64>::into(dmabuf.format().modifier),
 			width: dmabuf.width(),
 			height: dmabuf.height(),
-			created_at: Instant::now(),
+			created_at,
+			source_time: created_at,
 			composition_started_at: None,
 			buffer_index,
 			consumed,
@@ -330,6 +337,7 @@ impl ExportedFrame {
 	/// A frame without a source buffer, for admission/pipeline tests.
 	#[cfg(test)]
 	pub(crate) fn for_test() -> Self {
+		let created_at = Instant::now();
 		Self {
 			source: SourceLease(None),
 			planes: Vec::new(),
@@ -338,7 +346,8 @@ impl ExportedFrame {
 			modifier: 0,
 			width: 1920,
 			height: 1080,
-			created_at: Instant::now(),
+			created_at,
+			source_time: created_at,
 			composition_started_at: None,
 			buffer_index: 0,
 			consumed: Arc::new(AtomicBool::new(false)),

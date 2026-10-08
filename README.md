@@ -17,6 +17,9 @@ headless sessions and streams them to Moonlight-compatible clients.
 - H.264, HEVC, and AV1 through Vulkan Video.
 - [Native Wayland HDR](docs/NATIVE_PRESENTATION.md) through standard color management; ordinary XWayland applications remain supported as SDR.
 - Hardware encoding with DMA-BUF import, low-latency transport, and forward error correction.
+- VRR streaming: with [Pyrolight](https://github.com/karsyboy/pyrolight)'s VRR
+  presentation, frames are captured as the game presents them, so a VRR display
+  follows the game's real frame rate.
 - Keyboard, mouse, touch, pen, controller, haptics, and surround audio support.
 - Optional desktop app with a system tray, pairing notifications, client management,
   a settings editor, and a live stream dashboard. The server runs headless without it.
@@ -142,6 +145,11 @@ names to ease upstream synchronization. The client fork is
 [Pyrolight](https://github.com/karsyboy/pyrolight), and
 the codec is the pinned [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave)
 fork of [PyroWave](https://github.com/Themaister/pyrowave).
+
+VRR streaming is based on [Nonary](https://github.com/Nonary)'s idea and
+reference implementations in [Vibepollo](https://github.com/Nonary/Vibepollo)
+and [moonlight-qt](https://github.com/Nonary/moonlight-qt)
+([moonlight-stream/moonlight-qt#1956](https://github.com/moonlight-stream/moonlight-qt/pull/1956)).
 
 Licensed under the [BSD 2-Clause License](LICENSE). Original copyright notices
 are preserved; dependencies retain their own licenses.

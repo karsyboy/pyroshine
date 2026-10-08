@@ -915,6 +915,10 @@ impl Webserver {
 			Some(Ok(value)) => value != 0,
 			Some(Err(error)) => return xml_error(400, &format!("Invalid hdrMode in launch request: {error}.")),
 		};
+		let vrr_requested = match client_vrr_requested(&mut params) {
+			Ok(requested) => requested,
+			Err(error) => return xml_error(400, &format!("Invalid clientVrrRequested in launch request: {error}.")),
+		};
 
 		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
@@ -937,6 +941,7 @@ impl Webserver {
 				audio_channel_mask,
 				hdr,
 				client_ip: peer_address.ip(),
+				vrr_requested,
 			})
 			.await;
 
@@ -1028,6 +1033,12 @@ impl Webserver {
 				},
 				Err(reason) => return xml_error(400, &format!("Invalid resume request: {reason}.")),
 			}
+		}
+		// Per connection: a client that does not ask (any standard Moonlight)
+		// gets fixed pacing even when the previous client asked for VRR.
+		match client_vrr_requested(&mut params) {
+			Ok(requested) => resume_request.vrr_requested = requested,
+			Err(error) => return xml_error(400, &format!("Invalid clientVrrRequested in resume request: {error}.")),
 		}
 
 		match self
@@ -1233,6 +1244,16 @@ fn unmap_v4_mapped(addr: SocketAddr) -> SocketAddr {
 		},
 		IpAddr::V4(_) => addr,
 	}
+}
+
+/// `clientVrrRequested` launch/resume parameter: the client presents video
+/// on a variable-refresh display and paces playback from RTP timestamps
+/// (Pyrolight, Nonary's Moonlight fork). Hosts that do not know it ignore it;
+/// absent means not requested.
+fn client_vrr_requested(params: &mut HashMap<String, String>) -> Result<bool, std::num::ParseIntError> {
+	params
+		.remove("clientVrrRequested")
+		.map_or(Ok(false), |value| value.parse::<u32>().map(|value| value != 0))
 }
 
 /// Format an IP address for use as the host part of an RTSP URL. IPv6 addresses

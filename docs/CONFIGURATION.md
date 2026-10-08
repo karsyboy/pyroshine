@@ -276,6 +276,7 @@ suppress_home = true
 | --- | --- | --- |
 | `gpu` | optional string, automatic selection | Select a DRM render node using an absolute path (such as `/dev/dri/renderD128`), render-node name, or case-insensitive substring of its device `uevent` information (such as a PCI identifier). `MOONSHINE_RENDER_NODE`, if set, overrides this. |
 | `capture_mode` | string, `"auto"` | `auto` directly exports a fullscreen DMA-BUF only when it represents the complete visible scene; `composited` forces GLES scene composition for compatibility diagnosis. |
+| `vrr_capture` | string, `"auto"` | `auto` captures each new frame as the application presents it, at up to the stream's frame rate, when the client requests VRR presentation (Pyrolight with VRR enabled sends `clientVrrRequested`); other clients keep the fixed refresh clock. `off` always uses the fixed refresh clock. See [capture pacing](PIPELINE_OPTIMIZATION.md#capture-pacing-and-source-timing). |
 | `hdr` | boolean, `true` | Allow HDR when both the GPU probe and client support it. Disabling it also stops advertising HDR support. |
 | `steam_mode` | boolean, `true` | Enable Steam window filtering and use the Steam-controlled focus strategy, similar to Gamescope's `-e`. |
 | `virtual_connector_strategy` | string, `"single_application"` | Focus policy when Steam mode is disabled: `single_application` chooses one highest-priority window; `steam_controlled` uses Steam's focus list; `per_app_id` splits focus by app ID; `per_window` splits it by window. |

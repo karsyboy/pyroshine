@@ -10,7 +10,7 @@
 use moonshine_management::dto::{ChoiceOption, ConfigSchema, FieldKind, FieldSpec, ScannerVariant, SchemaSection};
 use serde::Serialize;
 
-use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy};
+use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy, VrrCapture};
 use crate::session::stream::control::input::gamepad::{GamepadEmulation, HomeTrigger};
 use crate::session::stream::video::{ConversionQueueMode, FecMode, PyroWaveQueueMode};
 
@@ -179,6 +179,16 @@ fn capture_mode(mode: CaptureMode) -> (&'static str, &'static str) {
 			"Always composite",
 			"Render every frame through the compositor. For diagnosing capture problems.",
 		),
+	}
+}
+
+fn vrr_capture(mode: VrrCapture) -> (&'static str, &'static str) {
+	match mode {
+		VrrCapture::Auto => (
+			"Automatic",
+			"Capture each new frame as it is presented when the client requests VRR presentation.",
+		),
+		VrrCapture::Off => ("Off", "Always capture on the fixed refresh clock."),
 	}
 }
 
@@ -708,6 +718,14 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		)
 		.advanced()
 		.caution("Always compositing costs GPU time; use it to diagnose capture problems."),
+		Field::new(
+			"compositor.vrr_capture",
+			"display",
+			"VRR capture",
+			"Presentation-driven capture for clients that request VRR presentation, such as Pyrolight.",
+			choices(&[VrrCapture::Auto, VrrCapture::Off], vrr_capture),
+		)
+		.advanced(),
 		Field::new(
 			"compositor.keyboard.layout",
 			"keyboard",

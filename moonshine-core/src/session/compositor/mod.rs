@@ -39,6 +39,7 @@ use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
 
 use self::admission::{CaptureReceiver, CaptureSender, capture_channel};
+pub(crate) use self::capture::CapturePacing;
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
 
@@ -95,6 +96,18 @@ pub enum CaptureMode {
 	Composited,
 }
 
+/// Whether presentation-driven capture may be used for clients that request
+/// VRR presentation (Pyrolight and Moonlight forks send `clientVrrRequested`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VrrCapture {
+	/// Follow the client's request; fixed refresh pacing otherwise.
+	#[default]
+	Auto,
+	/// Always capture on the fixed refresh clock.
+	Off,
+}
+
 /// Benchmark-only synthetic pointer, injected through the normal input path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchPointer {
@@ -112,6 +125,9 @@ pub struct CompositorConfig {
 	pub gpu: Option<String>,
 	/// Automatic direct export, or forced composition for compatibility diagnosis.
 	pub capture_mode: CaptureMode,
+
+	/// Presentation-driven capture for clients that request VRR presentation.
+	pub vrr_capture: VrrCapture,
 
 	/// Whether to enable HDR mode in the compositor if the client supports it.
 	pub hdr: bool,
@@ -140,6 +156,7 @@ impl Default for CompositorConfig {
 		Self {
 			gpu: None,
 			capture_mode: CaptureMode::Auto,
+			vrr_capture: VrrCapture::Auto,
 			hdr: true,
 			steam_mode: true,
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
@@ -178,6 +195,9 @@ pub(crate) struct OutputMode {
 	pub height: u32,
 	pub refresh_rate: u32,
 	pub hdr: bool,
+	/// Capture pacing the current client asked for; the compositor applies
+	/// [`CompositorConfig::vrr_capture`] on top of it.
+	pub capture_pacing: CapturePacing,
 }
 
 struct CompositorReconfigure {
@@ -290,11 +310,13 @@ impl Compositor {
 			reconfigure_rx,
 		} = self;
 
+		// The launch output has no client epoch yet; PLAY applies its pacing.
 		let requested = OutputMode {
 			width: context.width,
 			height: context.height,
 			refresh_rate: context.refresh_rate,
 			hdr: context.hdr,
+			capture_pacing: CapturePacing::Fixed,
 		};
 		// Registered before the thread exists: session completion then implies
 		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
@@ -610,6 +632,7 @@ fn run_compositor(
 
 	let refresh_rate = Arc::new(AtomicU32::new(context.refresh_rate.max(1)));
 	let reconfigured_refresh_rate = refresh_rate.clone();
+	let vrr_capture = config.vrr_capture;
 	let token = event_loop
 		.handle()
 		.insert_source(reconfigure_rx, move |event, _, state: &mut MoonshineCompositor| {
@@ -619,10 +642,21 @@ fn run_compositor(
 					height,
 					refresh_rate,
 					hdr,
+					capture_pacing,
 				} = request.mode;
-				let result = state.reconfigure_output(width, height, refresh_rate, hdr);
+				// A pacing-only change (another client, or VRR toggled) keeps
+				// the output, its damage tracking and the clients' wl_output.
+				let result = if state.output_mode_matches(width, height, refresh_rate, hdr) {
+					Ok(())
+				} else {
+					state.reconfigure_output(width, height, refresh_rate, hdr)
+				};
 				if result.is_ok() {
 					reconfigured_refresh_rate.store(refresh_rate.max(1), Ordering::Release);
+					state.set_capture_pacing(match vrr_capture {
+						VrrCapture::Auto => capture_pacing,
+						VrrCapture::Off => CapturePacing::Fixed,
+					});
 				}
 				let effective_hdr = result.map(|()| state.hdr);
 				let _ = request.applied.send(effective_hdr);
@@ -666,6 +700,12 @@ fn run_compositor(
 					);
 				}
 				bench_pointer_ticks = bench_pointer_ticks.wrapping_add(1);
+			}
+			if state.capture_pacing == CapturePacing::Vrr {
+				// Presentation-driven capture: commits open flips; this timer
+				// only services an output that stayed idle for an interval.
+				let next = state.vrr_heartbeat(std::time::Instant::now());
+				return smithay::reexports::calloop::timer::TimeoutAction::ToInstant(next);
 			}
 			state.refresh_tick(deadline);
 			// Schedule the next frame relative to the ideal wall-clock
@@ -826,7 +866,7 @@ mod tests {
 
 #[cfg(test)]
 mod reconfigure_tests {
-	use super::{CompositorReady, LaunchedCompositor, OutputMode};
+	use super::{CapturePacing, CompositorReady, LaunchedCompositor, OutputMode};
 
 	#[tokio::test]
 	async fn only_output_mode_changes_reach_the_live_compositor() {
@@ -836,6 +876,7 @@ mod reconfigure_tests {
 			height: 1920,
 			refresh_rate: 120,
 			hdr: false,
+			capture_pacing: CapturePacing::Fixed,
 		};
 		let mut compositor = LaunchedCompositor {
 			ready: CompositorReady {
@@ -869,6 +910,12 @@ mod reconfigure_tests {
 				..mode
 			},
 			OutputMode { hdr: true, ..mode },
+			// A client asking for VRR presentation changes only capture pacing.
+			OutputMode {
+				capture_pacing: CapturePacing::Vrr,
+				hdr: true,
+				..mode
+			},
 		];
 		for change in changes {
 			assert_eq!(compositor.reconfigure(change).await, Ok(change.hdr));
@@ -1250,6 +1297,7 @@ mod xwayland_tests {
 				height: 1080,
 				refresh_rate: 60,
 				hdr: false,
+				capture_pacing: super::CapturePacing::Fixed,
 			}))
 			.expect("live reconfiguration");
 		assert!(!effective_hdr);

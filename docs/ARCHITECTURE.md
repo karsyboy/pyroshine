@@ -379,9 +379,15 @@ thread. It owns:
 - input injection into the Smithay seat (`input.rs`);
 - capture and frame export (`capture.rs`, `admission.rs`, `frame.rs`).
 
-The refresh timer is the only capture clock: each refresh deadline offers at
-most one capture, independent of encoder completion. Buffer releases, frame
-callbacks and input continue even while capture is blocked.
+Capture pacing is per client epoch. With fixed pacing (every standard client)
+the refresh timer is the only capture clock: each refresh deadline offers at
+most one capture, independent of encoder completion. A client that presents on
+a VRR display asks for presentation-driven capture (`clientVrrRequested`):
+each latched buffer commit then opens a capture opportunity, rate-limited to
+the negotiated FPS, and frame callbacks follow those flips. Buffer releases,
+frame callbacks and input continue even while capture is blocked. Each frame
+carries its content time, from which the video stream derives the RTP
+timestamp (see [capture pacing](PIPELINE_OPTIMIZATION.md#capture-pacing-and-source-timing)).
 
 **Presentation.** Applications present through ordinary Wayland or X11 surfaces.
 **Capture.** Capture visibility and input focus are separate decisions:

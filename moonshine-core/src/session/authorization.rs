@@ -48,6 +48,9 @@ pub struct StreamAuthorization {
 	video_ping_payload: [u8; PING_PAYLOAD_LENGTH],
 	control_connect_data: u32,
 	session_id_v1: bool,
+	/// The launch/resume request asked for VRR presentation
+	/// (`clientVrrRequested=1`). It belongs to this generation's client only.
+	vrr_requested: bool,
 }
 
 impl StreamAuthorization {
@@ -69,7 +72,20 @@ impl StreamAuthorization {
 			// "no connect data", so keep it nonzero (a decimal without a leading 0).
 			control_connect_data: connect_data.max(1),
 			session_id_v1: false,
+			vrr_requested: false,
 		})
+	}
+
+	/// Record the generation's `clientVrrRequested` launch/resume parameter.
+	pub(crate) fn with_vrr_requested(mut self, requested: bool) -> Self {
+		self.vrr_requested = requested;
+		self
+	}
+
+	/// Whether this generation's client paces playback itself on a VRR display
+	/// and asked for presentation-driven capture.
+	pub(crate) fn vrr_requested(&self) -> bool {
+		self.vrr_requested
 	}
 
 	/// Monotonic launch/resume generation; never reused within a server process.

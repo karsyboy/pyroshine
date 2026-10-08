@@ -39,6 +39,56 @@ buffers and sends frame callbacks even while capture is blocked. Demand wakeups
 do not increase callback cadence or resolve presentation feedback; skipped
 presentation feedback is discarded, not reported as presented.
 
+## Capture pacing and source timing
+
+Fixed pacing above serves every client by default. It samples whatever was
+latched at each refresh deadline, which quantizes an application that does not
+run at exactly the stream rate onto the refresh grid: a 90 FPS game on a
+120 FPS stream is delivered as a mix of 8.3 and 16.7 ms intervals, and a
+vsync'd game that cannot sustain the refresh rate waits for whole ticks.
+
+A client presenting on a VRR display paces playback itself from RTP timestamps
+and asks for presentation-driven capture with `clientVrrRequested=1` on
+`/launch` or `/resume`. The request belongs to that authorization generation:
+a later client that does not send it (any standard Moonlight) gets fixed
+pacing, and a pacing change alone reconfigures only the compositor, never the
+video pipeline. `[compositor] vrr_capture = "off"` disables it.
+
+With VRR pacing a *flip* is one capture opportunity followed by frame
+callbacks and presentation feedback, like a variable-refresh panel whose
+maximum refresh is the stream rate:
+
+- A commit that latches a new (or removed) buffer anywhere in a surface tree
+  requests a flip, run from a calloop idle callback after the current dispatch.
+  Frame-callback-only and subsurface-state commits do not: they would capture
+  the old scene and spend the rate on it.
+- A credit limiter (`capture::PresentationLimiter`) keeps flips at or below
+  the negotiated rate on average. A long interval earns at most one interval of
+  credit for a following short one, so uneven but correctly averaged sources
+  keep their timing; oversupply is coalesced at the rate; a gap of two
+  intervals is a stall that cannot start a catch-up burst. A postponed flip
+  fires from a one-shot timer.
+- Without a consumer credit a flip still sends its frame callbacks; demand
+  then captures the newest scene. Admission credits, the pre-encode drop and
+  in-flight bounds are unchanged, so a fast game never raises encode or send
+  rates beyond the stream rate.
+- The refresh timer becomes an idle heartbeat: it flips only after a full
+  interval without one (cursor movement, keepalive, idle callbacks) and never
+  consumes limiter credit.
+
+Every exported frame carries its content time (`ExportedFrame::source_time`):
+the sampled refresh deadline under fixed pacing; under VRR pacing the latch
+time of the newest captured buffer, or the flip time when the limiter held the
+flip (the content is then sampled at the flip). The video stream derives the
+90 kHz RTP timestamp from it relative to the client epoch (`video::rtp_clock`),
+as Sunshine and GameStream do. Timestamps are strictly increasing, never zero,
+wrap at 32 bits, and restart near zero when a reconnecting client starts a new
+epoch; replays of the last frame (static-scene IDR, PyroWave resend) are stamped
+when they are sent. Moonlight clients use RTP only as frame PTS; loss detection
+uses sequence and frame numbers. Earlier releases synthesized RTP from the
+frame count and negotiated FPS, which made RTP time run faster than real time
+whenever captures were skipped.
+
 With `log_stats`, the five-second `Video capture cadence` summary reports
 capture spacing (min/p50/p95/p99/max), lateness against the sampled deadline,
 refresh versus deferred-slot captures, deferred/superseded/expired slots and how
@@ -49,7 +99,12 @@ commit, so these counts bound rather than equal game-frame repeats/skips; the
 `game_*` fields count the actual focused application surface and report when its
 commits land after the refresh deadline. A game paced by frame callbacks covers
 one commit per capture and commits shortly after each tick.
-`same_slot_captures` must stay zero.
+`same_slot_captures` must stay zero. Under VRR pacing `capture_pacing="vrr"`,
+captures are counted as `presentation_captures`, `heartbeat_captures` and
+`pending_captures`; lateness is measured from the flip request,
+`content_age_*` from the content's latch time to its capture, `limited_flips`
+counts flips the rate limiter postponed and `pending_flips` flips that waited
+for a consumer credit.
 
 Completed scanout holds must be released and resulting Wayland events flushed
 before static-screen skipping. A clean screen can mean the game is waiting for

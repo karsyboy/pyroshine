@@ -14,6 +14,15 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Capture each new frame as the application presents it for clients that request VRR presentation (`clientVrrRequested`, sent by Pyrolight with VRR enabled), at up to the stream's frame rate. Games that do not run at exactly the stream rate are no longer quantized onto the refresh grid: a 90 FPS game on a 120 FPS stream was delivered as alternating 8.3/16.7 ms frames and now keeps its 11.1 ms cadence. Standard clients keep fixed refresh pacing; `[compositor] vrr_capture = "off"` disables it.
+- Add `--vrr` and `--rtp-trace` to `moonshine-bench`, and honor `MOONSHINE_APPLICATION_UNIT` so a benchmark can run beside a live service without replacing its session.
+
+### Changed
+
+- Derive RTP timestamps from each frame's content time, as Sunshine does, instead of from the frame count and negotiated frame rate. Skipped captures and games below the stream rate no longer make the RTP timeline run faster than real time, so clients can learn the source cadence.
+
 ## [v0.17.1] - 2026-10-07
 
 ### Fixed

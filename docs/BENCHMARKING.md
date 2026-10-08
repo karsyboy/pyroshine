@@ -55,6 +55,8 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 | `--detach-seconds <N>` | `0` | After the run, measure N s attached, then N s with both media epochs paused by a reconnecting client's ANNOUNCE (no PLAY), then PLAY and time the first frame; reports frames, process CPU and per-engine GPU time of the benchmark process |
 | `--runtime-probe` | off | Run a 1 ms timer task on the session runtime and report its lateness percentiles (scheduling delay caused by packetization and transport) |
+| `--vrr` | off | Act as a client that requested VRR presentation, so the compositor uses presentation-driven capture. With `--reconnect-cycles`, the request alternates per cycle |
+| `--rtp-trace <path>` | none | Write `frame_index,rtp_timestamp,arrival_us` for every received video frame (unencrypted video only), to compare RTP and arrival intervals |
 
 ### Examples
 
@@ -114,6 +116,19 @@ The recorded PyroWave library is the one loaded. A workload that cannot run is l
 start while `moonshine-session.service` is active, because the benchmark would
 replace a live session; `--netns` keeps its ports and mDNS off the host network.
 Workload names are stable: add new ones rather than changing existing entries.
+
+To benchmark beside a live service on the same account, give the benchmark its
+own application unit and network namespace, for example:
+
+```sh
+MOONSHINE_APPLICATION_UNIT=moonshine-bench.service \
+  unshare --user --map-root-user --net sh -c \
+  'ip link set lo up && exec unshare --user --map-user=1000 --map-group=1000 "$@"' sh \
+  target/release/moonshine-bench --codec hevc --fps 120 --duration 20 /usr/bin/vkcube
+```
+
+`MOONSHINE_APPLICATION_UNIT` must be a plain `*.service` name; an invalid value
+is ignored with a warning.
 
 ### Output
 

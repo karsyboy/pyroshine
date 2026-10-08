@@ -715,6 +715,7 @@ async fn malformed_resume_from_another_client_preserves_reported_address() {
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: client,
+			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				crate::session::RemoteInputKey::from_bytes([7; 16]),
 				crate::session::RemoteInputKeyId::new(1),
@@ -748,6 +749,17 @@ async fn malformed_resume_from_another_client_preserves_reported_address() {
 	server.session_manager.stop_session().await.unwrap();
 }
 
+#[test]
+fn client_vrr_request_is_read_per_request() {
+	for (value, expected) in [(None, false), (Some("0"), false), (Some("1"), true), (Some("2"), true)] {
+		let mut params = launch_params(&[("clientVrrRequested", value)]);
+		assert_eq!(super::client_vrr_requested(&mut params), Ok(expected), "{value:?}");
+		assert!(!params.contains_key("clientVrrRequested"), "consumed");
+	}
+	let mut params = launch_params(&[("clientVrrRequested", Some("true"))]);
+	assert!(super::client_vrr_requested(&mut params).is_err());
+}
+
 /// CFG-001/SEC-004: launch and resume reject malformed keys and numeric
 /// domains at the authenticated boundary, before the session manager creates,
 /// rekeys or re-authorizes anything.
@@ -758,7 +770,7 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 	let peer: SocketAddr = "192.168.1.50:50000".parse().unwrap();
 	let grant = server.session_manager.authorize_client_for_test(peer.ip()).await;
 
-	let malformed: [(&str, Option<&str>); 17] = [
+	let malformed: [(&str, Option<&str>); 18] = [
 		("rikey", None),
 		("rikeyid", None),
 		("rikey", Some("")),
@@ -776,6 +788,7 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 		("mode", Some("3840x2160")),
 		("surroundAudioInfo", Some("196611")),
 		("hdrMode", Some("yes")),
+		("clientVrrRequested", Some("yes")),
 	];
 	for (name, value) in malformed {
 		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer).await).await;
@@ -802,6 +815,8 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 		("rikeyid", Some("-2147483648")),
 		("rikeyid", Some("4294967295")),
 		("mode", Some("7680x4320x240")),
+		("clientVrrRequested", Some("1")),
+		("clientVrrRequested", Some("0")),
 	] {
 		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer).await).await;
 		assert!(launch.contains("find application"), "{launch}");

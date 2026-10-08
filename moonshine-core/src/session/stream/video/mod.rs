@@ -19,6 +19,7 @@ mod pacing_timer;
 mod packetizer;
 mod pipeline;
 pub(crate) mod pyrowave;
+mod rtp_clock;
 pub use pipeline::ConversionQueueMode;
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
@@ -258,12 +259,16 @@ impl VideoStreamContext {
 	/// Keep this list next to the context definition so newly-added negotiated
 	/// fields cannot silently fall through the reconnect fast path.
 	/// The virtual-output properties this stream requires from the compositor.
-	pub(crate) fn output_mode(&self) -> crate::session::compositor::OutputMode {
+	pub(crate) fn output_mode(
+		&self,
+		capture_pacing: crate::session::compositor::CapturePacing,
+	) -> crate::session::compositor::OutputMode {
 		crate::session::compositor::OutputMode {
 			width: self.width,
 			height: self.height,
 			refresh_rate: self.fps,
 			hdr: self.format.hdr,
+			capture_pacing,
 		}
 	}
 
@@ -860,6 +865,7 @@ fn deliverable(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::session::compositor::CapturePacing;
 	use crate::session::stream::test_support::SocketId;
 
 	#[tokio::test]
@@ -1731,7 +1737,11 @@ mod tests {
 		];
 		for requested in media_only {
 			assert!(!active.changed_fields(&requested).is_empty());
-			assert_eq!(requested.output_mode(), active.output_mode(), "{requested:?}");
+			assert_eq!(
+				requested.output_mode(CapturePacing::Fixed),
+				active.output_mode(CapturePacing::Fixed),
+				"{requested:?}"
+			);
 		}
 		let display = [
 			VideoStreamContext {
@@ -1749,7 +1759,11 @@ mod tests {
 			},
 		];
 		for requested in display {
-			assert_ne!(requested.output_mode(), active.output_mode(), "{requested:?}");
+			assert_ne!(
+				requested.output_mode(CapturePacing::Fixed),
+				active.output_mode(CapturePacing::Fixed),
+				"{requested:?}"
+			);
 		}
 	}
 
