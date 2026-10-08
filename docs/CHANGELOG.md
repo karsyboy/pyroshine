@@ -16,7 +16,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
-- Publish `pyroshine-bin` and `pyroshine-ui-bin` to the AUR from each stable release, so Arch Linux and CachyOS hosts can install and upgrade Pyroshine with an AUR helper.
+- Publish `pyroshine-bin` and `pyroshine-ui-bin` in the signed `[pyrowave]` pacman repository (`karsyboy/pyrowave-packages`), so Arch Linux and CachyOS hosts install Pyroshine with pacman and upgrade it with `pacman -Syu`.
 
 ### Changed
 

@@ -25,16 +25,11 @@ sudo apt install ./pyroshine_*.deb
 sudo dnf install ./pyroshine-*.rpm
 ```
 
-On Arch Linux and CachyOS you can instead install `pyroshine-bin` (and
-optionally `pyroshine-ui-bin`) from the AUR with an AUR helper, which then
-upgrades them with the rest of the system:
-
-```sh
-paru -S pyroshine-bin pyroshine-ui-bin
-```
-
-They repackage the same release `.pkg.tar.zst` files; their source is
-[dist/aur/](../dist/aur/).
+On Arch Linux and CachyOS you can instead add the
+[`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages) and install
+`pyroshine-bin` (and optionally `pyroshine-ui-bin`); `sudo pacman -Syu` then
+upgrades them with the rest of the system. They repackage the same release
+`.pkg.tar.zst` files.
 
 Run only the command for your distribution. The package installs the binary,
 PyroWave library, systemd service, udev rules, kernel-module
