@@ -26,8 +26,8 @@ contents:
     dst: /usr/bin/pyroshine
   - src: ./dist/start-pyroshine.sh
     dst: /usr/bin/start-pyroshine.sh
-  - src: ./target/release/libpyrowave-shared.so.0
-    dst: /usr/lib/libpyrowave-shared.so.0
+  - src: ./target/release/libpyrowave-shared.so.1
+    dst: /usr/lib/libpyrowave-shared.so.1
   - src: ./dist/60-pyroshine.rules
     dst: /usr/lib/udev/rules.d/60-pyroshine.rules
   - src: ./dist/pyroshine-modules.conf

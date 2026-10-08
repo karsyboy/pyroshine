@@ -254,8 +254,10 @@ CMDS=(
 
   # Deploy PyroWave encoder library
   "mkdir -p '${PYROSHINE_HOME}/lib'"
-  "cp '${S}/lib/libpyrowave-shared.so.0' '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.0'"
-  "chmod 755 '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.0'"
+  # API 1.0 moved the soname to .so.1; drop the previous release's library.
+  "rm -f '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.0'"
+  "cp '${S}/lib/libpyrowave-shared.so.1' '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.1'"
+  "chmod 755 '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.1'"
 
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/pyroshine-install.sh' '${PYROSHINE_HOME}/bin/pyroshine-install.sh'"

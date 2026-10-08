@@ -63,7 +63,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 Run a PyroWave benchmark with the locally built backend:
 
 ```sh
-MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.0 \
+MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.1 \
   target/release/moonshine-bench --codec pyrowave --chroma 444 --duration 30 /usr/bin/vkcube
 ```
 

@@ -1,4 +1,5 @@
-//! Safe, deliberately small wrapper around the PyroWave 0.7 C API.
+//! Safe, deliberately small wrapper around the PyroWave 1.1 C API (upstream
+//! 1.0 plus the fork's color-metadata and overlay-layer additions).
 //!
 //! The shared library is loaded at runtime. This keeps the conventional Vulkan
 //! Video codecs usable on systems where PyroWave is not installed, while the
@@ -25,7 +26,7 @@ use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, MAX_OVER
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "4cff7867e603de5c9ab983fc762aad84d37c7dd6";
+pub(crate) const SOURCE_REVISION: &str = "689854dd9727fc2239699c386e69355189fbf332";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -54,7 +55,7 @@ pub(crate) fn quality_reference_frame_bytes(
 	}
 	usize::try_from(bytes).unwrap_or(usize::MAX) & !3
 }
-const API_VERSION: (u32, u32, u32) = (0, 9, 0);
+const API_VERSION: (u32, u32, u32) = (1, 1, 0);
 
 type ResultCode = i32;
 const SUCCESS: ResultCode = 0;
@@ -116,9 +117,13 @@ struct ScaledEncodeInfo {
 	force_linear_filtering: bool,
 	skip_dither: bool,
 	crop_rect: *const vk::Rect2D,
+	/// API 1.0: zero is full range; narrow range applies to RGB input only.
+	ycbcr_range: vk::SamplerYcbcrRange,
+	/// API 1.0: bit depth for narrow-range code values; zero means 8.
+	ycbcr_range_bit_depth: u32,
 }
 
-/// `pyrowave_overlay` (API 0.8): premultiplied 8-bit texels blended 1:1.
+/// `pyrowave_overlay` (fork API 1.1): premultiplied 8-bit texels blended 1:1.
 #[repr(C)]
 struct Overlay {
 	pixels: *const c_void,
@@ -131,7 +136,7 @@ struct Overlay {
 	generation: u64,
 }
 
-/// `pyrowave_overlay_layer` (API 0.9).
+/// `pyrowave_overlay_layer` (fork API 1.1).
 #[repr(C)]
 struct OverlayLayer {
 	pixels: *const Overlay,
@@ -250,8 +255,15 @@ unsafe extern "C" fn performance_callback(userdata: *mut c_void, message: *const
 }
 
 type GetApiVersion = unsafe extern "C" fn(*mut u32, *mut u32, *mut u32);
-type CreateDeviceByCompat =
-	unsafe extern "C" fn(u32, u32, *const Uuid, *const Uuid, *const c_void, *mut DeviceHandle) -> ResultCode;
+type CreateDeviceByCompat = unsafe extern "C" fn(
+	u32,
+	u32,
+	*const Uuid,
+	*const Uuid,
+	*const c_void,
+	vk::QueueGlobalPriorityKHR,
+	*mut DeviceHandle,
+) -> ResultCode;
 type ConfirmInterop = unsafe extern "C" fn(DeviceHandle) -> bool;
 type DestroyDevice = unsafe extern "C" fn(DeviceHandle);
 type CreateEncoder = unsafe extern "C" fn(*const EncoderCreateInfo, *mut EncoderHandle) -> ResultCode;
@@ -304,7 +316,7 @@ impl Api {
 	fn load() -> Result<Rc<Self>, String> {
 		let candidates: Vec<PathBuf> = match std::env::var_os("MOONSHINE_PYROWAVE_LIBRARY") {
 			Some(path) => vec![path.into()],
-			None => vec!["libpyrowave-shared.so.0".into(), "libpyrowave-shared.so".into()],
+			None => vec!["libpyrowave-shared.so.1".into(), "libpyrowave-shared.so".into()],
 		};
 		let mut errors = Vec::new();
 		for candidate in candidates {
@@ -318,7 +330,7 @@ impl Api {
 					continue;
 				},
 			};
-			// SAFETY: symbol types mirror pyrowave.h at the pinned 0.9.0 revision.
+			// SAFETY: symbol types mirror pyrowave.h at the pinned 1.1.0 revision.
 			unsafe {
 				let version = *library
 					.get::<GetApiVersion>(b"pyrowave_get_api_version\0")
@@ -356,11 +368,8 @@ impl Api {
 					create_image: symbol!("pyrowave_image_create", CreateImage),
 					destroy_image: symbol!("pyrowave_image_destroy", DestroyImage),
 					get_image_view: symbol!("pyrowave_image_get_image_view", GetImageView),
-					encode_scaled: symbol!("pyrowave_encoder_encode_gpu_scaled_synchronous", EncodeScaled),
-					encode_scaled_layers: symbol!(
-						"pyrowave_encoder_encode_gpu_scaled_layers_synchronous",
-						EncodeScaledLayers
-					),
+					encode_scaled: symbol!("pyrowave_encoder_encode_gpu_scaled", EncodeScaled),
+					encode_scaled_layers: symbol!("pyrowave_encoder_encode_gpu_scaled_layers", EncodeScaledLayers),
 					compute_num_packets: symbol!("pyrowave_encoder_compute_num_packets", ComputeNumPackets),
 					packetize: symbol!("pyrowave_encoder_packetize", Packetize),
 					_library: library,
@@ -467,6 +476,7 @@ impl Device {
 					&device_uuid,
 					&driver_uuid,
 					ptr::null(),
+					vk::QueueGlobalPriorityKHR::MEDIUM,
 					&mut handle,
 				)
 			},
@@ -985,6 +995,9 @@ impl PyroWaveEncoder {
 			force_linear_filtering: false,
 			skip_dither: false,
 			crop_rect: ptr::null(),
+			// `new` rejects limited range, so the scaler always writes full range.
+			ycbcr_range: vk::SamplerYcbcrRange::ITU_FULL,
+			ycbcr_range_bit_depth: 0,
 		};
 		let rate = RateControl {
 			maximum_bitstream_size: self.maximum_frame_bytes,
@@ -1311,7 +1324,7 @@ mod tests {
 		assert_eq!(SOURCE_URL, "https://github.com/karsyboy/pyrowave");
 		assert_eq!(SOURCE_REVISION.len(), 40);
 		assert!(SOURCE_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
-		assert_eq!(API_VERSION, (0, 9, 0));
+		assert_eq!(API_VERSION, (1, 1, 0));
 		let nix_dependency = include_str!("../../../../../nix/pyrowave.nix");
 		assert!(nix_dependency.contains(SOURCE_URL));
 		assert!(nix_dependency.contains(SOURCE_REVISION));
