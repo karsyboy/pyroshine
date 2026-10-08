@@ -153,7 +153,7 @@ def toolchain():
 def pyrowave_library():
     configured = os.environ.get("MOONSHINE_PYROWAVE_LIBRARY")
     candidates = [Path(configured)] if configured else []
-    candidates += [ROOT / "target" / "release" / "libpyrowave-shared.so.0", Path("/usr/lib/libpyrowave-shared.so.0")]
+    candidates += [ROOT / "target" / "release" / "libpyrowave-shared.so.1", Path("/usr/lib/libpyrowave-shared.so.1")]
     for path in candidates:
         if path.exists():
             return {"path": str(path), "configured": bool(configured), "sha256": sha256(path.resolve())}

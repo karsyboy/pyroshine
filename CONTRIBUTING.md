@@ -46,12 +46,12 @@ Build outputs:
 | --- | --- |
 | `target/release/moonshine` | Server; installed as `pyroshine` |
 | `target/release/moonshine-bench` | Developer benchmark utility |
-| `/tmp/pyrowave-install/lib/libpyrowave-shared.so.0` | Optional PyroWave backend |
+| `/tmp/pyrowave-install/lib/libpyrowave-shared.so.1` | Optional PyroWave backend |
 
 For a local server healthcheck, explicitly select the built PyroWave library:
 
 ```sh
-MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.0 \
+MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.1 \
   ./target/release/moonshine healthcheck
 ```
 
@@ -89,7 +89,7 @@ install the artifacts and integration files:
 ```sh
 sudo install -Dm755 target/release/moonshine /usr/bin/pyroshine
 sudo install -Dm755 dist/start-pyroshine.sh /usr/bin/start-pyroshine.sh
-sudo install -Dm755 /tmp/pyrowave-install/lib/libpyrowave-shared.so.0 /usr/lib/libpyrowave-shared.so.0
+sudo install -Dm755 /tmp/pyrowave-install/lib/libpyrowave-shared.so.1 /usr/lib/libpyrowave-shared.so.1
 sudo install -Dm644 dist/pyroshine@.service /usr/lib/systemd/system/pyroshine@.service
 sudo install -Dm644 dist/60-pyroshine.rules /usr/lib/udev/rules.d/60-pyroshine.rules
 sudo install -Dm644 dist/pyroshine-modules.conf /usr/lib/modules-load.d/pyroshine.conf
@@ -168,7 +168,7 @@ just built (the output must show `1 passed` and `pyrowave-ffi: loaded`):
 
 ```sh
 MOONSHINE_TEST_PYROWAVE=1 \
-MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.0 \
+MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.1 \
   cargo test -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api \
   -- --ignored --exact --nocapture
 ```

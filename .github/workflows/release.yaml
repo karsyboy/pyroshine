@@ -65,7 +65,7 @@ jobs:
         set -o pipefail
         ./scripts/build-pyrowave.sh "$RUNNER_TEMP/pyrowave" "$RUNNER_TEMP/pyrowave-install"
         MOONSHINE_TEST_PYROWAVE=1 \
-        MOONSHINE_PYROWAVE_LIBRARY="$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0" \
+        MOONSHINE_PYROWAVE_LIBRARY="$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.1" \
           cargo test --locked -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api \
           -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/validation/pyrowave-ffi.log"
         grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/validation/pyrowave-ffi.log"
@@ -168,8 +168,8 @@ jobs:
       run: |
         ./scripts/build-pyrowave.sh "$RUNNER_TEMP/pyrowave" "$RUNNER_TEMP/pyrowave-install"
         mkdir -p ./target/release
-        cp -L "$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0" \
-          ./target/release/libpyrowave-shared.so.0
+        cp -L "$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.1" \
+          ./target/release/libpyrowave-shared.so.1
 
     - name: Build
       run: cargo build --release --workspace
@@ -213,7 +213,7 @@ jobs:
         STAGE="$RUNNER_TEMP/pyroshine"
         mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share/pyroshine"
         cp ./target/release/moonshine "$STAGE/bin/pyroshine"
-        cp ./target/release/libpyrowave-shared.so.0 "$STAGE/lib/"
+        cp ./target/release/libpyrowave-shared.so.1 "$STAGE/lib/"
         cp ./dist/start-pyroshine.sh ./dist/60-pyroshine.rules ./dist/50-pyroshine-inhibit-sleep.rules \
            ./dist/pyroshine-modules.conf ./dist/pyroshine-sysusers.conf \
            ./dist/pyroshine@.service \

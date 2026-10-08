@@ -18,6 +18,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Publish `pyroshine-bin` and `pyroshine-ui-bin` to the AUR from each stable release, so Arch Linux and CachyOS hosts can install and upgrade Pyroshine with an AUR helper.
 
+### Changed
+
+- Require PyroWave C API 1.1 (fork revision `689854d`), which merges upstream's API 1.0 and frozen bitstream v1. The bundled library is now `libpyrowave-shared.so.1` and the portable installer removes the old `.so.0`. The wire format is unchanged, so existing Pyrolight clients keep working.
+
 ### Fixed
 
 - Make the native packages depend on the Vulkan loader (`vulkan-icd-loader`, `libvulkan1`, `vulkan-loader`), which the server loads at runtime for capture and encoding but the packages did not declare.

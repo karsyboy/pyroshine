@@ -254,8 +254,10 @@ CMDS=(
 
   # Deploy PyroWave encoder library
   "mkdir -p '${MOONSHINE_HOME}/lib'"
-  "cp '${S}/lib/libpyrowave-shared.so.0' '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.0'"
-  "chmod 755 '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.0'"
+  # API 1.0 moved the soname to .so.1; drop the previous release's library.
+  "rm -f '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.0'"
+  "cp '${S}/lib/libpyrowave-shared.so.1' '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.1'"
+  "chmod 755 '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.1'"
 
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"

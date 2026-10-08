@@ -20,7 +20,7 @@ Measures what streaming costs a game, not just Pyroshine's own GPU counters.
 scripts/gpu_interference/build.sh
 python3 scripts/gpu_interference/runbench.py --name probe-alone --out runs --probe 1800:96
 python3 scripts/gpu_interference/matrix.py --label after --bench target/release/moonshine-bench \
-  --pyrowave-lib /path/to/libpyrowave-shared.so.0 [--content pan4k120.mp4]
+  --pyrowave-lib /path/to/libpyrowave-shared.so.1 [--content pan4k120.mp4]
 ```
 
 Interpretation limits: engine percentages are active time at whatever clock

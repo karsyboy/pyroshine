@@ -6,7 +6,7 @@ Pyroshine accepts two PyroWave transport dialects: *native wire-v1*, used by
 block format. This guide also covers the authenticated bandwidth probe that
 clients use for calibration.
 
-Native wire-v1 has exactly one production path: the pinned C API 0.9.0 encoder
+Native wire-v1 has exactly one production path: the pinned C API 1.1.0 encoder
 returns a contiguous frame; the existing GameStream packetizer applies sequencing,
 FEC and encryption; Moonlight reassembles a complete decode unit; the native
 decoder validates and consumes that frame. No record adapter, partial delivery,

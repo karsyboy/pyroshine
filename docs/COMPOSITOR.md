@@ -108,7 +108,7 @@ Two scene elements can be composited after capture instead of rendering the
 whole frame through GLES: a Steam notification and, above it, the cursor. The
 active consumer declares which layer kinds it draws
 (`CaptureReceiver::set_overlay_caps`: CPU texels and/or client DMA-BUFs; the
-conventional codecs' packed converter and PyroWave's 1:1 scaler since C API 0.9
+conventional codecs' packed converter and PyroWave's 1:1 scaler since fork C API 0.9
 draw both). When the scene *without* those elements is directly exportable, the
 compositor exports the game's DMA-BUF with `ExportedFrame::overlays`, bottom to
 top, and the encoder blends each layer the way GLES would: texels premultiplied,
