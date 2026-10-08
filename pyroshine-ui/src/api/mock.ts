@@ -140,6 +140,18 @@ function stats(): StreamStats {
       { id: "send", label: "Socket send", avg_us: 3900 * jitter(), p50_us: 3850, p95_us: 4600, max_us: 6100 },
       { id: "total", label: "Total pipeline", avg_us: 6100 * jitter(), p50_us: 6000, p95_us: 7300, max_us: 9100 },
     ],
+    capture: {
+      pacing: "vrr",
+      source_fps: 94 + Math.random() * 4,
+      interval_p50_us: 10_600,
+      interval_p95_us: 10_700 + Math.random() * 400,
+      interval_p99_us: 12_400,
+      interval_max_us: 16_800,
+      interval_stddev_us: 340,
+      uneven_percent: 0.4 * jitter(),
+      content_age_p50_us: 6,
+      content_age_p95_us: 15,
+    },
   };
 }
 

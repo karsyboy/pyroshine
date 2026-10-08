@@ -180,6 +180,14 @@ pub struct FrameStats {
 	pub stale_frames_dropped: u32,
 	/// Whether this frame is a key (IDR) frame.
 	pub is_key_frame: bool,
+	/// Content-time interval since the previous frame with new content (the
+	/// source's frame time as carried in RTP); zero for replays and the first
+	/// frame of an epoch.
+	pub source_interval: std::time::Duration,
+	/// Time from the content becoming current to its capture.
+	pub content_age: std::time::Duration,
+	/// Captured with VRR (presentation-driven) pacing.
+	pub vrr_capture: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

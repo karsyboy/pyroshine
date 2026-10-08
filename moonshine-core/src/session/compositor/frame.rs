@@ -225,6 +225,8 @@ pub(crate) struct ExportedFrame {
 	/// pacing. The RTP timestamp is derived from it, so a client can recover
 	/// the source cadence; it is never later than `created_at`.
 	pub source_time: Instant,
+	/// Captured with VRR (presentation-driven) pacing; diagnostics only.
+	pub vrr_capture: bool,
 	/// GLES preparation/submission start, retained across the fence wait.
 	/// Direct exports have no compositor render and use `created_at` for pacing.
 	pub composition_started_at: Option<Instant>,
@@ -290,6 +292,7 @@ impl ExportedFrame {
 			height: dmabuf.height(),
 			created_at,
 			source_time: created_at,
+			vrr_capture: false,
 			composition_started_at: None,
 			buffer_index,
 			consumed,
@@ -348,6 +351,7 @@ impl ExportedFrame {
 			height: 1080,
 			created_at,
 			source_time: created_at,
+			vrr_capture: false,
 			composition_started_at: None,
 			buffer_index: 0,
 			consumed: Arc::new(AtomicBool::new(false)),

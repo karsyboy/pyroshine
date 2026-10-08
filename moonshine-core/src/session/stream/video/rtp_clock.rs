@@ -14,7 +14,7 @@
 //!
 //! [`ExportedFrame::source_time`]: crate::session::compositor::frame::ExportedFrame
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const RTP_CLOCK_HZ: u128 = 90_000;
 
@@ -22,6 +22,8 @@ const RTP_CLOCK_HZ: u128 = 90_000;
 pub(crate) struct RtpClock {
 	origin: Option<Instant>,
 	last: Option<u64>,
+	/// Content time of the last frame with new content, for diagnostics.
+	last_content: Option<Instant>,
 }
 
 impl RtpClock {
@@ -30,6 +32,7 @@ impl RtpClock {
 		Self {
 			origin: Some(Instant::now()),
 			last: None,
+			last_content: None,
 		}
 	}
 
@@ -37,6 +40,18 @@ impl RtpClock {
 	pub(crate) fn reset(&mut self, origin: Instant) {
 		self.origin = Some(origin);
 		self.last = None;
+		self.last_content = None;
+	}
+
+	/// Content-time interval since the previous frame with new content: the
+	/// source's frame time as a client sees it in RTP. Zero for the first
+	/// frame of an epoch. Replays show old content and must not be passed.
+	pub(crate) fn content_interval(&mut self, source_time: Instant) -> Duration {
+		let interval = self
+			.last_content
+			.map_or(Duration::ZERO, |last| source_time.saturating_duration_since(last));
+		self.last_content = Some(self.last_content.map_or(source_time, |last| last.max(source_time)));
+		interval
 	}
 
 	/// RTP timestamp of a frame whose content became current at `source_time`.
@@ -67,7 +82,32 @@ impl RtpClock {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::time::Duration;
+
+	#[test]
+	fn content_intervals_follow_new_content_and_restart_per_epoch() {
+		let origin = Instant::now();
+		let mut clock = RtpClock::default();
+		clock.reset(origin);
+		assert_eq!(
+			clock.content_interval(origin + Duration::from_millis(5)),
+			Duration::ZERO
+		);
+		assert_eq!(
+			clock.content_interval(origin + Duration::from_millis(16)),
+			Duration::from_millis(11)
+		);
+		// Content time never runs backwards.
+		assert_eq!(
+			clock.content_interval(origin + Duration::from_millis(10)),
+			Duration::ZERO
+		);
+		assert_eq!(
+			clock.content_interval(origin + Duration::from_millis(27)),
+			Duration::from_millis(11)
+		);
+		clock.reset(origin + Duration::from_secs(1));
+		assert_eq!(clock.content_interval(origin + Duration::from_secs(2)), Duration::ZERO);
+	}
 
 	#[test]
 	fn timestamps_follow_content_time_not_frame_count() {

@@ -2314,6 +2314,7 @@ impl MoonshineCompositor {
 			std::time::Instant::now(),
 		);
 		exported_frame.source_time = source_time;
+		exported_frame.vrr_capture = self.capture_pacing == super::capture::CapturePacing::Vrr;
 		match self
 			.frame_tx
 			.try_send(exported_frame, credit.take().expect("capture credit"))
@@ -2517,6 +2518,7 @@ impl MoonshineCompositor {
 			std::time::Instant::now(),
 		);
 		exported_frame.source_time = source_time;
+		exported_frame.vrr_capture = self.capture_pacing == super::capture::CapturePacing::Vrr;
 
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));

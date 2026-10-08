@@ -636,7 +636,10 @@ the desktop UI owns its bus name and a client is streaming, drains the channel
 on a 250 ms timer (no per-frame wakeups) and publishes one-second summaries
 (`StatsUpdated`). `broadcast::send` never blocks: a receiver that falls behind
 loses the oldest samples, which are counted, and with no receiver it remains
-the no-op it is on a headless server.
+the no-op it is on a headless server. Each sample also carries the frame's
+capture pacing, content age and content-time interval since the previous new
+frame (the frame time the client sees in RTP), summarized as the window's
+frame pacing.
 
 **Notifications.** While the UI owns `io.github.karsyboy.PyroshineUi` it
 receives `PairingRequested` and notifies the operator; the daemon's own

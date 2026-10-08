@@ -358,6 +358,10 @@ struct FrameContext {
 	created_at: std::time::Instant,
 	/// When the frame's content became current; the RTP timestamp's source.
 	source_time: std::time::Instant,
+	/// Whether the frame carries newly captured content (not a replay).
+	new_content: bool,
+	/// Captured with VRR (presentation-driven) pacing.
+	vrr_capture: bool,
 	/// Pre-encode latency breakdown measured on the encoding thread.
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
@@ -522,6 +526,15 @@ async fn run_packet_consumer(
 
 		// RTP carries the frame's content time; see `rtp_clock`.
 		let rtp_timestamp = rtp_clock.timestamp(frame_context.source_time);
+		let source_interval = if frame_context.new_content {
+			rtp_clock.content_interval(frame_context.source_time)
+		} else {
+			std::time::Duration::ZERO
+		};
+		let content_age = frame_context
+			.created_at
+			.saturating_duration_since(frame_context.source_time);
+		let vrr_capture = frame_context.vrr_capture;
 		frame_number += 1;
 
 		let t_start = std::time::Instant::now();
@@ -606,6 +619,9 @@ async fn run_packet_consumer(
 			discarded_packet_count: 0,
 			stale_frames_dropped: 0,
 			is_key_frame,
+			source_interval,
+			content_age,
+			vrr_capture,
 		};
 		let completion_stats_tx = stats_tx.clone();
 		let completion_idr_tx = idr_tx.clone();
@@ -695,6 +711,9 @@ async fn run_packet_consumer(
 			discarded_packet_count: 0,
 			stale_frames_dropped: 0,
 			is_key_frame,
+			source_interval,
+			content_age,
+			vrr_capture,
 		};
 		diagnostics.record(
 			&stats,
@@ -1122,6 +1141,8 @@ impl VideoPipelineInner {
 		);
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
+		// Pacing of the last captured frame, reported for resends of it.
+		let mut last_vrr_capture = false;
 		let mut rtp_clock = super::rtp_clock::RtpClock::new();
 		let mut last_encoded = None;
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -1174,7 +1195,7 @@ impl VideoPipelineInner {
 			// independently of the source buffer's earlier GPU-consumed lifecycle.
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
-			let (encoded, created_at, source_time, pacing_origin, buffer_index, channel_wait) =
+			let (encoded, created_at, source_time, pacing_origin, buffer_index, channel_wait, new_content) =
 				if let Some(frame) = received {
 					if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
 						// Overlays are composited only into unscaled input. A capture
@@ -1188,6 +1209,7 @@ impl VideoPipelineInner {
 					let received_at = std::time::Instant::now();
 					let created_at = frame.created_at;
 					let source_time = frame.source_time;
+					last_vrr_capture = frame.vrr_capture;
 					let pacing_origin = frame.pacing_origin();
 					let buffer_index = frame.buffer_index;
 					let reusable = last_encoded
@@ -1229,6 +1251,7 @@ impl VideoPipelineInner {
 						pacing_origin,
 						buffer_index,
 						received_at.saturating_duration_since(created_at),
+						true,
 					)
 				} else if resend_last && self.demand.may_replay(2 * frame_interval) {
 					let Some(encoded) = last_encoded.take() else {
@@ -1237,7 +1260,7 @@ impl VideoPipelineInner {
 					resend_last = false;
 					let now = std::time::Instant::now();
 					// A resend shows the last content again now.
-					(encoded, now, now, now, usize::MAX, std::time::Duration::ZERO)
+					(encoded, now, now, now, usize::MAX, std::time::Duration::ZERO, false)
 				} else {
 					if !self.demand.wanted() {
 						// No client: captures are not requested, so none arrive.
@@ -1253,6 +1276,11 @@ impl VideoPipelineInner {
 			let before_packetize = std::time::Instant::now();
 			let latency = (before_packetize.duration_since(created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
 			let rtp_timestamp = rtp_clock.timestamp(source_time);
+			let source_interval = if new_content {
+				rtp_clock.content_interval(source_time)
+			} else {
+				std::time::Duration::ZERO
+			};
 			// Wire version 1 transports one complete encoded frame through the
 			// ordinary GameStream packetizer. The client reassembles the decode
 			// unit before passing it to PyroWave.
@@ -1325,6 +1353,9 @@ impl VideoPipelineInner {
 					.saturating_sub(sent.outcome.submitted_datagrams + sent.outcome.failed_datagrams),
 				stale_frames_dropped,
 				is_key_frame: true,
+				source_interval,
+				content_age: created_at.saturating_duration_since(source_time),
+				vrr_capture: last_vrr_capture,
 			};
 			if stats.send > frame_interval {
 				consecutive_slow_sends = consecutive_slow_sends.saturating_add(1);
@@ -1537,6 +1568,8 @@ impl VideoPipelineInner {
 		let mut frame_number_base: u64 = 0;
 
 		// Track the last HDR mode state sent to the control stream.
+		// Pacing of the last captured frame, reported for replays of it.
+		let mut last_vrr_capture = false;
 		let mut last_hdr_state = HdrModeState {
 			enabled: ctx.format.hdr,
 			metadata: None,
@@ -1682,6 +1715,8 @@ impl VideoPipelineInner {
 									created_at: now,
 									// A replay shows the old content again now.
 									source_time: now,
+									new_content: false,
+									vrr_capture: last_vrr_capture,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
 									convert: std::time::Duration::ZERO,
@@ -2096,9 +2131,12 @@ impl VideoPipelineInner {
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
 						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+						last_vrr_capture = frame.vrr_capture;
 						let frame_context = FrameContext {
 							created_at: frame.created_at,
 							source_time: frame.source_time,
+							new_content: true,
+							vrr_capture: frame.vrr_capture,
 							channel_wait: t1_received.duration_since(frame.created_at),
 							import: t2_imported.duration_since(t1_received),
 							convert: t3_converted.duration_since(t2_imported),

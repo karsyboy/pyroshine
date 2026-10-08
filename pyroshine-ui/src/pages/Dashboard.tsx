@@ -16,7 +16,7 @@ import Typography from "@mui/material/Typography";
 import StopCircleOutlined from "@mui/icons-material/StopCircleOutlined";
 import AddLink from "@mui/icons-material/AddLink";
 import { call, errorMessage } from "../api/bridge";
-import type { SessionDetails, SessionPhase, StreamStats } from "../api/types";
+import type { CaptureStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
 import { ConfirmDialog, Facts, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
@@ -32,13 +32,20 @@ const headlines: Record<SessionPhase, string> = {
   error: "The session could not be stopped cleanly",
 };
 
-function formatChips(session: SessionDetails): string[] {
+function formatChips(session: SessionDetails, stats: StreamStats | null): string[] {
   const video = session.video;
   if (!video) return [];
   const chips = [video.codec_label, video.dynamic_range === "SDR" ? "SDR" : "HDR", video.chroma, `${video.bit_depth}-bit`];
   if (video.encrypted) chips.push("Encrypted");
+  if (stats?.epoch === session.epoch && stats.capture?.pacing === "vrr") chips.push("VRR capture");
   return chips;
 }
+
+const pacingLabels: Record<CaptureStats["pacing"], string> = {
+  vrr: "VRR capture",
+  fixed: "Fixed refresh",
+  mixed: "Changing",
+};
 
 function Hero({ onEnd, navigate }: { onEnd: () => void; navigate: (to: string) => void }) {
   const daemon = useDaemon();
@@ -93,7 +100,7 @@ function Hero({ onEnd, navigate }: { onEnd: () => void; navigate: (to: string) =
                 </Typography>
               )}
               <Stack direction="row" sx={{ gap: 1, mt: 1.5, flexWrap: "wrap" }}>
-                {formatChips(session).map((chip) => (
+                {formatChips(session, daemon.stats).map((chip) => (
                   <Chip key={chip} label={chip} size="small" variant="outlined" />
                 ))}
               </Stack>
@@ -241,6 +248,56 @@ function Performance({ stats, history }: { stats: StreamStats; history: StreamSt
   );
 }
 
+function FramePacing({ capture, history, streamFps }: { capture: CaptureStats; history: StreamStats[]; streamFps?: number }) {
+  const static_ = capture.source_fps === 0;
+  return (
+    <Box sx={{ mb: 3 }}>
+      <Stack direction="row" sx={{ alignItems: "center", gap: 1.5, mb: 1.5 }}>
+        <Typography variant="h6">Frame pacing</Typography>
+        <Chip
+          label={pacingLabels[capture.pacing]}
+          size="small"
+          color={capture.pacing === "vrr" ? "success" : capture.pacing === "mixed" ? "warning" : "default"}
+          variant="outlined"
+        />
+      </Stack>
+      <Stack direction="row" sx={{ gap: 2, flexWrap: "wrap", mb: 1 }}>
+        <Tile
+          label="Game frame rate"
+          value={static_ ? "Static" : `${capture.source_fps.toFixed(1)} fps`}
+          detail={streamFps ? `stream limit ${streamFps} fps` : "new frames per second"}
+          trend={history.map((s) => s.capture?.source_fps ?? 0)}
+          color="success.main"
+        />
+        <Tile
+          label="Frame time"
+          value={static_ ? "—" : micros(capture.interval_p50_us)}
+          detail={static_ ? "no new frames" : `p95 ${micros(capture.interval_p95_us)} · p99 ${micros(capture.interval_p99_us)} · max ${micros(capture.interval_max_us)}`}
+          trend={history.map((s) => s.capture?.interval_p95_us ?? 0)}
+          color="info.main"
+        />
+        <Tile
+          label="Uneven frame times"
+          value={static_ ? "—" : `${capture.uneven_percent.toFixed(1)} %`}
+          detail={static_ ? "no new frames" : `changes over 2 ms · σ ${micros(capture.interval_stddev_us)}`}
+          trend={history.map((s) => s.capture?.uneven_percent ?? 0)}
+          color="warning.main"
+        />
+        <Tile
+          label="Capture delay"
+          value={micros(capture.content_age_p50_us)}
+          detail={`p95 ${micros(capture.content_age_p95_us)} · new content to capture`}
+        />
+      </Stack>
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+        {capture.pacing === "fixed"
+          ? "Frames are captured on the stream's refresh clock. A client with VRR presentation (Pyrolight with VRR enabled) switches the host to VRR capture."
+          : "Frames are captured as the application presents them, up to the stream's frame rate, and sent with their real frame times, which a VRR client paces the display by."}
+      </Typography>
+    </Box>
+  );
+}
+
 function StreamDetails({ session }: { session: SessionDetails }) {
   const video = session.video;
   const audio = session.audio;
@@ -326,6 +383,9 @@ export function DashboardPage({ navigate }: { navigate: (to: string) => void }) 
       )}
       {daemon.session?.phase === "streaming" && daemon.stats && daemon.stats.epoch === session?.epoch && (
         <Performance stats={daemon.stats} history={daemon.history} />
+      )}
+      {daemon.session?.phase === "streaming" && daemon.stats?.capture && daemon.stats.epoch === session?.epoch && (
+        <FramePacing capture={daemon.stats.capture} history={daemon.history} streamFps={session?.video?.fps} />
       )}
       {daemon.session?.phase === "streaming" && !daemon.stats && (
         <Typography color="text.secondary" sx={{ mb: 3 }}>
