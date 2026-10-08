@@ -50,7 +50,33 @@ pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
 /// Fixed name of the application's transient user-systemd unit. Only one
 /// session exists at a time, and a replacement cannot launch until the previous
 /// session's teardown has stopped this unit.
-pub(crate) const APPLICATION_UNIT_NAME: &str = "moonshine-session.service";
+const APPLICATION_UNIT_NAME: &str = "moonshine-session.service";
+
+/// The application unit name: [`APPLICATION_UNIT_NAME`], or
+/// `MOONSHINE_APPLICATION_UNIT` for a benchmark or test instance that must not
+/// replace a live service's session on the same account. An invalid override
+/// is ignored with a warning.
+pub(crate) fn application_unit_name() -> &'static str {
+	static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+	NAME.get_or_init(|| match std::env::var("MOONSHINE_APPLICATION_UNIT") {
+		Ok(name) if valid_application_unit_name(&name) => Box::leak(name.into_boxed_str()),
+		Ok(name) => {
+			tracing::warn!(name, "Ignoring invalid MOONSHINE_APPLICATION_UNIT");
+			APPLICATION_UNIT_NAME
+		},
+		Err(_) => APPLICATION_UNIT_NAME,
+	})
+}
+
+fn valid_application_unit_name(name: &str) -> bool {
+	name.strip_suffix(".service").is_some_and(|stem| {
+		!stem.is_empty()
+			&& stem.len() <= 200
+			&& stem
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+	})
+}
 
 pub use self::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
@@ -109,6 +135,10 @@ pub struct SessionContext {
 	/// The current launch/resume client is owned by `StreamAuthorization`;
 	/// this launch metadata does not change when the retained session resumes.
 	pub client_ip: IpAddr,
+
+	/// The launching client asked for VRR presentation (`clientVrrRequested`).
+	/// Carried by its authorization generation, like a resume's request.
+	pub vrr_requested: bool,
 }
 
 /// Session-level values carried by the authenticated HTTP `/resume` request.
@@ -121,6 +151,8 @@ pub(crate) struct ResumeRequest {
 	pub hdr: Option<bool>,
 	pub audio_channels: Option<AudioChannels>,
 	pub audio_channel_mask: Option<u32>,
+	/// `clientVrrRequested`; absent means not requested by this client.
+	pub vrr_requested: bool,
 }
 
 /// Configuration and shared channels used to build production sessions.
@@ -176,7 +208,9 @@ impl SessionBackend for SystemSession {
 	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
 		// RTSP ANNOUNCE is authoritative for the output mode. Apply it before
 		// any stream exists, exactly as a reconnect does, or refuse the PLAY.
-		session.apply_output_mode(&request.video).await?;
+		session
+			.apply_output_mode(&request.video, request.capture_pacing)
+			.await?;
 		// Acquire before consuming the session: nothing is owned yet if this
 		// await is cancelled.
 		let sleep_inhibitor = if self.inhibit_sleep {
@@ -218,8 +252,15 @@ impl SessionBackend for SystemSession {
 
 	async fn resume(&self, session: &mut ActiveSession, plan: ResumePlan) -> Result<(), ()> {
 		match plan.video {
-			Some(context) => session.reconfigure_video(context, plan.generation).await?,
-			None => session.reset_video_stream(plan.generation).await?,
+			Some(context) => {
+				session
+					.reconfigure_video(context, plan.capture_pacing, plan.generation)
+					.await?
+			},
+			None => {
+				session.apply_capture_pacing(plan.capture_pacing).await?;
+				session.reset_video_stream(plan.generation).await?
+			},
 		}
 		session
 			.reconfigure_audio(plan.audio, plan.generation, plan.keys)
@@ -316,7 +357,7 @@ impl InitializedSession {
 		let application = Application::spawn(
 			context.application.clone(),
 			ApplicationContext {
-				unit_name: APPLICATION_UNIT_NAME.to_string(),
+				unit_name: application_unit_name().to_string(),
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),
@@ -363,8 +404,15 @@ pub(crate) struct LaunchedSession {
 impl LaunchedSession {
 	/// Apply the negotiated output mode to the running compositor (a no-op when
 	/// it matches the launch mode) and verify the effective HDR state.
-	pub(crate) async fn apply_output_mode(&mut self, video: &VideoStreamContext) -> Result<(), ()> {
-		let effective_hdr = self.launched_compositor.reconfigure(video.output_mode()).await?;
+	pub(crate) async fn apply_output_mode(
+		&mut self,
+		video: &VideoStreamContext,
+		capture_pacing: compositor::CapturePacing,
+	) -> Result<(), ()> {
+		let effective_hdr = self
+			.launched_compositor
+			.reconfigure(video.output_mode(capture_pacing))
+			.await?;
 		if effective_hdr != video.format.hdr {
 			tracing::warn!(
 				requested_hdr = video.format.hdr,
@@ -401,6 +449,8 @@ impl LaunchedSession {
 		let StartRequest {
 			video: video_ctx,
 			audio: audio_ctx,
+			// Applied with the output mode before this point.
+			capture_pacing: _,
 			generation,
 			authorization_rx,
 			stop,
@@ -483,8 +533,21 @@ impl ActiveSession {
 		self.video_handle.request_reset(generation).await
 	}
 
-	pub(crate) async fn reconfigure_video(&mut self, context: VideoStreamContext, generation: u64) -> Result<(), ()> {
-		let effective_hdr = self.compositor.reconfigure(context.output_mode()).await?;
+	/// Apply a resuming client's capture pacing to the unchanged output.
+	pub(crate) async fn apply_capture_pacing(&mut self, capture_pacing: compositor::CapturePacing) -> Result<(), ()> {
+		self.compositor
+			.reconfigure(self.video_context.output_mode(capture_pacing))
+			.await
+			.map(|_| ())
+	}
+
+	pub(crate) async fn reconfigure_video(
+		&mut self,
+		context: VideoStreamContext,
+		capture_pacing: compositor::CapturePacing,
+		generation: u64,
+	) -> Result<(), ()> {
+		let effective_hdr = self.compositor.reconfigure(context.output_mode(capture_pacing)).await?;
 		if effective_hdr != context.format.hdr {
 			tracing::warn!(
 				requested_hdr = context.format.hdr,
@@ -511,5 +574,25 @@ impl ActiveSession {
 			.await?;
 		self.audio_context = context;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod unit_name_tests {
+	#[test]
+	fn application_unit_override_must_be_a_plain_service_name() {
+		for name in ["moonshine-session.service", "moonshine-bench_2.service"] {
+			assert!(super::valid_application_unit_name(name), "{name}");
+		}
+		for name in [
+			".service",
+			"moonshine-session",
+			"a/b.service",
+			"x y.service",
+			"unit.socket",
+			"",
+		] {
+			assert!(!super::valid_application_unit_name(name), "{name}");
+		}
 	}
 }

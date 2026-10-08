@@ -379,9 +379,15 @@ thread. It owns:
 - input injection into the Smithay seat (`input.rs`);
 - capture and frame export (`capture.rs`, `admission.rs`, `frame.rs`).
 
-The refresh timer is the only capture clock: each refresh deadline offers at
-most one capture, independent of encoder completion. Buffer releases, frame
-callbacks and input continue even while capture is blocked.
+Capture pacing is per client epoch. With fixed pacing (every standard client)
+the refresh timer is the only capture clock: each refresh deadline offers at
+most one capture, independent of encoder completion. A client that presents on
+a VRR display asks for presentation-driven capture (`clientVrrRequested`):
+each latched buffer commit then opens a capture opportunity, rate-limited to
+the negotiated FPS, and frame callbacks follow those flips. Buffer releases,
+frame callbacks and input continue even while capture is blocked. Each frame
+carries its content time, from which the video stream derives the RTP
+timestamp (see [capture pacing](PIPELINE_OPTIMIZATION.md#capture-pacing-and-source-timing)).
 
 **Presentation.** Applications present through ordinary Wayland or X11 surfaces.
 **Capture.** Capture visibility and input focus are separate decisions:
@@ -630,7 +636,10 @@ the desktop UI owns its bus name and a client is streaming, drains the channel
 on a 250 ms timer (no per-frame wakeups) and publishes one-second summaries
 (`StatsUpdated`). `broadcast::send` never blocks: a receiver that falls behind
 loses the oldest samples, which are counted, and with no receiver it remains
-the no-op it is on a headless server.
+the no-op it is on a headless server. Each sample also carries the frame's
+capture pacing, content age and content-time interval since the previous new
+frame (the frame time the client sees in RTP), summarized as the window's
+frame pacing.
 
 **Notifications.** While the UI owns `io.github.karsyboy.PyroshineUi` it
 receives `PairingRequested` and notifies the operator; the daemon's own

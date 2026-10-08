@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use moonshine_management::dto::{StageStats, StreamStats};
+use moonshine_management::dto::{CaptureStats, StageStats, StreamStats};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 use tokio::sync::watch;
 
@@ -25,6 +25,8 @@ use crate::session::stream::video::FrameStats;
 pub(crate) const DRAIN_PERIOD: Duration = Duration::from_millis(250);
 /// Length of one published summary.
 pub(crate) const WINDOW: Duration = Duration::from_secs(1);
+/// A frame time differing from the previous one by more than this is uneven.
+const UNEVEN_STEP_US: f64 = 2_000.0;
 
 struct Stage {
 	id: &'static str,
@@ -101,6 +103,14 @@ pub(crate) struct StatsWindow {
 	stale_frames_dropped: u64,
 	samples_dropped: u64,
 	stage_micros: Vec<Vec<f64>>,
+	vrr_frames: u64,
+	captured_frames: u64,
+	intervals: Vec<f64>,
+	content_ages: Vec<f64>,
+	uneven_steps: u64,
+	interval_steps: u64,
+	/// Frame time of the previous new frame; carried across windows.
+	last_interval: Option<f64>,
 }
 
 impl StatsWindow {
@@ -117,6 +127,13 @@ impl StatsWindow {
 			stale_frames_dropped: 0,
 			samples_dropped: 0,
 			stage_micros: STAGES.iter().map(|_| Vec::with_capacity(256)).collect(),
+			vrr_frames: 0,
+			captured_frames: 0,
+			intervals: Vec::with_capacity(256),
+			content_ages: Vec::with_capacity(256),
+			uneven_steps: 0,
+			interval_steps: 0,
+			last_interval: None,
 		}
 	}
 
@@ -132,6 +149,78 @@ impl StatsWindow {
 		for (stage, samples) in STAGES.iter().zip(&mut self.stage_micros) {
 			samples.push((stage.read)(stats).as_secs_f64() * 1e6);
 		}
+		self.captured_frames += 1;
+		self.vrr_frames += u64::from(stats.vrr_capture);
+		self.content_ages.push(stats.content_age.as_secs_f64() * 1e6);
+		// Replays and the first frame of an epoch have no frame time.
+		if !stats.source_interval.is_zero() {
+			let interval = stats.source_interval.as_secs_f64() * 1e6;
+			if let Some(previous) = self.last_interval {
+				self.interval_steps += 1;
+				self.uneven_steps += u64::from((interval - previous).abs() > UNEVEN_STEP_US);
+			}
+			self.last_interval = Some(interval);
+			self.intervals.push(interval);
+		}
+	}
+
+	/// Summarize the window's frame pacing and clear its samples.
+	fn finish_capture(&mut self) -> Option<CaptureStats> {
+		if self.captured_frames == 0 {
+			return None;
+		}
+		let pacing = match self.vrr_frames {
+			0 => "fixed",
+			vrr if vrr == self.captured_frames => "vrr",
+			_ => "mixed",
+		};
+		let percentile = |samples: &[f64], p: f64| {
+			if samples.is_empty() {
+				0.0
+			} else {
+				samples[((samples.len() - 1) as f64 * p).round() as usize]
+			}
+		};
+		let total: f64 = self.intervals.iter().sum();
+		let mean = if self.intervals.is_empty() {
+			0.0
+		} else {
+			total / self.intervals.len() as f64
+		};
+		let variance = if self.intervals.is_empty() {
+			0.0
+		} else {
+			self.intervals
+				.iter()
+				.map(|interval| (interval - mean).powi(2))
+				.sum::<f64>()
+				/ self.intervals.len() as f64
+		};
+		self.intervals.sort_unstable_by(f64::total_cmp);
+		self.content_ages.sort_unstable_by(f64::total_cmp);
+		let stats = CaptureStats {
+			pacing: pacing.into(),
+			source_fps: if total > 0.0 {
+				self.intervals.len() as f64 * 1e6 / total
+			} else {
+				0.0
+			},
+			interval_p50_us: percentile(&self.intervals, 0.5),
+			interval_p95_us: percentile(&self.intervals, 0.95),
+			interval_p99_us: percentile(&self.intervals, 0.99),
+			interval_max_us: self.intervals.last().copied().unwrap_or(0.0),
+			interval_stddev_us: variance.sqrt(),
+			uneven_percent: if self.interval_steps == 0 {
+				0.0
+			} else {
+				self.uneven_steps as f64 * 100.0 / self.interval_steps as f64
+			},
+			content_age_p50_us: percentile(&self.content_ages, 0.5),
+			content_age_p95_us: percentile(&self.content_ages, 0.95),
+		};
+		self.intervals.clear();
+		self.content_ages.clear();
+		Some(stats)
 	}
 
 	/// Samples overwritten before they were read. They are still frames the
@@ -179,6 +268,7 @@ impl StatsWindow {
 				Some(stats)
 			})
 			.collect();
+		let capture = self.finish_capture();
 		let stats = StreamStats {
 			epoch,
 			at_ms: unix_millis(SystemTime::now()),
@@ -196,10 +286,17 @@ impl StatsWindow {
 			stale_frames_dropped: self.stale_frames_dropped,
 			samples_dropped: self.samples_dropped,
 			stages,
+			capture,
 		};
 		let buffers = std::mem::take(&mut self.stage_micros);
+		let intervals = std::mem::take(&mut self.intervals);
+		let content_ages = std::mem::take(&mut self.content_ages);
+		let last_interval = self.last_interval;
 		*self = Self {
 			stage_micros: buffers,
+			intervals,
+			content_ages,
+			last_interval,
 			..Self::new(now)
 		};
 		stats
@@ -278,7 +375,52 @@ mod tests {
 			discarded_packet_count: 0,
 			stale_frames_dropped: 1,
 			is_key_frame: key,
+			source_interval: Duration::from_micros(8_333),
+			content_age: Duration::from_micros(40),
+			vrr_capture: false,
 		}
+	}
+
+	#[test]
+	fn summarizes_frame_pacing() {
+		let start = Instant::now();
+		let mut window = StatsWindow::new(start);
+		// A VRR capture of a game alternating 7 and 13 ms frames.
+		for index in 0..100u64 {
+			let mut stats = frame(10_000, 12_000, 1_000, false);
+			stats.vrr_capture = true;
+			stats.source_interval = Duration::from_millis(if index % 2 == 0 { 7 } else { 13 });
+			stats.content_age = Duration::from_micros(10 + index);
+			window.record(&stats);
+		}
+		// A replay repeats old content: no frame time.
+		let mut replay = frame(10_000, 12_000, 1_000, false);
+		replay.vrr_capture = true;
+		replay.source_interval = Duration::ZERO;
+		replay.content_age = Duration::ZERO;
+		window.record(&replay);
+		let capture = window.finish(start + Duration::from_secs(1), 1).capture.unwrap();
+		assert_eq!(capture.pacing, "vrr");
+		assert!((capture.source_fps - 100.0).abs() < 1e-6, "{}", capture.source_fps);
+		assert!((capture.interval_stddev_us - 3_000.0).abs() < 1e-6);
+		assert_eq!(capture.interval_max_us, 13_000.0);
+		assert!((capture.uneven_percent - 100.0).abs() < 1e-9, "every step is 6 ms");
+		assert!(capture.content_age_p95_us < 120.0);
+
+		// Steady frames in the next window, half captured on the fixed clock.
+		for index in 0..10u64 {
+			let mut stats = frame(10_000, 12_000, 1_000, false);
+			stats.vrr_capture = index < 5;
+			stats.source_interval = Duration::from_millis(13);
+			window.record(&stats);
+		}
+		let capture = window.finish(start + Duration::from_secs(2), 1).capture.unwrap();
+		assert_eq!(capture.pacing, "mixed");
+		// Only the step from the previous window's last 13 ms frame is compared.
+		assert_eq!(capture.uneven_percent, 0.0);
+		assert_eq!(capture.interval_p50_us, 13_000.0);
+
+		assert!(window.finish(start + Duration::from_secs(3), 1).capture.is_none());
 	}
 
 	#[test]

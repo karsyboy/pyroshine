@@ -27,7 +27,6 @@ use async_shutdown::{DelayShutdownToken, ShutdownManager};
 use tokio::sync::{Mutex, MutexGuard, broadcast, watch};
 
 use crate::ShutdownReason;
-use crate::session::APPLICATION_UNIT_NAME;
 use crate::session::AuthorizationReceiver;
 use crate::session::FrameStats;
 use crate::session::ResumeRequest;
@@ -36,7 +35,9 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SystemSession;
+use crate::session::application_unit_name;
 use crate::session::authorization::StreamAuthorization;
+use crate::session::compositor::CapturePacing;
 use crate::session::compositor::CompositorConfig;
 use crate::session::keys::KeyLedger;
 use crate::session::lifecycle::StartLatch;
@@ -131,6 +132,8 @@ pub enum SessionShutdownReason {
 pub(crate) struct StartRequest {
 	pub video: VideoStreamContext,
 	pub audio: AudioStreamContext,
+	/// Capture pacing requested by the client of `generation`.
+	pub capture_pacing: CapturePacing,
 	pub generation: u64,
 	pub authorization_rx: AuthorizationReceiver,
 	pub stop: ShutdownManager<SessionShutdownReason>,
@@ -148,6 +151,9 @@ pub(crate) struct StartRequest {
 pub(crate) struct ResumePlan {
 	pub video: Option<VideoStreamContext>,
 	pub audio: AudioStreamContext,
+	/// Capture pacing requested by the resuming client. Applied on both
+	/// paths: a pacing change alone never recreates the video pipeline.
+	pub capture_pacing: CapturePacing,
 	pub generation: u64,
 	pub keys: crate::session::keys::ActiveKeys,
 }
@@ -430,8 +436,9 @@ impl<B: SessionBackend> SessionManagerInner<B> {
 
 	/// Start a new authorization generation for `client_ip`, replacing every
 	/// identifier the previous generation handed out.
-	fn rotate_authorization(&mut self, client_ip: IpAddr) -> Result<(), ()> {
-		let authorization = StreamAuthorization::new(self.next_generation, client_ip)?;
+	fn rotate_authorization(&mut self, client_ip: IpAddr, vrr_requested: bool) -> Result<(), ()> {
+		let authorization =
+			StreamAuthorization::new(self.next_generation, client_ip)?.with_vrr_requested(vrr_requested);
 		self.next_generation += 1;
 		self.progress_at = Instant::now();
 		match &self.authorization_tx {
@@ -958,6 +965,7 @@ impl<B: SessionBackend> SessionCore<B> {
 		};
 
 		let client_ip = context.client_ip;
+		let vrr_requested = context.vrr_requested;
 		let core = self.clone();
 		let task = tokio::spawn(async move {
 			let result = ticket
@@ -971,7 +979,7 @@ impl<B: SessionBackend> SessionCore<B> {
 					if guard.committable(&ticket).is_none() {
 						guard.orphan(&ticket, state);
 						Err(())
-					} else if guard.rotate_authorization(client_ip).is_err() {
+					} else if guard.rotate_authorization(client_ip, vrr_requested).is_err() {
 						core.fail_transition(&mut guard, &ticket, Some(state));
 						Err(())
 					} else {
@@ -1025,7 +1033,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			let ticket = guard.begin_transition(TransitionKind::Launch)?;
 			let live = guard.live().expect("checked above");
 			// Recorded before anything can create the unit.
-			live.record.application_unit = Some(APPLICATION_UNIT_NAME);
+			live.record.application_unit = Some(application_unit_name());
 			let Some(SessionState::Initialized(session)) = live.state.take() else {
 				unreachable!("checked above");
 			};
@@ -1247,6 +1255,11 @@ impl<B: SessionBackend> SessionCore<B> {
 				.map(watch::Sender::subscribe)
 				.expect("a current grant implies an authorization channel");
 			let generation = grant.generation();
+			let capture_pacing = if grant.vrr_requested() {
+				CapturePacing::Vrr
+			} else {
+				CapturePacing::Fixed
+			};
 			let Some(keys) = guard.keys_tx.as_ref().map(|keys_tx| keys_tx.borrow().clone()) else {
 				tracing::warn!("StartSession rejected: the session has no published keys");
 				return Err(());
@@ -1277,6 +1290,7 @@ impl<B: SessionBackend> SessionCore<B> {
 					StartRequest {
 						video: video.clone(),
 						audio: audio.clone(),
+						capture_pacing,
 						generation,
 						authorization_rx,
 						stop: live.record.stop.clone(),
@@ -1306,6 +1320,7 @@ impl<B: SessionBackend> SessionCore<B> {
 							ResumePlan {
 								video: None,
 								audio: audio.clone(),
+								capture_pacing,
 								generation,
 								keys: keys.clone(),
 							}
@@ -1323,6 +1338,7 @@ impl<B: SessionBackend> SessionCore<B> {
 							ResumePlan {
 								video: (!video_changed_fields.is_empty()).then(|| video.clone()),
 								audio: audio.clone(),
+								capture_pacing,
 								generation,
 								keys: keys.clone(),
 							}
@@ -1455,7 +1471,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
 			return Err(());
 		}
-		guard.rotate_authorization(client_ip)?;
+		guard.rotate_authorization(client_ip, request.vrr_requested)?;
 		// Keys were validated at the HTTP boundary; the ledger keeps nonce
 		// allocation continuous when the client resumes with the same key.
 		let keys = guard.key_ledger.publish(keys);
@@ -1571,8 +1587,13 @@ impl SessionManager {
 	/// Start a new authorization generation with `keys`, exactly as an
 	/// authenticated HTTPS `/resume` from `client_ip` would. For the benchmark's
 	/// reconnect cycles, which have no Moonlight client; servers use `/resume`.
-	pub async fn bench_resume(&self, keys: SessionKeyData, client_ip: IpAddr) -> Result<(), ()> {
-		self.resume_session(keys, ResumeRequest::default(), client_ip).await
+	/// `vrr_requested` is the client's `clientVrrRequested` parameter.
+	pub async fn bench_resume(&self, keys: SessionKeyData, client_ip: IpAddr, vrr_requested: bool) -> Result<(), ()> {
+		let request = ResumeRequest {
+			vrr_requested,
+			..ResumeRequest::default()
+		};
+		self.resume_session(keys, request, client_ip).await
 	}
 
 	/// Trigger the video and audio pipelines to start encoding.
@@ -1710,7 +1731,7 @@ impl SessionManager {
 impl<B: SessionBackend> SessionCore<B> {
 	pub(crate) async fn authorize_client_for_test(&self, client_ip: IpAddr) -> StreamAuthorization {
 		let mut guard = self.lock().await;
-		guard.rotate_authorization(client_ip).unwrap();
+		guard.rotate_authorization(client_ip, false).unwrap();
 		guard.authorization_tx.as_ref().unwrap().borrow().clone()
 	}
 }

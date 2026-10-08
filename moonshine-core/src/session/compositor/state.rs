@@ -270,6 +270,27 @@ pub(crate) struct MoonshineCompositor {
 	/// Commits of the focused application surface, for cadence
 	/// diagnostics only.
 	pub(super) source_commit_generation: u64,
+	/// Fixed refresh-slot capture, or presentation-driven capture for a client
+	/// that requested VRR presentation (see [`super::capture::CapturePacing`]).
+	pub(super) capture_pacing: super::capture::CapturePacing,
+	/// The trigger of the capture currently being attempted.
+	capture_trigger: super::capture::CaptureTrigger,
+	/// VRR pacing: limits flips (capture opportunity plus frame callbacks) to
+	/// the negotiated rate.
+	flip_limiter: super::capture::PresentationLimiter,
+	/// VRR pacing: last flip, the reference for the idle heartbeat.
+	pub(super) last_flip_at: Option<std::time::Instant>,
+	/// VRR pacing: an idle callback will run the requested flip.
+	flip_scheduled: bool,
+	/// VRR pacing: a flip postponed by the limiter is waiting on this timer.
+	flip_timer: Option<smithay::reexports::calloop::RegistrationToken>,
+	/// VRR pacing: when the oldest unserved flip was requested.
+	flip_requested_at: Option<std::time::Instant>,
+	/// VRR pacing: a flip had no consumer credit; demand captures the newest scene.
+	vrr_capture_pending: bool,
+	/// Latch time of the newest content change not yet captured. VRR captures
+	/// are stamped with it, so the RTP timeline follows the source cadence.
+	content_changed_at: Option<std::time::Instant>,
 
 	// -- Input --
 	pub seat: Seat<Self>,
@@ -558,6 +579,17 @@ impl ClientData for ClientState {
 }
 
 impl MoonshineCompositor {
+	/// Whether the live output already has this mode.
+	pub(crate) fn output_mode_matches(&self, width: u32, height: u32, refresh_rate: u32, hdr: bool) -> bool {
+		self.width == width
+			&& self.height == height
+			&& self.hdr == hdr
+			&& self
+				.output
+				.current_mode()
+				.is_some_and(|mode| mode.refresh == (refresh_rate * 1000) as i32)
+	}
+
 	/// Apply a client-requested output mode without replacing the compositor or
 	/// disconnecting the launched application.
 	pub(crate) fn reconfigure_output(
@@ -615,6 +647,8 @@ impl MoonshineCompositor {
 		};
 		self.output.change_current_state(Some(mode), None, None, None);
 		self.output.set_preferred(mode);
+		// The previous limiter phase belongs to the old rate.
+		self.flip_limiter.set_interval(self.refresh_interval());
 		if let Some(color_management) = self.color_management.as_mut() {
 			color_management.reconfigure(hdr);
 		}
@@ -767,6 +801,8 @@ impl MoonshineCompositor {
 		let mut pointer_element = PointerElement::default();
 		pointer_element.set_buffer(cursor_buffer);
 
+		let initial_refresh_interval = refresh_interval_for(output.current_mode());
+
 		// Pre-allocate GBM buffer pool for zero-alloc frame export.
 		let mut buffer_pool = Vec::with_capacity(BUFFER_POOL_SIZE);
 		for i in 0..BUFFER_POOL_SIZE {
@@ -812,6 +848,15 @@ impl MoonshineCompositor {
 				cadence: super::capture::CaptureCadence::new(log_stats),
 				commit_generation: 0,
 				source_commit_generation: 0,
+				capture_pacing: super::capture::CapturePacing::Fixed,
+				capture_trigger: super::capture::CaptureTrigger::Refresh,
+				flip_limiter: super::capture::PresentationLimiter::new(initial_refresh_interval),
+				last_flip_at: None,
+				flip_scheduled: false,
+				flip_timer: None,
+				flip_requested_at: None,
+				vrr_capture_pending: false,
+				content_changed_at: None,
 				seat,
 				pending_text: String::new(),
 				cursor_position: initial_cursor_position,
@@ -1118,9 +1163,7 @@ impl MoonshineCompositor {
 
 	/// One refresh interval of the virtual output.
 	fn refresh_interval(&self) -> std::time::Duration {
-		std::time::Duration::from_nanos(
-			1_000_000_000_000 / self.output.current_mode().map_or(60_000, |mode| mode.refresh.max(1)) as u64,
-		)
+		refresh_interval_for(self.output.current_mode())
 	}
 
 	/// Whether a cursor is presented in the captured scene now (see
@@ -1538,13 +1581,138 @@ impl MoonshineCompositor {
 			self.cadence.expired_slots += 1;
 		}
 		self.capture_deadline = deadline;
+		self.capture_trigger = super::capture::CaptureTrigger::Refresh;
 		self.render_and_export(true);
+	}
+
+	/// Switch capture pacing for the next client epoch. Deferred slots, pending
+	/// flips and limiter phase belong to the previous pacing and are dropped.
+	pub(crate) fn set_capture_pacing(&mut self, pacing: super::capture::CapturePacing) {
+		if pacing == self.capture_pacing {
+			return;
+		}
+		self.capture_pacing = pacing;
+		self.capture_schedule.begin_tick();
+		self.flip_limiter.set_interval(self.refresh_interval());
+		self.last_flip_at = None;
+		self.flip_requested_at = None;
+		self.vrr_capture_pending = false;
+		if let Some(timer) = self.flip_timer.take() {
+			self.handle.remove(timer);
+		}
+		// Whatever is on screen now is the first content of the new pacing.
+		self.screen_dirty = true;
+		tracing::info!(capture_pacing = pacing.as_str(), "Capture pacing changed");
+	}
+
+	/// Content changed at `at` (a latched commit). Under VRR pacing this asks
+	/// for a flip as soon as the limiter allows; fixed pacing waits for the tick.
+	pub(super) fn note_content_change(&mut self, at: std::time::Instant) {
+		self.content_changed_at = Some(self.content_changed_at.map_or(at, |previous| previous.max(at)));
+		if self.capture_pacing != super::capture::CapturePacing::Vrr {
+			return;
+		}
+		self.flip_requested_at.get_or_insert(at);
+		if self.flip_scheduled || self.flip_timer.is_some() {
+			// Coalesced into the flip already scheduled.
+			return;
+		}
+		self.flip_scheduled = true;
+		// Run after the current dispatch, so every commit of this batch of
+		// client requests is latched before the scene is captured.
+		self.handle.insert_idle(|state| {
+			state.flip_scheduled = false;
+			state.vrr_flip(super::capture::CaptureTrigger::Presentation);
+		});
+	}
+
+	/// VRR pacing: a flip is one capture opportunity followed by frame
+	/// callbacks, like a variable-refresh panel showing a new frame. The
+	/// limiter keeps the average at or below the negotiated rate.
+	fn vrr_flip(&mut self, trigger: super::capture::CaptureTrigger) {
+		if self.capture_pacing != super::capture::CapturePacing::Vrr {
+			self.flip_requested_at = None;
+			return;
+		}
+		let now = std::time::Instant::now();
+		// The heartbeat runs only after a quiet interval, so it never needs the
+		// limiter; counting it would hold back the source's next real frame.
+		let due = if trigger == super::capture::CaptureTrigger::Heartbeat {
+			now
+		} else {
+			self.flip_limiter.next_delivery(now)
+		};
+		if due > now {
+			if self.flip_timer.is_none() {
+				if self.log_stats {
+					self.cadence.limited_flips += 1;
+				}
+				let timer = smithay::reexports::calloop::timer::Timer::from_deadline(due);
+				match self.handle.insert_source(timer, move |_, _, state: &mut Self| {
+					state.flip_timer = None;
+					// The source outpaces the rate: its content is sampled at
+					// this flip, so the flip, not the latch, is the content time.
+					state.content_changed_at = None;
+					state.vrr_flip(trigger);
+					smithay::reexports::calloop::timer::TimeoutAction::Drop
+				}) {
+					Ok(token) => self.flip_timer = Some(token),
+					Err(error) => {
+						// The idle heartbeat still services the output.
+						tracing::warn!(%error, "Failed to arm the VRR flip timer");
+					},
+				}
+			}
+			return;
+		}
+		if trigger != super::capture::CaptureTrigger::Heartbeat {
+			self.flip_limiter.delivered(now);
+		}
+		self.last_flip_at = Some(now);
+		self.capture_deadline = self.flip_requested_at.take().unwrap_or(now);
+		self.capture_trigger = trigger;
+		self.render_and_export(true);
+	}
+
+	/// VRR pacing heartbeat from the refresh timer. Returns the next deadline.
+	/// It flips only after a full refresh interval without one, servicing
+	/// cursor movement, keepalive captures and idle frame callbacks without
+	/// forming a second capture grid next to the source's own cadence.
+	pub fn vrr_heartbeat(&mut self, now: std::time::Instant) -> std::time::Instant {
+		let interval = self.refresh_interval();
+		if self.flip_limiter.interval() != interval {
+			self.flip_limiter.set_interval(interval);
+		}
+		if let Some(last) = self.last_flip_at
+			&& last + interval > now
+		{
+			self.next_refresh_at = last + interval;
+			return self.next_refresh_at;
+		}
+		if self.flip_timer.is_none() && !self.flip_scheduled {
+			self.flip_requested_at.get_or_insert(now);
+			self.vrr_flip(super::capture::CaptureTrigger::Heartbeat);
+		}
+		self.next_refresh_at = self.last_flip_at.map_or(now, |last| last.max(now)) + interval;
+		self.next_refresh_at
 	}
 
 	/// Consumer demand: complete this refresh slot's deferred capture, if the
 	/// scene still holds the content of the slot's deadline. Demand never
 	/// opens a slot, sends frame callbacks or resolves presentation feedback.
+	///
+	/// Under VRR pacing, demand completes a flip that found no credit with the
+	/// newest scene: the content is source-timed, so a later capture moves
+	/// only its transmit time, never its timestamp.
 	pub fn complete_deferred_capture(&mut self) {
+		if self.capture_pacing == super::capture::CapturePacing::Vrr {
+			if self.vrr_capture_pending {
+				self.capture_trigger = super::capture::CaptureTrigger::Pending;
+				self.capture_deadline = std::time::Instant::now();
+				self.render_and_export(false);
+			}
+			return;
+		}
 		match self.capture_schedule.demand(self.commit_generation) {
 			super::capture::DemandOpportunity::None => {},
 			super::capture::DemandOpportunity::Superseded => {
@@ -1554,6 +1722,7 @@ impl MoonshineCompositor {
 			},
 			super::capture::DemandOpportunity::Capture(slot) => {
 				self.capture_deadline = slot.deadline;
+				self.capture_trigger = super::capture::CaptureTrigger::DeferredSlot;
 				self.render_and_export(false);
 			},
 		}
@@ -1580,18 +1749,17 @@ impl MoonshineCompositor {
 	}
 
 	/// Bookkeeping for a frame accepted by the consumer.
-	fn capture_published(&mut self, send_callbacks: bool, now: std::time::Instant) {
+	fn capture_published(&mut self, now: std::time::Instant, source_time: std::time::Instant) {
 		self.screen_dirty = false;
 		self.last_frame_sent_at = now;
 		self.capture_schedule.captured();
-		let trigger = if send_callbacks {
-			super::capture::CaptureTrigger::Refresh
-		} else {
-			super::capture::CaptureTrigger::DeferredSlot
-		};
+		self.vrr_capture_pending = false;
+		self.content_changed_at = None;
+		let trigger = self.capture_trigger;
 		self.cadence.record(
 			now,
 			self.capture_deadline,
+			source_time,
 			trigger,
 			self.commit_generation,
 			self.source_commit_generation,
@@ -1642,6 +1810,8 @@ impl MoonshineCompositor {
 		if self.cursor_position != self.last_cursor_position {
 			self.screen_dirty = true;
 			self.last_cursor_position = self.cursor_position;
+			// Moved since the last capture; this capture shows it now.
+			self.content_changed_at = Some(std::time::Instant::now());
 		}
 
 		// A static scene can mean the producer is waiting for wl_buffer.release.
@@ -1695,6 +1865,7 @@ impl MoonshineCompositor {
 			);
 			let c = self.cadence.take_summary();
 			tracing::info!(
+				capture_pacing = self.capture_pacing.as_str(),
 				captures = c.captures,
 				capture_interval_min_us = c.interval_us[0],
 				capture_interval_p50_us = c.interval_us[1],
@@ -1706,6 +1877,12 @@ impl MoonshineCompositor {
 				capture_lateness_max_us = c.lateness_us[2],
 				refresh_captures = c.refresh,
 				deferred_slot_captures = c.deferred,
+				presentation_captures = c.presentation,
+				heartbeat_captures = c.heartbeat,
+				pending_captures = c.pending,
+				content_age_p50_us = c.content_age_us[0],
+				content_age_p99_us = c.content_age_us[1],
+				content_age_max_us = c.content_age_us[2],
 				same_slot_captures = c.same_slot,
 				captures_without_new_commit = c.commits[0],
 				captures_with_one_commit = c.commits[1],
@@ -1722,6 +1899,8 @@ impl MoonshineCompositor {
 				deferred_slots = c.deferred_slots,
 				superseded_slots = c.superseded_slots,
 				expired_slots = c.expired_slots,
+				limited_flips = c.limited_flips,
+				pending_flips = c.pending_flips,
 				"Video capture cadence"
 			);
 			let r = self.direct_rejections;
@@ -1769,13 +1948,23 @@ impl MoonshineCompositor {
 
 		let Some(credit) = self.frame_tx.try_acquire() else {
 			if send_callbacks {
-				// The consumer may still accept this slot's content before
-				// any client commits again; it never gets a second slot.
-				self.capture_schedule
-					.defer(self.capture_deadline, self.commit_generation);
-				if self.log_stats {
-					self.pre_render_rejected += 1;
-					self.cadence.deferred_slots += 1;
+				if self.capture_pacing == super::capture::CapturePacing::Vrr {
+					// Demand captures the newest scene once the consumer is
+					// ready; the flip's frame callbacks are not withheld.
+					self.vrr_capture_pending = true;
+					if self.log_stats {
+						self.pre_render_rejected += 1;
+						self.cadence.pending_flips += 1;
+					}
+				} else {
+					// The consumer may still accept this slot's content before
+					// any client commits again; it never gets a second slot.
+					self.capture_schedule
+						.defer(self.capture_deadline, self.commit_generation);
+					if self.log_stats {
+						self.pre_render_rejected += 1;
+						self.cadence.deferred_slots += 1;
+					}
 				}
 				self.service_uncaptured_frame();
 			}
@@ -1850,6 +2039,9 @@ impl MoonshineCompositor {
 			// The encoder is still reading this buffer — skip the frame
 			// to avoid overwriting its content.
 			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
+			if self.capture_pacing == super::capture::CapturePacing::Vrr {
+				self.vrr_capture_pending = true;
+			}
 			if send_callbacks {
 				self.service_uncaptured_frame();
 			}
@@ -2115,6 +2307,14 @@ impl MoonshineCompositor {
 		// The rendering happened after export_dmabuf duplicated the fds,
 		// but the fds reference the same DMA-BUF — the encoder will see
 		// the freshly rendered content.
+		let source_time = capture_source_time(
+			self.capture_pacing,
+			self.capture_deadline,
+			self.content_changed_at,
+			std::time::Instant::now(),
+		);
+		exported_frame.source_time = source_time;
+		exported_frame.vrr_capture = self.capture_pacing == super::capture::CapturePacing::Vrr;
 		match self
 			.frame_tx
 			.try_send(exported_frame, credit.take().expect("capture credit"))
@@ -2182,7 +2382,7 @@ impl MoonshineCompositor {
 			.unwrap_or(std::time::Duration::from_millis(11));
 		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
 			self.clock.now(),
-			Refresh::Fixed(frame_period),
+			presentation_refresh(self.capture_pacing, frame_period),
 			0,
 			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
 			),
@@ -2198,7 +2398,7 @@ impl MoonshineCompositor {
 		}
 		drop(render_result);
 		if let Some(at) = published_at {
-			self.capture_published(send_callbacks, at);
+			self.capture_published(at, source_time);
 		}
 	}
 
@@ -2311,6 +2511,14 @@ impl MoonshineCompositor {
 			hdr_metadata,
 		);
 		exported_frame.overlays = overlays;
+		let source_time = capture_source_time(
+			self.capture_pacing,
+			self.capture_deadline,
+			self.content_changed_at,
+			std::time::Instant::now(),
+		);
+		exported_frame.source_time = source_time;
+		exported_frame.vrr_capture = self.capture_pacing == super::capture::CapturePacing::Vrr;
 
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
@@ -2335,7 +2543,7 @@ impl MoonshineCompositor {
 					self.captured_frames += 1;
 					self.direct_frames += 1;
 				}
-				self.capture_published(send_callbacks, std::time::Instant::now());
+				self.capture_published(std::time::Instant::now(), source_time);
 			},
 		}
 
@@ -2366,7 +2574,7 @@ impl MoonshineCompositor {
 			.unwrap_or(std::time::Duration::from_millis(11));
 		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
 			self.clock.now(),
-			Refresh::Fixed(frame_period),
+			presentation_refresh(self.capture_pacing, frame_period),
 			0,
 			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
 			),
@@ -2760,6 +2968,36 @@ impl MoonshineCompositor {
 		}
 		result
 	}
+}
+
+/// Content time of a capture, carried to the RTP timeline. Fixed pacing
+/// samples the scene as of its refresh deadline; VRR pacing uses the latch
+/// time of the newest captured content (or `now` for a cursor or keepalive
+/// capture), never later than the capture itself.
+fn capture_source_time(
+	pacing: super::capture::CapturePacing,
+	deadline: std::time::Instant,
+	content_changed_at: Option<std::time::Instant>,
+	now: std::time::Instant,
+) -> std::time::Instant {
+	match pacing {
+		super::capture::CapturePacing::Fixed => deadline,
+		super::capture::CapturePacing::Vrr => content_changed_at.map_or(now, |at| at.min(now)),
+	}
+}
+
+/// Refresh reported in presentation feedback: a fixed period, or under VRR
+/// pacing the minimum period of a variable-refresh output.
+fn presentation_refresh(pacing: super::capture::CapturePacing, period: std::time::Duration) -> Refresh {
+	match pacing {
+		super::capture::CapturePacing::Fixed => Refresh::Fixed(period),
+		super::capture::CapturePacing::Vrr => Refresh::Variable(period),
+	}
+}
+
+/// One refresh interval of an output mode (millihertz), 60 Hz when unset.
+fn refresh_interval_for(mode: Option<Mode>) -> std::time::Duration {
+	std::time::Duration::from_nanos(1_000_000_000_000 / mode.map_or(60_000, |mode| mode.refresh.max(1)) as u64)
 }
 
 fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Option<(i32, i32)>) -> Option<(i32, i32)> {

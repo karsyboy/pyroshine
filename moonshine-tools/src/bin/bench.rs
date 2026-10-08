@@ -144,6 +144,16 @@ struct Args {
 	/// Append one JSON object per cycle to this file.
 	#[arg(long)]
 	cycle_log: Option<std::path::PathBuf>,
+
+	/// Act as a client that requested VRR presentation (`clientVrrRequested=1`),
+	/// so the compositor uses presentation-driven capture.
+	#[arg(long)]
+	vrr: bool,
+
+	/// Write one CSV row per received video frame (frame index, RTP timestamp,
+	/// first-packet arrival in microseconds) to this file. Needs unencrypted video.
+	#[arg(long)]
+	rtp_trace: Option<std::path::PathBuf>,
 }
 
 #[path = "bench/cycles.rs"]
@@ -832,6 +842,7 @@ async fn run_benchmark(
 		// The benchmark is the local client: it discovers the video endpoint
 		// with a legacy PING from loopback below.
 		client_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+		vrr_requested: args.vrr,
 	};
 
 	tracing::info!("Initializing session...");
@@ -913,11 +924,39 @@ async fn run_benchmark(
 	ping_sock.send_to(b"PING", ping_addr)?;
 	ping_sock.set_nonblocking(true)?;
 	let receiver = std::sync::Arc::new(tokio::net::UdpSocket::from_std(ping_sock)?);
+	let mut rtp_trace = match &args.rtp_trace {
+		Some(path) => Some(std::io::BufWriter::new(std::fs::File::create(path)?)),
+		None => None,
+	};
+	if let Some(trace) = rtp_trace.as_mut() {
+		use std::io::Write;
+		writeln!(trace, "frame_index,rtp_timestamp,arrival_us")?;
+	}
 	let _udp_receiver = DrainGuard(tokio::spawn({
 		let receiver = receiver.clone();
 		async move {
 			let mut buffer = [0u8; 65536];
-			while receiver.recv_from(&mut buffer).await.is_ok() {}
+			let started = Instant::now();
+			let mut last_frame = None;
+			while let Ok((length, _)) = receiver.recv_from(&mut buffer).await {
+				// Unencrypted shard: RTP header (timestamp at 4..8, big endian),
+				// four bytes of padding, then NV_VIDEO_PACKET (frame index at 4..8).
+				if let Some(trace) = rtp_trace.as_mut()
+					&& length >= 24
+				{
+					let frame = u32::from_le_bytes(buffer[20..24].try_into().unwrap());
+					if last_frame != Some(frame) {
+						last_frame = Some(frame);
+						let rtp = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
+						use std::io::Write;
+						let _ = writeln!(trace, "{frame},{rtp},{}", started.elapsed().as_micros());
+					}
+				}
+			}
+			if let Some(mut trace) = rtp_trace {
+				use std::io::Write;
+				let _ = trace.flush();
+			}
 		}
 	}));
 	let detach_contexts = (video_ctx_for_detach, audio_ctx_for_detach);
@@ -1052,6 +1091,7 @@ async fn run_benchmark(
 			ping_addr,
 			detach_contexts,
 			Duration::from_secs(args.detach_seconds),
+			args.vrr,
 		)
 		.await;
 	}
@@ -1163,6 +1203,7 @@ async fn detach_measurement(
 	ping_addr: std::net::SocketAddr,
 	(video_ctx, audio_ctx): (VideoStreamContext, AudioStreamContext),
 	window: Duration,
+	vrr_requested: bool,
 ) {
 	let attached = measure_window(stats_rx, window).await;
 	let detached = async {
@@ -1170,6 +1211,7 @@ async fn detach_measurement(
 			.bench_resume(
 				SessionKeyData::new(RemoteInputKey::from_bytes([1; 16]), RemoteInputKeyId::new(1)),
 				std::net::Ipv4Addr::LOCALHOST.into(),
+				vrr_requested,
 			)
 			.await
 			.ok()?;

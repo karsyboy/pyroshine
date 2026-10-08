@@ -367,6 +367,35 @@ pub struct StreamStats {
 	/// slows the stream; it drops samples instead.
 	pub samples_dropped: u64,
 	pub stages: Vec<StageStats>,
+	/// Frame pacing of the captured content; absent when no frame was
+	/// captured in the window (or from a daemon that does not report it).
+	#[serde(default)]
+	pub capture: Option<CaptureStats>,
+}
+
+/// How the application's frames reached the encoder over the window: their
+/// content-time intervals (the frame times a client sees in RTP timestamps
+/// and paces VRR presentation by) and the capture pacing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaptureStats {
+	/// `vrr` when frames were captured as the application presented them
+	/// (the client requested VRR presentation), `fixed` when captured on the
+	/// stream's refresh clock, `mixed` when the pacing changed in the window.
+	pub pacing: String,
+	/// New frames per second of content time; zero when the content was static.
+	pub source_fps: f64,
+	/// Content-time interval between consecutive new frames, in microseconds.
+	pub interval_p50_us: f64,
+	pub interval_p95_us: f64,
+	pub interval_p99_us: f64,
+	pub interval_max_us: f64,
+	pub interval_stddev_us: f64,
+	/// Share of intervals that differ from the previous one by more than 2 ms,
+	/// in percent: visible unevenness when a display follows the frame times.
+	pub uneven_percent: f64,
+	/// Time from content becoming current to its capture, in microseconds.
+	pub content_age_p50_us: f64,
+	pub content_age_p95_us: f64,
 }
 
 /// Timing of one pipeline stage over the window, in microseconds.

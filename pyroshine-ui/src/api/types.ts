@@ -163,6 +163,24 @@ export interface StreamStats {
   stale_frames_dropped: number;
   samples_dropped: number;
   stages: StageStats[];
+  /** Frame pacing of the captured content; absent from older daemons. */
+  capture?: CaptureStats | null;
+}
+
+export interface CaptureStats {
+  /** `vrr`: captured as the application presents (client VRR); `fixed`: refresh clock. */
+  pacing: "vrr" | "fixed" | "mixed";
+  /** New frames per second of content time; 0 when the content was static. */
+  source_fps: number;
+  interval_p50_us: number;
+  interval_p95_us: number;
+  interval_p99_us: number;
+  interval_max_us: number;
+  interval_stddev_us: number;
+  /** Intervals differing from the previous one by more than 2 ms, in percent. */
+  uneven_percent: number;
+  content_age_p50_us: number;
+  content_age_p95_us: number;
 }
 
 export interface ServerEvent {

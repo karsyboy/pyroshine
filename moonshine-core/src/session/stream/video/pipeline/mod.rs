@@ -114,10 +114,6 @@ const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 /// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
 const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
 
-fn rtp_timestamp_for_frame(frame_number: u32, fps: u32) -> u32 {
-	((u64::from(frame_number) * 90_000) / u64::from(fps.max(1))) as u32
-}
-
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
 fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
@@ -360,6 +356,12 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 struct FrameContext {
 	/// When the source frame was captured (for end-to-end latency).
 	created_at: std::time::Instant,
+	/// When the frame's content became current; the RTP timestamp's source.
+	source_time: std::time::Instant,
+	/// Whether the frame carries newly captured content (not a replay).
+	new_content: bool,
+	/// Captured with VRR (presentation-driven) pacing.
+	vrr_capture: bool,
 	/// Pre-encode latency breakdown measured on the encoding thread.
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
@@ -435,6 +437,7 @@ async fn run_packet_consumer(
 	let network_queue = Arc::new(super::shard_batch::QueueDepth::default());
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
+	let mut rtp_clock = super::rtp_clock::RtpClock::new();
 	let mut latency_samples: Vec<LatencySample> = if config.log_stats {
 		Vec::with_capacity(512)
 	} else {
@@ -461,6 +464,7 @@ async fn run_packet_consumer(
 			ConsumerMessage::ResetCounters(EpochActivation { generation, applied }) => {
 				frame_number = 0;
 				sequence_number = 0;
+				rtp_clock.reset(std::time::Instant::now());
 				let (ready, waiting) = tokio::sync::oneshot::channel();
 				if packet_tx
 					.send(VideoPacketMessage::BeginEpoch {
@@ -520,8 +524,17 @@ async fn run_packet_consumer(
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame;
 
-		// Calculate RTP timestamp from PTS (convert to 90kHz clock).
-		let rtp_timestamp = (packet.pts * 90000 / ctx.fps as u64) as u32;
+		// RTP carries the frame's content time; see `rtp_clock`.
+		let rtp_timestamp = rtp_clock.timestamp(frame_context.source_time);
+		let source_interval = if frame_context.new_content {
+			rtp_clock.content_interval(frame_context.source_time)
+		} else {
+			std::time::Duration::ZERO
+		};
+		let content_age = frame_context
+			.created_at
+			.saturating_duration_since(frame_context.source_time);
+		let vrr_capture = frame_context.vrr_capture;
 		frame_number += 1;
 
 		let t_start = std::time::Instant::now();
@@ -606,6 +619,9 @@ async fn run_packet_consumer(
 			discarded_packet_count: 0,
 			stale_frames_dropped: 0,
 			is_key_frame,
+			source_interval,
+			content_age,
+			vrr_capture,
 		};
 		let completion_stats_tx = stats_tx.clone();
 		let completion_idr_tx = idr_tx.clone();
@@ -695,6 +711,9 @@ async fn run_packet_consumer(
 			discarded_packet_count: 0,
 			stale_frames_dropped: 0,
 			is_key_frame,
+			source_interval,
+			content_age,
+			vrr_capture,
 		};
 		diagnostics.record(
 			&stats,
@@ -1122,6 +1141,9 @@ impl VideoPipelineInner {
 		);
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
+		// Pacing of the last captured frame, reported for resends of it.
+		let mut last_vrr_capture = false;
+		let mut rtp_clock = super::rtp_clock::RtpClock::new();
 		let mut last_encoded = None;
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
@@ -1147,6 +1169,7 @@ impl VideoPipelineInner {
 				frame_rx.reset();
 				frame_number = 0;
 				sequence_number = 0;
+				rtp_clock.reset(std::time::Instant::now());
 				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
@@ -1172,86 +1195,92 @@ impl VideoPipelineInner {
 			// independently of the source buffer's earlier GPU-consumed lifecycle.
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
-			let (encoded, created_at, pacing_origin, buffer_index, channel_wait) = if let Some(frame) = received {
-				if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
-					// Overlays are composited only into unscaled input. A capture
-					// that raced an extent change is dropped rather than encoded
-					// without its cursor; the next one is composited by GLES.
-					frame.consumed.store(true, Ordering::Release);
-					continue;
-				}
-				gpu_window_encodes += 1;
-				resend_last = false;
-				let received_at = std::time::Instant::now();
-				let created_at = frame.created_at;
-				let pacing_origin = frame.pacing_origin();
-				let buffer_index = frame.buffer_index;
-				let reusable = last_encoded
-					.take()
-					.map(|encoded: EncodedFrame| encoded.data)
-					.unwrap_or_default();
-				let encoded = match encoder.encode(&frame, reusable) {
-					Ok(encoded) => encoded,
-					Err(failure) => {
-						// PyroWave has no inter-frame references: a dropped frame
-						// needs no IDR, only the source release the failure allows.
-						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+			let (encoded, created_at, source_time, pacing_origin, buffer_index, channel_wait, new_content) =
+				if let Some(frame) = received {
+					if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
+						// Overlays are composited only into unscaled input. A capture
+						// that raced an extent change is dropped rather than encoded
+						// without its cursor; the next one is composited by GLES.
+						frame.consumed.store(true, Ordering::Release);
 						continue;
-					},
-				};
-				failures.record_success();
-				// compute_num_packets/packetize waited for the GPU read, so the
-				// compositor buffer is no longer referenced by PyroWave.
-				frame.consumed.store(true, Ordering::Release);
-				if ctx.format.hdr {
-					let state = HdrModeState {
-						enabled: true,
-						metadata: frame.hdr_metadata,
+					}
+					gpu_window_encodes += 1;
+					resend_last = false;
+					let received_at = std::time::Instant::now();
+					let created_at = frame.created_at;
+					let source_time = frame.source_time;
+					last_vrr_capture = frame.vrr_capture;
+					let pacing_origin = frame.pacing_origin();
+					let buffer_index = frame.buffer_index;
+					let reusable = last_encoded
+						.take()
+						.map(|encoded: EncodedFrame| encoded.data)
+						.unwrap_or_default();
+					let encoded = match encoder.encode(&frame, reusable) {
+						Ok(encoded) => encoded,
+						Err(failure) => {
+							// PyroWave has no inter-frame references: a dropped frame
+							// needs no IDR, only the source release the failure allows.
+							apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+							continue;
+						},
 					};
-					let _ = hdr_metadata_tx.send_if_modified(|current| {
-						if *current != state {
-							*current = state;
-							true
-						} else {
-							false
-						}
-					});
-				}
-				last_frame_time = std::time::Instant::now();
-				(
-					encoded,
-					created_at,
-					pacing_origin,
-					buffer_index,
-					received_at.saturating_duration_since(created_at),
-				)
-			} else if resend_last && self.demand.may_replay(2 * frame_interval) {
-				let Some(encoded) = last_encoded.take() else {
+					failures.record_success();
+					// compute_num_packets/packetize waited for the GPU read, so the
+					// compositor buffer is no longer referenced by PyroWave.
+					frame.consumed.store(true, Ordering::Release);
+					if ctx.format.hdr {
+						let state = HdrModeState {
+							enabled: true,
+							metadata: frame.hdr_metadata,
+						};
+						let _ = hdr_metadata_tx.send_if_modified(|current| {
+							if *current != state {
+								*current = state;
+								true
+							} else {
+								false
+							}
+						});
+					}
+					last_frame_time = std::time::Instant::now();
+					(
+						encoded,
+						created_at,
+						source_time,
+						pacing_origin,
+						buffer_index,
+						received_at.saturating_duration_since(created_at),
+						true,
+					)
+				} else if resend_last && self.demand.may_replay(2 * frame_interval) {
+					let Some(encoded) = last_encoded.take() else {
+						continue;
+					};
+					resend_last = false;
+					let now = std::time::Instant::now();
+					// A resend shows the last content again now.
+					(encoded, now, now, now, usize::MAX, std::time::Duration::ZERO, false)
+				} else {
+					if !self.demand.wanted() {
+						// No client: captures are not requested, so none arrive.
+						last_frame_time = std::time::Instant::now();
+					} else if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+						tracing::warn!("No frames received for 5 seconds");
+						last_frame_time = std::time::Instant::now();
+					}
 					continue;
 				};
-				resend_last = false;
-				(
-					encoded,
-					std::time::Instant::now(),
-					std::time::Instant::now(),
-					usize::MAX,
-					std::time::Duration::ZERO,
-				)
-			} else {
-				if !self.demand.wanted() {
-					// No client: captures are not requested, so none arrive.
-					last_frame_time = std::time::Instant::now();
-				} else if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
-					tracing::warn!("No frames received for 5 seconds");
-					last_frame_time = std::time::Instant::now();
-				}
-				continue;
-			};
 
 			frame_number = frame_number.wrapping_add(1);
 			let before_packetize = std::time::Instant::now();
 			let latency = (before_packetize.duration_since(created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
-			let rtp_timestamp = rtp_timestamp_for_frame(frame_number, ctx.fps);
+			let rtp_timestamp = rtp_clock.timestamp(source_time);
+			let source_interval = if new_content {
+				rtp_clock.content_interval(source_time)
+			} else {
+				std::time::Duration::ZERO
+			};
 			// Wire version 1 transports one complete encoded frame through the
 			// ordinary GameStream packetizer. The client reassembles the decode
 			// unit before passing it to PyroWave.
@@ -1324,6 +1353,9 @@ impl VideoPipelineInner {
 					.saturating_sub(sent.outcome.submitted_datagrams + sent.outcome.failed_datagrams),
 				stale_frames_dropped,
 				is_key_frame: true,
+				source_interval,
+				content_age: created_at.saturating_duration_since(source_time),
+				vrr_capture: last_vrr_capture,
 			};
 			if stats.send > frame_interval {
 				consecutive_slow_sends = consecutive_slow_sends.saturating_add(1);
@@ -1536,6 +1568,8 @@ impl VideoPipelineInner {
 		let mut frame_number_base: u64 = 0;
 
 		// Track the last HDR mode state sent to the control stream.
+		// Pacing of the last captured frame, reported for replays of it.
+		let mut last_vrr_capture = false;
 		let mut last_hdr_state = HdrModeState {
 			enabled: ctx.format.hdr,
 			metadata: None,
@@ -1679,6 +1713,10 @@ impl VideoPipelineInner {
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
 									created_at: now,
+									// A replay shows the old content again now.
+									source_time: now,
+									new_content: false,
+									vrr_capture: last_vrr_capture,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
 									convert: std::time::Duration::ZERO,
@@ -2093,8 +2131,12 @@ impl VideoPipelineInner {
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
 						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+						last_vrr_capture = frame.vrr_capture;
 						let frame_context = FrameContext {
 							created_at: frame.created_at,
+							source_time: frame.source_time,
+							new_content: true,
+							vrr_capture: frame.vrr_capture,
 							channel_wait: t1_received.duration_since(frame.created_at),
 							import: t2_imported.duration_since(t1_received),
 							convert: t3_converted.duration_since(t2_imported),
@@ -2194,10 +2236,7 @@ impl Drop for ConsumerTask<'_> {
 
 #[cfg(test)]
 mod tests {
-	use super::{
-		BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost,
-		rtp_timestamp_for_frame,
-	};
+	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
 	use ash::vk::{self, Handle};
 	use pixelforge::{InputFormat, PixelForgeError};
 
@@ -2522,12 +2561,5 @@ mod tests {
 		let mut encoder = FakeSlots::default();
 		assert!(super::encode_static_recovery(&mut encoder, restore).is_err());
 		assert!(encoder.encoded.is_empty());
-	}
-
-	#[test]
-	fn pyrowave_rtp_timestamps_do_not_accumulate_integer_division_error() {
-		assert_eq!(rtp_timestamp_for_frame(165, 165), 90_000);
-		assert_eq!(rtp_timestamp_for_frame(144, 144), 90_000);
-		assert_eq!(rtp_timestamp_for_frame(240, 240), 90_000);
 	}
 }

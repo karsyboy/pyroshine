@@ -295,6 +295,9 @@ mod tests {
 			discarded_packet_count: 0,
 			stale_frames_dropped: 2,
 			is_key_frame: true,
+			source_interval: Duration::ZERO,
+			content_age: Duration::ZERO,
+			vrr_capture: false,
 		};
 		for _ in 0..10_000 {
 			window.record(&stats, 3, 128, Some(3));

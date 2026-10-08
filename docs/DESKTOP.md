@@ -128,6 +128,14 @@ one-second statistics from the video pipeline: frame rate, encoded and wire
 bitrate, transport overhead and the time spent in each pipeline stage. Stages
 the active encoder does not use are not shown.
 
+**Frame pacing** shows how the game's frames reach the client: **VRR capture**
+when a client with VRR presentation (Pyrolight with VRR enabled) has the host
+capture each frame as the game presents it, otherwise **Fixed refresh**. It
+reports the game's frame rate and frame times as sent to the client (median,
+p95, p99 and maximum), the share of frame times that change by more than 2 ms
+from one frame to the next (visible unevenness on a VRR display), and the
+delay from new content to its capture.
+
 **Diagnostics** shows the version, GPU, verified codec profiles, HDR and DMA-BUF
 support, listening ports and the startup health check.
 

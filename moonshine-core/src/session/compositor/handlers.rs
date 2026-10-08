@@ -340,6 +340,32 @@ impl ShmHandler for MoonshineCompositor {
 
 // -- Compositor Handler --
 
+/// Whether this commit applies a new or removed buffer anywhere in the
+/// surface tree (including synchronized subsurfaces applied with their
+/// parent). Must run before `on_commit_buffer_handler` consumes the buffers.
+fn surface_tree_buffer_changed(surface: &WlSurface) -> bool {
+	use smithay::wayland::compositor::{SurfaceAttributes, TraversalAction, with_surface_tree_upward};
+	let changed = std::cell::Cell::new(false);
+	with_surface_tree_upward(
+		surface,
+		(),
+		|_, _, _| TraversalAction::DoChildren(()),
+		|_, states, _| {
+			if states
+				.cached_state
+				.get::<SurfaceAttributes>()
+				.current()
+				.buffer
+				.is_some()
+			{
+				changed.set(true);
+			}
+		},
+		|_, _, _| !changed.get(),
+	);
+	changed.get()
+}
+
 /// Apply a commit only once the GPU has finished writing its new DMA-BUF.
 ///
 /// Wayland clients commit right after submitting rendering, before the GPU
@@ -421,6 +447,13 @@ impl CompositorHandler for MoonshineCompositor {
 		// Mark the screen as dirty so the next timer tick renders and sends a frame.
 		self.screen_dirty = true;
 		self.commit_generation = self.commit_generation.wrapping_add(1);
+		// Commits are applied once their buffer is readable (`latch_when_ready`),
+		// so this is the moment new content became presentable. Only a new (or
+		// removed) buffer is new content: frame-callback-only or subsurface
+		// state commits must not open a VRR flip of the old scene.
+		if !is_sync_subsurface(surface) && surface_tree_buffer_changed(surface) {
+			self.note_content_change(std::time::Instant::now());
+		}
 		if self
 			.focused_window
 			.as_ref()

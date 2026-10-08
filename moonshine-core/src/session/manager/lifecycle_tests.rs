@@ -94,6 +94,8 @@ struct FakeBackend {
 	foreground_tx: std::sync::Mutex<Option<watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>>>,
 	/// Every reconnect plan the backend ran.
 	plans: std::sync::Mutex<Vec<PlanRecord>>,
+	/// Capture pacing of every first PLAY.
+	start_pacing: std::sync::Mutex<Vec<CapturePacing>>,
 }
 
 /// What a reconnect plan asked the workers to do, and for which authorization.
@@ -102,6 +104,7 @@ struct PlanRecord {
 	audio: AudioStreamContext,
 	generation: u64,
 	key_id: u32,
+	capture_pacing: CapturePacing,
 }
 
 struct FakeSession {
@@ -119,6 +122,7 @@ impl FakeBackend {
 			session_stop: std::sync::Mutex::new(None),
 			foreground_tx: std::sync::Mutex::new(None),
 			plans: std::sync::Mutex::new(Vec::new()),
+			start_pacing: std::sync::Mutex::new(Vec::new()),
 		}
 	}
 
@@ -203,6 +207,7 @@ impl SessionBackend for FakeBackend {
 	}
 
 	async fn start(&self, session: FakeSession, request: StartRequest) -> Result<(FakeSession, Vec<StartLatch>), ()> {
+		self.start_pacing.lock().unwrap().push(request.capture_pacing);
 		let latch = StartLatch::new();
 		// Workers exist (and own resources) before the fallible step below.
 		self.spawn_worker(&request.stop, Some(latch.clone()))?;
@@ -245,6 +250,7 @@ impl SessionBackend for FakeBackend {
 			audio: plan.audio,
 			generation: plan.generation,
 			key_id: plan.keys.key_id().get(),
+			capture_pacing: plan.capture_pacing,
 		});
 		self.gate(Op::Resume).await
 	}
@@ -416,6 +422,41 @@ fn context() -> SessionContext {
 		audio_channel_mask: 0x3,
 		hdr: false,
 		client_ip: "127.0.0.1".parse().unwrap(),
+		vrr_requested: false,
+	}
+}
+
+#[tokio::test]
+async fn capture_pacing_follows_each_generations_vrr_request() {
+	let h = Harness::new();
+	let mut launch = context();
+	launch.vrr_requested = true;
+	h.core.initialize_session(launch).await.unwrap();
+	h.core.launch_session().await.unwrap();
+	let grant = h.grant().await;
+	assert!(grant.vrr_requested());
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(*h.backend().start_pacing.lock().unwrap(), [CapturePacing::Vrr]);
+
+	// A standard Moonlight client resumes without `clientVrrRequested`, then
+	// a VRR client resumes again. Both are unchanged-mode (fast) reconnects:
+	// pacing alone never recreates the video pipeline.
+	for (requested, expected) in [(false, CapturePacing::Fixed), (true, CapturePacing::Vrr)] {
+		let request = ResumeRequest {
+			vrr_requested: requested,
+			..ResumeRequest::default()
+		};
+		h.core.resume_session(keys(), request, h.client).await.unwrap();
+		let grant = h.grant().await;
+		assert_eq!(grant.vrr_requested(), requested);
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		let plans = h.backend().plans.lock().unwrap();
+		let plan = plans.last().unwrap();
+		assert_eq!(plan.capture_pacing, expected);
+		assert!(!plan.video_recreated);
+		assert_eq!(plan.generation, grant.generation());
 	}
 }
 

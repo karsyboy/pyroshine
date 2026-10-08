@@ -393,6 +393,122 @@ pub(super) fn next_refresh_deadline(
 	now + interval - std::time::Duration::from_nanos(remainder as u64)
 }
 
+/// How capture opportunities and frame callbacks are scheduled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CapturePacing {
+	/// The refresh tick at the negotiated rate is the only capture clock.
+	#[default]
+	Fixed,
+	/// Presentation-driven capture for a client that paces playback itself
+	/// (it requested VRR presentation). Each latched commit opens a capture
+	/// opportunity at once, limited by a [`PresentationLimiter`] at the
+	/// negotiated rate; frame callbacks follow those "flips" like a VRR panel
+	/// whose maximum refresh is the stream rate. The refresh timer only
+	/// services an idle output. Frames are stamped with the time their newest
+	/// content was latched, so the RTP timeline carries the source cadence.
+	Vrr,
+}
+
+impl CapturePacing {
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::Fixed => "fixed",
+			Self::Vrr => "vrr",
+		}
+	}
+}
+
+/// Rate limit for presentation-driven capture.
+///
+/// The negotiated stream rate is a ceiling on *average* output, not a minimum
+/// spacing: a game alternating 12/21 ms around a 16.7 ms stream period must
+/// keep that uneven timing, so a long interval earns phase credit that pays
+/// for a following short one. Credit is capped at one extra interval, so
+/// persistent oversupply is coalesced at the negotiated rate and a burst can
+/// never exceed two frames. A gap of two intervals or more is a stall, not
+/// credit: the resumed frame is delivered at once but cannot start a
+/// catch-up burst.
+#[derive(Clone, Debug)]
+pub(super) struct PresentationLimiter {
+	interval: Duration,
+	credit: Duration,
+	last: Option<std::time::Instant>,
+}
+
+impl PresentationLimiter {
+	pub(super) fn new(interval: Duration) -> Self {
+		Self {
+			interval,
+			credit: Duration::ZERO,
+			last: None,
+		}
+	}
+
+	/// Change the rate; the previous phase belongs to the old rate.
+	pub(super) fn set_interval(&mut self, interval: Duration) {
+		self.interval = interval;
+		self.reset();
+	}
+
+	pub(super) fn reset(&mut self) {
+		self.credit = Duration::ZERO;
+		self.last = None;
+	}
+
+	pub(super) fn interval(&self) -> Duration {
+		self.interval
+	}
+
+	fn capacity(&self) -> Duration {
+		self.interval * 2
+	}
+
+	fn available(&self, now: std::time::Instant) -> Duration {
+		match self.last {
+			Some(last) => (self.credit + now.saturating_duration_since(last)).min(self.capacity()),
+			None => self.capacity(),
+		}
+	}
+
+	/// Earliest time the next delivery may happen; `now` when it may happen at once.
+	pub(super) fn next_delivery(&self, now: std::time::Instant) -> std::time::Instant {
+		if self.interval.is_zero() {
+			return now;
+		}
+		let available = self.available(now);
+		if available >= self.interval {
+			now
+		} else {
+			now + (self.interval - available)
+		}
+	}
+
+	/// Record a delivery at `at`. Callers deliver only once
+	/// [`Self::next_delivery`] allows it.
+	pub(super) fn delivered(&mut self, at: std::time::Instant) {
+		if self.interval.is_zero() {
+			self.reset();
+			return;
+		}
+		let Some(last) = self.last else {
+			// Start with one interval of phase credit, so an uneven but
+			// correctly averaged source may begin with either half of a pair.
+			self.last = Some(at);
+			self.credit = self.interval;
+			return;
+		};
+		let elapsed = at.saturating_duration_since(last);
+		self.last = Some(at);
+		if elapsed >= self.capacity() {
+			self.credit = Duration::ZERO;
+			return;
+		}
+		self.credit = (self.credit + elapsed)
+			.min(self.capacity())
+			.saturating_sub(self.interval);
+	}
+}
+
 /// A refresh slot whose tick wanted a capture while the consumer had no credit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DeferredSlot {
@@ -469,6 +585,13 @@ pub(super) enum CaptureTrigger {
 	Refresh,
 	/// Late completion of a deferred refresh slot by consumer demand.
 	DeferredSlot,
+	/// VRR pacing: a flip opened by a latched commit.
+	Presentation,
+	/// VRR pacing: the idle heartbeat (cursor, keepalive) after a quiet interval.
+	Heartbeat,
+	/// VRR pacing: consumer demand completed a flip that had no credit,
+	/// capturing the newest scene.
+	Pending,
 }
 
 /// Bounded per-window sample storage; 5 s at 360 Hz fits without growth.
@@ -492,6 +615,9 @@ pub(super) struct CaptureCadence {
 	lateness_us: Vec<u32>,
 	refresh: u64,
 	deferred: u64,
+	presentation: u64,
+	heartbeat: u64,
+	pending: u64,
 	/// Two captures sampled the same refresh deadline. Must stay zero.
 	same_slot: u64,
 	commits: [u64; 4],
@@ -501,6 +627,12 @@ pub(super) struct CaptureCadence {
 	pub superseded_slots: u64,
 	/// Deferred slots still waiting when the next refresh deadline arrived.
 	pub expired_slots: u64,
+	/// VRR flips the presentation limiter postponed (source above the rate).
+	pub limited_flips: u64,
+	/// VRR flips that had no consumer credit; demand captures the newest scene.
+	pub pending_flips: u64,
+	/// Capture time minus the latch time of the newest captured content.
+	content_age_us: Vec<u32>,
 	/// Same coverage for commits of the focused application surface only,
 	/// excluding cursor, overlay and other client surfaces.
 	last_source_generation: u64,
@@ -518,11 +650,17 @@ pub(super) struct CadenceSummary {
 	pub lateness_us: [u32; 3],
 	pub refresh: u64,
 	pub deferred: u64,
+	pub presentation: u64,
+	pub heartbeat: u64,
+	pub pending: u64,
 	pub same_slot: u64,
 	pub commits: [u64; 4],
 	pub deferred_slots: u64,
 	pub superseded_slots: u64,
 	pub expired_slots: u64,
+	pub limited_flips: u64,
+	pub pending_flips: u64,
+	pub content_age_us: [u32; 3],
 	pub source_commits: [u64; 4],
 	pub source_commit_count: usize,
 	pub source_commit_phase_us: [u32; 3],
@@ -540,11 +678,17 @@ impl CaptureCadence {
 			lateness_us: Vec::with_capacity(capacity),
 			refresh: 0,
 			deferred: 0,
+			presentation: 0,
+			heartbeat: 0,
+			pending: 0,
 			same_slot: 0,
 			commits: [0; 4],
 			deferred_slots: 0,
 			superseded_slots: 0,
 			expired_slots: 0,
+			limited_flips: 0,
+			pending_flips: 0,
+			content_age_us: Vec::with_capacity(capacity),
 			last_source_generation: 0,
 			source_commits: [0; 4],
 			source_commit_phase_us: Vec::with_capacity(capacity),
@@ -559,10 +703,14 @@ impl CaptureCadence {
 		}
 	}
 
+	/// `deadline` is the refresh deadline (fixed pacing) or the request time
+	/// of the VRR flip; `content` is when the newest captured content latched.
+	#[allow(clippy::too_many_arguments)]
 	pub fn record(
 		&mut self,
 		now: std::time::Instant,
 		deadline: std::time::Instant,
+		content: std::time::Instant,
 		trigger: CaptureTrigger,
 		commit_generation: u64,
 		source_generation: u64,
@@ -579,12 +727,18 @@ impl CaptureCadence {
 		if self.lateness_us.len() < CADENCE_SAMPLES {
 			self.lateness_us.push(micros(now.saturating_duration_since(deadline)));
 		}
+		if self.content_age_us.len() < CADENCE_SAMPLES {
+			self.content_age_us.push(micros(now.saturating_duration_since(content)));
+		}
 		if self.last_deadline == Some(deadline) {
 			self.same_slot += 1;
 		}
 		match trigger {
 			CaptureTrigger::Refresh => self.refresh += 1,
 			CaptureTrigger::DeferredSlot => self.deferred += 1,
+			CaptureTrigger::Presentation => self.presentation += 1,
+			CaptureTrigger::Heartbeat => self.heartbeat += 1,
+			CaptureTrigger::Pending => self.pending += 1,
 		}
 		if self.last_capture.is_some() {
 			let commits = commit_generation.wrapping_sub(self.last_commit_generation);
@@ -610,6 +764,7 @@ impl CaptureCadence {
 		self.intervals_us.sort_unstable();
 		self.lateness_us.sort_unstable();
 		self.source_commit_phase_us.sort_unstable();
+		self.content_age_us.sort_unstable();
 		let i = &self.intervals_us;
 		let l = &self.lateness_us;
 		let p = &self.source_commit_phase_us;
@@ -625,11 +780,21 @@ impl CaptureCadence {
 			lateness_us: [percentile(l, 0.50), percentile(l, 0.99), l.last().copied().unwrap_or(0)],
 			refresh: self.refresh,
 			deferred: self.deferred,
+			presentation: self.presentation,
+			heartbeat: self.heartbeat,
+			pending: self.pending,
 			same_slot: self.same_slot,
 			commits: self.commits,
 			deferred_slots: self.deferred_slots,
 			superseded_slots: self.superseded_slots,
 			expired_slots: self.expired_slots,
+			limited_flips: self.limited_flips,
+			pending_flips: self.pending_flips,
+			content_age_us: [
+				percentile(&self.content_age_us, 0.50),
+				percentile(&self.content_age_us, 0.99),
+				self.content_age_us.last().copied().unwrap_or(0),
+			],
 			source_commits: self.source_commits,
 			source_commit_count: p.len(),
 			source_commit_phase_us: [percentile(p, 0.05), percentile(p, 0.50), percentile(p, 0.95)],
@@ -638,13 +803,19 @@ impl CaptureCadence {
 		self.source_commits = [0; 4];
 		self.intervals_us.clear();
 		self.lateness_us.clear();
+		self.content_age_us.clear();
 		self.refresh = 0;
 		self.deferred = 0;
+		self.presentation = 0;
+		self.heartbeat = 0;
+		self.pending = 0;
 		self.same_slot = 0;
 		self.commits = [0; 4];
 		self.deferred_slots = 0;
 		self.superseded_slots = 0;
 		self.expired_slots = 0;
+		self.limited_flips = 0;
+		self.pending_flips = 0;
 		summary
 	}
 }
@@ -757,6 +928,7 @@ mod cadence_tests {
 			cadence.record(
 				deadline + Duration::from_micros(late),
 				deadline,
+				deadline,
 				trigger,
 				generation,
 				generation,
@@ -775,6 +947,7 @@ mod cadence_tests {
 		cadence.record(
 			start + interval * 4,
 			start + interval * 4,
+			start + interval * 4,
 			CaptureTrigger::Refresh,
 			6,
 			6,
@@ -789,9 +962,152 @@ mod cadence_tests {
 	fn cadence_flags_two_captures_of_one_refresh_deadline() {
 		let deadline = Instant::now();
 		let mut cadence = CaptureCadence::new(true);
-		cadence.record(deadline, deadline, CaptureTrigger::Refresh, 1, 1);
-		cadence.record(deadline, deadline, CaptureTrigger::DeferredSlot, 1, 1);
+		cadence.record(deadline, deadline, deadline, CaptureTrigger::Refresh, 1, 1);
+		cadence.record(deadline, deadline, deadline, CaptureTrigger::DeferredSlot, 1, 1);
 		assert_eq!(cadence.take_summary().same_slot, 1);
+	}
+
+	/// Deliver every `request` whose limiter allows it at once, otherwise at
+	/// the limiter's next delivery time (as the compositor's flip timer does).
+	fn deliver(limiter: &mut PresentationLimiter, requests: &[Instant]) -> Vec<Instant> {
+		let mut delivered: Vec<Instant> = Vec::new();
+		let mut pending: Option<Instant> = None;
+		let mut index = 0;
+		loop {
+			let next_request = requests.get(index).copied();
+			// A postponed flip fires before a later request arrives.
+			if let Some(due) = pending
+				&& next_request.is_none_or(|request| due <= request)
+			{
+				limiter.delivered(due);
+				delivered.push(due);
+				pending = None;
+				continue;
+			}
+			let Some(request) = next_request else { break };
+			index += 1;
+			if pending.is_some() {
+				continue; // Coalesced into the postponed flip.
+			}
+			let at = limiter.next_delivery(request);
+			if at == request {
+				limiter.delivered(request);
+				delivered.push(request);
+			} else {
+				pending = Some(at);
+			}
+		}
+		delivered
+	}
+
+	#[test]
+	fn limiter_coalesces_oversupply_at_the_negotiated_rate() {
+		let start = Instant::now();
+		let interval = Duration::from_nanos(8_333_333);
+		let mut limiter = PresentationLimiter::new(interval);
+		// A 400 FPS source for one second.
+		let requests: Vec<_> = (0..400).map(|i| start + Duration::from_micros(2_500 * i)).collect();
+		let delivered = deliver(&mut limiter, &requests);
+		// One start-up burst of two, then the negotiated rate.
+		assert!(delivered.len() <= 122, "{} deliveries", delivered.len());
+		assert!(delivered.len() >= 118, "{} deliveries", delivered.len());
+		for pair in delivered[2..].windows(2) {
+			assert!(pair[1] - pair[0] >= interval - Duration::from_micros(1));
+		}
+	}
+
+	#[test]
+	fn limiter_preserves_uneven_pairs_that_average_to_the_rate() {
+		let start = Instant::now();
+		let interval = Duration::from_nanos(16_666_667);
+		let mut limiter = PresentationLimiter::new(interval);
+		let mut at = start;
+		let mut requests = vec![at];
+		for i in 0..120 {
+			at += Duration::from_micros(if i % 2 == 0 { 12_000 } else { 21_333 });
+			requests.push(at);
+		}
+		let delivered = deliver(&mut limiter, &requests);
+		assert_eq!(delivered, requests, "no frame of a correctly averaged source is moved");
+	}
+
+	#[test]
+	fn limiter_follows_a_slower_source_exactly() {
+		let start = Instant::now();
+		let mut limiter = PresentationLimiter::new(Duration::from_nanos(8_333_333));
+		// 90 FPS on a 120 FPS stream, with a little jitter.
+		let requests: Vec<_> = (0..90)
+			.map(|i| start + Duration::from_micros(11_111 * i + [0, 400, 150][i as usize % 3]))
+			.collect();
+		assert_eq!(deliver(&mut limiter, &requests), requests);
+	}
+
+	#[test]
+	fn limiter_stall_does_not_start_a_catch_up_burst() {
+		let start = Instant::now();
+		let interval = Duration::from_millis(10);
+		let mut limiter = PresentationLimiter::new(interval);
+		limiter.delivered(start);
+		limiter.delivered(start + interval);
+		// A 100 ms host stall, then a burst of queued commits 1 ms apart.
+		let resumed = start + Duration::from_millis(110);
+		assert_eq!(
+			limiter.next_delivery(resumed),
+			resumed,
+			"the resumed frame is immediate"
+		);
+		limiter.delivered(resumed);
+		let burst = resumed + Duration::from_millis(1);
+		assert_eq!(limiter.next_delivery(burst), resumed + interval);
+	}
+
+	#[test]
+	fn limiter_rate_change_starts_a_new_phase() {
+		let start = Instant::now();
+		let mut limiter = PresentationLimiter::new(Duration::from_millis(16));
+		limiter.delivered(start);
+		limiter.delivered(start + Duration::from_millis(1));
+		assert!(limiter.next_delivery(start + Duration::from_millis(2)) > start + Duration::from_millis(2));
+		limiter.set_interval(Duration::from_millis(8));
+		assert_eq!(limiter.interval(), Duration::from_millis(8));
+		let now = start + Duration::from_millis(2);
+		assert_eq!(limiter.next_delivery(now), now);
+	}
+
+	#[test]
+	fn vrr_triggers_are_reported_separately() {
+		let start = Instant::now();
+		let mut cadence = CaptureCadence::new(true);
+		let latch = start + Duration::from_micros(200);
+		cadence.record(
+			start + Duration::from_micros(700),
+			latch,
+			latch,
+			CaptureTrigger::Presentation,
+			1,
+			1,
+		);
+		cadence.record(
+			start + Duration::from_millis(9),
+			start + Duration::from_millis(9),
+			start + Duration::from_millis(9),
+			CaptureTrigger::Heartbeat,
+			1,
+			1,
+		);
+		cadence.record(
+			start + Duration::from_millis(20),
+			start + Duration::from_millis(18),
+			start + Duration::from_millis(19),
+			CaptureTrigger::Pending,
+			3,
+			2,
+		);
+		let summary = cadence.take_summary();
+		assert_eq!((summary.presentation, summary.heartbeat, summary.pending), (1, 1, 1));
+		assert_eq!(summary.refresh + summary.deferred, 0);
+		assert_eq!(summary.content_age_us[2], 1_000);
+		assert_eq!(summary.lateness_us[2], 2_000);
 	}
 
 	#[test]
@@ -799,7 +1115,7 @@ mod cadence_tests {
 		let mut cadence = CaptureCadence::new(false);
 		let now = Instant::now();
 		for generation in 0..10_000 {
-			cadence.record(now, now, CaptureTrigger::Refresh, generation, generation);
+			cadence.record(now, now, now, CaptureTrigger::Refresh, generation, generation);
 		}
 		assert_eq!(cadence.intervals_us.capacity(), 0);
 		assert_eq!(cadence.take_summary(), CadenceSummary::default());

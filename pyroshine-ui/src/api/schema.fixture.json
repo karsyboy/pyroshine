@@ -35,7 +35,8 @@
         "variant": ""
       },
       "steam_mode": true,
-      "virtual_connector_strategy": "single_application"
+      "virtual_connector_strategy": "single_application",
+      "vrr_capture": "auto"
     },
     "inhibit_sleep": true,
     "name": "Pyroshine",
@@ -647,6 +648,31 @@
         },
         "label": "Capture",
         "path": "compositor.capture_mode",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Presentation-driven capture for clients that request VRR presentation, such as Pyrolight.",
+        "kind": {
+          "options": [
+            {
+              "description": "Capture each new frame as it is presented when the client requests VRR presentation.",
+              "label": "Automatic",
+              "value": "auto"
+            },
+            {
+              "description": "Always capture on the fixed refresh clock.",
+              "label": "Off",
+              "value": "off"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "VRR capture",
+        "path": "compositor.vrr_capture",
         "required": false,
         "section": "display"
       },

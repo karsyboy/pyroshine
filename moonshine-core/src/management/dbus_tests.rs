@@ -257,6 +257,7 @@ async fn foreground_only_changes_emit_session_snapshots_without_lifecycle_change
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: "127.0.0.1".parse().unwrap(),
+			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				RemoteInputKey::from_bytes([7; 16]),
 				RemoteInputKeyId::new(1),
@@ -321,6 +322,7 @@ async fn authorization_changes_emit_current_client_address() {
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: "127.0.0.1".parse().unwrap(),
+			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				RemoteInputKey::from_bytes([7; 16]),
 				RemoteInputKeyId::new(1),

@@ -19,6 +19,7 @@ mod pacing_timer;
 mod packetizer;
 mod pipeline;
 pub(crate) mod pyrowave;
+mod rtp_clock;
 pub use pipeline::ConversionQueueMode;
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
@@ -179,6 +180,14 @@ pub struct FrameStats {
 	pub stale_frames_dropped: u32,
 	/// Whether this frame is a key (IDR) frame.
 	pub is_key_frame: bool,
+	/// Content-time interval since the previous frame with new content (the
+	/// source's frame time as carried in RTP); zero for replays and the first
+	/// frame of an epoch.
+	pub source_interval: std::time::Duration,
+	/// Time from the content becoming current to its capture.
+	pub content_age: std::time::Duration,
+	/// Captured with VRR (presentation-driven) pacing.
+	pub vrr_capture: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -258,12 +267,16 @@ impl VideoStreamContext {
 	/// Keep this list next to the context definition so newly-added negotiated
 	/// fields cannot silently fall through the reconnect fast path.
 	/// The virtual-output properties this stream requires from the compositor.
-	pub(crate) fn output_mode(&self) -> crate::session::compositor::OutputMode {
+	pub(crate) fn output_mode(
+		&self,
+		capture_pacing: crate::session::compositor::CapturePacing,
+	) -> crate::session::compositor::OutputMode {
 		crate::session::compositor::OutputMode {
 			width: self.width,
 			height: self.height,
 			refresh_rate: self.fps,
 			hdr: self.format.hdr,
+			capture_pacing,
 		}
 	}
 
@@ -860,6 +873,7 @@ fn deliverable(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::session::compositor::CapturePacing;
 	use crate::session::stream::test_support::SocketId;
 
 	#[tokio::test]
@@ -1731,7 +1745,11 @@ mod tests {
 		];
 		for requested in media_only {
 			assert!(!active.changed_fields(&requested).is_empty());
-			assert_eq!(requested.output_mode(), active.output_mode(), "{requested:?}");
+			assert_eq!(
+				requested.output_mode(CapturePacing::Fixed),
+				active.output_mode(CapturePacing::Fixed),
+				"{requested:?}"
+			);
 		}
 		let display = [
 			VideoStreamContext {
@@ -1749,7 +1767,11 @@ mod tests {
 			},
 		];
 		for requested in display {
-			assert_ne!(requested.output_mode(), active.output_mode(), "{requested:?}");
+			assert_ne!(
+				requested.output_mode(CapturePacing::Fixed),
+				active.output_mode(CapturePacing::Fixed),
+				"{requested:?}"
+			);
 		}
 	}
 
