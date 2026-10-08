@@ -23,8 +23,9 @@ sudo apt install ./pyroshine-ui_*.deb
 sudo dnf install ./pyroshine-ui-*.rpm
 ```
 
-On Arch Linux and CachyOS, the AUR package `pyroshine-ui-bin` installs the same
-app (`paru -S pyroshine-ui-bin`).
+On Arch Linux and CachyOS, `pyroshine-ui-bin` from the
+[`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages)
+installs the same app (`sudo pacman -Syu pyroshine-ui-bin`).
 
 It needs WebKitGTK 4.1 and GTK 3, which the package pulls in. The server
 package does not depend on it. The portable installer and the NixOS module do

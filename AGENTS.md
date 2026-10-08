@@ -73,8 +73,8 @@ Other workspace and integration areas:
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
   (`build-shaders.sh`), changelog tooling/tests, measurement harnesses.
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
-  installers, systemd, device permissions and system policy; `dist/aur/` is the
-  AUR source (`pyroshine-bin`, `pyroshine-ui-bin`) that the release workflow publishes.
+  installers, systemd, device permissions and system policy. The Arch
+  `pyroshine-bin`/`pyroshine-ui-bin` PKGBUILDs live in `karsyboy/pyrowave-packages`.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
 - `vendor/inputtino/`: maintained native Inputtino patch, including build/binding sources.
 

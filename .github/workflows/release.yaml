@@ -267,42 +267,16 @@ jobs:
           ./release-validation.json
           ./SHA256SUMS
 
-  # Stable releases also update the AUR packages pyroshine-bin and
-  # pyroshine-ui-bin from dist/aur. Enabled by the AUR_PUBLISH repository
-  # variable ('true') and the AUR_SSH_PRIVATE_KEY secret; see CONTRIBUTING.md.
-  aur:
-    name: Update AUR packages
+  # Publishes the release to the [pyrowave] pacman repository by starting the
+  # Publish workflow of karsyboy/pyrowave-packages, which skips prereleases.
+  # Needs the PACKAGES_DISPATCH_TOKEN secret; see CONTRIBUTING.md.
+  pacman:
+    name: Update pacman repository
     needs: build
-    if: vars.AUR_PUBLISH == 'true' && !contains(github.event.inputs.tag || github.ref_name, '-')
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-24.04
-    container: archlinux:base-devel
-
     steps:
-    - name: Install packaging tools
-      run: pacman -Syu --noconfirm --needed git openssh pacman-contrib
-
-    - uses: actions/checkout@v7
-      with:
-        ref: ${{ github.event.inputs.tag || github.ref }}
-
-    - name: Publish to the AUR
+    - name: Start the pyrowave-packages Publish workflow
       env:
-        AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-        RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        GIT_AUTHOR_NAME: ${{ github.actor }}
-        GIT_AUTHOR_EMAIL: ${{ github.actor }}@users.noreply.github.com
-        GIT_COMMITTER_NAME: ${{ github.actor }}
-        GIT_COMMITTER_EMAIL: ${{ github.actor }}@users.noreply.github.com
-      run: |
-        # makepkg refuses to run as root.
-        useradd -m builder
-        install -d -o builder -m 0700 /home/builder/.ssh
-        printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /home/builder/.ssh/aur
-        echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
-          > /home/builder/.ssh/known_hosts
-        chown builder /home/builder/.ssh/*
-        chmod 0600 /home/builder/.ssh/aur
-        cp -r dist/aur /home/builder/aur
-        chown -R builder /home/builder/aur
-        GIT_SSH_COMMAND='ssh -i /home/builder/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes' \
-          runuser -u builder -- /home/builder/aur/publish.sh "$RELEASE_TAG"
+        GH_TOKEN: ${{ secrets.PACKAGES_DISPATCH_TOKEN }}
+      run: gh workflow run publish.yml --repo karsyboy/pyrowave-packages

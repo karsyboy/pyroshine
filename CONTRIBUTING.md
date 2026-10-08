@@ -327,25 +327,16 @@ Packaging is defined in [nfpm.yaml](nfpm.yaml), [nfpm-ui.yaml](nfpm-ui.yaml)
 portable and native package integration files consistent when changing service,
 udev or policy paths.
 
-### AUR packages
+### Pacman repository
 
-[dist/aur/](dist/aur/) is the AUR source for `pyroshine-bin` and
-`pyroshine-ui-bin` (one split PKGBUILD), which repackage the release's Arch
-packages. Keep its `depends` in sync with the `archlinux` overrides in the nfpm
-files, and its `.install` files in sync with `dist/nfpm/` (pacman hooks already
-reload udev rules, apply sysusers.d and refresh icon and desktop caches).
+The [`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages) publishes
+`pyroshine-bin` and `pyroshine-ui-bin`, which repackage the release's Arch
+packages. After a stable release is published, the release workflow's `pacman`
+job starts that repository's **Publish** workflow, so a release needs no further
+step; prereleases are not published. The job needs the `PACKAGES_DISPATCH_TOKEN`
+secret: a fine-grained token with access to `pyrowave-packages` only and the
+**Actions: Read and write** permission. If the job fails, run **Publish** in
+`pyrowave-packages` by hand.
 
-The release workflow's `aur` job runs `dist/aur/publish.sh` for stable tags
-(prereleases are skipped) after the GitHub Release is published. It runs only
-when the repository variable `AUR_PUBLISH` is `true` and the secret
-`AUR_SSH_PRIVATE_KEY` holds a private key registered with the AUR account that
-maintains `pyroshine-bin`. To publish by hand from an Arch system with that key
-in your ssh configuration:
-
-```sh
-dist/aur/publish.sh X.Y.Z
-```
-
-`publish.sh` sets `pkgver` and checksums (through `update.sh`), checks that the
-packages build, and pushes `PKGBUILD`, `.SRCINFO` and the install files. A
-PKGBUILD-only fix needs a `pkgrel` bump before publishing the same version again.
+When changing the `archlinux` dependencies in the nfpm files, update the
+PKGBUILD there to match.

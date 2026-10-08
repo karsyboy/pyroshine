@@ -1,4 +1,0 @@
-post_install() {
-  echo "==> pyroshine-ui starts in the system tray at your next desktop login,"
-  echo "    or run 'pyroshine-ui' now. It manages a running pyroshine@<user> service."
-}
