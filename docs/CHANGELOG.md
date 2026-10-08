@@ -14,18 +14,6 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-### Added
-
-- Publish `pyroshine-bin` and `pyroshine-ui-bin` in the signed `[pyrowave]` pacman repository (`karsyboy/pyrowave-packages`), so Arch Linux and CachyOS hosts install Pyroshine with pacman and upgrade it with `pacman -Syu`.
-
-### Changed
-
-- Require PyroWave C API 1.1 (fork revision `689854d`), which merges upstream's API 1.0 and frozen bitstream v1. The bundled library is now `libpyrowave-shared.so.1` and the portable installer removes the old `.so.0`. The wire format is unchanged, so existing Pyrolight clients keep working.
-
-### Fixed
-
-- Make the native packages depend on the Vulkan loader (`vulkan-icd-loader`, `libvulkan1`, `vulkan-loader`), which the server loads at runtime for capture and encoding but the packages did not declare.
-
 ## [v0.17.2] - 2026-10-08
 
 ### Added
@@ -33,10 +21,16 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Show frame pacing on the desktop app's dashboard while a client streams: whether frames are captured as the game presents them (VRR capture) or on the refresh clock, the game's frame rate and frame times (median, p95, p99, max) as sent to the client, the share of uneven frame times, and the delay from new content to capture.
 - Capture each new frame as the application presents it for clients that request VRR presentation (`clientVrrRequested`, sent by Pyrolight with VRR enabled), at up to the stream's frame rate. Games that do not run at exactly the stream rate are no longer quantized onto the refresh grid: a 90 FPS game on a 120 FPS stream was delivered as alternating 8.3/16.7 ms frames and now keeps its 11.1 ms cadence. Standard clients keep fixed refresh pacing; `[compositor] vrr_capture = "off"` disables it.
 - Add `--vrr` and `--rtp-trace` to `moonshine-bench`, and honor `MOONSHINE_APPLICATION_UNIT` so a benchmark can run beside a live service without replacing its session.
+- Publish `pyroshine-bin` and `pyroshine-ui-bin` in the signed `[pyrowave]` pacman repository (`karsyboy/pyrowave-packages`), so Arch Linux and CachyOS hosts install Pyroshine with pacman and upgrade it with `pacman -Syu`.
 
 ### Changed
 
 - Derive RTP timestamps from each frame's content time, as Sunshine does, instead of from the frame count and negotiated frame rate. Skipped captures and games below the stream rate no longer make the RTP timeline run faster than real time, so clients can learn the source cadence.
+- Require PyroWave C API 1.1 (fork revision `689854d`), which merges upstream's API 1.0 and frozen bitstream v1. The bundled library is now `libpyrowave-shared.so.1` and the portable installer removes the old `.so.0`. The wire format is unchanged, so existing Pyrolight clients keep working.
+
+### Fixed
+
+- Make the native packages depend on the Vulkan loader (`vulkan-icd-loader`, `libvulkan1`, `vulkan-loader`), which the server loads at runtime for capture and encoding but the packages did not declare.
 
 ## [v0.17.1] - 2026-10-07
 
