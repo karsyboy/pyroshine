@@ -86,6 +86,7 @@ to manage Pyroshine without editing files or reading logs:
 
 | Distribution | Install or upgrade |
 | --- | --- |
+| Arch Linux / CachyOS (pacman repository) | Add the [`[pyrowave]` repository](https://github.com/karsyboy/pyrowave-packages#setup), then `sudo pacman -Syu pyroshine-ui-bin` |
 | Arch Linux / CachyOS | `sudo pacman -U ./pyroshine-ui-*.pkg.tar.zst` |
 | Debian / Ubuntu | `sudo apt install ./pyroshine-ui_*.deb` |
 | Fedora / RHEL | `sudo dnf install ./pyroshine-ui-*.rpm` |
