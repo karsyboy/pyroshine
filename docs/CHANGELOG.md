@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.2] - 2026-10-08
+
 ### Added
 
 - Capture each new frame as the application presents it for clients that request VRR presentation (`clientVrrRequested`, sent by Pyrolight with VRR enabled), at up to the stream's frame rate. Games that do not run at exactly the stream rate are no longer quantized onto the refresh grid: a 90 FPS game on a 120 FPS stream was delivered as alternating 8.3/16.7 ms frames and now keeps its 11.1 ms cadence. Standard clients keep fixed refresh pacing; `[compositor] vrr_capture = "off"` disables it.
