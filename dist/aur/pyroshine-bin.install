@@ -1,0 +1,23 @@
+# pacman hooks already reload udev rules and apply sysusers.d (the pyroshine
+# group); this loads the virtual input modules and applies the new device
+# permissions without a reboot.
+_load_input() {
+  modprobe uinput 2>/dev/null || true
+  modprobe uhid 2>/dev/null || true
+  udevadm trigger --subsystem-match=misc --subsystem-match=hidraw 2>/dev/null || true
+}
+
+post_install() {
+  _load_input
+  cat <<'MSG'
+==> Start Pyroshine for your streaming user:
+      sudo systemctl enable --now "pyroshine@$USER"
+      pyroshine healthcheck
+    Optional, for headless hosts:  sudo loginctl enable-linger "$USER"
+MSG
+}
+
+post_upgrade() {
+  _load_input
+  echo '==> Restart the service to use the new binaries: sudo systemctl restart "pyroshine@$USER"'
+}

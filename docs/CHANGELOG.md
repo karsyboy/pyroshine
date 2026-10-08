@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Publish `pyroshine-bin` and `pyroshine-ui-bin` to the AUR from each stable release, so Arch Linux and CachyOS hosts can install and upgrade Pyroshine with an AUR helper.
+
+### Fixed
+
+- Make the native packages depend on the Vulkan loader (`vulkan-icd-loader`, `libvulkan1`, `vulkan-loader`), which the server loads at runtime for capture and encoding but the packages did not declare.
+
 ## [v0.17.2] - 2026-10-08
 
 ### Added

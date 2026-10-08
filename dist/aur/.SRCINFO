@@ -1,0 +1,54 @@
+pkgbase = pyroshine-bin
+	pkgdesc = Pyroshine game-streaming host for Moonlight clients, with native PyroWave support
+	pkgver = 0.17.1
+	pkgrel = 1
+	url = https://github.com/karsyboy/pyroshine
+	arch = x86_64
+	license = BSD-2-Clause
+	noextract = pyroshine-0.17.1-nfpm.tar.zst
+	noextract = pyroshine-ui-0.17.1-nfpm.tar.zst
+	options = !strip
+	options = !debug
+	source = pyroshine-0.17.1-nfpm.tar.zst::https://github.com/karsyboy/pyroshine/releases/download/v0.17.1/pyroshine-0.17.1-1-x86_64.pkg.tar.zst
+	source = pyroshine-ui-0.17.1-nfpm.tar.zst::https://github.com/karsyboy/pyroshine/releases/download/v0.17.1/pyroshine-ui-0.17.1-1-x86_64.pkg.tar.zst
+	sha256sums = 41d767f1003df7a7955411c1cdd328c2958cf82c6e689b96a0911946ef2c1077
+	sha256sums = d5601b7c0c18b261e7fade07afad1a7f98f67628f59d097d2a4171e1a1bfa266
+
+pkgname = pyroshine-bin
+	install = pyroshine-bin.install
+	depends = glibc>=2.39
+	depends = libgcc
+	depends = libstdc++
+	depends = libdrm
+	depends = libevdev
+	depends = libffi
+	depends = libxkbcommon
+	depends = mesa
+	depends = opus
+	depends = vulkan-icd-loader
+	depends = wayland
+	depends = xorg-xwayland
+	optdepends = vulkan-driver: hardware Vulkan for PyroWave encoding
+	optdepends = pyroshine-ui-bin: system tray, pairing and settings app
+	provides = pyroshine=0.17.1
+	conflicts = pyroshine
+	conflicts = moonshine
+	conflicts = moonshine-bin
+
+pkgname = pyroshine-ui-bin
+	pkgdesc = Desktop app for the Pyroshine streaming server: tray, pairing, clients, settings and stream dashboard
+	install = pyroshine-ui-bin.install
+	depends = pyroshine=0.17.1
+	depends = cairo
+	depends = dbus
+	depends = gdk-pixbuf2
+	depends = glib2
+	depends = glibc>=2.39
+	depends = gtk3
+	depends = hicolor-icon-theme
+	depends = libgcc
+	depends = libsoup3
+	depends = webkit2gtk-4.1
+	provides = pyroshine-ui=0.17.1
+	conflicts = pyroshine-ui
+	backup = etc/xdg/autostart/pyroshine-ui.desktop

@@ -41,6 +41,7 @@ and install it with your distribution's package manager:
 
 | Distribution | Install or upgrade |
 | --- | --- |
+| Arch Linux / CachyOS (AUR) | `paru -S pyroshine-bin` or `yay -S pyroshine-bin` |
 | Arch Linux / CachyOS | `sudo pacman -U ./pyroshine-*.pkg.tar.zst` |
 | Debian / Ubuntu | `sudo apt install ./pyroshine_*.deb` |
 | Fedora / RHEL | `sudo dnf install ./pyroshine-*.rpm` |

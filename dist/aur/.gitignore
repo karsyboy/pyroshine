@@ -1,0 +1,4 @@
+# makepkg and updpkgsums output
+*.tar.zst
+src/
+pkg/

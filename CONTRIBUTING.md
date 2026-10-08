@@ -326,3 +326,26 @@ Packaging is defined in [nfpm.yaml](nfpm.yaml), [nfpm-ui.yaml](nfpm-ui.yaml)
 (the separate desktop app package) and [dist/](dist/). Keep the
 portable and native package integration files consistent when changing service,
 udev or policy paths.
+
+### AUR packages
+
+[dist/aur/](dist/aur/) is the AUR source for `pyroshine-bin` and
+`pyroshine-ui-bin` (one split PKGBUILD), which repackage the release's Arch
+packages. Keep its `depends` in sync with the `archlinux` overrides in the nfpm
+files, and its `.install` files in sync with `dist/nfpm/` (pacman hooks already
+reload udev rules, apply sysusers.d and refresh icon and desktop caches).
+
+The release workflow's `aur` job runs `dist/aur/publish.sh` for stable tags
+(prereleases are skipped) after the GitHub Release is published. It runs only
+when the repository variable `AUR_PUBLISH` is `true` and the secret
+`AUR_SSH_PRIVATE_KEY` holds a private key registered with the AUR account that
+maintains `pyroshine-bin`. To publish by hand from an Arch system with that key
+in your ssh configuration:
+
+```sh
+dist/aur/publish.sh X.Y.Z
+```
+
+`publish.sh` sets `pkgver` and checksums (through `update.sh`), checks that the
+packages build, and pushes `PKGBUILD`, `.SRCINFO` and the install files. A
+PKGBUILD-only fix needs a `pkgrel` bump before publishing the same version again.

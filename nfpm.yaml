@@ -64,6 +64,7 @@ overrides:
       - libgbm1
       - libstdc++6
       - libgcc-s1
+      - libvulkan1
       - libwayland-client0
       - xwayland
   rpm:
@@ -76,6 +77,7 @@ overrides:
       - libstdc++
       - libgcc
       - libwayland-client
+      - vulkan-loader
       - xorg-x11-server-Xwayland
   archlinux:
     depends:
@@ -87,5 +89,6 @@ overrides:
       - libxkbcommon
       - mesa
       - opus
+      - vulkan-icd-loader
       - wayland
       - xorg-xwayland
