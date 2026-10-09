@@ -192,12 +192,24 @@ Requests whose datagram would exceed one UDP payload (65507 bytes) are rejected.
 | Setting | Type / default | Effect |
 | --- | --- | --- |
 | `port` | integer, `48000` | Audio listener port (UDP). |
+| `quality` | string, `"standard"` | Opus bitrate for clients that do not request one: `standard`, `high` or `maximum` (table below). Pyrolight sends its own **Audio quality** setting, which takes precedence. |
 
-Channel count, audio quality, resolution, FPS, bitrate, and video codec are
-negotiated with the client; they are not additional `config.toml` settings.
-Audio supports 5/10 ms packets. Opus bitrate is bounded by Moonlight’s 1400-byte
-packet limit, including encryption and FEC overhead; high-quality surround at
-10 ms is limited to 1,088,000 bits/s.
+| Layout | `standard` | `high` | `maximum` |
+| --- | --- | --- | --- |
+| Stereo | 96 kbit/s | 256 kbit/s | 512 kbit/s |
+| 5.1 | 256 kbit/s | 512 kbit/s | 768 kbit/s |
+| 7.1 | 450 kbit/s | 768 kbit/s | 1024 kbit/s |
+
+Every Moonlight-compatible client decodes these bitrates; only the bitrate
+changes, not the stream layout. A client that requests GameStream high-quality
+surround (Moonlight does at 15 Mbit/s and above; Pyrolight at **High** and
+**Maximum**) gets its fixed 1536 kbit/s 5.1 or 2048 kbit/s 7.1 layout instead.
+
+Channel count, resolution, FPS, bitrate, and video codec are negotiated with the
+client; they are not additional `config.toml` settings. Audio supports 5/10 ms
+packets. Opus bitrate is bounded by Moonlight’s 1400-byte packet limit,
+including encryption and FEC overhead; high-quality surround at 10 ms is limited
+to 1,088,000 bits/s.
 
 ### `[stream.control]`
 

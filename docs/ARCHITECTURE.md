@@ -479,6 +479,19 @@ GameStream audio FEC and optional AES-CBC encryption, and the packet task sends
 them over UDP. Opus bitrate is bounded by Moonlight's 1400-byte audio packet
 limit. Reconnects follow the epoch barrier described under negotiation.
 
+The stream layout and the bitrate are negotiated separately, independent of the
+video codec. The client chooses the layout: channel count, and for surround the
+GameStream high-quality layout (`x-nv-audio.surround.AudioQuality`), whose
+separate mono streams it must decode. The bitrate of stereo and the normal
+surround layouts comes from an audio quality level (`AudioQuality` in
+`stream/audio/mod.rs`). DESCRIBE advertises the highest level as
+`x-moonshine-audio.quality:2`; Pyrolight requests a level (`0` standard, `1`
+high, `2` maximum) with the same attribute in ANNOUNCE. A higher number selects
+the highest level; malformed or duplicated values are rejected with 400. Other
+clients get `[stream.audio] quality`. Opus packets carry their own size, so every
+client decodes every level. The high-quality surround layouts keep their fixed
+bitrates.
+
 The server's single thread serves every client, the capture clock and
 reconfiguration, so no client may hold it: a receive pass reads at most
 256 KiB before others get a turn (the client is rescheduled explicitly, since

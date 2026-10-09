@@ -11,6 +11,7 @@ use moonshine_management::dto::{ChoiceOption, ConfigSchema, FieldKind, FieldSpec
 use serde::Serialize;
 
 use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy, VrrCapture};
+use crate::session::stream::audio::AudioQuality;
 use crate::session::stream::control::input::gamepad::{GamepadEmulation, HomeTrigger};
 use crate::session::stream::video::{ConversionQueueMode, FecMode, PyroWaveQueueMode};
 
@@ -179,6 +180,14 @@ fn capture_mode(mode: CaptureMode) -> (&'static str, &'static str) {
 			"Always composite",
 			"Render every frame through the compositor. For diagnosing capture problems.",
 		),
+	}
+}
+
+fn audio_quality(quality: AudioQuality) -> (&'static str, &'static str) {
+	match quality {
+		AudioQuality::Standard => ("Standard", "GameStream bitrates: 96 kbit/s stereo."),
+		AudioQuality::High => ("High", "256 kbit/s stereo; about twice the surround bitrate."),
+		AudioQuality::Maximum => ("Maximum", "512 kbit/s stereo; about three times the surround bitrate."),
 	}
 }
 
@@ -439,6 +448,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"Video",
 			"Forward error correction, packet size and GPU queues.",
 		),
+		section("audio", "Audio", "Audio quality for clients that do not choose one."),
 		section(
 			"input",
 			"Input & controllers",
@@ -541,6 +551,16 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		)
 		.advanced()
 		.caution("Changing the server identity requires pairing every client again."),
+		Field::new(
+			"stream.audio.quality",
+			"audio",
+			"Quality",
+			"Opus bitrate for clients that do not request a quality. Pyrolight chooses its own; any client decodes the higher bitrates.",
+			choices(
+				&[AudioQuality::Standard, AudioQuality::High, AudioQuality::Maximum],
+				audio_quality,
+			),
+		),
 		Field::new(
 			"stream.video.fec_mode",
 			"video",

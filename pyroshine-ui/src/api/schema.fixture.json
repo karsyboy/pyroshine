@@ -42,7 +42,8 @@
     "name": "Pyroshine",
     "stream": {
       "audio": {
-        "port": 48000
+        "port": 48000,
+        "quality": "standard"
       },
       "control": {
         "gamepad": {
@@ -268,6 +269,36 @@
         "path": "webserver.private_key",
         "required": false,
         "section": "security"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Opus bitrate for clients that do not request a quality. Pyrolight chooses its own; any client decodes the higher bitrates.",
+        "kind": {
+          "options": [
+            {
+              "description": "GameStream bitrates: 96 kbit/s stereo.",
+              "label": "Standard",
+              "value": "standard"
+            },
+            {
+              "description": "256 kbit/s stereo; about twice the surround bitrate.",
+              "label": "High",
+              "value": "high"
+            },
+            {
+              "description": "512 kbit/s stereo; about three times the surround bitrate.",
+              "label": "Maximum",
+              "value": "maximum"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Quality",
+        "path": "stream.audio.quality",
+        "required": false,
+        "section": "audio"
       },
       {
         "advanced": false,
@@ -1446,6 +1477,11 @@
         "description": "Forward error correction, packet size and GPU queues.",
         "id": "video",
         "title": "Video"
+      },
+      {
+        "description": "Audio quality for clients that do not choose one.",
+        "id": "audio",
+        "title": "Audio"
       },
       {
         "description": "Virtual controllers and the Home button shortcut.",

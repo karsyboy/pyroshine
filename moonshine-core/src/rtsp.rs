@@ -24,6 +24,7 @@ use crate::session::negotiation;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
 use crate::session::stream::audio::AudioConfig;
+use crate::session::stream::audio::AudioQuality;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
@@ -232,6 +233,11 @@ impl RtspServer {
 			}
 			result.push_str(&format!("a=fmtp:97 surround-params={}\r\n", params));
 		}
+		// The highest audio quality level a client may request in ANNOUNCE.
+		result.push_str(&format!(
+			"a=x-moonshine-audio.quality:{}\r\n",
+			AudioQuality::MAX.level()
+		));
 
 		result
 	}
@@ -604,14 +610,24 @@ impl RtspServer {
 			}
 		};
 		let high_quality = audio_quality != 0;
-		let audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality);
+		// Pyrolight requests a bitrate level; other clients get the configured default.
+		let quality = match negotiated_audio_quality(&sdp_session) {
+			Ok(requested) => requested.unwrap_or(self.audio_config.quality),
+			Err(reason) => {
+				tracing::warn!(reason, "Rejecting invalid audio negotiation");
+				return bad_request(cseq, request.version(), reason);
+			},
+		};
+		let audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality).with_quality(quality);
 
-		tracing::debug!(
-			"Audio config: {} channels, mask=0x{:x}, high_quality={}, config={:?}",
-			audio_config.channels,
-			audio_config.channel_mask,
-			audio_config.high_quality,
-			audio_config.stream_config
+		tracing::info!(
+			channels = %audio_config.channels,
+			channel_mask = format_args!("{:#x}", audio_config.channel_mask),
+			high_quality = audio_config.high_quality,
+			quality = ?audio_config.quality,
+			bitrate = audio_config.stream_config.bitrate,
+			packet_duration_ms = packet_duration,
+			"Selected audio mode"
 		);
 
 		let audio_stream_context = AudioStreamContext {
@@ -944,6 +960,18 @@ fn negotiated_pyrowave_dialect(
 	.map(Some)
 }
 
+/// The audio quality level a Pyrolight client requested, if any.
+fn negotiated_audio_quality(session: &sdp_types::Session) -> Result<Option<AudioQuality>, &'static str> {
+	unique_sdp_attribute(session, "x-moonshine-audio.quality")?
+		.map(|value| {
+			value
+				.parse::<u32>()
+				.map(AudioQuality::from_level)
+				.map_err(|_| "invalid x-moonshine-audio.quality")
+		})
+		.transpose()
+}
+
 fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Option<F> {
 	sdp_session
 		.get_first_attribute_value(attribute)
@@ -1083,6 +1111,10 @@ mod tests {
 				][..],
 				// Encrypted jumbo packets that still fit one datagram.
 				&[("x-nv-video[0].packetSize", "65459")][..],
+				&[("x-moonshine-audio.quality", "0")][..],
+				&[("x-moonshine-audio.quality", "2")][..],
+				// A newer client's higher level selects the highest known one.
+				&[("x-moonshine-audio.quality", "7")][..],
 			] {
 				let (status, body) = announce(&server, &grant, sdp(overrides)).await;
 				assert_eq!(status, 500, "{overrides:?}: {body}");
@@ -1104,6 +1136,8 @@ mod tests {
 				(&[("x-ml-video.configuredBitrateKbps", "5000000")][..], "32-bit"),
 				(&[("x-nv-aqos.packetDuration", "20")][..], "audio packet duration"),
 				(&[("x-nv-aqos.packetDuration", "0")][..], "audio packet duration"),
+				(&[("x-moonshine-audio.quality", "high")][..], "audio.quality"),
+				(&[("x-moonshine-audio.quality", "-1")][..], "audio.quality"),
 				(
 					&[
 						("x-nv-audio.surround.enable", "1"),
@@ -1647,6 +1681,41 @@ mod tests {
 			let data = format!("{base}a={attribute}:{value}\r\n");
 			assert!(negotiated_video_axes(&sdp_types::Session::parse(data.as_bytes()).unwrap()).is_err());
 		}
+	}
+
+	/// DESCRIBE advertises the highest audio quality level, ANNOUNCE requests a
+	/// level, and clients that send none get the configured default.
+	#[tokio::test]
+	async fn audio_quality_is_advertised_and_parsed() {
+		use super::*;
+		let shutdown = ShutdownManager::new();
+		let server = RtspServer::for_test(SessionManager::for_test(shutdown.clone()), RtspLimits::default());
+		assert!(server.description().contains("a=x-moonshine-audio.quality:2\r\n"));
+
+		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n";
+		let parse = |extra: &str| {
+			negotiated_audio_quality(&sdp_types::Session::parse(format!("{base}{extra}").as_bytes()).unwrap())
+		};
+		assert_eq!(parse(""), Ok(None));
+		for (level, quality) in [
+			("0", AudioQuality::Standard),
+			("1", AudioQuality::High),
+			("2", AudioQuality::Maximum),
+			("3", AudioQuality::Maximum),
+		] {
+			assert_eq!(
+				parse(&format!("a=x-moonshine-audio.quality:{level}\r\n")),
+				Ok(Some(quality))
+			);
+		}
+		for invalid in [
+			"a=x-moonshine-audio.quality:max\r\n",
+			"a=x-moonshine-audio.quality:\r\n",
+			"a=x-moonshine-audio.quality:1\r\na=x-moonshine-audio.quality:2\r\n",
+		] {
+			assert!(parse(invalid).is_err(), "{invalid:?}");
+		}
+		shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 	}
 
 	#[test]

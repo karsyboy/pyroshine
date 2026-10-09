@@ -789,6 +789,73 @@ mod tests {
 		stop.wait_shutdown_complete().await;
 	}
 
+	/// Every quality level keeps the negotiated layout, the standard level keeps
+	/// the GameStream bitrates, levels only raise the bitrate, and every
+	/// configuration encodes noise into Moonlight's 1400-byte packets at its
+	/// requested bitrate (no clamp) at both packet durations.
+	#[test]
+	fn quality_levels_raise_bitrate_within_the_packet_limit() {
+		use crate::session::stream::audio::{AudioChannels, AudioConfig, AudioQuality};
+		let levels = [AudioQuality::Standard, AudioQuality::High, AudioQuality::Maximum];
+		for channels in [
+			AudioChannels::Stereo,
+			AudioChannels::Surround51,
+			AudioChannels::Surround71,
+		] {
+			for high_quality in [false, true] {
+				let base = AudioConfig::from_channels(channels, 0, high_quality);
+				let mut previous = 0;
+				for quality in levels {
+					let config = base.clone().with_quality(quality);
+					let stream = &config.stream_config;
+					assert_eq!(
+						(stream.streams, stream.coupled_streams, stream.mapping),
+						(
+							base.stream_config.streams,
+							base.stream_config.coupled_streams,
+							base.stream_config.mapping
+						),
+						"{channels:?} {quality:?}: the layout is negotiated, not chosen by quality"
+					);
+					if quality == AudioQuality::Standard || high_quality {
+						assert_eq!(stream.bitrate, base.stream_config.bitrate, "{channels:?} {quality:?}");
+					}
+					assert!(stream.bitrate >= previous, "{channels:?} {quality:?}");
+					previous = stream.bitrate;
+
+					for duration in [5u32, 10] {
+						let cap = (MAX_OPUS_PAYLOAD_SIZE as u32 * 8 * 1000) / duration;
+						// The high-quality surround layouts are clamped at 10 ms, as before.
+						if !(high_quality && channels != AudioChannels::Stereo) {
+							assert!(stream.bitrate <= cap, "{channels:?} {quality:?} {duration} ms");
+						}
+						let mut encoder = create_encoder(48_000, stream, duration).unwrap();
+						let samples = 48 * duration as usize * channels as usize;
+						let mut seed = 0x2545_f491u32;
+						let noise: Vec<f32> = (0..samples)
+							.map(|_| {
+								seed ^= seed << 13;
+								seed ^= seed >> 17;
+								seed ^= seed << 5;
+								seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+							})
+							.collect();
+						let mut encoded = vec![0u8; MAX_OPUS_PAYLOAD_SIZE];
+						let size = encoder.encode_float(&noise, &mut encoded).unwrap();
+						assert!(size <= MAX_OPUS_PAYLOAD_SIZE, "{channels:?} {quality:?} {duration} ms");
+					}
+				}
+			}
+		}
+		assert_eq!(
+			AudioConfig::from_channels(AudioChannels::Stereo, 0x3, false)
+				.with_quality(AudioQuality::Standard)
+				.stream_config
+				.bitrate,
+			96_000
+		);
+	}
+
 	#[test]
 	fn audio_iv_matches_the_client_for_extreme_key_ids() {
 		// moonlight-common-c: `BE32(avRiKeyId + rtp->sequenceNumber)` in uint32.

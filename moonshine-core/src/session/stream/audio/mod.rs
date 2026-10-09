@@ -25,11 +25,71 @@ mod pulse_server;
 pub struct AudioStreamConfig {
 	/// Port to use for streaming audio data.
 	pub port: u16,
+
+	/// Audio quality for clients that do not request one.
+	pub quality: AudioQuality,
 }
 
 impl Default for AudioStreamConfig {
 	fn default() -> Self {
-		Self { port: 48000 }
+		Self {
+			port: 48000,
+			quality: AudioQuality::default(),
+		}
+	}
+}
+
+/// Opus bitrate level for the layouts every Moonlight client decodes.
+///
+/// Stereo and the normal-quality surround layouts keep their stream mapping at
+/// every level; Opus packets describe their own size, so any client decodes a
+/// higher bitrate without negotiating it. Pyrolight requests a level with
+/// `x-moonshine-audio.quality` (the wire value is the variant index). The
+/// high-quality surround layouts already use their maximum bitrate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioQuality {
+	/// The GameStream bitrates: 96 kbit/s stereo.
+	#[default]
+	Standard,
+	/// 256 kbit/s stereo, about twice the surround bitrate.
+	High,
+	/// 512 kbit/s stereo, about three times the surround bitrate.
+	Maximum,
+}
+
+impl AudioQuality {
+	/// The highest level, advertised in RTSP DESCRIBE.
+	pub(crate) const MAX: Self = Self::Maximum;
+
+	/// The `x-moonshine-audio.quality` wire value.
+	pub(crate) fn level(self) -> u32 {
+		self as u32
+	}
+
+	/// A requested wire level; levels above the highest known one (from a newer
+	/// client) select the highest.
+	pub(crate) fn from_level(level: u32) -> Self {
+		match level {
+			0 => Self::Standard,
+			1 => Self::High,
+			_ => Self::Maximum,
+		}
+	}
+
+	/// Opus bitrate of a stereo or normal-quality surround layout.
+	fn bitrate(self, channels: AudioChannels) -> u32 {
+		match (channels, self) {
+			(AudioChannels::Stereo, Self::Standard) => OPUS_STEREO.bitrate,
+			(AudioChannels::Stereo, Self::High) => 256_000,
+			(AudioChannels::Stereo, Self::Maximum) => OPUS_HIGH_STEREO.bitrate,
+			(AudioChannels::Surround51, Self::Standard) => OPUS_SURROUND51.bitrate,
+			(AudioChannels::Surround51, Self::High) => 512_000,
+			(AudioChannels::Surround51, Self::Maximum) => 768_000,
+			(AudioChannels::Surround71, Self::Standard) => OPUS_SURROUND71.bitrate,
+			(AudioChannels::Surround71, Self::High) => 768_000,
+			(AudioChannels::Surround71, Self::Maximum) => 1_024_000,
+		}
 	}
 }
 
@@ -126,7 +186,12 @@ pub(crate) const ALL_AUDIO_CONFIGS: [&OpusStreamConfig; 6] = [
 pub struct AudioConfig {
 	pub channels: AudioChannels,
 	pub channel_mask: u32,
+	/// GameStream high-quality mode (`x-nv-audio.surround.AudioQuality`). For
+	/// surround it selects a different stream layout, which the client must
+	/// decode, so only the client can request it.
 	pub high_quality: bool,
+	/// Bitrate level of a stereo or normal-quality surround layout.
+	pub quality: AudioQuality,
 	pub stream_config: OpusStreamConfig,
 }
 
@@ -136,12 +201,23 @@ impl Default for AudioConfig {
 			channels: AudioChannels::default(),
 			channel_mask: 0x3,
 			high_quality: true,
+			quality: AudioQuality::default(),
 			stream_config: OPUS_HIGH_STEREO,
 		}
 	}
 }
 
 impl AudioConfig {
+	/// Apply a bitrate level. The high-quality layouts already use their
+	/// maximum bitrate (512 kbit/s for stereo) and are not lowered.
+	pub fn with_quality(mut self, quality: AudioQuality) -> Self {
+		self.quality = quality;
+		if !self.high_quality {
+			self.stream_config.bitrate = quality.bitrate(self.channels);
+		}
+		self
+	}
+
 	/// Select the appropriate OpusStreamConfig based on channel count and quality.
 	pub fn from_channels(channels: AudioChannels, channel_mask: u32, high_quality: bool) -> Self {
 		let stream_config = match (channels, high_quality) {
@@ -156,6 +232,7 @@ impl AudioConfig {
 			channels,
 			channel_mask,
 			high_quality,
+			quality: AudioQuality::default(),
 			stream_config,
 		}
 	}
@@ -783,7 +860,10 @@ mod tests {
 			let stop = ShutdownManager::new();
 			let audio = construct_on_fixed_port(port, async || {
 				AudioStream::new_in(
-					AudioStreamConfig { port },
+					AudioStreamConfig {
+						port,
+						..Default::default()
+					},
 					"127.0.0.1".into(),
 					stop.clone(),
 					pulse_dir.path(),

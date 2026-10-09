@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Choose the audio quality: Pyrolight's **Audio quality** setting requests Standard, High or Maximum per stream (`x-moonshine-audio.quality`), and `[stream.audio] quality` sets it for other clients. Stereo streams at 96, 256 or 512 kbit/s, 5.1 at 256, 512 or 768 kbit/s and 7.1 at 450, 768 or 1024 kbit/s. Moonlight clients previously always received 96 kbit/s stereo; every client decodes the higher bitrates. The default stays Standard.
+
 ### Fixed
 
 - Keep application audio playing after a client reconnects. The embedded PulseAudio server discarded a client's outstanding write credit when a reconnect emptied its stream, so some clients (Chromium-based audio such as Steam Big Picture's UI) ended up a few milliseconds short of the prebuffer and stopped writing. The stream then stayed silent, on any client, until another reconnect. Request accounting now matches PulseAudio across reconnects, underruns, cork/uncork and flushes.

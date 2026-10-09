@@ -1237,7 +1237,10 @@ mod tests {
 			.await
 			.is_err()
 		);
-		let audio = crate::session::stream::audio::AudioStreamConfig { port };
+		let audio = crate::session::stream::audio::AudioStreamConfig {
+			port,
+			..Default::default()
+		};
 		assert!(
 			crate::session::stream::audio::AudioStream::new(audio, "127.0.0.1".into(), ShutdownManager::new())
 				.await

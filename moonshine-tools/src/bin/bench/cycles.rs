@@ -404,7 +404,10 @@ fn session_manager(args: &Args, shutdown: &ShutdownManager<ShutdownReason>) -> R
 			..Default::default()
 		},
 		VideoStreamConfig::default(),
-		AudioStreamConfig { port: 0 },
+		AudioStreamConfig {
+			port: 0,
+			..Default::default()
+		},
 		ControlStreamConfig {
 			port: 0,
 			..Default::default()
