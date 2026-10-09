@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.3] - 2026-10-09
+
 ### Added
 
 - Choose the audio quality: Pyrolight's **Audio quality** setting requests Standard, High or Maximum per stream (`x-moonshine-audio.quality`), and `[stream.audio] quality` sets it for other clients. Stereo streams at 96, 256 or 512 kbit/s, 5.1 at 256, 512 or 768 kbit/s and 7.1 at 450, 768 or 1024 kbit/s. Moonlight clients previously always received 96 kbit/s stereo; every client decodes the higher bitrates. The default stays Standard.
