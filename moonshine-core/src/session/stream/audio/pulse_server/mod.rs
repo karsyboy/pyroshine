@@ -92,16 +92,22 @@ struct PlaybackStream {
 	buffer: DynPlaybackBuffer,
 	volume: Vec<f32>,
 	muted: bool,
-	/// Bytes consumed by the audio clock since the last REQUEST was sent.
-	/// Grows on every successful drain. Zeroed atomically when a REQUEST is issued.
-	/// Mirrors `pa_memblockq::missing` (signed to allow temporary negative values
-	/// from flush/seek, though in practice it never goes negative here).
+	/// Demand not yet requested from the client. Grows when buffered audio is
+	/// consumed or discarded; moved into `requested` when a REQUEST is issued.
+	/// Mirrors `pa_memblockq::missing`.
 	missing: i64,
 
-	/// Bytes we have sent a REQUEST for but have not yet received from the client.
-	/// Grows when a REQUEST is sent. Shrinks when the client writes data.
+	/// The client's write credit: every REQUEST adds to it and every write
+	/// subtracts its full length. libpulse keeps the same counter
+	/// (`pa_stream::requested_bytes`) and only writes while it is positive, so
+	/// this must track it exactly. It is negative when the client wrote more
+	/// than requested (Chromium always writes whole buffers), and nothing but a
+	/// REQUEST or a write may change it. In particular flush, cork, underflow
+	/// and prebuffering leave it alone, as in PulseAudio: a reset makes
+	/// `missing` under-count, so a prebuffering stream, which consumes nothing,
+	/// can wait forever for bytes the client has no credit to send.
 	/// Mirrors `pa_memblockq::requested`.
-	requested: usize,
+	requested: i64,
 	played_bytes: u64,
 	write_offset: u64,
 	read_offset: u64,
@@ -203,7 +209,7 @@ pub(crate) struct PulseServer {
 /// The `in_prebuf` flag bypasses the `min_req` gate — when re-filling after
 /// an underrun the server should not wait for a full `min_req` chunk to
 /// accumulate before asking; any positive demand should be requested immediately.
-fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_prebuf: bool) -> usize {
+fn pop_missing(missing: &mut i64, requested: &mut i64, min_req: usize, in_prebuf: bool) -> usize {
 	if *missing <= 0 {
 		return 0;
 	}
@@ -211,9 +217,26 @@ fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_preb
 		return 0;
 	}
 	let l = *missing as usize;
-	*requested += l;
+	*requested += *missing;
 	*missing = 0;
 	l
+}
+
+impl PlaybackStream {
+	/// Mirrors `pa_memblockq_prebuf_force`: hold playback until the buffer
+	/// holds `pre_buffering` bytes. Request accounting is unchanged.
+	fn prebuf_force(&mut self) {
+		let pre_buffering = u64::from(self.buffer_attr.pre_buffering);
+		if pre_buffering == 0 {
+			return;
+		}
+		let needed = pre_buffering.saturating_sub(self.buffer.len_bytes() as u64);
+		self.state = if needed > 0 {
+			StreamState::Prebuffering(needed)
+		} else {
+			StreamState::Playing
+		};
+	}
 }
 
 impl PulseServer {
@@ -392,12 +415,17 @@ impl PulseServer {
 					Ok(())
 				};
 				if result.is_ok() {
-					// Retain Pulse sockets, but discard buffered PCM and resampler history.
+					// Retain Pulse sockets, but discard buffered PCM and resampler
+					// history (`pa_memblockq_flush_read`): the discarded bytes become
+					// demand and the stream prebuffers again.
 					for client in self.clients.values_mut() {
 						for stream in client.playback_streams.values_mut() {
 							stream.missing += stream.buffer.len_bytes() as i64;
 							stream.read_offset = stream.write_offset;
 							stream.buffer.clear();
+							if matches!(stream.state, StreamState::Playing | StreamState::Prebuffering(_)) {
+								stream.prebuf_force();
+							}
 						}
 					}
 					self.spare_frame = None;
@@ -844,13 +872,10 @@ impl PulseServer {
 							client.protocol_version,
 						)?;
 
-						if stream.buffer_attr.pre_buffering > 0 && matches!(stream.state, StreamState::Playing) {
-							stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
-							// Seed missing = pre_buffering so pop_missing fires immediately
-							// in the REQUEST phase below (same tick, no one-tick delay).
-							// Reset requested — any stale in-flight credit is discarded.
-							stream.missing = stream.buffer_attr.pre_buffering as i64;
-							stream.requested = 0;
+						if matches!(stream.state, StreamState::Playing) {
+							// Accounting is unchanged: any demand not yet covered by
+							// the client's credit is requested below, this tick.
+							stream.prebuf_force();
 						}
 						// Fall through to REQUEST phase — do NOT continue.
 					} else {
@@ -1296,6 +1321,167 @@ mod receive_tests {
 			drop(stalled);
 		}
 		assert!(server.stop().await, "shutdown with fuzzed clients");
+	}
+
+	/// A client that writes like Chromium (Steam's web helper, Big Picture's UI
+	/// sound) is audible again after every reconnect flush. libpulse writes
+	/// only while its credit (initial request + REQUESTs - writes) is positive,
+	/// and Chromium writes whole buffers, overshooting a request. The server
+	/// used to forget that credit when a flushed stream underflowed and
+	/// re-entered prebuffering: with 512-frame buffers it then asked for
+	/// `prebuf` bytes against a client still in debt, the client wrote one
+	/// buffer short of `prebuf`, and a prebuffering stream never requests
+	/// again. The stream stayed silent until the next reconnect.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn chromium_like_client_is_audible_after_every_resume() {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		const BUFFER: usize = 512 * 2 * 4; // 512 frames, f32 stereo
+		let mut server = Server::spawn();
+		let mut client = UnixStream::connect(&server.path).unwrap();
+		let auth = pulse::Command::Auth(pulse::AuthParams {
+			version: pulse::MAX_VERSION,
+			..Default::default()
+		});
+		let mut name = pulse::Props::new();
+		name.set(pulse::Prop::ApplicationName, c"chromium-like");
+		let create = pulse::Command::CreatePlaybackStream(pulse::PlaybackStreamParams {
+			sample_spec: pulse::SampleSpec {
+				format: pulse::SampleFormat::Float32Le,
+				sample_rate: 48_000,
+				channels: 2,
+			},
+			channel_map: pulse::ChannelMap::stereo(),
+			buffer_attr: pulse::stream::BufferAttr {
+				max_length: u32::MAX,
+				target_length: 3 * BUFFER as u32,
+				pre_buffering: u32::MAX,
+				minimum_request_length: BUFFER as u32 / 2,
+				fragment_size: u32::MAX,
+			},
+			flags: pulse::stream::StreamFlags {
+				start_corked: true,
+				adjust_latency: true,
+				..Default::default()
+			},
+			..Default::default()
+		});
+		client
+			.write_all(
+				&[
+					command(0, &auth),
+					command(1, &pulse::Command::SetClientName(name)),
+					command(2, &create),
+				]
+				.concat(),
+			)
+			.unwrap();
+
+		let stop = Arc::new(AtomicBool::new(false));
+		let player = std::thread::spawn({
+			let stop = stop.clone();
+			move || {
+				client.set_read_timeout(Some(time::Duration::from_millis(20))).unwrap();
+				let chunk = [descriptor(BUFFER as u32, 0), 0.5f32.to_le_bytes().repeat(BUFFER / 4)].concat();
+				let mut credit = 0i64;
+				let mut channel = None;
+				while !stop.load(Ordering::Relaxed) {
+					let mut message = vec![0u8; pulse::DESCRIPTOR_SIZE];
+					match client.read_exact(&mut message) {
+						Ok(()) => {},
+						Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+							continue;
+						},
+						Err(e) => panic!("client read: {e}"),
+					}
+					let desc = pulse::read_descriptor(&mut std::io::Cursor::new(&message)).unwrap();
+					let start = message.len();
+					message.resize(start + desc.length as usize, 0);
+					client.set_read_timeout(None).unwrap();
+					client.read_exact(&mut message[start..]).unwrap();
+					client.set_read_timeout(Some(time::Duration::from_millis(20))).unwrap();
+					match pulse::read_command_message(&mut std::io::Cursor::new(&message), pulse::MAX_VERSION).unwrap()
+					{
+						(2, pulse::Command::Reply) => {
+							let (_, reply) = pulse::read_reply_message::<pulse::CreatePlaybackStreamReply>(
+								&mut std::io::Cursor::new(&message),
+								pulse::MAX_VERSION,
+							)
+							.unwrap();
+							credit += i64::from(reply.requested_bytes);
+							channel = Some(reply.channel);
+							let uncork = pulse::Command::CorkPlaybackStream(pulse::CorkStreamParams {
+								channel: reply.channel,
+								cork: false,
+							});
+							client.write_all(&command(3, &uncork)).unwrap();
+						},
+						(_, pulse::Command::Request(request)) => credit += i64::from(request.length),
+						_ => {},
+					}
+					// Chromium's write callback: whole buffers until the request is covered.
+					if let Some(channel) = channel {
+						assert_eq!(channel, 0, "the chunk descriptor addresses channel 0");
+						while credit > 0 {
+							client.write_all(&chunk).unwrap();
+							credit -= BUFFER as i64;
+						}
+					}
+				}
+			}
+		});
+
+		let audible = |generation: u64, frames: crossbeam_channel::Receiver<AudioFrame>| {
+			let deadline = time::Instant::now() + time::Duration::from_secs(1);
+			while let Some(left) = deadline.checked_duration_since(time::Instant::now()) {
+				match frames.recv_timeout(left) {
+					Ok(frame) if frame.generation == generation && frame.buf.iter().any(|v| *v > 0.1) => return true,
+					Ok(_) => {},
+					Err(_) => return false,
+				}
+			}
+			false
+		};
+		assert!(
+			tokio::task::spawn_blocking({
+				let frames = server.frames.clone();
+				move || audible(1, frames)
+			})
+			.await
+			.unwrap(),
+			"the client plays before any resume"
+		);
+		let mut silent = Vec::new();
+		for cycle in 0..60u64 {
+			// Vary the flush's phase against the client's write cycle.
+			tokio::time::sleep(time::Duration::from_millis(cycle * 7 % 23)).await;
+			server.generation += 1;
+			let generation = server.generation;
+			let (applied, waiting) = tokio::sync::oneshot::channel();
+			server
+				.commands
+				.send(PulseReconfigure {
+					generation,
+					reconfigure_capture: false,
+					channels: 2,
+					packet_duration_ms: 5,
+					applied,
+				})
+				.unwrap();
+			waiting.await.unwrap().unwrap();
+			let frames = server.frames.clone();
+			if !tokio::task::spawn_blocking(move || audible(generation, frames))
+				.await
+				.unwrap()
+			{
+				silent.push(cycle);
+			}
+		}
+		stop.store(true, Ordering::Relaxed);
+		player.join().unwrap();
+		assert!(silent.is_empty(), "silent after resumes {silent:?}");
+		assert!(server.stop().await);
 	}
 
 	/// Real libpulse clients (`pacat`) play stereo, 5.1 and 7.1 into the

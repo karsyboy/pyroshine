@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep application audio playing after a client reconnects. The embedded PulseAudio server discarded a client's outstanding write credit when a reconnect emptied its stream, so some clients (Chromium-based audio such as Steam Big Picture's UI) ended up a few milliseconds short of the prebuffer and stopped writing. The stream then stayed silent, on any client, until another reconnect. Request accounting now matches PulseAudio across reconnects, underruns, cork/uncork and flushes.
+
 ## [v0.17.2] - 2026-10-08
 
 ### Added

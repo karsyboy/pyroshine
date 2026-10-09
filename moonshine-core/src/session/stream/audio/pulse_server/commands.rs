@@ -277,19 +277,15 @@ pub(super) fn handle_command(
 					//   immediately issues a seeding REQUEST from the command handler (not
 					//   deferred to the audio clock) for low startup latency.
 					if stream.state == StreamState::Corked {
-						let buf_len = stream.buffer.len_bytes();
-						let target = stream.buffer_attr.target_length as usize;
 						let min_req = stream.buffer_attr.minimum_request_length as usize;
+						stream.state = StreamState::Playing;
+						stream.prebuf_force();
 
-						// Reset accounting — any pre-cork in-flight requests are stale.
-						stream.missing = (target.saturating_sub(buf_len)) as i64;
-						stream.requested = 0;
-
-						// pop_missing with in_prebuf=true bypasses the min_req gate,
-						// ensuring an immediate REQUEST even when missing < min_req.
+						// Accounting is unchanged: the client keeps any credit it
+						// holds. pop_missing with in_prebuf=true bypasses the min_req
+						// gate, ensuring an immediate REQUEST even when missing < min_req.
 						let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, true);
-
-						stream.state = if req > 0 {
+						if req > 0 {
 							pulse::write_command_message(
 								&mut ClientWriter(&mut client.outgoing),
 								u32::MAX,
@@ -299,10 +295,7 @@ pub(super) fn handle_command(
 								}),
 								client.protocol_version,
 							)?;
-							StreamState::Prebuffering(req as u64)
-						} else {
-							StreamState::Playing
-						};
+						}
 					}
 				}
 			}
@@ -312,15 +305,16 @@ pub(super) fn handle_command(
 		},
 		pulse::Command::FlushPlaybackStream(channel) => {
 			if let Some(stream) = client.playback_streams.get_mut(&channel) {
+				// Mirrors `pa_memblockq_flush_write(bq, false)`: the dropped bytes
+				// become demand, requested on the next clock tick. libpulse keeps
+				// its credit across a flush, so the server's mirror does too.
+				stream.missing += stream.buffer.len_bytes() as i64;
 				stream.buffer.clear();
-				// Discard all in-flight credit and accumulated demand, then re-seed
-				// missing = target_length so pop_missing immediately issues a fresh
-				// REQUEST on the next clock tick — mirroring PA's flush + handle_seek
-				// path which calls pop_missing right after flushing the queue.
-				stream.missing = stream.buffer_attr.target_length as i64;
-				stream.requested = 0;
 				stream.played_bytes = 0;
 				stream.read_offset = stream.write_offset;
+				if matches!(stream.state, StreamState::Playing | StreamState::Prebuffering(_)) {
+					stream.prebuf_force();
+				}
 			}
 
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
@@ -397,12 +391,7 @@ pub(super) fn handle_command(
 			if let Some(stream) = client.playback_streams.get_mut(&channel)
 				&& matches!(stream.state, StreamState::Playing)
 			{
-				stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
-				// Mirror the underflow re-entry path: seed missing so pop_missing
-				// immediately issues a seeding REQUEST on the next clock tick, and
-				// discard stale in-flight credit accumulated while Playing.
-				stream.missing = stream.buffer_attr.pre_buffering as i64;
-				stream.requested = 0;
+				stream.prebuf_force();
 			}
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
 			Ok(())
@@ -440,11 +429,11 @@ pub(super) fn handle_command(
 				let sample_spec = stream.buffer.sample_spec();
 				configure_buffer(&mut stream.buffer_attr, &sample_spec);
 
-				// Re-seed missing based on the new target so the next pop_missing()
-				// issues a correctly-sized REQUEST.
-				let new_target = stream.buffer_attr.target_length as usize;
-				let buf_len = stream.buffer.len_bytes();
-				stream.missing = (new_target.saturating_sub(buf_len + stream.requested)) as i64;
+				// Re-seed missing for the new target (buffered + credit + missing =
+				// target), so the next pop_missing() issues a correctly-sized REQUEST.
+				let new_target = i64::from(stream.buffer_attr.target_length);
+				let buf_len = stream.buffer.len_bytes() as i64;
+				stream.missing = new_target - buf_len - stream.requested;
 
 				let buffer_attr = stream.buffer_attr;
 				write_reply(
@@ -563,6 +552,10 @@ pub(super) fn handle_stream_write(client: &mut Client, desc: pulse::Descriptor, 
 		tracing::warn!("seeking not supported, ignoring offset {}", desc.offset);
 	}
 
+	// libpulse charges the whole write against its credit, including any part
+	// dropped as overflow below, and may go negative (it writes whole chunks).
+	stream.requested -= payload.len() as i64;
+
 	let buffer_len = stream.buffer.len_bytes();
 	let remaining = (stream.buffer_attr.max_length as usize).saturating_sub(buffer_len);
 	let payload = if payload.len() > remaining {
@@ -594,7 +587,6 @@ pub(super) fn handle_stream_write(client: &mut Client, desc: pulse::Descriptor, 
 	}
 
 	stream.buffer.write(payload);
-	stream.requested = stream.requested.saturating_sub(payload.len());
 	stream.write_offset += payload.len() as u64;
 
 	Ok(())
