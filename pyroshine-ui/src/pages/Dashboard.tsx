@@ -16,7 +16,7 @@ import Typography from "@mui/material/Typography";
 import StopCircleOutlined from "@mui/icons-material/StopCircleOutlined";
 import AddLink from "@mui/icons-material/AddLink";
 import { call, errorMessage } from "../api/bridge";
-import type { CaptureStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
+import type { AudioDetails, CaptureStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
 import { ConfirmDialog, Facts, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
@@ -298,12 +298,59 @@ function FramePacing({ capture, history, streamFps }: { capture: CaptureStats; h
   );
 }
 
-function StreamDetails({ session }: { session: SessionDetails }) {
-  const video = session.video;
+const QUALITY_LABELS: Record<string, string> = { standard: "Standard", high: "High", maximum: "Maximum" };
+
+function audioQuality(audio: AudioDetails): string {
+  if (!audio.quality) return "—";
+  const level = QUALITY_LABELS[audio.quality] ?? audio.quality;
+  return `${level} · ${audio.quality_requested ? "requested by the client" : "host default"}`;
+}
+
+function opusLayout(audio: AudioDetails): string {
+  const streams = audio.opus_streams ?? 0;
+  const coupled = audio.opus_coupled_streams ?? 0;
+  if (audio.high_quality && audio.channels > 2) {
+    return streams ? `High-quality surround · ${streams} mono streams` : "High-quality surround";
+  }
+  if (!streams) return "Standard";
+  const mono = streams - coupled;
+  const parts = [coupled ? `${coupled} stereo` : "", mono ? `${mono} mono` : ""].filter(Boolean);
+  return `${streams} ${streams === 1 ? "stream" : "streams"} (${parts.join(" + ")})`;
+}
+
+function AudioCard({ session }: { session: SessionDetails }) {
   const audio = session.audio;
   return (
-    <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: 2 }}>
-      <Card sx={{ flex: 1 }}>
+    <Card sx={{ flex: "1 1 300px" }}>
+      <CardContent>
+        <Typography variant="h6" sx={{ mb: 2 }}>
+          Audio
+        </Typography>
+        {audio ? (
+          <Facts
+            rows={[
+              ["Channels", `${channels(audio.channels)} · mask 0x${audio.channel_mask.toString(16)}`],
+              ["Quality", audioQuality(audio)],
+              ["Opus bitrate", bitrate(audio.opus_bitrate_bps)],
+              ["Opus layout", opusLayout(audio)],
+              ["Sample rate", audio.sample_rate_hz ? `${audio.sample_rate_hz / 1000} kHz` : "—"],
+              ["Packet duration", `${audio.packet_duration_ms} ms`],
+              ["Encryption", audio.encrypted ? "AES-128-CBC" : "Off"],
+            ]}
+          />
+        ) : (
+          <Typography color="text.secondary">Negotiating {channels(session.requested.audio_channels).toLowerCase()}…</Typography>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function StreamDetails({ session }: { session: SessionDetails }) {
+  const video = session.video;
+  return (
+    <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: 2, flexWrap: "wrap" }}>
+      <Card sx={{ flex: "1 1 300px" }}>
         <CardContent>
           <Typography variant="h6" sx={{ mb: 2 }}>
             Video
@@ -329,7 +376,8 @@ function StreamDetails({ session }: { session: SessionDetails }) {
           )}
         </CardContent>
       </Card>
-      <Card sx={{ flex: 1 }}>
+      <AudioCard session={session} />
+      <Card sx={{ flex: "1 1 300px" }}>
         <CardContent>
           <Typography variant="h6" sx={{ mb: 2 }}>
             Session
@@ -341,8 +389,6 @@ function StreamDetails({ session }: { session: SessionDetails }) {
               ["Application ID", String(session.application.id)],
               ["Client", session.client_address],
               ["Requested mode", `${session.requested.width} × ${session.requested.height} @ ${session.requested.refresh_rate} Hz${session.requested.hdr ? " · HDR" : ""}`],
-              ["Audio", audio ? `${channels(audio.channels)} · Opus ${bitrate(audio.opus_bitrate_bps)} · ${audio.packet_duration_ms} ms packets` : channels(session.requested.audio_channels)],
-              ["Audio encryption", audio ? (audio.encrypted ? "AES-128-CBC" : "Off") : "—"],
               ["Started", new Date(session.started_at_ms).toLocaleTimeString()],
             ]}
           />

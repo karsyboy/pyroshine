@@ -57,10 +57,18 @@ export interface VideoDetails {
 export interface AudioDetails {
   channels: number;
   channel_mask: number;
+  /** GameStream high-quality surround layout (one mono Opus stream per channel). */
   high_quality: boolean;
+  /** Encoded Opus bitrate, after the packet-size limit. */
   opus_bitrate_bps: number;
   packet_duration_ms: number;
   encrypted: boolean;
+  /** The remaining fields are absent from older daemons. */
+  quality?: "standard" | "high" | "maximum" | null;
+  quality_requested?: boolean;
+  opus_streams?: number;
+  opus_coupled_streams?: number;
+  sample_rate_hz?: number;
 }
 
 export interface LastStop {

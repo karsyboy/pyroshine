@@ -92,7 +92,9 @@ client; record the desktop environment, session type and client used.
    or the logged `http://localhost:<port>/pin?uniqueid=…` link.
 4. **Streaming state.** Start a stream: the icon shows the green play badge and
    the dashboard matches the application, resolution, refresh rate, codec, HDR
-   and chroma Moonlight negotiated, with statistics about once per second.
+   and chroma Moonlight negotiated, and the **Audio** card shows the channels,
+   audio quality (and whether the client requested it) and Opus bitrate, with
+   statistics about once per second.
    Disconnect Moonlight without quitting: the amber pause badge and "Client
    disconnected" appear and the game keeps running. Resume: the state returns to
    streaming. **End Session** (tray or dashboard) closes the application and

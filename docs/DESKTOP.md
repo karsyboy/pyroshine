@@ -140,6 +140,14 @@ p95, p99 and maximum), the share of frame times that change by more than 2 ms
 from one frame to the next (visible unevenness on a VRR display), and the
 delay from new content to its capture.
 
+**Audio** shows the stream the client receives: channel layout and mask, the
+audio quality level (Standard, High or Maximum) and whether the client
+requested it or the host default (`[stream.audio] quality`) applied, the
+encoded Opus bitrate after the audio packet-size limit, the Opus stream layout
+(GameStream high-quality surround uses one mono stream per channel), sample
+rate, packet duration and encryption. It updates when a reconnect negotiates a
+different audio mode.
+
 **Diagnostics** shows the version, GPU, verified codec profiles, HDR and DMA-BUF
 support, listening ports and the startup health check.
 

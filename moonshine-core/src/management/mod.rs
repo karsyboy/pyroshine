@@ -47,6 +47,7 @@ use crate::config::Config;
 use crate::healthcheck::{self, CheckOutcome};
 use crate::session::manager::{SessionManager, SessionView};
 use crate::session::status::{self, ClientPresence, ManagerStatus};
+use crate::session::stream::audio::{AudioQuality, AudioStreamContext};
 use crate::session::stream::video::{ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoCodec};
 
 /// Facts established at startup, reported by `GetServer`.
@@ -532,14 +533,30 @@ fn session_details(view: SessionView) -> SessionDetails {
 				}),
 			}
 		}),
-		audio: audio.map(|audio| AudioDetails {
-			channels: audio.audio_config.channels as u8,
-			channel_mask: audio.audio_config.channel_mask,
-			high_quality: audio.audio_config.high_quality,
-			opus_bitrate_bps: audio.audio_config.stream_config.bitrate,
-			packet_duration_ms: audio.packet_duration_ms,
-			encrypted: audio.encrypt_audio,
-		}),
+		audio: audio.map(audio_details),
+	}
+}
+
+fn audio_details(audio: AudioStreamContext) -> AudioDetails {
+	AudioDetails {
+		channels: audio.audio_config.channels as u8,
+		channel_mask: audio.audio_config.channel_mask,
+		high_quality: audio.audio_config.high_quality,
+		opus_bitrate_bps: audio.opus_bitrate(),
+		packet_duration_ms: audio.packet_duration_ms,
+		encrypted: audio.encrypt_audio,
+		quality: Some(
+			match audio.audio_config.quality {
+				AudioQuality::Standard => "standard",
+				AudioQuality::High => "high",
+				AudioQuality::Maximum => "maximum",
+			}
+			.into(),
+		),
+		quality_requested: audio.audio_config.quality_requested,
+		opus_streams: audio.audio_config.stream_config.streams,
+		opus_coupled_streams: audio.audio_config.stream_config.coupled_streams,
+		sample_rate_hz: audio.sample_rate_hz(),
 	}
 }
 
@@ -609,5 +626,46 @@ fn server_info(facts: &ServerFacts, config: &Config) -> ServerInfo {
 			control_port: config.stream.control.port,
 		},
 		pairing_enabled: config.webserver.enable_pairing,
+	}
+}
+
+#[cfg(test)]
+mod audio_details_tests {
+	use super::*;
+	use crate::session::stream::audio::{AudioChannels, AudioConfig};
+
+	/// The dashboard reports the level, who chose it, the Opus layout and the
+	/// bitrate the encoder actually uses.
+	#[test]
+	fn audio_details_report_quality_layout_and_encoded_bitrate() {
+		let mut config =
+			AudioConfig::from_channels(AudioChannels::Stereo, 0x3, false).with_quality(AudioQuality::Maximum);
+		config.quality_requested = true;
+		let stereo = audio_details(AudioStreamContext {
+			packet_duration_ms: 5,
+			qos: false,
+			audio_config: config,
+			encrypt_audio: true,
+		});
+		assert_eq!(stereo.quality.as_deref(), Some("maximum"));
+		assert!(stereo.quality_requested);
+		assert!(!stereo.high_quality);
+		assert_eq!(stereo.opus_bitrate_bps, 512_000);
+		assert_eq!((stereo.opus_streams, stereo.opus_coupled_streams), (1, 1));
+		assert_eq!(stereo.sample_rate_hz, 48_000);
+		assert!(stereo.encrypted);
+
+		// High-quality 7.1 (2048 kbit/s) is capped by the 10 ms packet size.
+		let surround = audio_details(AudioStreamContext {
+			packet_duration_ms: 10,
+			qos: false,
+			audio_config: AudioConfig::from_channels(AudioChannels::Surround71, 0x63f, true),
+			encrypt_audio: false,
+		});
+		assert_eq!(surround.quality.as_deref(), Some("standard"));
+		assert!(!surround.quality_requested);
+		assert!(surround.high_quality);
+		assert_eq!(surround.opus_bitrate_bps, 1_088_000);
+		assert_eq!((surround.opus_streams, surround.opus_coupled_streams), (8, 0));
 	}
 }

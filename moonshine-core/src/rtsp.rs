@@ -611,20 +611,23 @@ impl RtspServer {
 		};
 		let high_quality = audio_quality != 0;
 		// Pyrolight requests a bitrate level; other clients get the configured default.
-		let quality = match negotiated_audio_quality(&sdp_session) {
-			Ok(requested) => requested.unwrap_or(self.audio_config.quality),
+		let requested_quality = match negotiated_audio_quality(&sdp_session) {
+			Ok(requested) => requested,
 			Err(reason) => {
 				tracing::warn!(reason, "Rejecting invalid audio negotiation");
 				return bad_request(cseq, request.version(), reason);
 			},
 		};
-		let audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality).with_quality(quality);
+		let mut audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality)
+			.with_quality(requested_quality.unwrap_or(self.audio_config.quality));
+		audio_config.quality_requested = requested_quality.is_some();
 
 		tracing::info!(
 			channels = %audio_config.channels,
 			channel_mask = format_args!("{:#x}", audio_config.channel_mask),
 			high_quality = audio_config.high_quality,
 			quality = ?audio_config.quality,
+			quality_requested = audio_config.quality_requested,
 			bitrate = audio_config.stream_config.bitrate,
 			packet_duration_ms = packet_duration,
 			"Selected audio mode"

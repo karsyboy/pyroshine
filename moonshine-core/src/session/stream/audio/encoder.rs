@@ -93,6 +93,14 @@ impl AudioEncoder {
 	}
 }
 
+/// The Opus bitrate actually encoded: the configured bitrate, capped by what
+/// fits Moonlight's audio packets at the negotiated duration.
+pub(super) fn opus_bitrate(stream_config: &OpusStreamConfig, packet_duration_ms: u32) -> u32 {
+	stream_config
+		.bitrate
+		.min((MAX_OPUS_PAYLOAD_SIZE as u32 * 8 * 1000) / packet_duration_ms.max(1))
+}
+
 fn create_encoder(
 	sample_rate: u32,
 	stream_config: &OpusStreamConfig,
@@ -111,9 +119,7 @@ fn create_encoder(
 		.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
 	encoder
 		.set_bitrate(opus::Bitrate::Bits(
-			stream_config
-				.bitrate
-				.min((MAX_OPUS_PAYLOAD_SIZE as u32 * 8 * 1000) / packet_duration_ms.max(1)) as i32,
+			opus_bitrate(stream_config, packet_duration_ms) as i32
 		))
 		.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 	Ok(encoder)

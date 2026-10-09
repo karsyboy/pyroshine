@@ -192,6 +192,8 @@ pub struct AudioConfig {
 	pub high_quality: bool,
 	/// Bitrate level of a stereo or normal-quality surround layout.
 	pub quality: AudioQuality,
+	/// Whether the client requested `quality`; otherwise it is the host default.
+	pub quality_requested: bool,
 	pub stream_config: OpusStreamConfig,
 }
 
@@ -202,6 +204,7 @@ impl Default for AudioConfig {
 			channel_mask: 0x3,
 			high_quality: true,
 			quality: AudioQuality::default(),
+			quality_requested: false,
 			stream_config: OPUS_HIGH_STEREO,
 		}
 	}
@@ -233,6 +236,7 @@ impl AudioConfig {
 			channel_mask,
 			high_quality,
 			quality: AudioQuality::default(),
+			quality_requested: false,
 			stream_config,
 		}
 	}
@@ -248,6 +252,18 @@ pub struct AudioStreamContext {
 	pub audio_config: AudioConfig,
 	/// Whether the client has enabled audio encryption.
 	pub encrypt_audio: bool,
+}
+
+impl AudioStreamContext {
+	/// The Opus bitrate the encoder uses for this context.
+	pub fn opus_bitrate(&self) -> u32 {
+		encoder::opus_bitrate(&self.audio_config.stream_config, self.packet_duration_ms)
+	}
+
+	/// The capture and encoding sample rate; every layout uses 48 kHz.
+	pub fn sample_rate_hz(&self) -> u32 {
+		CAPTURE_SAMPLE_RATE
+	}
 }
 
 /// Handle returned by `AudioStream::start` that gates the encoder and packet handler.

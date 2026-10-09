@@ -133,10 +133,27 @@ pub struct VideoDetails {
 pub struct AudioDetails {
 	pub channels: u8,
 	pub channel_mask: u32,
+	/// GameStream high-quality surround layout (one mono Opus stream per channel).
 	pub high_quality: bool,
+	/// The Opus bitrate encoded, after the packet-size limit of the packet duration.
 	pub opus_bitrate_bps: u32,
 	pub packet_duration_ms: u32,
 	pub encrypted: bool,
+	/// Audio quality level: `standard`, `high` or `maximum`. Absent from older daemons.
+	#[serde(default)]
+	pub quality: Option<String>,
+	/// Whether the client requested `quality` (Pyrolight); otherwise the host default applied.
+	#[serde(default)]
+	pub quality_requested: bool,
+	/// Opus streams in the layout, of which `opus_coupled_streams` are stereo pairs.
+	/// Zero from older daemons.
+	#[serde(default)]
+	pub opus_streams: u8,
+	#[serde(default)]
+	pub opus_coupled_streams: u8,
+	/// Capture and encoding sample rate. Zero from older daemons.
+	#[serde(default)]
+	pub sample_rate_hz: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +568,27 @@ mod tests {
 			.remove("foreground_application");
 		let snapshot: SessionSnapshot = serde_json::from_value(legacy).unwrap();
 		assert_eq!(snapshot.session.unwrap().foreground_application, None);
+	}
+
+	/// Audio details from a daemon without audio quality still parse; the
+	/// additive fields take their defaults.
+	#[test]
+	fn audio_details_from_an_older_daemon_parse() {
+		let audio: AudioDetails = serde_json::from_value(serde_json::json!({
+			"channels": 2,
+			"channel_mask": 3,
+			"high_quality": false,
+			"opus_bitrate_bps": 96000,
+			"packet_duration_ms": 5,
+			"encrypted": true,
+		}))
+		.unwrap();
+		assert_eq!(audio.quality, None);
+		assert!(!audio.quality_requested);
+		assert_eq!(
+			(audio.opus_streams, audio.opus_coupled_streams, audio.sample_rate_hz),
+			(0, 0, 0)
+		);
 	}
 
 	#[test]

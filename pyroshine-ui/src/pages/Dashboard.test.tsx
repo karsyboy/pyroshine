@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../api/session.fixture.json";
-import type { CaptureStats, SessionSnapshot, StreamStats } from "../api/types";
+import type { AudioDetails, CaptureStats, SessionSnapshot, StreamStats } from "../api/types";
 import { DashboardPage } from "./Dashboard";
 
 const daemon = vi.hoisted(() => ({
@@ -109,5 +109,61 @@ describe("frame pacing", () => {
     const html = renderStats(base);
     expect(html).toContain("Performance");
     expect(html).not.toContain("Frame pacing");
+  });
+});
+
+describe("audio stream", () => {
+  const snapshot: SessionSnapshot = { ...fixture, phase: "streaming" };
+  const stereo: AudioDetails = {
+    channels: 2,
+    channel_mask: 3,
+    high_quality: false,
+    opus_bitrate_bps: 256_000,
+    packet_duration_ms: 5,
+    encrypted: true,
+    quality: "high",
+    quality_requested: true,
+    opus_streams: 1,
+    opus_coupled_streams: 1,
+    sample_rate_hz: 48_000,
+  };
+  const withAudio = (audio: AudioDetails | null) => render({ ...snapshot, session: { ...snapshot.session!, audio } });
+
+  it("shows the quality the client requested and the encoded stream", () => {
+    const html = withAudio(stereo);
+    expect(html).toContain("High · requested by the client");
+    expect(html).toContain("256 kb/s");
+    expect(html).toContain("1 stream (1 stereo)");
+    expect(html).toContain("48 kHz");
+    expect(html).toContain("5 ms");
+    expect(html).toContain("AES-128-CBC");
+  });
+
+  it("labels the host default and the high-quality surround layout", () => {
+    const html = withAudio({
+      ...stereo,
+      channels: 8,
+      channel_mask: 0x63f,
+      high_quality: true,
+      opus_bitrate_bps: 1_088_000,
+      packet_duration_ms: 10,
+      quality: "standard",
+      quality_requested: false,
+      opus_streams: 8,
+      opus_coupled_streams: 0,
+    });
+    expect(html).toContain("Standard · host default");
+    expect(html).toContain("7.1 surround · mask 0x63f");
+    expect(html).toContain("High-quality surround · 8 mono streams");
+    expect(html).toContain("1.1 Mb/s");
+  });
+
+  it("falls back for an older daemon and while negotiating", () => {
+    const { quality: _q, quality_requested: _r, opus_streams: _s, opus_coupled_streams: _c, sample_rate_hz: _h, ...older } = stereo;
+    const html = withAudio({ ...older, opus_bitrate_bps: 96_000 });
+    expect(html).toContain("96 kb/s");
+    expect(html).toMatch(/>Opus layout<\/dt><dd[^>]*>Standard</);
+    expect(html).not.toContain("requested by the client");
+    expect(withAudio(null)).toContain("Negotiating stereo…");
   });
 });
