@@ -2,29 +2,44 @@
 //!
 //! Converts the captured RGB DMA-BUF into the encoder's YCbCr input image in a
 //! single compute dispatch plus one buffer-to-image copy. The dispatch can also
-//! composite the compositor cursor while sampling the source, which lets a
-//! fullscreen direct export keep its zero-render path while the cursor stays
-//! part of the encoded picture (see `compositor/cursor.rs`).
+//! composite the compositor cursor and a Steam notification while sampling the
+//! source, which lets a fullscreen direct export keep its zero-render path
+//! while those layers stay part of the encoded picture (see
+//! `compositor/cursor.rs`). This is the only RGB-to-YCbCr path of the
+//! conventional codecs.
 //!
-//! The arithmetic mirrors Pixelforge's `ColorConverter` (shared coefficients,
-//! transfer functions and truncating quantization) and its packed buffer
-//! layout; it differs in how the work is scheduled:
+//! Three extents are kept apart:
 //!
-//! * each invocation writes whole 32-bit words for a 4x2 pixel block, so the
-//!   per-byte global atomics and the full-buffer clear before them are gone;
+//! * the *frame* extent is the negotiated stream size (what the client shows);
+//! * the *conversion* extent is the frame rounded up to the encoder's block
+//!   alignment (see [`conversion_extent`]) and is what the copy writes into
+//!   the encoder input image, whose own (coded) extent is at least as large.
+//!   Pixels past the frame replicate its nearest edge pixel, so alignment
+//!   padding is deterministic and cheap to encode; codec cropping metadata
+//!   written by the encoder hides it;
+//! * the *buffer* extent rounds the conversion extent up to whole 4x2 blocks
+//!   so every 32-bit output word belongs to exactly one shader invocation
+//!   (see [`Layout`]). Those extra samples are never copied.
+//!
+//! The work is scheduled for latency:
+//!
+//! * each invocation writes whole 32-bit words for a 4x2 pixel block, so no
+//!   atomics and no buffer clear are needed;
 //! * the submission prefers the device's dedicated compute family, which on
 //!   AMD runs concurrently with a game's graphics queue instead of waiting
 //!   behind its frames (a GPU-bound game otherwise delays every conversion by
 //!   roughly a frame and caps the stream frame rate);
 //! * conversion GPU time is measured with timestamps when supported.
 //!
-//! Pixelforge's converter remains the fallback for extents this layout cannot
-//! represent (odd heights or widths that are not a multiple of four).
+//! Every converter verifies its own output on the GPU against [`reference`]
+//! when it is created (see [`InputConverter::new`]), so a driver that
+//! miscompiles the shader fails the stream setup with a precise error instead
+//! of streaming corrupted colors.
 
 use std::sync::Arc;
 
 use ash::vk;
-use pixelforge::{ColorSpace, OutputFormat, VideoContext};
+use pixelforge::{Codec, ColorSpace, OutputFormat, VideoContext};
 
 use super::dmabuf::CachedImport;
 use crate::session::compositor::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
@@ -32,9 +47,11 @@ use crate::session::compositor::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImag
 /// Precompiled from `shaders/convert.comp` by `scripts/build-shaders.sh`.
 const CONVERT_SPIRV: &[u8] = include_bytes!("shaders/convert.spv");
 
-/// Workgroup footprint in pixels: 8x8 invocations of 4x2 pixels each.
-const GROUP_WIDTH: u32 = 32;
-const GROUP_HEIGHT: u32 = 16;
+/// Pixels per shader invocation (one 4x2 block).
+const BLOCK_WIDTH: u32 = 4;
+const BLOCK_HEIGHT: u32 = 2;
+/// Invocations per workgroup in each dimension (`local_size_x/y`).
+const GROUP_SIZE: u32 = 8;
 
 /// Views kept for recently seen source images (swapchains rotate 2-4 images).
 const MAX_CACHED_VIEWS: usize = 8;
@@ -46,26 +63,37 @@ pub enum ConversionQueueMode {
 	/// Dedicated compute family when the device exposes one, else graphics.
 	#[default]
 	Auto,
-	/// The graphics-capable family Pixelforge uses for its own converter.
+	/// The graphics-capable family Pixelforge uses for its own work.
 	Graphics,
 	/// Require the dedicated compute family; falls back to graphics if absent.
 	Compute,
 }
 
+/// Mirrors the shader's push-constant block (std430 offsets).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
 	width: u32,
 	height: u32,
+	source_max_x: u32,
+	source_max_y: u32,
 	output_format: u32,
 	color_space: u32,
 	full_range: u32,
 	sdr_white_nits: f32,
-	_padding: [u32; 2],
+	luma_pitch: u32,
+	chroma_offset: u32,
+	chroma_pitch: u32,
+	blocks_x: u32,
+	blocks_y: u32,
+	_padding: [u32; 3],
 	layer_rect: [[i32; 4]; MAX_OVERLAYS],
 	layer_opacity: [f32; MAX_OVERLAYS],
 	layer_opaque: [u32; MAX_OVERLAYS],
 }
+
+// Every implementation supports at least 128 bytes of push constants.
+const _: () = assert!(std::mem::size_of::<PushConstants>() == 112);
 
 /// Where a late-composition layer's texels come from.
 pub(crate) enum LayerInput<'a> {
@@ -94,18 +122,52 @@ pub(crate) struct Layer<'a> {
 /// Layers bottom to top (notification, cursor).
 pub(crate) type Layers<'a> = [Option<Layer<'a>>; MAX_OVERLAYS];
 
-/// Whether the packed word layout can represent `width` x `height`.
-pub(crate) fn supports_extent(width: u32, height: u32) -> bool {
-	width != 0 && height != 0 && width.is_multiple_of(4) && height.is_multiple_of(2)
+/// The image receiving the converted planes and the layout it is in before
+/// the conversion and must be left in afterwards.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Target {
+	pub image: vk::Image,
+	pub layout: vk::ImageLayout,
 }
 
-fn output_format_code(format: OutputFormat) -> Option<u32> {
-	// Pixelforge's shader numbering; I420 is never negotiated by Pyroshine.
+impl Target {
+	/// A Pixelforge encoder input slot. Pixelforge clears each slot at
+	/// creation and leaves it in `VIDEO_ENCODE_SRC_KHR`, and every conversion
+	/// returns it there.
+	pub(crate) fn encoder_input(image: vk::Image) -> Self {
+		Self {
+			image,
+			layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+		}
+	}
+}
+
+/// Per-format sample sizes of the 2-plane (Y + interleaved CbCr) layouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FormatInfo {
+	/// Shader format code (Pixelforge's numbering).
+	code: u32,
+	/// Bytes per luma sample.
+	luma_bytes: u32,
+	/// Bytes per CbCr pair.
+	chroma_bytes: u32,
+	/// 4:2:0 (chroma at half width and height) rather than 4:4:4.
+	subsampled: bool,
+}
+
+fn format_info(format: OutputFormat) -> Option<FormatInfo> {
+	let info = |code, luma_bytes, chroma_bytes, subsampled| FormatInfo {
+		code,
+		luma_bytes,
+		chroma_bytes,
+		subsampled,
+	};
+	// I420 (3 planes) is never negotiated by Pyroshine.
 	match format {
-		OutputFormat::NV12 => Some(0),
-		OutputFormat::YUV444 => Some(2),
-		OutputFormat::P010 => Some(3),
-		OutputFormat::YUV444P10 => Some(4),
+		OutputFormat::NV12 => Some(info(0, 1, 2, true)),
+		OutputFormat::YUV444 => Some(info(2, 1, 2, false)),
+		OutputFormat::P010 => Some(info(3, 2, 4, true)),
+		OutputFormat::YUV444P10 => Some(info(4, 2, 4, false)),
 		OutputFormat::I420 => None,
 	}
 }
@@ -119,46 +181,447 @@ fn color_space_code(color_space: ColorSpace) -> u32 {
 	}
 }
 
-/// Total packed output bytes, identical to Pixelforge's layout for these formats.
-fn output_size(format: OutputFormat, width: u32, height: u32) -> u64 {
-	let pixels = u64::from(width) * u64::from(height);
-	match format {
-		OutputFormat::NV12 | OutputFormat::I420 => pixels * 3 / 2,
-		OutputFormat::YUV444 => pixels * 3,
-		OutputFormat::P010 => pixels * 3,
-		OutputFormat::YUV444P10 => pixels * 6,
+/// Extent the converter writes into a Pixelforge encoder input image for a
+/// `width` x `height` frame: rounded up to the codec's block size (macroblock,
+/// CTB or superblock).
+///
+/// Pixelforge sizes its input images to the coded extent, which it aligns to
+/// a multiple of this block size (and of the device's picture access
+/// granularity) and never below the device minimum, so this extent always
+/// fits the image. The blocks past the frame are cropped by the codec headers
+/// Pixelforge writes; filling them with replicated edge pixels keeps them
+/// cheap to encode. Any further granularity padding keeps the zeros Pixelforge
+/// cleared the image with.
+pub(crate) fn conversion_extent(codec: Codec, width: u32, height: u32) -> Result<(u32, u32), String> {
+	let unit = super::encode_caps::block_size(codec);
+	match (
+		width.checked_next_multiple_of(unit),
+		height.checked_next_multiple_of(unit),
+	) {
+		(Some(w), Some(h)) if width != 0 && height != 0 => Ok((w, h)),
+		_ => Err(format!("{width}x{height} has no {codec:?} conversion extent")),
 	}
 }
 
-fn copy_regions(format: OutputFormat, width: u32, height: u32) -> [vk::BufferImageCopy; 2] {
-	let pixels = u64::from(width) * u64::from(height);
-	let (chroma_offset, chroma_extent) = match format {
-		OutputFormat::NV12 => (pixels, (width / 2, height / 2)),
-		OutputFormat::P010 => (pixels * 2, (width / 2, height / 2)),
-		OutputFormat::YUV444 => (pixels, (width, height)),
-		OutputFormat::YUV444P10 | OutputFormat::I420 => (pixels * 2, (width, height)),
-	};
-	let region = |offset, aspect, (w, h)| vk::BufferImageCopy {
-		buffer_offset: offset,
-		buffer_row_length: 0,
-		buffer_image_height: 0,
-		image_subresource: vk::ImageSubresourceLayers {
-			aspect_mask: aspect,
-			mip_level: 0,
-			base_array_layer: 0,
-			layer_count: 1,
-		},
-		image_offset: vk::Offset3D::default(),
-		image_extent: vk::Extent3D {
-			width: w,
-			height: h,
-			depth: 1,
-		},
-	};
-	[
-		region(0, vk::ImageAspectFlags::PLANE_0, (width, height)),
-		region(chroma_offset, vk::ImageAspectFlags::PLANE_1, chroma_extent),
-	]
+/// Plane layout of the conversion buffer and of its copy into the encoder
+/// input image.
+///
+/// Both planes start on a 32-bit word and every row is a whole number of
+/// words, so each word lies in one row and belongs to exactly one 4x2 block:
+/// luma rows hold `4 * blocks_x` samples, chroma rows hold the CbCr pairs of
+/// the same blocks (`2 * blocks_x` for 4:2:0, `4 * blocks_x` for 4:4:4). The
+/// copy regions address the conversion extent through `bufferRowLength`, so
+/// the samples past it are never copied. Word-aligned offsets also satisfy
+/// `VkBufferImageCopy::bufferOffset` (a multiple of each plane's element
+/// size, at most four bytes) on any queue family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+	pub format: OutputFormat,
+	info: FormatInfo,
+	/// Conversion extent copied into the target image.
+	pub extent: (u32, u32),
+	/// Invocation grid: 4x2 pixel blocks covering `extent`.
+	pub blocks: (u32, u32),
+	/// Luma row pitch in 32-bit words.
+	pub luma_pitch: u32,
+	/// Start of the chroma plane in 32-bit words.
+	pub chroma_offset: u32,
+	/// Chroma row pitch in 32-bit words.
+	pub chroma_pitch: u32,
+	/// Buffer size in bytes.
+	pub size: u64,
+}
+
+impl Layout {
+	pub(crate) fn new(format: OutputFormat, (width, height): (u32, u32)) -> Result<Self, String> {
+		let info = format_info(format).ok_or_else(|| format!("unsupported output format {format:?}"))?;
+		if width == 0 || height == 0 {
+			return Err(format!("empty conversion extent {width}x{height}"));
+		}
+		if info.subsampled && (!width.is_multiple_of(2) || !height.is_multiple_of(2)) {
+			return Err(format!(
+				"4:2:0 conversion extent {width}x{height} must be even (chroma covers 2x2 pixels)"
+			));
+		}
+		let blocks_x = u64::from(width.div_ceil(BLOCK_WIDTH));
+		let blocks_y = u64::from(height.div_ceil(BLOCK_HEIGHT));
+		let luma_pitch = blocks_x * u64::from(info.luma_bytes);
+		let (chroma_pitch, chroma_rows) = if info.subsampled {
+			(blocks_x * 2 * u64::from(info.chroma_bytes) / 4, blocks_y)
+		} else {
+			(blocks_x * u64::from(info.chroma_bytes), blocks_y * 2)
+		};
+		let chroma_offset = luma_pitch * blocks_y * 2;
+		let words = chroma_offset + chroma_pitch * chroma_rows;
+		// The shader indexes words with 32-bit integers.
+		let word = |value: u64| {
+			u32::try_from(value).map_err(|_| format!("{format:?} {width}x{height} exceeds 32-bit buffer addressing"))
+		};
+		word(words)?;
+		Ok(Self {
+			format,
+			info,
+			extent: (width, height),
+			blocks: (word(blocks_x)?, word(blocks_y)?),
+			luma_pitch: word(luma_pitch)?,
+			chroma_offset: word(chroma_offset)?,
+			chroma_pitch: word(chroma_pitch)?,
+			size: words * 4,
+		})
+	}
+
+	/// Chroma plane extent of the conversion.
+	pub(crate) fn chroma_extent(&self) -> (u32, u32) {
+		if self.info.subsampled {
+			(self.extent.0 / 2, self.extent.1 / 2)
+		} else {
+			self.extent
+		}
+	}
+
+	/// Luma and chroma `VkBufferImageCopy` regions.
+	pub(crate) fn copy_regions(&self) -> [vk::BufferImageCopy; 2] {
+		let region = |offset, row_length, aspect, (width, height)| vk::BufferImageCopy {
+			buffer_offset: offset,
+			buffer_row_length: row_length,
+			buffer_image_height: 0,
+			image_subresource: vk::ImageSubresourceLayers {
+				aspect_mask: aspect,
+				mip_level: 0,
+				base_array_layer: 0,
+				layer_count: 1,
+			},
+			image_offset: vk::Offset3D::default(),
+			image_extent: vk::Extent3D {
+				width,
+				height,
+				depth: 1,
+			},
+		};
+		[
+			region(
+				0,
+				self.luma_pitch * 4 / self.info.luma_bytes,
+				vk::ImageAspectFlags::PLANE_0,
+				self.extent,
+			),
+			region(
+				u64::from(self.chroma_offset) * 4,
+				self.chroma_pitch * 4 / self.info.chroma_bytes,
+				vk::ImageAspectFlags::PLANE_1,
+				self.chroma_extent(),
+			),
+		]
+	}
+
+	/// Decode the conversion extent of a buffer with this layout into code
+	/// values (10-bit samples shifted down from their P010 position).
+	pub(crate) fn read_planes(&self, bytes: &[u8]) -> Result<reference::Planes, String> {
+		if (bytes.len() as u64) < self.size {
+			return Err(format!("buffer holds {} of {} bytes", bytes.len(), self.size));
+		}
+		let ten_bit = self.info.luma_bytes == 2;
+		let sample = |offset: usize| -> Result<u16, String> {
+			if !ten_bit {
+				return Ok(u16::from(bytes[offset]));
+			}
+			let raw = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+			if raw & 0x3f != 0 {
+				return Err(format!("10-bit sample 0x{raw:04x} at byte {offset} has low bits set"));
+			}
+			Ok(raw >> 6)
+		};
+		let (width, height) = self.extent;
+		let (chroma_width, chroma_height) = self.chroma_extent();
+		let luma_bytes = self.info.luma_bytes as usize;
+		let mut planes = reference::Planes::new(self.extent, (chroma_width, chroma_height));
+		for y in 0..height as usize {
+			for x in 0..width as usize {
+				planes.luma[y * width as usize + x] = sample(y * self.luma_pitch as usize * 4 + x * luma_bytes)?;
+			}
+		}
+		let component = luma_bytes;
+		for y in 0..chroma_height as usize {
+			let row = (self.chroma_offset as usize + y * self.chroma_pitch as usize) * 4;
+			for x in 0..chroma_width as usize {
+				let pair = row + x * 2 * component;
+				planes.chroma[y * chroma_width as usize + x] = [sample(pair)?, sample(pair + component)?];
+			}
+		}
+		Ok(planes)
+	}
+}
+
+/// Independent CPU definition of the conversion, used by the creation-time
+/// self-check and the tests.
+///
+/// The equations follow the standards rather than the shader: luma weights
+/// Kr/Kb of Rec. ITU-R BT.709 / BT.2020 (non-constant luminance), Cb and Cr as
+/// scaled B-Y and R-Y differences, SMPTE ST 2084 (PQ), the IEC 61966-2-1 sRGB
+/// decoding function, the Rec. ITU-R BT.2087 primaries conversion, and the
+/// Rec. ITU-R BT.2100 / ITU-T H.273 quantization with round-to-nearest. 4:2:0
+/// chroma is the mean of the 2x2 co-sited pixels; pixels past the frame
+/// replicate its nearest edge pixel. Arithmetic is in f64, so the GPU (f32)
+/// may differ by one code where a value lies on a rounding boundary.
+pub(crate) mod reference {
+	use pixelforge::{ColorSpace, OutputFormat};
+
+	/// Color conversion parameters of one frame.
+	#[derive(Clone, Copy, Debug)]
+	pub(crate) struct Color {
+		pub space: ColorSpace,
+		pub full_range: bool,
+		/// Nits of the SDR/scRGB reference white in the PQ conversions.
+		pub sdr_white_nits: f32,
+	}
+
+	/// Code values of both planes over an extent. 10-bit samples are stored
+	/// as 0..=1023.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub(crate) struct Planes {
+		pub extent: (u32, u32),
+		pub chroma_extent: (u32, u32),
+		pub luma: Vec<u16>,
+		/// (Cb, Cr) per chroma sample.
+		pub chroma: Vec<[u16; 2]>,
+	}
+
+	impl Planes {
+		pub(crate) fn new(extent: (u32, u32), chroma_extent: (u32, u32)) -> Self {
+			Self {
+				extent,
+				chroma_extent,
+				luma: vec![0; extent.0 as usize * extent.1 as usize],
+				chroma: vec![[0; 2]; chroma_extent.0 as usize * chroma_extent.1 as usize],
+			}
+		}
+	}
+
+	fn pq(linear: f64) -> f64 {
+		const M1: f64 = 2610.0 / 16384.0;
+		const M2: f64 = 2523.0 / 4096.0 * 128.0;
+		const C1: f64 = 3424.0 / 4096.0;
+		const C2: f64 = 2413.0 / 4096.0 * 32.0;
+		const C3: f64 = 2392.0 / 4096.0 * 32.0;
+		let lm1 = linear.max(0.0).powf(M1);
+		((C1 + C2 * lm1) / (1.0 + C3 * lm1)).powf(M2)
+	}
+
+	fn srgb_to_linear(value: f64) -> f64 {
+		let value = value.clamp(0.0, 1.0);
+		if value <= 0.04045 {
+			value / 12.92
+		} else {
+			((value + 0.055) / 1.055).powf(2.4)
+		}
+	}
+
+	fn bt709_to_bt2020([r, g, b]: [f64; 3]) -> [f64; 3] {
+		[
+			0.6274 * r + 0.3293 * g + 0.0433 * b,
+			0.0691 * r + 0.9195 * g + 0.0114 * b,
+			0.0164 * r + 0.0880 * g + 0.8956 * b,
+		]
+	}
+
+	/// Normalized (Y, Cb + 1/2, Cr + 1/2), each clamped to [0, 1], of an RGB
+	/// sample in the source's signal encoding.
+	pub(crate) fn ycbcr(rgb: [f32; 3], color: Color) -> [f64; 3] {
+		let rgb = rgb.map(f64::from);
+		let scale = f64::from(color.sdr_white_nits) / 10_000.0;
+		let signal = match color.space {
+			ColorSpace::Bt709 | ColorSpace::Bt2020 => rgb,
+			ColorSpace::SrgbToBt2020Pq => bt709_to_bt2020(rgb.map(srgb_to_linear)).map(|c| pq(c * scale)),
+			ColorSpace::Bt709LinearToBt2020Pq => bt709_to_bt2020(rgb).map(|c| pq(c * scale)),
+		};
+		let (kr, kb) = match color.space {
+			ColorSpace::Bt709 => (0.2126, 0.0722),
+			_ => (0.2627, 0.0593),
+		};
+		let [r, g, b] = signal;
+		let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+		let cb = (b - y) / (2.0 * (1.0 - kb));
+		let cr = (r - y) / (2.0 * (1.0 - kr));
+		[
+			y.clamp(0.0, 1.0),
+			(cb + 0.5).clamp(0.0, 1.0),
+			(cr + 0.5).clamp(0.0, 1.0),
+		]
+	}
+
+	fn round_clamped(value: f64, bits: u32) -> u16 {
+		(value + 0.5).floor().clamp(0.0, f64::from((1u32 << bits) - 1)) as u16
+	}
+
+	/// Luma code of a normalized Y.
+	pub(crate) fn luma_code(y: f64, bits: u32, full_range: bool) -> u16 {
+		let value = if full_range {
+			y * f64::from((1u32 << bits) - 1)
+		} else {
+			(219.0 * y + 16.0) * f64::from(1u32 << (bits - 8))
+		};
+		round_clamped(value, bits)
+	}
+
+	/// Chroma code of a normalized Cb or Cr (offset by 1/2).
+	pub(crate) fn chroma_code(c: f64, bits: u32, full_range: bool) -> u16 {
+		let e = c - 0.5;
+		let value = if full_range {
+			e * f64::from((1u32 << bits) - 1) + f64::from(1u32 << (bits - 1))
+		} else {
+			(224.0 * e + 128.0) * f64::from(1u32 << (bits - 8))
+		};
+		round_clamped(value, bits)
+	}
+
+	/// Expected planes of `format` over `extent` for a `frame`-sized source
+	/// whose (composited) RGB is `rgb(x, y)`. Rows for which `row` is false
+	/// are left zero (and skipped by [`compare`]); chroma rows follow their
+	/// first luma row.
+	pub(crate) fn convert(
+		format: OutputFormat,
+		color: Color,
+		frame: (u32, u32),
+		extent: (u32, u32),
+		rgb: &dyn Fn(u32, u32) -> [f32; 3],
+		row: &dyn Fn(u32) -> bool,
+	) -> Planes {
+		let (bits, subsampled) = match format {
+			OutputFormat::NV12 => (8, true),
+			OutputFormat::P010 => (10, true),
+			OutputFormat::YUV444 | OutputFormat::I420 => (8, false),
+			OutputFormat::YUV444P10 => (10, false),
+		};
+		let chroma_extent = if subsampled {
+			(extent.0.div_ceil(2), extent.1.div_ceil(2))
+		} else {
+			extent
+		};
+		let mut planes = Planes::new(extent, chroma_extent);
+		let at = |x: u32, y: u32| ycbcr(rgb(x.min(frame.0 - 1), y.min(frame.1 - 1)), color);
+		let width = extent.0 as usize;
+		for y in 0..extent.1 {
+			let include = if subsampled { row(y & !1) } else { row(y) };
+			if !include {
+				continue;
+			}
+			for x in 0..extent.0 {
+				let [luma, cb, cr] = at(x, y);
+				planes.luma[y as usize * width + x as usize] = luma_code(luma, bits, color.full_range);
+				if !subsampled {
+					planes.chroma[y as usize * width + x as usize] = [
+						chroma_code(cb, bits, color.full_range),
+						chroma_code(cr, bits, color.full_range),
+					];
+				} else if y % 2 == 0 && x % 2 == 0 {
+					let mut sum = [0.0; 2];
+					for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+						let [_, cb, cr] = at(x + dx, y + dy);
+						sum[0] += cb;
+						sum[1] += cr;
+					}
+					let index = (y / 2) as usize * chroma_extent.0 as usize + (x / 2) as usize;
+					planes.chroma[index] = sum.map(|s| chroma_code(s / 4.0, bits, color.full_range));
+				}
+			}
+		}
+		planes
+	}
+
+	/// Outcome of a plane comparison within the tolerance.
+	#[derive(Debug, Default)]
+	pub(crate) struct Agreement {
+		/// Samples (luma or chroma components) that differ at all.
+		pub differing: u64,
+		pub compared: u64,
+		pub max_difference: u16,
+	}
+
+	/// Compare `actual` with `expected` over the rows `row` selects. Fails
+	/// with a description that locates the differences by plane and by sample
+	/// position within the shader's 4x2 blocks, which identifies layout or
+	/// per-block defects (e.g. a lost second chroma sample of every block).
+	pub(crate) fn compare(
+		expected: &Planes,
+		actual: &Planes,
+		tolerance: u16,
+		row: &dyn Fn(u32) -> bool,
+	) -> Result<Agreement, String> {
+		if expected.extent != actual.extent || expected.chroma_extent != actual.chroma_extent {
+			return Err(format!(
+				"plane extents differ: expected {:?}/{:?}, got {:?}/{:?}",
+				expected.extent, expected.chroma_extent, actual.extent, actual.chroma_extent
+			));
+		}
+		let mut agreement = Agreement::default();
+		// Out-of-tolerance samples by plane (0 luma, 1 Cb, 2 Cr) and by column
+		// within a block (4 luma columns; 2 or 4 chroma columns).
+		let mut failures = [[0u64; 4]; 3];
+		let mut first: Option<String> = None;
+		let subsampled = expected.chroma_extent != expected.extent;
+		let chroma_per_block = if subsampled { 2 } else { 4 };
+		let mut check = |plane: usize, x: u32, y: u32, want: u16, got: u16| {
+			agreement.compared += 1;
+			let difference = want.abs_diff(got);
+			if difference == 0 {
+				return;
+			}
+			agreement.differing += 1;
+			agreement.max_difference = agreement.max_difference.max(difference);
+			if difference > tolerance {
+				let per_block = if plane == 0 { 4 } else { chroma_per_block };
+				failures[plane][(x % per_block) as usize] += 1;
+				first.get_or_insert_with(|| {
+					format!("{} ({x}, {y}): expected {want}, got {got}", ["Y", "Cb", "Cr"][plane])
+				});
+			}
+		};
+		let (width, height) = expected.extent;
+		for y in (0..height).filter(|&y| row(y)) {
+			for x in 0..width {
+				let index = (y * width + x) as usize;
+				check(0, x, y, expected.luma[index], actual.luma[index]);
+			}
+		}
+		let (chroma_width, chroma_height) = expected.chroma_extent;
+		for y in 0..chroma_height {
+			if !row(if subsampled { y * 2 } else { y }) {
+				continue;
+			}
+			for x in 0..chroma_width {
+				let index = (y * chroma_width + x) as usize;
+				for component in 0..2 {
+					check(
+						1 + component,
+						x,
+						y,
+						expected.chroma[index][component],
+						actual.chroma[index][component],
+					);
+				}
+			}
+		}
+		let total: u64 = failures.iter().flatten().sum();
+		if total == 0 {
+			return Ok(agreement);
+		}
+		let by_column = |plane: usize, columns: usize| {
+			failures[plane][..columns]
+				.iter()
+				.map(u64::to_string)
+				.collect::<Vec<_>>()
+				.join("/")
+		};
+		Err(format!(
+			"{total} samples differ by more than {tolerance} (max {}); first at {}; \
+			 by column within a 4x2 block: Y {}, Cb {}, Cr {}",
+			agreement.max_difference,
+			first.unwrap_or_default(),
+			by_column(0, 4),
+			by_column(1, chroma_per_block as usize),
+			by_column(2, chroma_per_block as usize),
+		))
+	}
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
@@ -227,8 +690,6 @@ pub(crate) struct ConvertWindow {
 	gpu_ns: u64,
 	gpu_samples: u64,
 	late_layer_frames: u64,
-	/// Frames dropped because they carried an overlay this converter cannot draw.
-	pub overlay_drops: u64,
 }
 
 impl ConvertWindow {
@@ -241,18 +702,16 @@ impl ConvertWindow {
 		self.late_layer_frames += u64::from(layered);
 	}
 
-	pub(crate) fn maybe_log(&mut self, async_compute: Option<bool>) {
+	pub(crate) fn maybe_log(&mut self, async_compute: bool) {
 		let started = *self.started.get_or_insert_with(std::time::Instant::now);
 		if started.elapsed() < std::time::Duration::from_secs(5) {
 			return;
 		}
 		tracing::info!(
-			packed_converter = async_compute.is_some(),
-			async_compute = async_compute.unwrap_or(false),
+			async_compute,
 			converted_frames = self.frames,
 			convert_gpu_us = (self.gpu_samples != 0).then(|| self.gpu_ns as f64 / self.gpu_samples as f64 / 1e3),
 			late_layer_frames = self.late_layer_frames,
-			overlay_drops = self.overlay_drops,
 			"Video conversion summary"
 		);
 		*self = Self {
@@ -268,16 +727,34 @@ pub(crate) struct ConvertOutcome {
 	pub gpu_ns: Option<u64>,
 }
 
+/// What last wrote the output buffer before a copy is recorded.
+#[derive(Clone, Copy)]
+enum BufferWriter {
+	/// The dispatch earlier in the same command buffer.
+	Dispatch,
+	/// A conversion whose submission already completed (static recovery).
+	Completed,
+}
+
+/// The sampled source of one conversion.
+struct SourceBinding {
+	image: vk::Image,
+	view: vk::ImageView,
+	extent: (u32, u32),
+	/// First use of an imported (EXCLUSIVE, external) image: acquire it.
+	first_use: bool,
+}
+
 pub(crate) struct InputConverter {
 	context: VideoContext,
 	queue: vk::Queue,
 	queue_family: u32,
 	/// Whether conversion runs on a dedicated compute family.
 	pub(crate) async_compute: bool,
+	/// Frame (logical) extent.
 	width: u32,
 	height: u32,
-	output_format: OutputFormat,
-	output_format_code: u32,
+	layout: Layout,
 	color_space: ColorSpace,
 	full_range: bool,
 	sdr_white_nits: f32,
@@ -289,6 +766,8 @@ pub(crate) struct InputConverter {
 	descriptor_set: vk::DescriptorSet,
 	output_buffer: vk::Buffer,
 	output_memory: vk::DeviceMemory,
+	/// Host mapping of `output_memory` for self-check converters, else null.
+	readback: *const u8,
 	/// Whether `output_buffer` holds a completed conversion (false from the
 	/// start of a conversion until it succeeds).
 	output_valid: bool,
@@ -306,20 +785,78 @@ pub(crate) struct InputConverter {
 }
 
 impl InputConverter {
+	/// Create a converter for `frame`-sized captures that writes `extent`
+	/// (see [`conversion_extent`]) into the encoder input image.
+	///
+	/// Before returning, a small converter with the same queue and output
+	/// format converts a fixed pattern with partial blocks and edge padding
+	/// and its output is compared with [`reference`]; a mismatch is returned
+	/// as an error that locates the defect, since every frame would be
+	/// corrupted the same way.
 	pub(crate) fn new(
 		context: VideoContext,
 		mode: ConversionQueueMode,
-		width: u32,
-		height: u32,
+		frame: (u32, u32),
+		extent: (u32, u32),
 		output_format: OutputFormat,
 		color_space: ColorSpace,
 		full_range: bool,
 	) -> Result<Self, String> {
-		if !supports_extent(width, height) {
-			return Err(format!("{width}x{height} is not representable by the packed converter"));
+		let converter = Self::create(
+			context.clone(),
+			mode,
+			frame,
+			extent,
+			output_format,
+			color_space,
+			full_range,
+			false,
+		)?;
+		self_check(&context, mode, output_format)
+			.map_err(|e| format!("{output_format:?} converter self-check failed on this GPU: {e}"))?;
+		Ok(converter)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn create(
+		context: VideoContext,
+		mode: ConversionQueueMode,
+		(width, height): (u32, u32),
+		extent: (u32, u32),
+		output_format: OutputFormat,
+		color_space: ColorSpace,
+		full_range: bool,
+		readback: bool,
+	) -> Result<Self, String> {
+		if width == 0 || height == 0 || extent.0 < width || extent.1 < height {
+			return Err(format!(
+				"conversion extent {}x{} does not cover the {width}x{height} frame",
+				extent.0, extent.1
+			));
 		}
-		let output_format_code =
-			output_format_code(output_format).ok_or_else(|| format!("unsupported output format {output_format:?}"))?;
+		let layout = Layout::new(output_format, extent)?;
+		let limits = context.device_properties().limits;
+		if layout.size > u64::from(limits.max_storage_buffer_range) {
+			return Err(format!(
+				"{output_format:?} {}x{} needs a {} byte storage buffer; this GPU addresses at most {}",
+				extent.0, extent.1, layout.size, limits.max_storage_buffer_range
+			));
+		}
+		let groups = (
+			layout.blocks.0.div_ceil(GROUP_SIZE),
+			layout.blocks.1.div_ceil(GROUP_SIZE),
+		);
+		if groups.0 > limits.max_compute_work_group_count[0] || groups.1 > limits.max_compute_work_group_count[1] {
+			return Err(format!(
+				"{}x{} needs {}x{} workgroups; this GPU dispatches at most {}x{}",
+				extent.0,
+				extent.1,
+				groups.0,
+				groups.1,
+				limits.max_compute_work_group_count[0],
+				limits.max_compute_work_group_count[1]
+			));
+		}
 		// SAFETY: plain physical-device property query.
 		let families = unsafe {
 			context
@@ -333,7 +870,7 @@ impl InputConverter {
 					&& !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
 			});
 		let use_dedicated = dedicated_compute && mode != ConversionQueueMode::Graphics;
-		if mode == ConversionQueueMode::Compute && !dedicated_compute {
+		if mode == ConversionQueueMode::Compute && !dedicated_compute && !readback {
 			tracing::warn!("No dedicated compute queue family is available; converting on the graphics family");
 		}
 		// The encoder input image is shared CONCURRENTLY by Pixelforge between
@@ -353,8 +890,7 @@ impl InputConverter {
 			async_compute: use_dedicated,
 			width,
 			height,
-			output_format,
-			output_format_code,
+			layout,
 			color_space,
 			full_range,
 			sdr_white_nits: 203.0,
@@ -365,19 +901,20 @@ impl InputConverter {
 			descriptor_pool: vk::DescriptorPool::null(),
 			descriptor_set: vk::DescriptorSet::null(),
 			output_buffer: vk::Buffer::null(),
-			output_valid: false,
 			output_memory: vk::DeviceMemory::null(),
+			readback: std::ptr::null(),
+			output_valid: false,
 			layer_textures: [OverlayTexture::EMPTY; MAX_OVERLAYS],
 			views: Vec::new(),
 			command_pool: vk::CommandPool::null(),
 			command_buffer: vk::CommandBuffer::null(),
 			fence: vk::Fence::null(),
 			query_pool: vk::QueryPool::null(),
-			timestamp_period_ns: f64::from(context.device_properties().limits.timestamp_period),
+			timestamp_period_ns: f64::from(limits.timestamp_period),
 			context,
 		};
 		// Partially created objects are released by Drop on error.
-		converter.create_resources(timestamps)?;
+		converter.create_resources(timestamps, readback)?;
 		// 1x1 placeholders keep the layer bindings valid without layers.
 		for slot in 0..MAX_OVERLAYS {
 			converter.ensure_overlay_capacity(slot, 1, 1)?;
@@ -385,7 +922,7 @@ impl InputConverter {
 		Ok(converter)
 	}
 
-	fn create_resources(&mut self, timestamps: bool) -> Result<(), String> {
+	fn create_resources(&mut self, timestamps: bool, readback: bool) -> Result<(), String> {
 		let device = self.context.device().clone();
 		let err = |what: &str| {
 			let what = what.to_string();
@@ -426,7 +963,6 @@ impl InputConverter {
 		];
 		let code = ash::util::read_spv(&mut std::io::Cursor::new(CONVERT_SPIRV))
 			.map_err(|e| format!("invalid converter SPIR-V: {e}"))?;
-		let size = output_size(self.output_format, self.width, self.height);
 
 		// SAFETY: every handle below is created on this converter's device and
 		// stored immediately so Drop destroys it on any later error.
@@ -490,18 +1026,30 @@ impl InputConverter {
 			self.output_buffer = device
 				.create_buffer(
 					&vk::BufferCreateInfo::default()
-						.size(size)
+						.size(self.layout.size)
 						.usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
 						.sharing_mode(vk::SharingMode::EXCLUSIVE),
 					None,
 				)
 				.map_err(err("output buffer"))?;
 			let requirements = device.get_buffer_memory_requirements(self.output_buffer);
-			let memory_type = find_memory_type(
-				&self.context,
-				requirements.memory_type_bits,
-				vk::MemoryPropertyFlags::DEVICE_LOCAL,
-			)?;
+			let memory_type = if readback {
+				// Host-cached system memory: the CPU reads every sample back, which
+				// is very slow from write-combined device memory.
+				let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+				find_memory_type(
+					&self.context,
+					requirements.memory_type_bits,
+					host | vk::MemoryPropertyFlags::HOST_CACHED,
+				)
+				.or_else(|_| find_memory_type(&self.context, requirements.memory_type_bits, host))?
+			} else {
+				find_memory_type(
+					&self.context,
+					requirements.memory_type_bits,
+					vk::MemoryPropertyFlags::DEVICE_LOCAL,
+				)?
+			};
 			self.output_memory = device
 				.allocate_memory(
 					&vk::MemoryAllocateInfo::default()
@@ -513,6 +1061,12 @@ impl InputConverter {
 			device
 				.bind_buffer_memory(self.output_buffer, self.output_memory, 0)
 				.map_err(err("bind output memory"))?;
+			if readback {
+				self.readback = device
+					.map_memory(self.output_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+					.map_err(err("map output memory"))?
+					.cast();
+			}
 			let buffer_info = vk::DescriptorBufferInfo::default()
 				.buffer(self.output_buffer)
 				.offset(0)
@@ -557,6 +1111,11 @@ impl InputConverter {
 			}
 		}
 		Ok(())
+	}
+
+	/// The conversion buffer's plane layout.
+	pub(crate) fn layout(&self) -> &Layout {
+		&self.layout
 	}
 
 	pub(crate) fn set_color(&mut self, color_space: ColorSpace, full_range: bool, sdr_white_nits: f32) {
@@ -783,28 +1342,57 @@ impl InputConverter {
 
 	/// Convert `source` into `target`, the encoder's input image, compositing
 	/// `layers` bottom to top, and wait for completion. On success no GPU work
-	/// reads the source or any imported layer any more. `target` is left in
-	/// VIDEO_ENCODE_SRC layout.
+	/// reads the source or any imported layer any more, and `target` is back
+	/// in its layout.
 	pub(crate) fn convert(
 		&mut self,
 		source: &Arc<CachedImport>,
 		source_format: vk::Format,
 		first_use: bool,
 		layers: &Layers<'_>,
-		target: vk::Image,
+		target: Target,
 	) -> Result<ConvertOutcome, vk::Result> {
 		self.output_valid = false;
-		let source_view = self
+		let view = self
 			.source_view(source, source_format)
 			.map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+		let binding = SourceBinding {
+			image: source.image(),
+			view,
+			extent: source.extent(),
+			first_use,
+		};
+		let outcome = self.dispatch(&binding, layers, Some(target))?;
+		self.output_valid = true;
+		Ok(outcome)
+	}
+
+	/// Record, submit and wait for one conversion; copy the result into
+	/// `target` when given, else make it host-visible (self-check).
+	fn dispatch(
+		&mut self,
+		source: &SourceBinding,
+		layers: &Layers<'_>,
+		target: Option<Target>,
+	) -> Result<ConvertOutcome, vk::Result> {
+		let layout = self.layout;
 		let mut push = PushConstants {
 			width: self.width,
 			height: self.height,
-			output_format: self.output_format_code,
+			// A source smaller than the frame (a capture that raced an extent
+			// change) is edge-extended rather than read out of bounds.
+			source_max_x: source.extent.0.min(self.width).max(1) - 1,
+			source_max_y: source.extent.1.min(self.height).max(1) - 1,
+			output_format: layout.info.code,
 			color_space: color_space_code(self.color_space),
 			full_range: u32::from(self.full_range),
 			sdr_white_nits: self.sdr_white_nits,
-			_padding: [0; 2],
+			luma_pitch: layout.luma_pitch,
+			chroma_offset: layout.chroma_offset,
+			chroma_pitch: layout.chroma_pitch,
+			blocks_x: layout.blocks.0,
+			blocks_y: layout.blocks.1,
+			_padding: [0; 3],
 			layer_rect: [[0; 4]; MAX_OVERLAYS],
 			layer_opacity: [0.0; MAX_OVERLAYS],
 			layer_opaque: [0; MAX_OVERLAYS],
@@ -820,7 +1408,10 @@ impl InputConverter {
 				layer_views[slot] = self.layer_textures[slot].views[0];
 				continue;
 			};
-			push.layer_rect[slot] = [layer.x, layer.y, layer.width as i32, layer.height as i32];
+			let (Ok(width), Ok(height)) = (i32::try_from(layer.width), i32::try_from(layer.height)) else {
+				return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+			};
+			push.layer_rect[slot] = [layer.x, layer.y, width, height];
 			push.layer_opacity[slot] = layer.opacity;
 			match &layer.input {
 				LayerInput::Pixels(image) => {
@@ -846,7 +1437,7 @@ impl InputConverter {
 		}
 		let device = self.context.device().clone();
 		let cmd = self.command_buffer;
-		let source_image = source.image();
+		let source_image = source.image;
 
 		// SAFETY: all handles belong to this device; the command buffer is not
 		// pending (the previous submission was waited for); descriptor updates
@@ -867,7 +1458,7 @@ impl InputConverter {
 				}
 			};
 			let image_infos = [
-				image_info(source_view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+				image_info(source.view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
 				image_info(layer_views[0], layer_layout(0)),
 				image_info(layer_views[1], layer_layout(1)),
 			];
@@ -890,10 +1481,10 @@ impl InputConverter {
 				device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
 			}
 
-			// Same ownership protocol as Pixelforge's converter: the first use of
-			// an imported (EXCLUSIVE) DMA-BUF acquires it from the external
-			// owner; later uses start from the GENERAL layout left below. Imported
-			// layers are client DMA-BUFs and follow the same protocol.
+			// The first use of an imported (EXCLUSIVE) DMA-BUF acquires it from
+			// the external owner; later uses start from the GENERAL layout left
+			// below. Imported layers are client DMA-BUFs and follow the same
+			// protocol.
 			let acquire = |image: vk::Image, first_use: bool| {
 				vk::ImageMemoryBarrier::default()
 					.old_layout(if first_use {
@@ -934,7 +1525,7 @@ impl InputConverter {
 					barrier.old_layout(vk::ImageLayout::GENERAL)
 				}
 			};
-			let mut acquires = [acquire(source_image, first_use); 1 + MAX_OVERLAYS];
+			let mut acquires = [acquire(source_image, source.first_use); 1 + MAX_OVERLAYS];
 			let mut acquire_count = 1;
 			for (image, layer_first_use) in imported.iter().flatten() {
 				acquires[acquire_count] = layer_barrier(*image, *layer_first_use);
@@ -1059,98 +1650,64 @@ impl InputConverter {
 					std::mem::size_of::<PushConstants>(),
 				),
 			);
+			// The previous conversion's copy (TRANSFER_READ of this buffer)
+			// completed before its fence; no barrier is needed before these
+			// writes.
 			device.cmd_dispatch(
 				cmd,
-				self.width.div_ceil(GROUP_WIDTH),
-				self.height.div_ceil(GROUP_HEIGHT),
+				layout.blocks.0.div_ceil(GROUP_SIZE),
+				layout.blocks.1.div_ceil(GROUP_SIZE),
 				1,
 			);
 
-			// Shader writes -> copy; encoder input -> TRANSFER_DST. The previous
-			// encode that read this slot completed before Pixelforge returned it.
-			let to_transfer = [vk::ImageMemoryBarrier::default()
-				.src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-				.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-				.old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-				.new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+			match target {
+				Some(target) => self.record_copy(cmd, BufferWriter::Dispatch, target),
+				None => {
+					let to_host = [vk::BufferMemoryBarrier::default()
+						.src_access_mask(vk::AccessFlags::SHADER_WRITE)
+						.dst_access_mask(vk::AccessFlags::HOST_READ)
+						.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+						.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+						.buffer(self.output_buffer)
+						.size(vk::WHOLE_SIZE)];
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::COMPUTE_SHADER,
+						vk::PipelineStageFlags::HOST,
+						vk::DependencyFlags::empty(),
+						&[],
+						&to_host,
+						&[],
+					);
+				},
+			}
+			// Sampled images return to GENERAL for their next use; imported
+			// layers already are in GENERAL.
+			let release = [vk::ImageMemoryBarrier::default()
+				.old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+				.new_layout(vk::ImageLayout::GENERAL)
 				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
 				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.image(target)
-				.subresource_range(color_range())];
-			let buffer_barrier = [vk::BufferMemoryBarrier::default()
-				.src_access_mask(vk::AccessFlags::SHADER_WRITE)
-				.dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.buffer(self.output_buffer)
-				.size(vk::WHOLE_SIZE)];
+				.image(source_image)
+				.subresource_range(color_range())
+				.src_access_mask(vk::AccessFlags::SHADER_READ)
+				.dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)];
 			device.cmd_pipeline_barrier(
 				cmd,
 				vk::PipelineStageFlags::COMPUTE_SHADER,
-				vk::PipelineStageFlags::TRANSFER,
-				vk::DependencyFlags::empty(),
-				&[],
-				&buffer_barrier,
-				&to_transfer,
-			);
-			device.cmd_copy_buffer_to_image(
-				cmd,
-				self.output_buffer,
-				target,
-				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-				&copy_regions(self.output_format, self.width, self.height),
-			);
-			// Sampled images return to GENERAL for their next use.
-			let release = |image: vk::Image| {
-				vk::ImageMemoryBarrier::default()
-					.old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-					.new_layout(vk::ImageLayout::GENERAL)
-					.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.image(image)
-					.subresource_range(color_range())
-					.src_access_mask(vk::AccessFlags::SHADER_READ)
-					.dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-			};
-			let post = [
-				vk::ImageMemoryBarrier::default()
-					.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-					.dst_access_mask(vk::AccessFlags::empty())
-					.old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-					.new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-					.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.image(target)
-					.subresource_range(color_range()),
-				release(source_image),
-			];
-			// Imported layers already are in GENERAL.
-			let post_count = 2;
-			device.cmd_pipeline_barrier(
-				cmd,
-				vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
 				vk::PipelineStageFlags::BOTTOM_OF_PIPE,
 				vk::DependencyFlags::empty(),
 				&[],
 				&[],
-				&post[..post_count],
+				&release,
 			);
 			if self.query_pool != vk::QueryPool::null() {
 				device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
 			}
 			device.end_command_buffer(cmd)?;
-
-			let command_buffers = [cmd];
-			device.queue_submit(
-				self.queue,
-				&[vk::SubmitInfo::default().command_buffers(&command_buffers)],
-				self.fence,
-			)?;
 			// Encode submission needs the converted input; Pixelforge's encode
 			// API takes no wait semaphore, so completion is established here.
-			let waited = device.wait_for_fences(&[self.fence], true, u64::MAX);
-			device.reset_fences(&[self.fence])?;
-			waited?;
+			self.submit_and_wait(cmd)?;
 		}
 
 		let gpu_ns = (self.query_pool != vk::QueryPool::null())
@@ -1162,118 +1719,67 @@ impl InputConverter {
 					.map(|()| (stamps[1].saturating_sub(stamps[0]) as f64 * self.timestamp_period_ns) as u64)
 			})
 			.flatten();
-		self.output_valid = true;
 		Ok(ConvertOutcome { gpu_ns })
 	}
 
-	/// Copy the last completed conversion into `target` (an encoder input
-	/// slot) without converting again. `Ok(false)` if there is none.
-	pub(crate) fn copy_last_output(&self, target: vk::Image) -> Result<bool, vk::Result> {
-		if !self.output_valid {
-			return Ok(false);
-		}
-		copy_output_to_input(
-			&self.context,
-			self.queue,
-			self.queue_family,
-			self.output_buffer,
-			self.output_format,
-			self.width,
-			self.height,
-			target,
-		)?;
-		Ok(true)
-	}
-}
-
-/// Copy a converter's packed output buffer, which still holds its last
-/// completed conversion, into an encoder input image and wait for it.
-///
-/// Static-scene recovery needs this: the encoder rotates its input slots, so
-/// the current slot never holds the latest frame (review 2026-10-05 BUG-002).
-/// Runs on `queue`, which must be of the family that wrote `buffer`; the target
-/// is left in `VIDEO_ENCODE_SRC_KHR` like after a conversion.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn copy_output_to_input(
-	context: &VideoContext,
-	queue: vk::Queue,
-	queue_family: u32,
-	buffer: vk::Buffer,
-	format: OutputFormat,
-	width: u32,
-	height: u32,
-	target: vk::Image,
-) -> Result<(), vk::Result> {
-	let device = context.device();
-	// SAFETY: every object is created and destroyed here; the submission is
-	// waited for before they are destroyed. The buffer's writes completed under
-	// its converter's fence, and the target slot is free (Pixelforge returns it
-	// from `input_image` only once its previous encode completed).
-	unsafe {
-		let pool = device.create_command_pool(
-			&vk::CommandPoolCreateInfo::default()
-				.queue_family_index(queue_family)
-				.flags(vk::CommandPoolCreateFlags::TRANSIENT),
-			None,
-		)?;
-		let fence = match device.create_fence(&vk::FenceCreateInfo::default(), None) {
-			Ok(fence) => fence,
-			Err(e) => {
-				device.destroy_command_pool(pool, None);
-				return Err(e);
-			},
+	/// Record the copy of the output buffer into `target` after `writer`
+	/// (the dispatch in this command buffer, or a completed earlier one)
+	/// wrote the buffer, leaving `target` in its layout.
+	///
+	/// # Safety
+	///
+	/// `cmd` is recording on this converter's queue family.
+	unsafe fn record_copy(&self, cmd: vk::CommandBuffer, writer: BufferWriter, target: Target) {
+		let (src_stage, src_access) = match writer {
+			BufferWriter::Dispatch => (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE),
+			BufferWriter::Completed => (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_WRITE),
 		};
-		let result = (|| {
-			let cmd = device.allocate_command_buffers(
-				&vk::CommandBufferAllocateInfo::default()
-					.command_pool(pool)
-					.command_buffer_count(1),
-			)?[0];
-			device.begin_command_buffer(
-				cmd,
-				&vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-			)?;
-			let buffer_barrier = [vk::BufferMemoryBarrier::default()
-				.src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-				.dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+		let device = self.context.device();
+		// Buffer writes -> copy; target -> TRANSFER_DST. The target's previous
+		// reader (an encode) completed before Pixelforge returned the slot.
+		let buffer_barrier = [vk::BufferMemoryBarrier::default()
+			.src_access_mask(src_access)
+			.dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+			.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+			.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+			.buffer(self.output_buffer)
+			.size(vk::WHOLE_SIZE)];
+		let image_barrier = |old, new, src, dst| {
+			[vk::ImageMemoryBarrier::default()
+				.src_access_mask(src)
+				.dst_access_mask(dst)
+				.old_layout(old)
+				.new_layout(new)
 				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
 				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.buffer(buffer)
-				.size(vk::WHOLE_SIZE)];
-			let to_transfer = [vk::ImageMemoryBarrier::default()
-				.src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-				.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-				.old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-				.new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.image(target)
-				.subresource_range(color_range())];
+				.image(target.image)
+				.subresource_range(color_range())]
+		};
+		// SAFETY: guaranteed by the caller.
+		unsafe {
 			device.cmd_pipeline_barrier(
 				cmd,
-				vk::PipelineStageFlags::ALL_COMMANDS,
+				src_stage,
 				vk::PipelineStageFlags::TRANSFER,
 				vk::DependencyFlags::empty(),
 				&[],
 				&buffer_barrier,
-				&to_transfer,
+				&image_barrier(
+					target.layout,
+					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+					vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+					vk::AccessFlags::TRANSFER_WRITE,
+				),
 			);
 			device.cmd_copy_buffer_to_image(
 				cmd,
-				buffer,
-				target,
+				self.output_buffer,
+				target.image,
 				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-				&copy_regions(format, width, height),
+				&self.layout.copy_regions(),
 			);
-			let to_encode = [vk::ImageMemoryBarrier::default()
-				.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-				.dst_access_mask(vk::AccessFlags::empty())
-				.old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-				.new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.image(target)
-				.subresource_range(color_range())];
+			// The encode that reads the target is submitted after the host
+			// observed this submission's fence.
 			device.cmd_pipeline_barrier(
 				cmd,
 				vk::PipelineStageFlags::TRANSFER,
@@ -1281,25 +1787,368 @@ pub(crate) fn copy_output_to_input(
 				vk::DependencyFlags::empty(),
 				&[],
 				&[],
-				&to_encode,
+				&image_barrier(
+					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+					target.layout,
+					vk::AccessFlags::TRANSFER_WRITE,
+					vk::AccessFlags::empty(),
+				),
 			);
-			device.end_command_buffer(cmd)?;
-			let command_buffers = [cmd];
-			device.queue_submit(
-				queue,
-				&[vk::SubmitInfo::default().command_buffers(&command_buffers)],
-				fence,
-			)?;
-			device.wait_for_fences(&[fence], true, u64::MAX)
-		})();
-		if result.is_err() {
-			// A failed wait leaves the submission state unknown; idle the queue
-			// before destroying what it may still reference.
-			let _ = device.queue_wait_idle(queue);
 		}
-		device.destroy_fence(fence, None);
-		device.destroy_command_pool(pool, None);
-		result
+	}
+
+	/// Submit `cmd` to this converter's queue and wait for it.
+	///
+	/// # Safety
+	///
+	/// `cmd` was recorded from this converter's pool and is executable.
+	unsafe fn submit_and_wait(&self, cmd: vk::CommandBuffer) -> Result<(), vk::Result> {
+		let device = self.context.device();
+		let command_buffers = [cmd];
+		// SAFETY: guaranteed by the caller; the fence is unsignaled (it is reset
+		// after every wait).
+		unsafe {
+			device.queue_submit(
+				self.queue,
+				&[vk::SubmitInfo::default().command_buffers(&command_buffers)],
+				self.fence,
+			)?;
+			let waited = device.wait_for_fences(&[self.fence], true, u64::MAX);
+			device.reset_fences(&[self.fence])?;
+			waited
+		}
+	}
+
+	/// Copy the last completed conversion into `target` (an encoder input
+	/// slot) without converting again. `Ok(false)` if there is none.
+	///
+	/// Static-scene recovery needs this: the encoder rotates its input slots,
+	/// so the current slot never holds the latest frame (review 2026-10-05
+	/// BUG-002).
+	pub(crate) fn copy_last_output(&self, target: vk::Image) -> Result<bool, vk::Result> {
+		if !self.output_valid {
+			return Ok(false);
+		}
+		let device = self.context.device();
+		let cmd = self.command_buffer;
+		// SAFETY: the command buffer is not pending (every submission is waited
+		// for); the buffer's writes completed under the conversion's fence.
+		unsafe {
+			device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+			device.begin_command_buffer(
+				cmd,
+				&vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+			)?;
+			self.record_copy(cmd, BufferWriter::Completed, Target::encoder_input(target));
+			device.end_command_buffer(cmd)?;
+			if let Err(e) = self.submit_and_wait(cmd) {
+				// A failed wait leaves the submission state unknown; idle the
+				// queue before the command buffer is reused.
+				let _ = device.queue_wait_idle(self.queue);
+				return Err(e);
+			}
+		}
+		Ok(true)
+	}
+
+	/// Host view of the last conversion of a self-check converter.
+	fn readback(&self) -> &[u8] {
+		assert!(!self.readback.is_null(), "not a readback converter");
+		// SAFETY: the mapping covers the whole allocation (at least `size`
+		// bytes) for the converter's lifetime; the last dispatch made its
+		// writes host-visible and completed.
+		unsafe { std::slice::from_raw_parts(self.readback, self.layout.size as usize) }
+	}
+}
+
+/// Frame and conversion extents of the self-check: one partial block in each
+/// direction, with edge padding in both directions for 4:2:0 and none for
+/// 4:4:4.
+const SELF_CHECK_FRAME: (u32, u32) = (9, 5);
+
+/// Self-check source pixel (RGBA8): saturated and mid colors, greys and a
+/// diagonal ramp, so neighbouring chroma samples differ and none is neutral by
+/// accident.
+fn self_check_pixel(x: u32, y: u32) -> [u8; 4] {
+	const PALETTE: [[u8; 3]; 8] = [
+		[255, 0, 0],
+		[0, 255, 0],
+		[0, 0, 255],
+		[255, 255, 0],
+		[0, 255, 255],
+		[255, 0, 255],
+		[128, 128, 128],
+		[200, 120, 40],
+	];
+	let [r, g, b] = PALETTE[((x + 3 * y) % 8) as usize];
+	let ramp = ((x * 17 + y * 29) % 64) as u8;
+	[
+		r.saturating_sub(ramp),
+		g.saturating_sub(ramp / 2),
+		b.saturating_add(ramp / 4),
+		255,
+	]
+}
+
+/// Convert the self-check pattern on `mode`'s queue and compare with
+/// [`reference`] (BT.709, limited range).
+fn self_check(context: &VideoContext, mode: ConversionQueueMode, format: OutputFormat) -> Result<(), String> {
+	let frame = SELF_CHECK_FRAME;
+	let subsampled = format_info(format).is_some_and(|info| info.subsampled);
+	let extent = if subsampled {
+		(frame.0.next_multiple_of(2), frame.1.next_multiple_of(2))
+	} else {
+		frame
+	};
+	let mut converter = InputConverter::create(
+		context.clone(),
+		mode,
+		frame,
+		extent,
+		format,
+		ColorSpace::Bt709,
+		false,
+		true,
+	)?;
+	let pixels: Vec<u8> = (0..frame.1)
+		.flat_map(|y| (0..frame.0).flat_map(move |x| self_check_pixel(x, y)))
+		.collect();
+	let source = SelfCheckSource::new(&converter, frame, &pixels)?;
+	converter
+		.dispatch(
+			&SourceBinding {
+				image: source.image,
+				view: source.view,
+				extent: frame,
+				first_use: false,
+			},
+			&[None, None],
+			None,
+		)
+		.map_err(|e| format!("conversion failed: {e}"))?;
+	let actual = converter.layout().read_planes(converter.readback())?;
+	let rgb = |x: u32, y: u32| {
+		let [r, g, b, _] = self_check_pixel(x, y);
+		[r, g, b].map(|c| f32::from(c) / 255.0)
+	};
+	let expected = reference::convert(
+		format,
+		reference::Color {
+			space: ColorSpace::Bt709,
+			full_range: false,
+			sdr_white_nits: 203.0,
+		},
+		frame,
+		extent,
+		&rgb,
+		&|_| true,
+	);
+	reference::compare(&expected, &actual, 1, &|_| true).map(|_| ())
+}
+
+/// The self-check's source image (RGBA8, GENERAL layout) and view, freed on
+/// drop. Uploaded through the converter's own queue and command buffer.
+struct SelfCheckSource {
+	context: VideoContext,
+	image: vk::Image,
+	memory: vk::DeviceMemory,
+	view: vk::ImageView,
+}
+
+impl SelfCheckSource {
+	fn new(converter: &InputConverter, (width, height): (u32, u32), pixels: &[u8]) -> Result<Self, String> {
+		let context = &converter.context;
+		let device = context.device();
+		let err = |what: &'static str| move |e: vk::Result| format!("self-check {what}: {e}");
+		let mut source = Self {
+			context: context.clone(),
+			image: vk::Image::null(),
+			memory: vk::DeviceMemory::null(),
+			view: vk::ImageView::null(),
+		};
+		// SAFETY: test objects on this device, stored immediately so Drop
+		// frees them; the upload is waited for before the staging buffer goes.
+		unsafe {
+			source.image = device
+				.create_image(
+					&vk::ImageCreateInfo::default()
+						.image_type(vk::ImageType::TYPE_2D)
+						.format(vk::Format::R8G8B8A8_UNORM)
+						.extent(vk::Extent3D {
+							width,
+							height,
+							depth: 1,
+						})
+						.mip_levels(1)
+						.array_layers(1)
+						.samples(vk::SampleCountFlags::TYPE_1)
+						.tiling(vk::ImageTiling::OPTIMAL)
+						.usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+						.sharing_mode(vk::SharingMode::EXCLUSIVE)
+						.initial_layout(vk::ImageLayout::UNDEFINED),
+					None,
+				)
+				.map_err(err("image"))?;
+			let requirements = device.get_image_memory_requirements(source.image);
+			source.memory = device
+				.allocate_memory(
+					&vk::MemoryAllocateInfo::default()
+						.allocation_size(requirements.size)
+						.memory_type_index(find_memory_type(
+							context,
+							requirements.memory_type_bits,
+							vk::MemoryPropertyFlags::DEVICE_LOCAL,
+						)?),
+					None,
+				)
+				.map_err(err("image memory"))?;
+			device
+				.bind_image_memory(source.image, source.memory, 0)
+				.map_err(err("bind image memory"))?;
+			source.view = device
+				.create_image_view(
+					&vk::ImageViewCreateInfo::default()
+						.image(source.image)
+						.view_type(vk::ImageViewType::TYPE_2D)
+						.format(vk::Format::R8G8B8A8_UNORM)
+						.subresource_range(color_range()),
+					None,
+				)
+				.map_err(err("view"))?;
+
+			let staging = device
+				.create_buffer(
+					&vk::BufferCreateInfo::default()
+						.size(pixels.len() as u64)
+						.usage(vk::BufferUsageFlags::TRANSFER_SRC)
+						.sharing_mode(vk::SharingMode::EXCLUSIVE),
+					None,
+				)
+				.map_err(err("staging buffer"))?;
+			let upload = (|| {
+				let requirements = device.get_buffer_memory_requirements(staging);
+				let memory = device
+					.allocate_memory(
+						&vk::MemoryAllocateInfo::default()
+							.allocation_size(requirements.size)
+							.memory_type_index(find_memory_type(
+								context,
+								requirements.memory_type_bits,
+								vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+							)?),
+						None,
+					)
+					.map_err(err("staging memory"))?;
+				let result = (|| {
+					device
+						.bind_buffer_memory(staging, memory, 0)
+						.map_err(err("bind staging memory"))?;
+					let mapped = device
+						.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+						.map_err(err("map staging memory"))?;
+					std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped.cast::<u8>(), pixels.len());
+					let cmd = converter.command_buffer;
+					device
+						.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+						.map_err(err("reset"))?;
+					device
+						.begin_command_buffer(
+							cmd,
+							&vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+						)
+						.map_err(err("begin"))?;
+					let barrier = |old, new, src, dst| {
+						[vk::ImageMemoryBarrier::default()
+							.old_layout(old)
+							.new_layout(new)
+							.src_access_mask(src)
+							.dst_access_mask(dst)
+							.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+							.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+							.image(source.image)
+							.subresource_range(color_range())]
+					};
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TOP_OF_PIPE,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&barrier(
+							vk::ImageLayout::UNDEFINED,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							vk::AccessFlags::empty(),
+							vk::AccessFlags::TRANSFER_WRITE,
+						),
+					);
+					device.cmd_copy_buffer_to_image(
+						cmd,
+						staging,
+						source.image,
+						vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+						&[vk::BufferImageCopy {
+							image_subresource: vk::ImageSubresourceLayers {
+								aspect_mask: vk::ImageAspectFlags::COLOR,
+								mip_level: 0,
+								base_array_layer: 0,
+								layer_count: 1,
+							},
+							image_extent: vk::Extent3D {
+								width,
+								height,
+								depth: 1,
+							},
+							..Default::default()
+						}],
+					);
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::COMPUTE_SHADER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&barrier(
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							vk::ImageLayout::GENERAL,
+							vk::AccessFlags::TRANSFER_WRITE,
+							vk::AccessFlags::SHADER_READ,
+						),
+					);
+					device.end_command_buffer(cmd).map_err(err("end"))?;
+					if let Err(e) = converter.submit_and_wait(cmd) {
+						let _ = device.queue_wait_idle(converter.queue);
+						return Err(format!("self-check upload: {e}"));
+					}
+					Ok(())
+				})();
+				device.free_memory(memory, None);
+				result
+			})();
+			device.destroy_buffer(staging, None);
+			upload?;
+		}
+		Ok(source)
+	}
+}
+
+impl Drop for SelfCheckSource {
+	fn drop(&mut self) {
+		let device = self.context.device();
+		// SAFETY: every submission that used these objects was waited for (or
+		// its queue idled) before the converter returned.
+		unsafe {
+			if self.view != vk::ImageView::null() {
+				device.destroy_image_view(self.view, None);
+			}
+			if self.image != vk::Image::null() {
+				device.destroy_image(self.image, None);
+			}
+			if self.memory != vk::DeviceMemory::null() {
+				device.free_memory(self.memory, None);
+			}
+		}
 	}
 }
 
@@ -1352,921 +2201,4 @@ impl Drop for InputConverter {
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn packed_layout_requires_word_aligned_rows() {
-		assert!(supports_extent(1920, 1080));
-		assert!(supports_extent(3840, 2160));
-		assert!(supports_extent(2880, 1920));
-		assert!(
-			!supports_extent(1366, 768),
-			"1366 bytes per NV12 row is not word aligned"
-		);
-		assert!(!supports_extent(1920, 1081));
-		assert!(!supports_extent(0, 1080));
-	}
-
-	#[test]
-	fn output_layout_matches_pixelforge() {
-		for (w, h) in [(1920u32, 1080u32), (3840, 2160), (2560, 1440)] {
-			for format in [
-				OutputFormat::NV12,
-				OutputFormat::P010,
-				OutputFormat::YUV444,
-				OutputFormat::YUV444P10,
-			] {
-				assert_eq!(output_size(format, w, h), format.output_size(w, h) as u64, "{format:?}");
-			}
-			let p = u64::from(w) * u64::from(h);
-			assert_eq!(copy_regions(OutputFormat::NV12, w, h)[1].buffer_offset, p);
-			assert_eq!(copy_regions(OutputFormat::P010, w, h)[1].buffer_offset, 2 * p);
-			assert_eq!(copy_regions(OutputFormat::YUV444, w, h)[1].buffer_offset, p);
-			assert_eq!(copy_regions(OutputFormat::YUV444P10, w, h)[1].buffer_offset, 2 * p);
-		}
-	}
-
-	/// GPU fixture comparing this converter with Pixelforge's on identical
-	/// random sources, and late cursor composition with a CPU-composited
-	/// reference. Run on a GPU host:
-	/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core packed_converter -- --ignored --nocapture`
-	#[test]
-	#[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
-	fn packed_converter_matches_pixelforge_on_gpu() {
-		assert!(
-			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
-			"set MOONSHINE_TEST_GPU=1"
-		);
-		gpu_fixture::run();
-	}
-
-	/// Pins the Pixelforge input-slot contract modelled by `FakeSlots` in the
-	/// pipeline tests: two slots, `encode` advances to the next one. A change in
-	/// the pinned encoder must fail here rather than silently change recovery.
-	/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encoder_input_slots -- --ignored`
-	#[test]
-	#[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
-	fn encoder_input_slots_rotate_on_gpu() {
-		assert!(
-			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
-			"set MOONSHINE_TEST_GPU=1"
-		);
-		gpu_fixture::slot_rotation();
-	}
-
-	/// Review 2026-10-05 BUG-002 on real hardware: encode one, two or five
-	/// distinct solid scenes, then a static-scene recovery keyframe through the
-	/// production `encode_static_recovery`, decode the stream with `ffmpeg` and
-	/// compare the recovered picture with the latest scene.
-	/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core static_recovery_decodes -- --ignored --nocapture`
-	#[test]
-	#[ignore = "needs a Vulkan Video GPU and ffmpeg: MOONSHINE_TEST_GPU=1"]
-	fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
-		assert!(
-			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
-			"set MOONSHINE_TEST_GPU=1"
-		);
-		gpu_fixture::static_recovery_decode();
-	}
-
-	#[test]
-	fn embedded_shader_is_spirv() {
-		let words = ash::util::read_spv(&mut std::io::Cursor::new(CONVERT_SPIRV)).unwrap();
-		assert_eq!(words[0], 0x0723_0203);
-	}
-}
-
-#[cfg(test)]
-mod gpu_fixture {
-	use super::*;
-	use pixelforge::{
-		Codec, ColorConverter, ColorConverterConfig, EncodeBitDepth, EncodeConfig, Encoder, InputFormat, PixelFormat,
-		VideoContextBuilder,
-	};
-
-	struct Rng(u64);
-	impl Rng {
-		fn next(&mut self) -> u32 {
-			self.0 = self
-				.0
-				.wrapping_mul(6364136223846793005)
-				.wrapping_add(1442695040888963407);
-			(self.0 >> 33) as u32
-		}
-	}
-
-	fn host_buffer(
-		context: &VideoContext,
-		size: u64,
-		usage: vk::BufferUsageFlags,
-	) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
-		let device = context.device();
-		// SAFETY: test-owned objects on a live device.
-		unsafe {
-			let buffer = device
-				.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)
-				.unwrap();
-			let req = device.get_buffer_memory_requirements(buffer);
-			let ty = find_memory_type(
-				context,
-				req.memory_type_bits,
-				vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-			)
-			.unwrap();
-			let memory = device
-				.allocate_memory(
-					&vk::MemoryAllocateInfo::default()
-						.allocation_size(req.size)
-						.memory_type_index(ty),
-					None,
-				)
-				.unwrap();
-			device.bind_buffer_memory(buffer, memory, 0).unwrap();
-			let ptr = device
-				.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-				.unwrap()
-				.cast();
-			(buffer, memory, ptr)
-		}
-	}
-
-	/// One-shot command buffer on the graphics/compute queue.
-	fn submit(context: &VideoContext, record: impl FnOnce(vk::CommandBuffer)) {
-		let device = context.device();
-		// SAFETY: test-owned objects; waits for completion before returning.
-		unsafe {
-			let pool = device
-				.create_command_pool(
-					&vk::CommandPoolCreateInfo::default().queue_family_index(context.compute_queue_family()),
-					None,
-				)
-				.unwrap();
-			let cmd = device
-				.allocate_command_buffers(
-					&vk::CommandBufferAllocateInfo::default()
-						.command_pool(pool)
-						.command_buffer_count(1),
-				)
-				.unwrap()[0];
-			device
-				.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
-				.unwrap();
-			record(cmd);
-			device.end_command_buffer(cmd).unwrap();
-			let cmds = [cmd];
-			device
-				.queue_submit(
-					context.compute_queue(),
-					&[vk::SubmitInfo::default().command_buffers(&cmds)],
-					vk::Fence::null(),
-				)
-				.unwrap();
-			device.queue_wait_idle(context.compute_queue()).unwrap();
-			device.destroy_command_pool(pool, None);
-		}
-	}
-
-	/// A sampled source image in GENERAL layout holding `bytes`.
-	fn source_image(context: &VideoContext, w: u32, h: u32, format: vk::Format, bytes: &[u8]) -> Arc<CachedImport> {
-		let device = context.device();
-		// SAFETY: test-owned objects on a live device.
-		let (image, memory) = unsafe {
-			let image = device
-				.create_image(
-					&vk::ImageCreateInfo::default()
-						.image_type(vk::ImageType::TYPE_2D)
-						.format(format)
-						.extent(vk::Extent3D {
-							width: w,
-							height: h,
-							depth: 1,
-						})
-						.mip_levels(1)
-						.array_layers(1)
-						.samples(vk::SampleCountFlags::TYPE_1)
-						.tiling(vk::ImageTiling::OPTIMAL)
-						.usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-						.initial_layout(vk::ImageLayout::UNDEFINED),
-					None,
-				)
-				.unwrap();
-			let req = device.get_image_memory_requirements(image);
-			let ty = find_memory_type(context, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL).unwrap();
-			let memory = device
-				.allocate_memory(
-					&vk::MemoryAllocateInfo::default()
-						.allocation_size(req.size)
-						.memory_type_index(ty),
-					None,
-				)
-				.unwrap();
-			device.bind_image_memory(image, memory, 0).unwrap();
-			(image, memory)
-		};
-		let (staging, staging_memory, ptr) =
-			host_buffer(context, bytes.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC);
-		// SAFETY: the mapping holds bytes.len() bytes.
-		unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
-		submit(context, |cmd| unsafe {
-			let barrier = |old, new| {
-				vk::ImageMemoryBarrier::default()
-					.old_layout(old)
-					.new_layout(new)
-					.src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-					.dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-					.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.image(image)
-					.subresource_range(color_range())
-			};
-			device.cmd_pipeline_barrier(
-				cmd,
-				vk::PipelineStageFlags::ALL_COMMANDS,
-				vk::PipelineStageFlags::ALL_COMMANDS,
-				vk::DependencyFlags::empty(),
-				&[],
-				&[],
-				&[barrier(
-					vk::ImageLayout::UNDEFINED,
-					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-				)],
-			);
-			device.cmd_copy_buffer_to_image(
-				cmd,
-				staging,
-				image,
-				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-				&[vk::BufferImageCopy {
-					image_subresource: vk::ImageSubresourceLayers {
-						aspect_mask: vk::ImageAspectFlags::COLOR,
-						mip_level: 0,
-						base_array_layer: 0,
-						layer_count: 1,
-					},
-					image_extent: vk::Extent3D {
-						width: w,
-						height: h,
-						depth: 1,
-					},
-					..Default::default()
-				}],
-			);
-			device.cmd_pipeline_barrier(
-				cmd,
-				vk::PipelineStageFlags::ALL_COMMANDS,
-				vk::PipelineStageFlags::ALL_COMMANDS,
-				vk::DependencyFlags::empty(),
-				&[],
-				&[],
-				&[barrier(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL)],
-			);
-		});
-		// SAFETY: the upload completed.
-		unsafe {
-			device.destroy_buffer(staging, None);
-			device.free_memory(staging_memory, None);
-		}
-		Arc::new(CachedImport::for_test(context.clone(), image, memory, w, h, format))
-	}
-
-	fn read_buffer(context: &VideoContext, buffer: vk::Buffer, size: u64) -> Vec<u8> {
-		let (dst, memory, ptr) = host_buffer(context, size, vk::BufferUsageFlags::TRANSFER_DST);
-		submit(context, |cmd| unsafe {
-			context.device().cmd_copy_buffer(
-				cmd,
-				buffer,
-				dst,
-				&[vk::BufferCopy {
-					src_offset: 0,
-					dst_offset: 0,
-					size,
-				}],
-			);
-		});
-		// SAFETY: the copy completed; the mapping holds `size` bytes.
-		let out = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
-		unsafe {
-			context.device().destroy_buffer(dst, None);
-			context.device().free_memory(memory, None);
-		}
-		out
-	}
-
-	/// Pixelforge 0.9.1's 8-bit 4:4:4 path computes the V byte offset from the
-	/// U byte index, so it ORs V into the U byte and leaves every V byte zero.
-	/// Confirm exactly that signature against the correct packed output, then
-	/// compare the rest normally (returns the reference with the defect undone).
-	fn pixelforge_yuv444_defect(reference: &[u8], packed: &[u8], pixels: usize, failures: &mut Vec<String>) -> Vec<u8> {
-		let mut repaired = reference.to_vec();
-		let mut mismatches = 0usize;
-		for p in 0..pixels {
-			let (u, v) = (pixels + 2 * p, pixels + 2 * p + 1);
-			if reference[v] != 0 || reference[u] != packed[u] | packed[v] {
-				mismatches += 1;
-			}
-			repaired[u] = packed[u];
-			repaired[v] = packed[v];
-		}
-		eprintln!("YUV444 reference defect signature mismatches: {mismatches}");
-		if mismatches != 0 {
-			failures.push(format!(
-				"YUV444 reference differs beyond the known defect at {mismatches} pixels"
-			));
-		}
-		repaired
-	}
-
-	/// (differing bytes, max absolute difference per sample).
-	fn compare(a: &[u8], b: &[u8], ten_bit: bool) -> (usize, u32) {
-		if ten_bit {
-			let words = |v: &[u8]| {
-				v.as_chunks::<2>()
-					.0
-					.iter()
-					.map(|c| u16::from_le_bytes(*c) >> 6)
-					.collect::<Vec<_>>()
-			};
-			let (a, b) = (words(a), words(b));
-			let mut diff = 0;
-			let mut max = 0;
-			for (x, y) in a.iter().zip(&b) {
-				if x != y {
-					diff += 1;
-					max = max.max(u32::from(x.abs_diff(*y)));
-				}
-			}
-			(diff, max)
-		} else {
-			let mut diff = 0;
-			let mut max = 0;
-			for (x, y) in a.iter().zip(b) {
-				if x != y {
-					diff += 1;
-					max = max.max(u32::from(x.abs_diff(*y)));
-				}
-			}
-			(diff, max)
-		}
-	}
-
-	fn half(v: f32) -> u16 {
-		// Enough for [0, 4): round-to-nearest-even is not needed for a fixture.
-		let bits = v.to_bits();
-		let sign = (bits >> 16) & 0x8000;
-		let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-		if v == 0.0 || exp <= 0 {
-			return sign as u16;
-		}
-		(sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16
-	}
-
-	fn random_source(rng: &mut Rng, format: vk::Format, w: u32, h: u32) -> Vec<u8> {
-		let n = (w * h) as usize;
-		match format {
-			vk::Format::R16G16B16A16_SFLOAT => {
-				let mut out = Vec::with_capacity(n * 8);
-				for _ in 0..n {
-					for c in 0..4 {
-						// scRGB-like range, including highlights above 1.0.
-						let v = if c == 3 {
-							1.0
-						} else {
-							(rng.next() % 4096) as f32 / 1024.0
-						};
-						out.extend_from_slice(&half(v).to_le_bytes());
-					}
-				}
-				out
-			},
-			_ => (0..n * 4).map(|_| rng.next() as u8).collect(),
-		}
-	}
-
-	/// A non-video planar image for formats the encoder cannot use here.
-	/// Dropping it frees the image.
-	struct PlainTarget(vk::Image, vk::DeviceMemory, VideoContext);
-	impl Drop for PlainTarget {
-		fn drop(&mut self) {
-			// SAFETY: every conversion targeting it completed.
-			unsafe {
-				self.2.device().destroy_image(self.0, None);
-				self.2.device().free_memory(self.1, None);
-			}
-		}
-	}
-	fn plain_planar_target(context: &VideoContext, w: u32, h: u32, format: vk::Format) -> PlainTarget {
-		let device = context.device();
-		// SAFETY: test-owned objects. Converters transition it from the video
-		// encode layout like an encoder input, which RADV accepts for fixtures.
-		unsafe {
-			let image = device
-				.create_image(
-					&vk::ImageCreateInfo::default()
-						.image_type(vk::ImageType::TYPE_2D)
-						.format(format)
-						.extent(vk::Extent3D {
-							width: w,
-							height: h,
-							depth: 1,
-						})
-						.mip_levels(1)
-						.array_layers(1)
-						.samples(vk::SampleCountFlags::TYPE_1)
-						.tiling(vk::ImageTiling::OPTIMAL)
-						.usage(vk::ImageUsageFlags::TRANSFER_DST)
-						.initial_layout(vk::ImageLayout::UNDEFINED),
-					None,
-				)
-				.unwrap();
-			let req = device.get_image_memory_requirements(image);
-			let ty = find_memory_type(context, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL).unwrap();
-			let memory = device
-				.allocate_memory(
-					&vk::MemoryAllocateInfo::default()
-						.allocation_size(req.size)
-						.memory_type_index(ty),
-					None,
-				)
-				.unwrap();
-			device.bind_image_memory(image, memory, 0).unwrap();
-			PlainTarget(image, memory, context.clone())
-		}
-	}
-
-	/// One conventional codec configuration of the recovery fixture: the
-	/// encoder, its converter output and how ffmpeg reads the raw stream.
-	#[derive(Clone, Copy, Debug)]
-	struct RecoveryCodec {
-		codec: Codec,
-		depth: EncodeBitDepth,
-		output: OutputFormat,
-		demuxer: &'static str,
-	}
-
-	const RECOVERY_CODECS: [RecoveryCodec; 4] = [
-		RecoveryCodec {
-			codec: Codec::H264,
-			depth: EncodeBitDepth::Eight,
-			output: OutputFormat::NV12,
-			demuxer: "h264",
-		},
-		RecoveryCodec {
-			codec: Codec::H265,
-			depth: EncodeBitDepth::Eight,
-			output: OutputFormat::NV12,
-			demuxer: "hevc",
-		},
-		RecoveryCodec {
-			codec: Codec::H265,
-			depth: EncodeBitDepth::Ten,
-			output: OutputFormat::P010,
-			demuxer: "hevc",
-		},
-		RecoveryCodec {
-			codec: Codec::AV1,
-			depth: EncodeBitDepth::Eight,
-			output: OutputFormat::NV12,
-			demuxer: "obu",
-		},
-	];
-
-	/// A small encoder for the slot/recovery fixtures, or `None` when the GPU
-	/// does not encode this configuration.
-	fn recovery_encoder(codec: RecoveryCodec) -> Option<(VideoContext, Encoder, (u32, u32))> {
-		let context = VideoContextBuilder::new()
-			.app_name("recovery-fixture")
-			.require_encode(codec.codec)
-			.build()
-			.ok()?;
-		let size = (256u32, 128u32);
-		let config = match codec.codec {
-			Codec::H264 => EncodeConfig::h264(size.0, size.1),
-			Codec::H265 => EncodeConfig::h265(size.0, size.1),
-			Codec::AV1 => EncodeConfig::av1(size.0, size.1),
-		}
-		.with_bit_depth(codec.depth);
-		let encoder = Encoder::new(context.clone(), config).ok()?;
-		Some((context, encoder, size))
-	}
-
-	fn block_on<F: std::future::Future>(future: F) -> F::Output {
-		tokio::runtime::Builder::new_current_thread()
-			.build()
-			.unwrap()
-			.block_on(future)
-	}
-
-	pub(super) fn slot_rotation() {
-		let (_context, mut encoder, _) = recovery_encoder(RECOVERY_CODECS[1]).expect("HEVC encoder");
-		let mut inputs = vec![encoder.input_image()];
-		for _ in 0..4 {
-			let image = encoder.input_image();
-			block_on(encoder.encode(image).unwrap()).unwrap();
-			inputs.push(encoder.input_image());
-		}
-		assert_ne!(inputs[0], inputs[1], "encode advances the input slot");
-		assert_eq!(inputs[0], inputs[2], "the pinned encoder has two input slots");
-		assert_eq!(inputs[1], inputs[3]);
-		assert_eq!(inputs[2], inputs[4]);
-	}
-
-	/// Decode a raw elementary stream to one 8-bit luma plane per frame.
-	fn decode_luma(stream: &[u8], demuxer: &str, (w, h): (u32, u32)) -> Vec<Vec<u8>> {
-		let path = std::env::temp_dir().join(format!("pyroshine-static-recovery-{}.{demuxer}", std::process::id()));
-		std::fs::write(&path, stream).unwrap();
-		let output = std::process::Command::new("ffmpeg")
-			.args(["-hide_banner", "-loglevel", "error", "-f", demuxer, "-i"])
-			.arg(&path)
-			.args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
-			.output();
-		let _ = std::fs::remove_file(&path);
-		let output = output.expect("ffmpeg is required for the decode check");
-		assert!(
-			output.status.success(),
-			"ffmpeg failed: {}",
-			String::from_utf8_lossy(&output.stderr)
-		);
-		output
-			.stdout
-			.chunks_exact((w * h) as usize)
-			.map(<[u8]>::to_vec)
-			.collect()
-	}
-
-	fn mean(plane: &[u8]) -> f64 {
-		plane.iter().map(|&v| f64::from(v)).sum::<f64>() / plane.len() as f64
-	}
-
-	pub(super) fn static_recovery_decode() {
-		// Distinct grey levels; each run's last level differs from every slot
-		// a stale recovery could read.
-		const LEVELS: [u8; 5] = [200, 40, 120, 160, 80];
-		let mut failures = Vec::new();
-		let mut checked = 0;
-		for (codec, preceding) in RECOVERY_CODECS
-			.into_iter()
-			.flat_map(|codec| [1usize, 2, 5].map(|preceding| (codec, preceding)))
-		{
-			let Some((context, mut encoder, (w, h))) = recovery_encoder(codec) else {
-				eprintln!("{codec:?}: not encoded by this GPU; skipped");
-				continue;
-			};
-			checked += 1;
-			let mut converter = InputConverter::new(
-				context.clone(),
-				ConversionQueueMode::Auto,
-				w,
-				h,
-				codec.output,
-				ColorSpace::Bt709,
-				true,
-			)
-			.unwrap();
-			let mut stream = Vec::new();
-			for &level in &LEVELS[..preceding] {
-				let pixels: Vec<u8> = (0..w * h).flat_map(|_| [level, level, level, 255]).collect();
-				let source = source_image(&context, w, h, vk::Format::R8G8B8A8_UNORM, &pixels);
-				// The conventional loop's per-frame step.
-				converter
-					.convert(
-						&source,
-						vk::Format::R8G8B8A8_UNORM,
-						false,
-						&[None, None],
-						encoder.input_image(),
-					)
-					.unwrap();
-				let image = encoder.input_image();
-				stream.extend(block_on(encoder.encode(image).unwrap()).unwrap().data);
-			}
-			// Static scene: two recovery keyframes in a row, no new conversion.
-			for _ in 0..2 {
-				encoder.request_idr();
-				let restore = |_: &mut Encoder, target| match converter.copy_last_output(target) {
-					Ok(true) => Ok(()),
-					Ok(false) => panic!("a conversion completed"),
-					Err(e) => Err(pixelforge::PixelForgeError::Vulkan(e)),
-				};
-				let recovery = block_on(super::super::encode_static_recovery(&mut encoder, restore).unwrap()).unwrap();
-				assert!(recovery.is_key_frame, "the recovery frame is an IDR");
-				stream.extend(recovery.data);
-			}
-			let frames = decode_luma(&stream, codec.demuxer, (w, h));
-			assert_eq!(frames.len(), preceding + 2, "decoded frame count");
-			let latest = mean(&frames[preceding - 1]);
-			for recovered in [mean(&frames[preceding]), mean(&frames[preceding + 1])] {
-				let line = format!(
-					"{:?} {:?}: after {preceding} frame(s): latest scene luma {latest:.1}, recovery luma {recovered:.1}",
-					codec.codec, codec.depth
-				);
-				eprintln!("{line}");
-				if (latest - recovered).abs() > 4.0 {
-					failures.push(line);
-				}
-			}
-		}
-		assert!(checked > 0, "no conventional codec could be checked");
-		assert!(
-			failures.is_empty(),
-			"review 2026-10-05 BUG-002: static recovery did not decode to the latest scene: {failures:#?}"
-		);
-	}
-
-	pub(super) fn run() {
-		let context = VideoContextBuilder::new()
-			.app_name("convert-fixture")
-			.require_encode(Codec::H265)
-			.build()
-			.expect("Vulkan Video context");
-		let (w, h) = (1920u32, 1080u32);
-		let mut rng = Rng(0x5eed);
-		let mut failures = Vec::new();
-		let mut checked = 0;
-		for (pixel_format, depth, output_format) in [
-			(PixelFormat::Yuv420, EncodeBitDepth::Eight, OutputFormat::NV12),
-			(PixelFormat::Yuv420, EncodeBitDepth::Ten, OutputFormat::P010),
-			(PixelFormat::Yuv444, EncodeBitDepth::Eight, OutputFormat::YUV444),
-			(PixelFormat::Yuv444, EncodeBitDepth::Ten, OutputFormat::YUV444P10),
-		] {
-			let config = EncodeConfig::h265(w, h)
-				.with_pixel_format(pixel_format)
-				.with_bit_depth(depth);
-			// Without encoder support (e.g. 4:4:4 on RADV) both converters still
-			// write their packed buffers; a plain planar image receives the copy.
-			let encoder = Encoder::new(context.clone(), config).ok();
-			let _plain_target;
-			let target = match &encoder {
-				Some(encoder) => encoder.input_image(),
-				None => {
-					eprintln!("{output_format:?}: no encoder; comparing against a plain planar target");
-					_plain_target = plain_planar_target(&context, w, h, output_format.vulkan_format());
-					_plain_target.0
-				},
-			};
-			let ten = output_format.is_10bit();
-			for (input_format, vk_format) in [
-				(InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM),
-				(InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),
-				(InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32),
-				(InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),
-			] {
-				let bytes = random_source(&mut rng, vk_format, w, h);
-				let source = source_image(&context, w, h, vk_format, &bytes);
-				for color_space in [
-					ColorSpace::Bt709,
-					ColorSpace::Bt2020,
-					ColorSpace::SrgbToBt2020Pq,
-					ColorSpace::Bt709LinearToBt2020Pq,
-				] {
-					for full_range in [false, true] {
-						let mut reference_config = ColorConverterConfig::new(w, h, input_format, output_format);
-						reference_config.color_space = color_space;
-						reference_config.full_range = full_range;
-						let mut reference = ColorConverter::new(context.clone(), reference_config).unwrap();
-						reference
-							.convert(source.image(), vk::ImageLayout::GENERAL, target)
-							.unwrap();
-						let size = output_size(output_format, w, h);
-						let expected = read_buffer(&context, reference.output_buffer(), size);
-
-						let mut packed = InputConverter::new(
-							context.clone(),
-							ConversionQueueMode::Auto,
-							w,
-							h,
-							output_format,
-							color_space,
-							full_range,
-						)
-						.unwrap();
-						packed
-							.convert(&source, vk_format, false, &[None, None], target)
-							.unwrap();
-						let actual = read_buffer(&context, packed.output_buffer, size);
-						let expected = if output_format == OutputFormat::YUV444 {
-							pixelforge_yuv444_defect(&expected, &actual, (w * h) as usize, &mut failures)
-						} else {
-							expected
-						};
-						let (diff, max) = compare(&expected, &actual, ten);
-						checked += 1;
-						let line = format!(
-							"{output_format:?} {input_format:?} {color_space:?} full={full_range}: {diff} differing samples, max {max}"
-						);
-						eprintln!("{line}");
-						// Shader compilers may contract differently; allow rare 1-code
-						// truncation-boundary flips, never larger or systematic errors.
-						if max > 1 || diff * 10_000 > expected.len() {
-							failures.push(line);
-						}
-					}
-				}
-			}
-		}
-		assert!(checked > 0, "no format could be checked");
-		timing(&context);
-		overlay_matches_cpu_composition(&context, &mut failures);
-		assert!(failures.is_empty(), "converter mismatches: {failures:#?}");
-	}
-
-	/// Informational: wall time per synchronous conversion for both converters
-	/// (interleaved, same clocks), plus the packed converter's GPU timestamps.
-	fn timing(context: &VideoContext) {
-		let (w, h) = (3840u32, 2160u32);
-		let mut rng = Rng(7);
-		let encoder = Encoder::new(context.clone(), EncodeConfig::h265(w, h)).unwrap();
-		let target = encoder.input_image();
-		let bytes = random_source(&mut rng, vk::Format::R8G8B8A8_UNORM, w, h);
-		let source = source_image(context, w, h, vk::Format::R8G8B8A8_UNORM, &bytes);
-		let mut reference = ColorConverter::new(
-			context.clone(),
-			ColorConverterConfig::new(w, h, InputFormat::RGBA, OutputFormat::NV12),
-		)
-		.unwrap();
-		for mode in [ConversionQueueMode::Graphics, ConversionQueueMode::Auto] {
-			let mut packed = InputConverter::new(
-				context.clone(),
-				mode,
-				w,
-				h,
-				OutputFormat::NV12,
-				ColorSpace::Bt709,
-				false,
-			)
-			.unwrap();
-			let (mut reference_ns, mut packed_ns, mut gpu_ns) = (0u128, 0u128, 0u64);
-			const N: u32 = 200;
-			for _ in 0..N {
-				let t = std::time::Instant::now();
-				reference
-					.convert(source.image(), vk::ImageLayout::GENERAL, target)
-					.unwrap();
-				reference_ns += t.elapsed().as_nanos();
-				let t = std::time::Instant::now();
-				gpu_ns += packed
-					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
-					.unwrap()
-					.gpu_ns
-					.unwrap_or(0);
-				packed_ns += t.elapsed().as_nanos();
-			}
-			eprintln!(
-				"4K NV12 timing ({mode:?}): pixelforge {:.1} us/frame wall, packed {:.1} us wall, {:.1} us GPU",
-				reference_ns as f64 / f64::from(N) / 1e3,
-				packed_ns as f64 / f64::from(N) / 1e3,
-				gpu_ns as f64 / f64::from(N) / 1e3
-			);
-		}
-	}
-
-	/// Late composition must equal GLES-style premultiplied source-over
-	/// blending in the frame's encoding followed by the same conversion: a
-	/// notification layer read from an imported image (X format, so its alpha
-	/// bytes are ignored) at 75% window opacity, partly off the right edge,
-	/// then a cursor with every alpha level, partly off the left edge.
-	fn overlay_matches_cpu_composition(context: &VideoContext, failures: &mut Vec<String>) {
-		let (w, h) = (256u32, 128u32);
-		let mut rng = Rng(42);
-		let config = EncodeConfig::h265(w, h);
-		let encoder = Encoder::new(context.clone(), config).unwrap();
-		let target = encoder.input_image();
-		let source_bytes = random_source(&mut rng, vk::Format::R8G8B8A8_UNORM, w, h);
-		let (cw, ch, cx, cy) = (32u32, 24u32, -5i32, 37i32);
-		let mut cursor = vec![0u8; (cw * ch * 4) as usize];
-		for (i, texel) in cursor.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-			let a = ((i * 7) % 256) as u8;
-			for channel in &mut texel[..3] {
-				*channel = (rng.next() % (u32::from(a) + 1)) as u8;
-			}
-			texel[3] = a;
-		}
-		// BGRX texels with garbage in the X byte.
-		let (nw, nh, nx, ny, opacity) = (120u32, 60u32, 180i32, 30i32, 0.75f32);
-		let notification: Vec<u8> = (0..nw * nh * 4).map(|_| rng.next() as u8).collect();
-
-		// Reference: blend each layer into an 8-bit buffer, as GLES draws into
-		// an 8-bit target, then convert with Pixelforge.
-		let blend =
-			|dst: &mut [u8], (ox, oy): (i32, i32), (ow, oh): (u32, u32), texel: &dyn Fn(u32, u32) -> [f32; 4]| {
-				for y in 0..oh as i32 {
-					for x in 0..ow as i32 {
-						let (px, py) = (ox + x, oy + y);
-						if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-							continue;
-						}
-						let o = texel(x as u32, y as u32);
-						let d = &mut dst[((py as u32 * w + px as u32) * 4) as usize..][..4];
-						for c in 0..3 {
-							let v = o[c] + f32::from(d[c]) / 255.0 * (1.0 - o[3]);
-							d[c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
-						}
-					}
-				}
-			};
-		let mut composited = source_bytes.clone();
-		blend(&mut composited, (nx, ny), (nw, nh), &|x, y| {
-			let t = &notification[((y * nw + x) * 4) as usize..][..4];
-			// BGRA bytes -> RGB, alpha forced to one, times window opacity.
-			[
-				f32::from(t[2]) / 255.0 * opacity,
-				f32::from(t[1]) / 255.0 * opacity,
-				f32::from(t[0]) / 255.0 * opacity,
-				opacity,
-			]
-		});
-		blend(&mut composited, (cx, cy), (cw, ch), &|x, y| {
-			let t = &cursor[((y * cw + x) * 4) as usize..][..4];
-			[
-				f32::from(t[0]) / 255.0,
-				f32::from(t[1]) / 255.0,
-				f32::from(t[2]) / 255.0,
-				f32::from(t[3]) / 255.0,
-			]
-		});
-		let plain = source_image(context, w, h, vk::Format::R8G8B8A8_UNORM, &source_bytes);
-		let notification_image = source_image(context, nw, nh, vk::Format::B8G8R8A8_UNORM, &notification);
-		let reference_source = source_image(context, w, h, vk::Format::R8G8B8A8_UNORM, &composited);
-		let mut reference = ColorConverter::new(
-			context.clone(),
-			ColorConverterConfig::new(w, h, InputFormat::RGBA, OutputFormat::NV12),
-		)
-		.unwrap();
-		reference
-			.convert(reference_source.image(), vk::ImageLayout::GENERAL, target)
-			.unwrap();
-		let size = output_size(OutputFormat::NV12, w, h);
-		let expected = read_buffer(context, reference.output_buffer(), size);
-		let mut packed = InputConverter::new(
-			context.clone(),
-			ConversionQueueMode::Auto,
-			w,
-			h,
-			OutputFormat::NV12,
-			ColorSpace::Bt709,
-			false,
-		)
-		.unwrap();
-		let cursor_image = OverlayImage {
-			generation: 1,
-			width: cw,
-			height: ch,
-			format: OverlayFormat::Rgba8,
-			pixels: cursor.into_boxed_slice(),
-		};
-		let layers: Layers<'_> = [
-			Some(Layer {
-				input: LayerInput::Imported {
-					import: &notification_image,
-					format: vk::Format::B8G8R8A8_UNORM,
-					first_use: false,
-					opaque: true,
-				},
-				x: nx,
-				y: ny,
-				width: nw,
-				height: nh,
-				opacity,
-			}),
-			Some(Layer {
-				input: LayerInput::Pixels(&cursor_image),
-				x: cx,
-				y: cy,
-				width: cw,
-				height: ch,
-				opacity: 1.0,
-			}),
-		];
-		packed
-			.convert(&plain, vk::Format::R8G8B8A8_UNORM, false, &layers, target)
-			.unwrap();
-		let actual = read_buffer(context, packed.output_buffer, size);
-		let (diff, max) = compare(&expected, &actual, false);
-		eprintln!("notification + cursor layers NV12: {diff} differing samples, max {max}");
-		// The reference rounds to 8 bits after each layer (as an 8-bit GLES
-		// target does); the late path blends in float. Overlapping layers can
-		// accumulate one code of rounding each.
-		if max > 2 {
-			failures.push(format!("layered NV12 max difference {max}"));
-		}
-		// Without layers the same converter must not draw any.
-		packed
-			.convert(&plain, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
-			.unwrap();
-		let without = read_buffer(context, packed.output_buffer, size);
-		let mut plain_reference = ColorConverter::new(
-			context.clone(),
-			ColorConverterConfig::new(w, h, InputFormat::RGBA, OutputFormat::NV12),
-		)
-		.unwrap();
-		plain_reference
-			.convert(plain.image(), vk::ImageLayout::GENERAL, target)
-			.unwrap();
-		let plain_expected = read_buffer(context, plain_reference.output_buffer(), size);
-		let (diff, max) = compare(&plain_expected, &without, false);
-		eprintln!("layers removed NV12: {diff} differing samples, max {max}");
-		if max > 1 {
-			failures.push(format!("layer removal max difference {max}"));
-		}
-	}
-}
+mod tests;

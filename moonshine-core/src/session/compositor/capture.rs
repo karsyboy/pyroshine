@@ -77,9 +77,11 @@ pub(super) enum DirectReject {
 	Size,
 	NoSurface,
 	NotDmabuf,
+	/// A DMA-BUF format the encoders cannot sample (e.g. a video player's NV12).
+	Format,
 }
 impl DirectReject {
-	pub const COUNT: usize = 17;
+	pub const COUNT: usize = 18;
 }
 
 impl SceneExtras {

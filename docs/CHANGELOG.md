@@ -14,6 +14,17 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix dark green, vertically striped H.264/HEVC/AV1 video on NVIDIA Blackwell GPUs (reported on an RTX 5070 Ti, issue #11) since v0.17.0-beta-11. The RGB-to-YCbCr shader kept each 4x2 pixel block in a dynamically indexed array, and on that GPU the second chroma sample of every block came out wrong while luma stayed intact. The shader now writes every sample explicitly, and each stream first converts a small test pattern on its GPU and compares it with an independent CPU reference: a GPU that still converts incorrectly fails the stream setup with an error naming the wrong plane and position instead of streaming corrupted colors.
+- Convert every stream size with Pyroshine's own converter, including widths that are not a multiple of four and odd sizes, with late cursor and notification composition; previously those fell back to Pixelforge's converter without late composition. The encoder's alignment padding now repeats the frame's edge pixels instead of staying black-green, which also helps clients that ignore AV1's render size.
+- Round YCbCr samples to nearest (Rec. BT.709/BT.2100) instead of truncating. Full-range neutral grey is now exactly 128 (512 at 10 bits) instead of one code low, which tinted full-range streams slightly green.
+- Sample 10-bit ARGB/XRGB2101010 buffers in the H.264/HEVC/AV1 pipeline with their real channel layout instead of as 8-bit BGRA, and composite fullscreen buffers in other formats (for example a video player's NV12 surface) instead of handing them to the encoder (`direct_reject_format`).
+
+### Changed
+
+- Reject stream sizes the codec cannot represent exactly with a precise error: odd widths or heights with H.264 or HEVC 4:2:0 (they crop in two-pixel steps; use an even size, 4:4:4 or AV1), and AV1 frames below the GPU's minimum coded size, which hung the AMD video encoder.
+
 ## [v0.17.3] - 2026-10-09
 
 ### Added

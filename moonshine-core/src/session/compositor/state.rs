@@ -1922,6 +1922,7 @@ impl MoonshineCompositor {
 				direct_reject_size = r[14],
 				direct_reject_no_surface = r[15],
 				direct_reject_not_dmabuf = r[16],
+				direct_reject_format = r[17],
 				"Video direct-export rejections"
 			);
 			self.gpu_timer.reset_window();
@@ -2461,6 +2462,16 @@ impl MoonshineCompositor {
 			return false;
 		};
 		let client_dmabuf = client_dmabuf.clone();
+		// Both encoder families sample single-plane RGB formats only; GLES
+		// composition converts anything else.
+		if client_dmabuf.num_planes() != 1 || !super::frame::encoder_samples_fourcc(client_dmabuf.format().code as u32)
+		{
+			if self.log_stats {
+				self.direct_rejections[DirectReject::Format as usize] += 1;
+			}
+			tracing::trace!("Direct scanout: unsupported format {:?}", client_dmabuf.format());
+			return false;
+		}
 
 		// The surface buffer must exactly match the output dimensions with
 		// no scaling or offset, otherwise the encoder would receive a

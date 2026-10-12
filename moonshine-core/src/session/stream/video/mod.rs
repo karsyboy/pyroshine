@@ -259,6 +259,20 @@ impl VideoStreamContext {
 				self.bitrate, self.format.codec
 			));
 		}
+		// H.264 and HEVC encode whole 4:2:0 chroma samples and crop the coded
+		// picture in units of two luma samples (CropUnitX/Y, SubWidthC and
+		// SubHeightC are 2), so an odd extent would decode one pixel larger.
+		// AV1 signals the exact frame size and 4:4:4 crops per pixel.
+		if matches!(self.format.codec, VideoCodec::H264 | VideoCodec::Hevc)
+			&& self.format.chroma == ChromaFormat::Yuv420
+			&& (!self.width.is_multiple_of(2) || !self.height.is_multiple_of(2))
+		{
+			return Err(format!(
+				"{} 4:2:0 cannot represent the odd extent {}x{} (it crops in 2-pixel units); \
+				 request an even extent, 4:4:4 or AV1",
+				self.format.codec, self.width, self.height
+			));
+		}
 		Ok(())
 	}
 
@@ -1875,6 +1889,39 @@ mod tests {
 			..valid_context()
 		};
 		assert_eq!(pyrowave.validate(), Ok(()));
+	}
+
+	/// Every extent the converter handles is accepted unless the codec cannot
+	/// represent it exactly: odd 4:2:0 extents for H.264 and HEVC.
+	#[test]
+	fn unaligned_extents_validate_where_the_codec_represents_them() {
+		let context = |codec, chroma, width, height| VideoStreamContext {
+			width,
+			height,
+			format: NegotiatedVideoFormat::sdr(codec, chroma, BitDepth::Eight, ColorRange::Limited),
+			..valid_context()
+		};
+		for (width, height) in [(1366, 768), (3440, 1440), (2, 2), (1920, 1082)] {
+			for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+				for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv444] {
+					let context = context(codec, chroma, width, height);
+					assert_eq!(context.validate(), Ok(()), "{codec} {chroma:?} {width}x{height}");
+				}
+			}
+		}
+		for (width, height) in [(1365, 767), (1920, 1081), (1, 1), (3, 5)] {
+			for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+				let error = context(codec, ChromaFormat::Yuv420, width, height)
+					.validate()
+					.unwrap_err();
+				assert!(error.contains("odd extent"), "{error}");
+				assert_eq!(context(codec, ChromaFormat::Yuv444, width, height).validate(), Ok(()));
+			}
+			assert_eq!(
+				context(VideoCodec::Av1, ChromaFormat::Yuv420, width, height).validate(),
+				Ok(())
+			);
+		}
 	}
 
 	#[test]
