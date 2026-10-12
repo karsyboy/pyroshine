@@ -158,13 +158,25 @@ with `bufferRowLength`, so any extent works without partial-word writes and the
 samples past it are never copied. H.264 and HEVC cannot crop 4:2:0 to an odd
 extent; stream validation rejects those (4:4:4 and AV1 accept them).
 
-The vendored Pixelforge patch also rounds the input image width up to 64 texels
-within the GPU's maximum coded width. This keeps NVIDIA's 8-bit 4:4:4 chroma
-pitch consistent at widths such as 1360, 1440 and 2400. The picture's coded
-extent stays aligned to codec blocks and device granularity; cropping/render
-metadata retains the negotiated frame size. Additional image columns are
-outside the picture. See
+The vendored Pixelforge patches also round the input and DPB image widths up
+to 64 texels within the GPU's maximum coded width. This keeps NVIDIA's 8-bit
+4:4:4 chroma pitch consistent at widths such as 1360, 1440 and 2400: input
+chroma is read, and reconstructed chroma written, inside the image. The
+picture's coded extent stays aligned to codec blocks and device granularity;
+cropping/render metadata retains the negotiated frame size. Additional image
+columns are outside the picture. AV1 frames are coded on the implementation's
+picture grid (`codedPictureAlignment`, 8x2 on RADV) with the negotiated size as
+render size, so the encoder reads the converter's edge padding instead of
+filling the grid remainder itself. See
 [local dependency maintenance](../vendor/pixelforge/LOCAL_CHANGES.md).
+
+In CBR mode some encoders pad every frame to the per-frame bit budget with
+filler data (H.264 NAL type 12, HEVC `FD_NUT`, AV1 `OBU_PADDING`); RADV does so
+for all three codecs. With the one-frame virtual buffer that would send every
+frame at the negotiated bitrate. The packet consumer removes these units
+(`pipeline/padding.rs`) before HDR metadata injection and packetization, so the
+transmitted size follows the encoded content; decoders discard padding, and
+the remaining bytes are unchanged.
 
 Pixelforge owns profile construction and capability/extent calculations. Setup
 queries the exact encoder configuration, including usage hints, then checks
@@ -327,16 +339,22 @@ MOONSHINE_TEST_GPU=1 cargo test --release -p moonshine-core converter_timing -- 
 The first compares the dimension matrix (1x1 to 8K, odd and unaligned
 extents), every source format, color conversion and range, edge padding, late
 layers at the frame edges and the copy into planar images with the CPU
-reference; the second encodes, decodes with `ffmpeg` and checks decoded size,
-error and chroma bias per codec, chroma format and bit depth. On a host that
+reference; the second encodes, removes rate-control padding as production
+does, decodes with `ffmpeg` and checks decoded size, mean error, chroma bias
+and the largest per-sample error per codec, chroma format and bit depth. The
+per-sample bound catches localized corruption and unencoded padding rows,
+which averages hide; the mean error applies to planes of at least one 8x8
+transform block (a 2x2 4:2:0 frame has a single chroma sample). On a host that
 only runs the packaged daemon, the converter self-check at stream start covers
 the same store and layout path: a failure is logged as `Failed to create the
 YCbCr converter` with the differing plane and block column.
 
 The encode/decode matrix includes the NVIDIA 8-bit 4:4:4 width regressions at
 1360, 1440 and 2400. Run it on NVIDIA hardware when updating the Pixelforge
-patch. The streaming variant uses full-range color, low-latency CBR and multiple
-frames instead of the CQP quality fixture:
+patches, as one process with the default extents: H.264 4:4:4 at 1440 after
+1360 is the sequence whose DPB overrun lost the device. The streaming variant
+uses full-range color, low-latency CBR and twelve frames instead of the CQP
+quality fixture, so reference corruption that grows over P frames is visible:
 
 ```sh
 MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_E2E_SAVE_DIR=/tmp/streams \

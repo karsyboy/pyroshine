@@ -1550,6 +1550,15 @@ mod gpu {
 		}
 	}
 
+	fn video_format(codec: Codec) -> crate::session::stream::video::VideoFormat {
+		use crate::session::stream::video::VideoFormat;
+		match codec {
+			Codec::H264 => VideoFormat::H264,
+			Codec::H265 => VideoFormat::Hevc,
+			Codec::AV1 => VideoFormat::Av1,
+		}
+	}
+
 	/// Planar Y, Cb and Cr samples of one decoded frame.
 	type DecodedFrame = [Vec<u16>; 3];
 
@@ -1740,6 +1749,7 @@ mod gpu {
 				)
 				.unwrap();
 				let mut stream = Vec::new();
+				let mut padding_bytes = 0;
 				for _ in 0..frame_count {
 					converter
 						.convert(
@@ -1751,7 +1761,14 @@ mod gpu {
 						)
 						.unwrap();
 					let image = encoder.input_image();
-					stream.extend(block_on(encoder.encode(image).unwrap()).unwrap().data);
+					let mut data = block_on(encoder.encode(image).unwrap()).unwrap().data;
+					// Decode what production transmits.
+					padding_bytes +=
+						crate::session::stream::video::pipeline::padding::strip(&mut data, video_format(case.codec));
+					stream.extend(data);
+				}
+				if padding_bytes > 0 {
+					eprintln!("{label}: removed {padding_bytes} bytes of rate-control padding");
 				}
 				if let Some(directory) = std::env::var_os("MOONSHINE_TEST_E2E_SAVE_DIR") {
 					std::fs::create_dir_all(&directory).unwrap();
@@ -1769,12 +1786,12 @@ mod gpu {
 				// H.264/HEVC crop to the frame exactly. AV1 frames are coded on
 				// the implementation's picture grid (render_size carries the
 				// requested size); the extra columns/rows hold replicated edges.
-				let coded = match caps.av1_coded_picture_alignment {
-					Some(a) => (
-						frame.0.next_multiple_of(a.width.max(1)),
-						frame.1.next_multiple_of(a.height.max(1)),
-					),
-					None => frame,
+				let coded = match case.codec {
+					Codec::AV1 => {
+						let extent = caps.av1_frame_extent(frame.0, frame.1).unwrap();
+						(extent.width, extent.height)
+					},
+					_ => frame,
 				};
 				if (w, h) != coded || frames.len() != frame_count {
 					failures.push(format!(
@@ -1792,6 +1809,7 @@ mod gpu {
 				let scale = if case.depth == EncodeBitDepth::Ten { 4.0 } else { 1.0 };
 				for (index, decoded) in frames.iter().enumerate() {
 					let mut line = format!("{label} frame {index}:");
+					let mut failed = false;
 					for plane in 0..3 {
 						let (want, got) = (&expected_planes[plane], &decoded[plane]);
 						if want.len() != got.len() {
@@ -1804,23 +1822,39 @@ mod gpu {
 						}
 						let n = want.len() as f64;
 						let mean = |v: &[u16]| v.iter().map(|&s| f64::from(s)).sum::<f64>() / n;
-						let mae = want
-							.iter()
-							.zip(got)
-							.map(|(&a, &b)| f64::from(a.abs_diff(b)))
-							.sum::<f64>() / n;
+						let errors = || want.iter().zip(got).map(|(&a, &b)| f64::from(a.abs_diff(b)));
+						let mae = errors().sum::<f64>() / n;
+						let (worst, max) = errors()
+							.enumerate()
+							.fold((0, 0.0), |best, (i, e)| if e > best.1 { (i, e) } else { best });
+						let width = if want.len() == expected_planes[0].len() {
+							coded.0
+						} else {
+							coded.0.div_ceil(2)
+						} as usize;
 						let bias = mean(got) - mean(want);
 						line += &format!(
-							" {} mae {:.2} bias {:+.2};",
+							" {} mae {:.2} max {:.0} at {:?} bias {:+.2};",
 							["Y", "Cb", "Cr"][plane],
 							mae / scale,
+							max / scale,
+							(worst % width, worst / width),
 							bias / scale
 						);
 						// Lossy coding error only: a green tint shifts mean chroma
-						// by tens of codes, a layout defect raises the MAE. The mean
-						// is only meaningful over enough samples.
-						if mae / scale > 2.5 || (n >= 4096.0 && bias.abs() / scale > 1.0) {
-							failures.push(line.clone());
+						// by tens of codes, a layout defect raises the MAE, and a
+						// corrupted block or an unencoded padding row is off by
+						// ~200 codes in a few samples (lossy coding stays within
+						// ~32 codes at color-bar edges). The mean is only
+						// meaningful over enough samples: below one 8x8 transform
+						// block (a 2x2 4:2:0 frame has one chroma sample) it is a
+						// single DC quantization error, up to 8 codes at the rate
+						// controller's starting QP of 24 (AMD H.264).
+						let wrong = max / scale > 64.0
+							|| (n >= 64.0 && mae / scale > 2.5)
+							|| (n >= 4096.0 && bias.abs() / scale > 1.0);
+						if wrong {
+							failed = true;
 							if plane > 0 && index == 0 {
 								let dims = if want.len() == expected_planes[0].len() {
 									coded
@@ -1830,6 +1864,9 @@ mod gpu {
 								eprintln!("{label}: {}", diagnose(want, got, &expected_planes[0], dims));
 							}
 						}
+					}
+					if failed {
+						failures.push(line.clone());
 					}
 					eprintln!("{line}");
 				}

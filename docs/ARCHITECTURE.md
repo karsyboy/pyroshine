@@ -434,7 +434,7 @@ transfer, primaries, matrix, range and HDR as independent negotiated properties.
 
 | Backend | Formats | Path |
 | --- | --- | --- |
-| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
+| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → rate-control padding removed (`pipeline/padding.rs`) → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
 | PyroWave (`pyrowave.rs`, `pyrowave_protocol.rs`) | Intra-only wavelet codec, 4:2:0/4:4:4, SDR/HDR10 | DMA-BUF import into a PyroWave-owned Vulkan device on the same GPU → GPU scale, color transform and encode → one frame at a time through send completion |
 
 PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a

@@ -8,6 +8,7 @@ pub(super) mod dmabuf;
 mod encode_caps;
 pub(super) mod failure;
 mod hdr_sei;
+mod padding;
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -416,6 +417,7 @@ async fn run_packet_consumer(
 	mut fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 ) -> Result<(), String> {
 	let mut failures = FailurePolicy::default();
+	let mut logged_padding = false;
 	let network_queue = Arc::new(super::shard_batch::QueueDepth::default());
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
@@ -492,6 +494,17 @@ async fn run_packet_consumer(
 		};
 		let t_packet_ready = std::time::Instant::now();
 		let encode_wait_dur = t_packet_ready.saturating_duration_since(frame_context.submitted_at);
+
+		// Rate-control padding only consumes bandwidth (see `padding`).
+		let padding_bytes = padding::strip(&mut packet.data, ctx.format.codec);
+		if padding_bytes > 0 && !logged_padding {
+			logged_padding = true;
+			tracing::info!(
+				padding_bytes,
+				remaining_bytes = packet.data.len(),
+				"The encoder pads frames to its bitrate; padding is removed before transmission"
+			);
+		}
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
 		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.

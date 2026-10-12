@@ -14,30 +14,34 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-### Changed
-
-- Select the Vulkan capture/encode adapter by the opened DRM render node, with complete PCI identity fallback and independent verification. Multi-GPU systems can use the configured capture GPU without reordering Vulkan adapters; an unavailable or incompatible GPU fails setup without choosing another device.
-- Use Pixelforge's shared encode capabilities and actual input-image bounds during stream setup, retaining the NVIDIA width fix and AV1 minimum-frame guard. Preserve typed Vulkan results for device-loss recovery and share color signaling between setup and later updates.
-
-### Fixed
-
-- Fix repeatedly flashing black HEVC 4:4:4 streams on Intel hardware decoding in Pyrolight and Moonlight. NVIDIA Vulkan encoding omitted the profile constraint flags needed to identify Main 4:4:4; cached VPS/SPS headers now declare the correct 8-bit or 10-bit profile.
-- Fix sheared colors in NVIDIA HEVC 8-bit 4:4:4 streams at widths such as 1360, 1440 and 2400. Encoder input images now use a 64-texel-aligned width while the bitstream keeps the negotiated picture size, through a maintained local Pixelforge patch.
-- Allocate compositor capture buffers only with DMA-BUF modifiers supported by both EGL rendering and Vulkan import. NVIDIA's EGL also offers modifiers Vulkan cannot import, which caused PyroWave streams to produce no video. Fullscreen buffers and late overlay layers with unsupported modifiers now use GLES composition; an incompatible GBM allocation fails setup with a precise error.
-- Remove a duplicate external-memory structure from PyroWave's DMA-BUF import request. The library adds it from the supplied handle type; passing another copy violated Vulkan's image-creation rules.
-
 ## [v0.17.4] - 2026-10-12
 
-### Fixed
-
-- Fix dark green, vertically striped H.264/HEVC/AV1 video on NVIDIA Blackwell GPUs (reported on an RTX 5070 Ti, issue #11) since v0.17.0-beta-11. The RGB-to-YCbCr shader kept each 4x2 pixel block in a dynamically indexed array, and on that GPU the second chroma sample of every block came out wrong while luma stayed intact. The shader now writes every sample explicitly, and each stream first converts a small test pattern on its GPU and compares it with an independent CPU reference: a GPU that still converts incorrectly fails the stream setup with an error naming the wrong plane and position instead of streaming corrupted colors.
-- Convert every stream size with Pyroshine's own converter, including widths that are not a multiple of four and odd sizes, with late cursor and notification composition; previously those fell back to Pixelforge's converter without late composition. The encoder's alignment padding now repeats the frame's edge pixels instead of staying black-green, which also helps clients that ignore AV1's render size.
-- Round YCbCr samples to nearest (Rec. BT.709/BT.2100) instead of truncating. Full-range neutral grey is now exactly 128 (512 at 10 bits) instead of one code low, which tinted full-range streams slightly green.
-- Sample 10-bit ARGB/XRGB2101010 buffers in the H.264/HEVC/AV1 pipeline with their real channel layout instead of as 8-bit BGRA, and composite fullscreen buffers in other formats (for example a video player's NV12 surface) instead of handing them to the encoder (`direct_reject_format`).
-
 ### Changed
 
-- Reject stream sizes the codec cannot represent exactly with a precise error: odd widths or heights with H.264 or HEVC 4:2:0 (they crop in two-pixel steps; use an even size, 4:4:4 or AV1), and AV1 frames below the GPU's minimum coded size, which hung the AMD video encoder.
+- Use the configured capture GPU for Vulkan encoding on multi-GPU systems without requiring Vulkan adapter reordering. Match the opened DRM render node, with PCI identity fallback, and fail setup if that GPU is unavailable or incompatible.
+- Validate stream sizes against Pixelforge's shared encoder capabilities and actual input-image bounds before conversion, preserving the NVIDIA width padding and AV1 minimum-size guard.
+- Maintain Inputtino and Pixelforge as pinned sources with reproducible patch series and CI checks for vendor drift and dependency pins.
+- Reject odd widths or heights for H.264/HEVC 4:2:0 with a clear error; use an even size, supported 4:4:4, or AV1. Also reject AV1 frames below the GPU's minimum coded size to avoid AMD encoder hangs.
+
+### Fixed
+
+- Fix flashing black NVIDIA-encoded HEVC 4:4:4 video on Intel hardware decoders in Pyrolight and Moonlight by declaring the correct 8-bit or 10-bit Main 4:4:4 profile constraints.
+- Fix sheared colors in NVIDIA HEVC 8-bit 4:4:4 streams at widths such as 1360, 1440 and 2400 by aligning encoder input-image widths to 64 texels while retaining the negotiated picture size.
+- Prevent blank PyroWave video from capture buffers whose DMA-BUF modifiers NVIDIA's Vulkan driver cannot import. Capture uses formats supported by both EGL and Vulkan; unsupported fullscreen buffers and late overlays use GLES composition, and incompatible GBM allocations fail setup with a clear error.
+- Correct PyroWave DMA-BUF image creation by supplying its external-memory information only once.
+- Preserve Vulkan error codes through encoder operations so device loss reliably ends the session instead of depending on driver error wording.
+- Stop sending AMD-encoded streams at the full negotiated bitrate regardless of content. In CBR mode the RADV encoder pads every H.264, HEVC and AV1 frame to the per-frame bit budget with filler data, which made up over 95% of a static desktop's video traffic; the padding is now removed before packetization. Decoded video is unchanged.
+- Fix NVIDIA 8-bit 4:4:4 H.264/HEVC streams at widths such as 1360, 1440 and 2400 losing the GPU (`ERROR_DEVICE_LOST`, kernel Xid 31) or showing corrupted chroma blocks that grew until the next keyframe. The encoder wrote reconstructed reference pictures past the end of their images; reference images now use the same 64-texel-aligned width as input images.
+- Encode the last row of AV1 streams whose height is odd (for example 1365x767) on AMD instead of a black line visible in clients that ignore AV1's render size. Frames are now coded on the GPU's AV1 picture grid with the replicated frame edge.
+- Order each encoder reference-picture write after its preceding layout transition and previous encode, removing a synchronization hazard reported by Vulkan validation on AMD and NVIDIA.
+- Address dark green, vertically striped H.264/HEVC/AV1 video reported on an RTX 5070 Ti since v0.17.0-beta-11 ([#11](https://github.com/karsyboy/pyroshine/issues/11)). Replace dynamically indexed pixel arrays in the RGB-to-YCbCr shader with explicit sample writes to avoid corrupted chroma. Confirmation on the affected Blackwell GPU is still pending.
+- Keep late cursor and notification composition at every codec-supported stream size, including widths not divisible by four and supported odd sizes. Replicate frame-edge pixels into codec-block padding instead of leaving black-green borders.
+- Round YCbCr samples to nearest instead of truncating, keeping full-range neutral chroma at 128 (512 at 10 bits) and removing the slight green bias.
+- Read 10-bit ARGB/XRGB2101010 buffers with their correct channel layout in H.264/HEVC/AV1 streams. Composite unsupported fullscreen formats, such as NV12, instead of interpreting them as 8-bit RGB.
+
+### Added
+
+- Check RGB-to-YCbCr conversion against an independent CPU reference on the selected GPU whenever a converter is created. Incorrect test-pattern output stops stream setup with the affected plane and position instead of allowing corrupted colors through.
 
 ## [v0.17.3] - 2026-10-09
 
