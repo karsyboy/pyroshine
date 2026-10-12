@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.4] - 2026-10-12
+
 ### Fixed
 
 - Fix dark green, vertically striped H.264/HEVC/AV1 video on NVIDIA Blackwell GPUs (reported on an RTX 5070 Ti, issue #11) since v0.17.0-beta-11. The RGB-to-YCbCr shader kept each 4x2 pixel block in a dynamically indexed array, and on that GPU the second chroma sample of every block came out wrong while luma stayed intact. The shader now writes every sample explicitly, and each stream first converts a small test pattern on its GPU and compares it with an independent CPU reference: a GPU that still converts incorrectly fails the stream setup with an error naming the wrong plane and position instead of streaming corrupted colors.
