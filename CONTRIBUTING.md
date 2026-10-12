@@ -48,7 +48,8 @@ Build outputs:
 | `target/release/moonshine-bench` | Developer benchmark utility |
 | `/tmp/pyrowave-install/lib/libpyrowave-shared.so.1` | Optional PyroWave backend |
 
-For a local server healthcheck, explicitly select the built PyroWave library:
+With any server using the same ports stopped, explicitly select the built
+PyroWave library for a local healthcheck:
 
 ```sh
 MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.1 \
@@ -122,18 +123,22 @@ Log out and back in after changing group membership. The service grants the
 in the user's own membership. If your home is outside `/home/<user>`, update the
 [service config path](docs/CONFIGURATION.md#file-location-and-loading) before starting.
 
-Start or restart the service and verify the installed build:
+Check the installed build while the service is stopped (the healthcheck binds
+ports), then start it. Fix fatal check failures first:
 
 ```sh
-sudo systemctl enable --now "pyroshine@$USER"
 pyroshine --version
-pyroshine healthcheck
+pyroshine "$HOME/.config/moonshine/config.toml" healthcheck
+sudo systemctl enable --now "pyroshine@$USER"
 systemctl status "pyroshine@$USER"
 journalctl -u "pyroshine@$USER" -e
 ```
 
+Look for **Pyroshine is ready and waiting for connections.** in the latest
+startup log. Use your overridden config path for the check if it differs.
+
 Remove the old layer artifacts and session environment on upgrade as described
-in [native presentation migration](docs/NATIVE_PRESENTATION.md#migration).
+in [native presentation migration](docs/NATIVE_PRESENTATION.md#upgrade-migration).
 
 Repeat the build, stop, install, and start steps for subsequent manual upgrades.
 Do not replace your config or pairing state with defaults. If validation fails,

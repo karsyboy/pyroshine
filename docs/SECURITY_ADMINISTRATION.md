@@ -1,12 +1,24 @@
 # Pairing, identity and revocation
 
-Pairing approval is a host operator action. With the [desktop app](DESKTOP.md),
-open the pairing notification or **Clients**; otherwise open the loopback HTTP
-`/pin` page linked in the server log. Check the requester and certificate
-fingerprint, then enter the PIN displayed by the client. The approval token
-applies to that exact request; replacing a client ID requires a fresh approval.
-A remote client cannot approve itself. For a headless host, forward the HTTP
-port over SSH as described in [Configuration](CONFIGURATION.md#webserver).
+Pair using the [desktop app](DESKTOP.md#pair-a-client) or
+[`pyroshine pair`](INSTALLATION.md#pair-without-the-desktop-app). Both approve
+through the existing same-user management interface, using the exact pending
+request token and the PIN shown by the client. The CLI waits for that request's
+completion; accepted PIN submission alone is not proof of trust.
+
+Approve only pairings you initiated. Check the requester address and, when you
+can compare it, the certificate fingerprint. A remote client cannot approve
+itself. Keep streaming on a trusted LAN/VPN.
+
+## Browser approval
+
+The [browser/SSH procedure](INSTALLATION.md#browser-pairing) remains available.
+The complete logged `/pin?uniqueid=...` URL selects a pending request. The page
+fetches its approval token in the hidden `request` field; POST `/submit-pin`
+requires `uniqueid`, `pin` **and** `request`. The token is not in the logged URL.
+Bare `/pin`, stale tokens and submissions containing only an ID/PIN fail.
+Peer, Host and browser Origin/site checks require loopback on the configured
+HTTP port; do not weaken them to make forwarding work.
 
 ## Local management interface
 

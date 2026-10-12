@@ -88,8 +88,9 @@ client; record the desktop environment, session type and client used.
    opens **Clients** at the request, entering the PIN pairs the client and it is
    listed; a wrong PIN fails on both sides; **Reject** ends the request in
    Moonlight. Restarting pairing in Moonlight replaces the shown request.
-3. **Headless fallback.** Quit the app and pair a client using the notification
-   or the logged `http://localhost:<port>/pin?uniqueid=…` link.
+3. **Headless fallback.** Quit the app and use `pyroshine pair`, following
+   [pairing without the app](../docs/INSTALLATION.md#pair-without-the-desktop-app).
+   Also check the browser fallback with the complete logged `/pin?uniqueid=…` URL.
 4. **Streaming state.** Start a stream: the icon shows the green play badge and
    the dashboard matches the application, resolution, refresh rate, codec, HDR
    and chroma Moonlight negotiated, and the **Audio** card shows the channels,

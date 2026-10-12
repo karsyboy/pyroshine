@@ -1,132 +1,222 @@
 # Installation and upgrades
 
-See the [README](../README.md#requirements) for host requirements. Release assets
-are available from the [Pyroshine releases page](https://github.com/karsyboy/pyroshine/releases).
-The published portable archive and native packages target x86_64 Linux; release
-binaries are built on Ubuntu 24.04 (glibc 2.39), so older systems may need a source build.
+Use the [README](../README.md#quick-start) for the recommended Arch/CachyOS
+pacman setup, startup, pairing and first stream.
 
-Presentation uses ordinary Wayland/XWayland surfaces. For native HDR,
-Wine/Proton selection and upgrades from earlier builds, see
-[native presentation](NATIVE_PRESENTATION.md).
+## Platform compatibility
+
+Prebuilt native and portable releases target **x86_64 Linux**, built on Ubuntu
+24.04 with a **glibc 2.39 baseline**. Check `getconf GNU_LIBC_VERSION` on older
+systems. The availability of `.deb`/`.rpm` files does not guarantee every
+Debian, Ubuntu, Fedora or RHEL release works. Upgrade an older distribution or
+[build from source](../CONTRIBUTING.md#manually-building-the-app); do not replace
+its system glibc manually.
+
+All setups need systemd, the streaming user's systemd manager/session bus,
+GPU render access, EGL/GBM capture and Vulkan DMA-BUF import on the **same GPU**.
+H.264/HEVC/AV1 require usable Vulkan Video encode profiles. The healthcheck
+verifies the actual driver and profiles; hardware family alone is insufficient.
+The kernel must allow `kcmp(2)`; restrictive sandboxes may block it.
+A monitor or active desktop compositor is unnecessary.
+
+PyroWave additionally needs Pyrolight, the matching encoder library (bundled),
+and hardware Vulkan compute, timeline semaphores and external memory support.
+Software Vulkan is rejected. HDR needs a compatible game, 10-bit profile and
+client/display; VRR needs Pyrolight's VRR presentation and a compatible display.
+These are optional; see [PyroWave](PYROWAVE.md) and [HDR](NATIVE_PRESENTATION.md).
 
 ## Native packages
 
-Download the package for your distribution. These commands install a new package
-or upgrade an existing installation:
+For maintained Arch/CachyOS updates, use the [pacman repository](../README.md#1-install).
+Otherwise download the server and optional `pyroshine-ui` from the same
+[release](https://github.com/karsyboy/pyroshine/releases). In the download
+directory, keep one version of each and run your distribution's command:
 
-```sh
-# Arch Linux / CachyOS
-sudo pacman -U ./pyroshine-*.pkg.tar.zst
+| Distribution | Server | Optional desktop app (add to the same install command) |
+| --- | --- | --- |
+| Arch / CachyOS | `sudo pacman -U ./pyroshine-[0-9]*.pkg.tar.zst` | `./pyroshine-ui-[0-9]*.pkg.tar.zst` |
+| Debian / Ubuntu | `sudo apt install ./pyroshine_*.deb` | `./pyroshine-ui_*.deb` |
+| Fedora / RHEL | `sudo dnf install ./pyroshine-[0-9]*.rpm` | `./pyroshine-ui-[0-9]*.rpm` |
 
-# Debian / Ubuntu
-sudo apt install ./pyroshine_*.deb
+The package manager resolves runtime dependencies. Packages install the server,
+PyroWave library, systemd unit, udev rules, `uinput`/`uhid` module configuration
+and sleep-inhibition policy. The GUI adds GTK 3/WebKitGTK 4.1 and desktop
+autostart. Steam and a suitable GPU driver must already be installed separately.
+Packages do not start the server or open the firewall.
 
-# Fedora / RHEL
-sudo dnf install ./pyroshine-*.rpm
-```
-
-On Arch Linux and CachyOS you can instead add the
-[`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages) and install
-`pyroshine-bin` (and optionally `pyroshine-ui-bin`); `sudo pacman -Syu` then
-upgrades them with the rest of the system. They repackage the same release
-`.pkg.tar.zst` files.
-
-Run only the command for your distribution. The package installs the binary,
-PyroWave library, systemd service, udev rules, kernel-module
-configuration, and sleep-inhibition policy. Start it as your regular streaming user:
-
-```sh
-sudo systemctl enable --now "pyroshine@$USER"
-pyroshine healthcheck
-```
-
-On a desktop, also install the optional `pyroshine-ui` package from the same
-release for a system tray, pairing notifications, client management and a
-settings editor; see [Desktop app](DESKTOP.md). Headless hosts do not need it.
-
-After an upgrade, restart the service to use the new binaries:
-
-```sh
-sudo systemctl restart "pyroshine@$USER"
-```
+Continue with [Start → Pair → Play](../README.md#2-start).
 
 ## Portable installer and SteamOS
 
-Run the release installer as your normal user; it requests sudo for system changes:
+Run as the normal streaming user with sudo access, curl, tar/zstd and systemd.
+On SteamOS, use Desktop Mode; set a password with `passwd` if sudo needs one.
 
 ```sh
 curl -fsSL https://github.com/karsyboy/pyroshine/releases/latest/download/pyroshine-install.sh -o pyroshine-install.sh
-bash pyroshine-install.sh
+bash pyroshine-install.sh --no-start --no-healthcheck
 ```
 
-The installer deploys to `/opt/pyroshine`, configures systemd, udev, kernel
-modules and polkit, and offers to enable lingering and start
-the service. It also installs SteamOS atomic-update integration when available.
-Runtime libraries such as Opus, libevdev, libxkbcommon, GBM, Wayland, and
-Xwayland must be supplied by the host; the portable archive does not include them.
+Choose your user; enable lingering for logged-out use. The installer writes the
+server/library to `/opt/pyroshine` and integration to `/etc`. It registers files
+for SteamOS atomic updates when `/etc/atomic-update.conf.d` exists. Compatibility
+with every future SteamOS update is not guaranteed.
 
-For an unattended install:
+Check before starting; fix any `FAIL`, then run:
 
 ```sh
-bash pyroshine-install.sh --user "$USER" --enable --linger --start --healthcheck
+/opt/pyroshine/start-pyroshine.sh "$HOME/.config/moonshine/config.toml" healthcheck
+sudo systemctl enable --now "pyroshine@$USER"
+systemctl status "pyroshine@$USER" --no-pager
+journalctl -u "pyroshine@$USER" -b -n 60 --no-pager
 ```
 
-Run a freshly downloaded release installer again to upgrade. The copy installed
-under `/opt/pyroshine/bin/` is pinned to its release version, so rerunning that
-copy reinstalls that version. Configuration and pairing data are kept in your
-home directory.
+The host supplies Opus, libevdev, libxkbcommon, GBM/EGL, Wayland, Vulkan/driver,
+C++ runtime and Xwayland; the archive does not bundle them. Use your host's
+supported package mechanism for missing libraries. See
+[dependency troubleshooting](TIPS.md#missing-libraries-or-an-older-system).
+The installer does not include the GUI.
 
-Open a new shell to pick up the installed PATH, or run diagnostics directly:
+For unattended headless installation:
 
 ```sh
-/opt/pyroshine/start-pyroshine.sh healthcheck
+bash pyroshine-install.sh --user "$USER" --enable --linger --no-start --no-healthcheck
+/opt/pyroshine/start-pyroshine.sh "$HOME/.config/moonshine/config.toml" healthcheck && sudo systemctl start "pyroshine@$USER"
 ```
 
-Use the [contributor guide](../CONTRIBUTING.md#manual-installation-and-upgrade)
-for installation from local build artifacts without the downloader.
+The interactive installer's own check runs before startup but ignores failures;
+the separate check above lets you fix them first. A new login shell adds the
+binary to PATH; the wrapper works immediately.
+
+[Pair below](#pair-without-the-desktop-app), then [play](../README.md#4-play).
+For a first SteamOS stream, stay in Desktop Mode and quit Steam before launching
+streamed Steam. Game Mode's same-user Steam can take over the launch; switch to
+Desktop Mode and quit it, or configure a different application. For logged-out
+operation, apply headless setup below.
+
+Local build artifacts use the [manual installation guide](../CONTRIBUTING.md#manual-installation-and-upgrade).
 
 ## Headless setup
 
-To keep the user's systemd instance running while logged out:
+Run as the streaming user; replace `$USER` when administering another account:
 
 ```sh
 sudo loginctl enable-linger "$USER"
-```
-
-For gamepad access without an active desktop session, add the streaming user to
-`input`, then log out and back in:
-
-```sh
+# Needed for gamepads without an active desktop seat:
 sudo usermod -aG input "$USER"
 ```
 
-The packaged service grants the `pyroshine` supplementary group for sleep
-inhibition. When running the binary directly, join that group yourself if you
-want the same policy; see [sleep inhibition](TIPS.md#prevent-the-host-from-suspending-while-streaming).
+Log out/in after changing groups; reboot if the running user manager retains old
+groups. Lingering keeps the user's systemd manager and bus alive while logged
+out. Active desktop seats normally provide input ACLs instead of needing
+`input`. Check [input access](TIPS.md#keyboard-mouse-or-gamepads-do-not-work)
+and [GPU access](TIPS.md#healthcheck-fails) if diagnostics report denied devices.
 
-## Configuration and pairing
+Use the [README check/start sequence](../README.md#2-start), then pair below.
+The native/portable service grants `pyroshine` for sleep inhibition; direct
+binary launches need their own membership. [NixOS](NIXOS.md) manages lingering
+and uses different service/group names.
 
-The default CLI config is `$XDG_CONFIG_HOME/moonshine/config.toml`, falling back
-to `~/.config/moonshine/config.toml`. The shipped systemd unit explicitly uses
-`/home/<user>/.config/moonshine/config.toml`; for a different home or config path,
-create a service override as described in the [configuration reference](CONFIGURATION.md).
-Pairing state remains under `~/.local/share/moonshine` by default. Back up these
-paths before upgrading or migrating from Moonshine.
+## Pair without the desktop app
 
-See the [configuration reference](CONFIGURATION.md) for application entries and
-server settings. Add the host in Moonlight and enter its pairing PIN in the
-[desktop app](DESKTOP.md#pair-a-client), or at the host-local page linked in the
-service log (`http://localhost:47989/pin?uniqueid=…`, or the configured HTTP
-port). The page only accepts requests from the host itself; on a headless host,
-use an SSH port forward as described under [`[webserver]`](CONFIGURATION.md#webserver).
-Keep the host on a trusted LAN or VPN and restrict its listening ports.
+1. On the host, run `pyroshine pair` as the streaming user, without sudo.
+   Over SSH, log in as that user; use `ssh -t user@host 'pyroshine pair'` for
+   a single-command session. Portable installs can run
+   `/opt/pyroshine/start-pyroshine.sh pair`; NixOS uses `moonshine pair`.
+2. Select the host in Moonlight/Pyrolight and start pairing. If it is missing,
+   add its LAN/VPN IP. The command waits up to five minutes for a request.
+3. Check the requester address and fingerprint. If several requests exist,
+   select yours. Confirm, then enter the PIN shown by your device. Wait for
+   **Device paired** and the client's application list; select Steam to play.
+
+Optional: `pyroshine pair --name "Living room"` names the paired device.
+The command needs the server's user/session bus. A wrong PIN, expired/replaced
+request or server restart requires a new attempt.
+
+The subcommand requires a build containing this change. For older releases or
+an unavailable management interface, use the browser workflow below.
+
+## Browser pairing
+
+1. Start pairing in the client while watching the host's log:
+
+   ```sh
+   journalctl -u "pyroshine@$USER" -f -o cat
+   ```
+
+   Use `sudo journalctl` if access is denied; NixOS uses `-u moonshine`.
+2. Open the complete latest URL from **Waiting for the host operator to enter
+   the PIN**, shaped like `http://localhost:47989/pin?uniqueid=...`.
+   Keep the encoded query; bare `/pin` cannot select a request.
+3. Check **Requested by**, enter the client PIN and select **Submit**. **PIN
+   accepted** means submission, not completion; wait for applications in the
+   client. Expired/replaced requests need a fresh pairing/link.
+
+For a browser on another computer, keep this SSH tunnel running there first:
+
+```sh
+ssh -N -L 127.0.0.1:47989:127.0.0.1:47989 user@host
+```
+
+Open the copied localhost URL on that computer. Both ports must equal the
+configured HTTP port; a different local port fails Host/origin validation.
+If occupied, use the CLI on the host instead. This tunnel carries approval
+only; the streaming client still needs LAN/VPN access. The page supplies the
+request-specific token automatically; see [security](SECURITY_ADMINISTRATION.md).
+
+## Network and firewall
+
+Allow these host ports **only from your trusted LAN/VPN**. Packages and the
+portable installer do not configure the firewall.
+
+| Protocol | Default ports | Purpose |
+| --- | --- | --- |
+| TCP | 47989, 47984, 48010 | HTTP, HTTPS, RTSP |
+| UDP | 47998, 47999, 48000 | Video, control/input, audio |
+| UDP | 5353 | Local mDNS discovery |
+
+With UFW, replace the subnet with your trusted LAN:
+
+```sh
+sudo ufw allow from 192.168.1.0/24 to any port 47984 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 47989 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 48010 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 47998:48000 proto udp
+```
+
+Manual IP addition avoids mDNS when multicast is blocked or subnets differ.
+Guest Wi-Fi isolation can block all host access. Custom ports need matching
+firewall/client settings. NixOS `openFirewall` opens streaming ports globally;
+restrict public interfaces separately. The protocol is not fully encrypted;
+do not forward these ports to the internet. Use a VPN.
+
+## Upgrades and configuration
+
+- Pacman repository: `sudo pacman -Syu`.
+- Downloaded packages: install a new release using [the package commands](#native-packages).
+- Portable: download and rerun the latest installer. The copy under
+  `/opt/pyroshine/bin/` reinstalls its original version.
+- NixOS: update the flake input and rebuild; see [NixOS](NIXOS.md).
+
+After a native package upgrade, restart `sudo systemctl restart "pyroshine@$USER"`.
+Update server and GUI together. Restarts end active streams; they also apply
+settings/GUI saves and refresh scanners.
+
+Back up `~/.config/moonshine` (config/TLS identity) and
+`~/.local/share/moonshine` (pairing state) privately before migration.
+Do not rename these inherited paths. Native/portable units explicitly use
+`/home/<user>/.config/moonshine/config.toml`; other homes/paths need a
+[service override](CONFIGURATION.md#file-location-and-loading).
+Older builds may need [presentation migration](NATIVE_PRESENTATION.md#upgrade-migration).
 
 ## Service diagnostics
 
 ```sh
-systemctl status "pyroshine@$USER"
-journalctl -u "pyroshine@$USER" -e
+systemctl status "pyroshine@$USER" --no-pager
+journalctl -u "pyroshine@$USER" -b -n 100 --no-pager
 ```
 
-For application output, see [debugging a failing application](TIPS.md#debug-a-failing-application).
-For NixOS use the [NixOS module guide](NIXOS.md), which manages service setup declaratively.
+Look for the latest **Pyroshine is ready and waiting for connections.** An
+active process may still be waiting for D-Bus or restarting after failure.
+Desktop login or lingering provides the user's runtime directory/bus.
+Use `sudo journalctl` if needed. See [host troubleshooting](TIPS.md) or
+[application logs](TIPS.md#debug-a-failing-application).

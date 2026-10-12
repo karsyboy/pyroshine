@@ -10,6 +10,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod pair;
+
 pub use moonshine_core::ShutdownReason;
 use moonshine_core::clients::ClientManager;
 use moonshine_core::config::Config;
@@ -37,6 +39,12 @@ struct Args {
 enum Command {
 	/// Run health checks and report results, then exit.
 	Healthcheck,
+	/// Pair a Moonlight or Pyrolight device with the running server.
+	Pair {
+		/// Optional name for the paired device.
+		#[arg(long)]
+		name: Option<String>,
+	},
 }
 
 fn default_config_path() -> PathBuf {
@@ -54,6 +62,14 @@ async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
 	init_tracing();
+
+	// Pairing talks to the running server; it must not load/create a config,
+	// probe the GPU, or acquire the daemon's state lock.
+	if let Some(Command::Pair { name }) = &args.command {
+		return pair::run(name.as_deref().unwrap_or("")).await.map_err(|error| {
+			eprintln!("Pairing failed: {error}");
+		});
+	}
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let mut config = Config::load_or_create(&config_path)?;
@@ -277,5 +293,26 @@ impl Moonshine {
 			)?,
 			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),
 		})
+	}
+}
+
+#[cfg(test)]
+mod cli_tests {
+	use super::*;
+
+	#[test]
+	fn pairing_subcommand_needs_no_config_and_accepts_a_device_name() {
+		let args = Args::try_parse_from(["pyroshine", "pair"]).unwrap();
+		assert!(args.config.is_none());
+		assert!(matches!(args.command, Some(Command::Pair { name: None })));
+		let args = Args::try_parse_from(["pyroshine", "pair", "--name", "Living room"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Pair { name: Some(name) }) if name == "Living room"));
+	}
+
+	#[test]
+	fn healthcheck_keeps_its_positional_config_path() {
+		let args = Args::try_parse_from(["pyroshine", "/tmp/config.toml", "healthcheck"]).unwrap();
+		assert_eq!(args.config, Some(PathBuf::from("/tmp/config.toml")));
+		assert!(matches!(args.command, Some(Command::Healthcheck)));
 	}
 }

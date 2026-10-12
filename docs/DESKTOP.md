@@ -1,181 +1,112 @@
 # Desktop app
 
-The optional `pyroshine-ui` desktop app adds a system tray icon, pairing
-notifications, PIN approval, paired-client management, a settings editor and a
-stream dashboard. It manages a Pyroshine service that is already running for
-your user; it never starts, stops or restarts that service. Pyroshine works the
-same without it, including on hosts with no graphical session.
+The optional app handles pairing, clients, settings and stream status.
+[Install and start the server](../README.md#quick-start) first. The app cannot
+start, stop or restart it; closing the app leaves streaming running.
 
-## Install
+## Install and open
 
-Install the `pyroshine-ui` package from the
-[releases page](https://github.com/karsyboy/pyroshine/releases) next to the
-server package:
+Install `pyroshine-ui-bin` from the Arch/CachyOS repository, or the matching
+`pyroshine-ui` [release package](INSTALLATION.md#native-packages).
+The package supplies GTK 3/WebKitGTK 4.1 and desktop autostart.
+Portable/NixOS installs need a [separate GUI build](../pyroshine-ui/README.md#build)
+or [terminal pairing](INSTALLATION.md#pair-without-the-desktop-app).
+
+Open **Pyroshine** from the application menu, or run:
 
 ```sh
-# Arch Linux / CachyOS
-sudo pacman -U ./pyroshine-ui-*.pkg.tar.zst
-
-# Debian / Ubuntu
-sudo apt install ./pyroshine-ui_*.deb
-
-# Fedora / RHEL
-sudo dnf install ./pyroshine-ui-*.rpm
+pyroshine-ui
 ```
 
-On Arch Linux and CachyOS, `pyroshine-ui-bin` from the
-[`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages)
-installs the same app (`sudo pacman -Syu pyroshine-ui-bin`).
-
-It needs WebKitGTK 4.1 and GTK 3, which the package pulls in. The server
-package does not depend on it. The portable installer and the NixOS module do
-not include the app; build it from source as described in
-[pyroshine-ui/README.md](../pyroshine-ui/README.md).
-
-The app starts in the tray at each desktop login (`/etc/xdg/autostart`); turn
-that off in your desktop's autostart settings. Open it from the application
-menu as **Pyroshine** or run `pyroshine-ui`. Starting it again shows the
-running instance instead of opening a second one.
-
-The app and the service must belong to the same user and share that user's
-D-Bus session bus. This is the case for the packaged `pyroshine@<user>`
-service. If the app reports that Pyroshine isn't running while the service is
-active, check the service log for "Desktop management interface unavailable".
-
-## Tray
-
-| Icon | Meaning |
-| --- | --- |
-| Logo | Ready for connections |
-| Green play button | A client is streaming |
-| Amber pause button | The application is running, but the client disconnected; Moonlight can resume it |
-| Blue dots | A session is starting or a client is reconnecting |
-| Grey square | The session is ending |
-| Red exclamation mark | The session could not be stopped cleanly; the service is restarting |
-| Indigo keypad (attention) | A client is waiting to pair |
-| Grey logo | The Pyroshine service is not running |
-
-Left-click opens the window. The menu shows the current application, mode and
-client, and offers **Pair a Client**, **End Session** and **Quit Pyroshine UI**.
-
-The dashboard and tray show the primary application selected by Pyroshine's
-compositor. Launching a game from Steam changes that name to the game's window
-title; exiting it returns to the launcher. Session details show both the
-foreground application and the original **Moonlight application**, whose
-**Application ID** stays unchanged. If a window supplies no name, the main
-display falls back to the Moonlight application. Reporting continues while a
-disconnected session is retained. Overlays and notifications follow the
-compositor's existing primary-focus policy.
-
-**End Session** ends the session exactly like quitting from Moonlight: it
-closes the streamed application (unsaved progress may be lost) and disconnects
-the client. **Quit Pyroshine UI** only closes the app; the server and any stream
-keep running.
+It starts in the tray at desktop login; disable this in your desktop's autostart
+settings if desired. The app and server must use the same user's session bus.
+Opening the app again shows its existing window.
 
 ## Pair a client
 
-1. In Moonlight, add the host and select it. Moonlight shows a PIN.
-2. A **Pairing request** notification appears. Click it, or open **Clients**.
-3. Check the requester address and certificate fingerprint, enter the PIN and,
-   optionally, a name for the device, then select **Pair**.
+1. Select the host in Moonlight/Pyrolight and start pairing. The client shows a
+   PIN. If discovery fails, add the host's LAN IP.
+2. Open Pyroshine's **Pairing request** notification or **Clients → Pairing requests**.
+3. Verify the requester belongs to your device. Enter its PIN, optionally name
+   it, and select **Pair**. **Reject** requests you did not initiate.
+4. Wait for **Client paired**, the device under **Paired clients**, and the
+   client's application list. Select Steam or an installed game.
 
-The PIN applies only to the request shown. If the client restarts pairing, the
-new request replaces the old one and needs its own PIN. Requests expire after
-five minutes. A wrong PIN makes pairing fail on both sides; start again in
-Moonlight. **Reject** refuses a request you do not recognize.
-
-Moonlight does not send a device name, and many clients send the same client
-ID, so the certificate fingerprint identifies a device. Name devices when you
-pair them to tell them apart later.
-
-Without the app, for example on a headless host, Pyroshine shows a desktop
-notification where possible and logs a host-local approval link
-(`http://localhost:47989/pin?uniqueid=…`); see
-[Security administration](SECURITY_ADMINISTRATION.md).
+No notification? Open **Clients** directly. No request? Check the service and
+retry in the client. Failed/expired pairings need a fresh request and PIN.
+See [troubleshooting](#troubleshooting) or [pairing security](SECURITY_ADMINISTRATION.md).
 
 ## Manage clients
 
-**Clients** lists every paired certificate with its name, when it was paired
-(for pairings made by this version or later) and when it last connected since
-Pyroshine started. Rename a client with the pencil icon. **Revoke** removes its
-trust immediately; it must pair again to connect. Revoking also ends any active
-session, because sessions do not record which client started them.
+In **Clients**, the pencil renames a device; names are assigned by you.
+**Revoke** removes its trust immediately, requiring it to pair again.
+Revoking **any client ends the active stream**, including another client's.
+Other clients remain trusted. Pairing times are available for newer pairings;
+last-connection times cover the current server run.
+
+For certificate details and terminal revocation, see
+[Security administration](SECURITY_ADMINISTRATION.md#revoke-a-client).
 
 ## Settings
 
-**Settings** edits every `config.toml` setting described in the
-[configuration reference](CONFIGURATION.md), grouped by area, including
-applications and application scanners. Rarely needed settings appear with
-**Show advanced**; settings that can break streaming or require re-pairing show
-a warning.
+**Settings** edits applications, scanners and server options; **Show advanced**
+reveals less common fields. Fresh native/portable configurations already include
+Steam and library scanning. See the [configuration reference](CONFIGURATION.md).
 
-Saving validates the whole configuration first; nothing is written if any
-value is invalid or if the file changed on disk since it was loaded. The save
-changes only the settings you edited and keeps the rest of the file, including
-comments and formatting.
-
-Pyroshine reads its configuration only at startup. After saving, restart it to
-apply the changes (this ends any active session):
+Saving validates the whole file and preserves unedited settings/comments.
+Invalid values or external file changes prevent saving. Apply saved changes by
+restarting the service; this ends active streams:
 
 ```sh
 sudo systemctl restart "pyroshine@$USER"
 ```
 
-The app cannot edit a configuration it cannot write, such as the NixOS
-module's generated file; change `services.moonshine.settings` instead.
+NixOS's generated configuration is read-only: edit
+`services.moonshine.settings` and rebuild instead.
 
-## Dashboard and diagnostics
+## Stream status and tray
 
-The dashboard shows the session state, application, negotiated video and audio
-format, client address and session duration. While a client streams it adds
-one-second statistics from the video pipeline: frame rate, encoded and wire
-bitrate, transport overhead and the time spent in each pipeline stage. Stages
-the active encoder does not use are not shown.
+The dashboard shows the active application/client, duration, video/audio formats
+and streaming performance. **Diagnostics** shows version, GPU, profiles, ports
+and the startup healthcheck. The application name follows the foreground game;
+**Moonlight application** retains the original launcher. Disconnected sessions
+retain status until stopped. Frame pacing distinguishes VRR from fixed refresh;
+audio details reflect the negotiated layout and quality.
 
-**Frame pacing** shows how the game's frames reach the client: **VRR capture**
-when a client with VRR presentation (Pyrolight with VRR enabled) has the host
-capture each frame as the game presents it, otherwise **Fixed refresh**. It
-reports the game's frame rate and frame times as sent to the client (median,
-p95, p99 and maximum), the share of frame times that change by more than 2 ms
-from one frame to the next (visible unevenness on a VRR display), and the
-delay from new content to its capture.
+| Tray indicator | Meaning |
+| --- | --- |
+| Logo | Ready |
+| Green play | Streaming |
+| Amber pause | Disconnected; application remains resumable |
+| Blue dots | Starting/reconnecting |
+| Grey square | Ending session |
+| Red exclamation | Cleanup failed; service restarting |
+| Indigo keypad | Pairing request waiting |
+| Grey logo | Service unavailable |
 
-**Audio** shows the stream the client receives: channel layout and mask, the
-audio quality level (Standard, High or Maximum) and whether the client
-requested it or the host default (`[stream.audio] quality`) applied, the
-encoded Opus bitrate after the audio packet-size limit, the Opus stream layout
-(GameStream high-quality surround uses one mono stream per channel), sample
-rate, packet duration and encryption. It updates when a reconnect negotiates a
-different audio mode.
-
-**Diagnostics** shows the version, GPU, verified codec profiles, HDR and DMA-BUF
-support, listening ports and the startup health check.
+Left-click opens the window. **End Session** closes the streamed application
+and disconnects the client; save progress first. **Quit Pyroshine UI** closes
+only the app.
 
 ## Desktop environment support
 
-| Environment | Tray | Notes |
-| --- | --- | --- |
-| KDE Plasma (Wayland or X11) | Yes | Native StatusNotifierItem support. |
-| GNOME (Wayland or X11) | With an extension | GNOME has no tray; install the AppIndicator/KStatusNotifierItem extension (preinstalled on Ubuntu). Notifications and the window work without it. |
-| Other X11 or Wayland panels | If the panel hosts StatusNotifierItem icons | Xfce, Cinnamon, MATE, LXQt and waybar support it; legacy XEmbed-only trays do not. |
+KDE Plasma supports the tray. GNOME needs an AppIndicator/KStatusNotifierItem
+extension for a tray; other panels need a StatusNotifierItem host.
+The window and notifications work without one: reopen from the application menu.
+Wayland may highlight the taskbar instead of focusing the window; select it manually.
 
-Without a tray, closing the window keeps the app running for notifications;
-open it again from the application menu.
-
-On Wayland a window may only take focus with an activation token from the
-compositor. The app uses the token that comes with the click on a
-notification, the tray icon or the application menu entry, so the window comes
-to the front. Desktops that do not pass a token (some notification servers and
-tray extensions) only highlight the window in the taskbar instead.
-On NVIDIA systems the app disables WebKitGTK's DMA-BUF renderer, which can show
-blank windows there; set `WEBKIT_DISABLE_DMABUF_RENDERER=0` to override.
+On NVIDIA, the app disables WebKitGTK's DMA-BUF renderer to avoid blank windows.
+Override only if needed with `WEBKIT_DISABLE_DMABUF_RENDERER=0`.
 
 ## Troubleshooting
 
-| Symptom | Check |
+| Symptom | Action |
 | --- | --- |
-| "Pyroshine isn't running" | `systemctl status "pyroshine@$USER"`; the app reconnects by itself once the service runs. |
-| "Pyroshine is running, but this app can't connect to it" | A transient error (for example the session bus or a service still starting) is retried automatically with growing delays up to 30 s. If it says retrying won't help, the app and the service are different versions or access is denied: update both, then restart the app. |
-| Service runs, app cannot reach it | The service log line "Desktop management interface unavailable" explains why, for example a different user or session bus. |
-| No tray icon | The table above; the app logs "System tray unavailable" when no host exists. |
-| App diagnostics | Run `PYROSHINE_UI_LOG=info pyroshine-ui` from a terminal. |
+| No notification | Open **Clients**, retry pairing, check desktop notification settings. |
+| No request | Check server/network; enable **Settings → Pairing & security → Allow new pairings**, save and restart. [More pairing help](TIPS.md#pairing-does-not-complete). |
+| "Pyroshine isn't running" | Follow [Start](../README.md#2-start); the app reconnects automatically. |
+| Cannot connect / persistent retrying | Check `journalctl -u "pyroshine@$USER" -e` for **Desktop management interface unavailable**. Use the server's user/session bus; update server and GUI together, then restart both. |
+| No tray | Use the window; check desktop support above. |
+| Blank/unavailable app | Inspect `PYROSHINE_UI_LOG=info pyroshine-ui`; use [terminal pairing](INSTALLATION.md#pair-without-the-desktop-app) meanwhile. |
+
+Use `sudo journalctl` if journal access is denied.

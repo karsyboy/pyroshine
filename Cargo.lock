@@ -2349,7 +2349,12 @@ version = "0.17.3"
 dependencies = [
  "async-shutdown",
  "clap",
+ "futures-util",
  "moonshine-core",
+ "moonshine-management",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

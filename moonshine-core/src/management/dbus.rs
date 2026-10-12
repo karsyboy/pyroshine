@@ -148,7 +148,7 @@ impl ManagementInterface {
 		clients
 			.register_pin_with_label(client_id, pin, request, label)
 			.map_err(|()| ManagementError::Failed("The PIN could not be applied to this request.".into()))?;
-		tracing::info!(requester = %pending.requester, "Pairing PIN entered in the desktop app");
+		tracing::info!(requester = %pending.requester, "Pairing PIN entered through the local management interface");
 		Ok(())
 	}
 

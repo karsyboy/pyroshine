@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Add `pyroshine pair` for interactive pairing from the host terminal or SSH. It verifies the requester, submits the PIN through the existing same-user management interface, and confirms the exact request completed. `--name` optionally labels the device; no GUI, browser or token copying is needed.
+
+### Changed
+
+- Reorganize user documentation around Install → Start → Pair → Play, with GUI pairing recommended, native terminal pairing and browser fallback, platform compatibility notes and first-run troubleshooting. Correct healthcheck ordering, request-specific pairing links and configuration guidance without changing server behavior.
+
 ## [v0.17.3] - 2026-10-09
 
 ### Added

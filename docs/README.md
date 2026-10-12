@@ -1,18 +1,19 @@
 # Pyroshine documentation
 
-Start with the [project README](../README.md) for requirements and a quick start.
+## Getting started
 
-## Using Pyroshine
+- [README quick start](../README.md): requirements and **Install → Start → Pair → Play** for a standard desktop.
+- [Installation](INSTALLATION.md): platform compatibility, SteamOS/portable setup, headless use, networking and upgrades.
+- [Desktop app](DESKTOP.md): open the app, pair devices, manage clients, save settings and read stream status.
+- [Pair without the GUI](INSTALLATION.md#pair-without-the-desktop-app): `pyroshine pair`, including over SSH; browser fallback.
+- [NixOS](NIXOS.md): declarative installation, Steam configuration and the `moonshine` service.
 
-User guides are task-oriented and avoid implementation detail.
+## Advanced configuration and troubleshooting
 
-- [Installation and upgrades](INSTALLATION.md): native packages, portable builds, headless setup, and service diagnostics.
-- [Desktop app](DESKTOP.md): optional system tray, pairing notifications, client management, settings editor, and stream dashboard.
-- [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults, and examples.
-- [Tips and troubleshooting](TIPS.md): Steam, Flatpak, Gamescope, desktop sessions, and application logs.
-- [Security administration](SECURITY_ADMINISTRATION.md): pairing approval, durable state recovery, TLS identity permissions and revocation.
-- [NixOS](NIXOS.md): flake package, service module, and development shell.
-- [Changelog](CHANGELOG.md): Pyroshine fork releases and upcoming changes.
+- [Troubleshooting and recipes](TIPS.md): host discovery, healthcheck failures, pairing, Steam, input access, Flatpak and application logs.
+- [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults and examples.
+- [Security administration](SECURITY_ADMINISTRATION.md): pairing security, certificate identity, revocation and state recovery.
+- [Changelog](CHANGELOG.md): Pyroshine releases and upcoming changes.
 - [Upstream changelog](UPSTREAM_CHANGELOG.md): archived Moonshine release history and attribution.
 
 ## Development and architecture

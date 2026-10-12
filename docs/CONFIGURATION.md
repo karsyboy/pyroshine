@@ -16,6 +16,9 @@ custom file as a positional argument:
 pyroshine /absolute/path/config.toml
 ```
 
+For a normal native/portable Steam setup, the generated defaults are enough;
+you do not need to create application entries before the first stream.
+
 If the file does not exist, Pyroshine creates it with defaults. It reads the file
 at startup; restart the server after edits. Invalid TOML or missing required
 fields prevents startup. Unknown fields are not rejected by the current parser,
@@ -49,17 +52,20 @@ Top-level keys must appear before any `[table]` or `[[array_of_tables]]` header.
 A table header changes the scope of subsequent keys. Applications and scanners
 are arrays of tables; repeat their headers to add entries.
 
-Omitted top-level settings use defaults. Most nested tables also default their
+Omitted top-level settings generally use defaults; scanners are the exception
+described below. Most nested tables also default their
 individual fields, with one exception: if `[webserver]` is present, `port`,
 `port_https`, `certificate`, and `private_key` are required. Only
 `enable_pairing` can be omitted from that table.
 
-If `application` is omitted, one Steam Big Picture entry is supplied. If
-`application_scanner` is omitted, a Steam scanner is supplied using
-`$HOME/.local/share/Steam` and
+A newly generated file contains a Steam Big Picture entry and a Steam scanner
+using `$HOME/.local/share/Steam` and
 `["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]`.
-Explicit arrays replace those defaults. Use `application = []` or
-`application_scanner = []` at the top of the file to disable either default list.
+When reading an existing file, omitting `application` supplies the Steam entry,
+but omitting `application_scanner` gives an empty scanner list. Keep or explicitly
+add the Steam scanner if you want discovery in a hand-written file.
+Explicit arrays replace the corresponding lists. Use `application = []` or
+`application_scanner = []` at the top of the file to disable them.
 
 A minimal file with one explicit application and no scanner:
 
@@ -80,7 +86,7 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 | `address` | string, `"0.0.0.0"` | Bind address for web and stream listeners. `0.0.0.0` is IPv4; `::` enables dual-stack IPv4/IPv6. With a specific non-loopback address, the pairing PIN page is additionally served on `127.0.0.1` at the HTTP port. |
 | `inhibit_sleep` | boolean, `true` | Ask logind to block suspend while streaming. Requires the shipped polkit rule and `pyroshine` group access; the packaged service grants that group. Failure logs a warning and does not prevent streaming. |
 | `application` | array of tables, Steam entry | Static applications exposed to clients; see below. |
-| `application_scanner` | array of tables, Steam scanner | Dynamically discover installed applications at startup and append them to the static list; see below. |
+| `application_scanner` | array of tables, Steam scanner in generated config; `[]` if omitted from an existing file | Discover installed applications at startup and append them to the static list; see below. |
 | `webserver` | table | HTTP/HTTPS ports, pairing, and TLS files. |
 | `stream` | table | RTSP, timeout, video, audio, and control settings. |
 | `compositor` | table | GPU, capture, HDR, window focus, and keyboard settings. |
@@ -116,21 +122,18 @@ they must be fixed), two TCP listeners (`webserver.port`,
 port, `[stream].timeout` is outside 1–86400, or whose `address` is not an IP
 address. The desktop settings editor applies the same checks.
 
-Pairing approval is an operator action on the host. `/pin` and `/submit-pin`
-reject requests whose peer or `Host` is not loopback and cross-origin browser
-requests, so a client cannot approve its own pairing. The page approves the
-specific pending request it shows (requester address and certificate
-fingerprint); an unapproved request expires after five minutes and the client
-must retry. On a headless host, forward the port over SSH and open the page
-locally:
+Pair through the [desktop app](DESKTOP.md#pair-a-client), or follow the
+[headless/browser procedure](INSTALLATION.md#pair-without-the-desktop-app).
+The page needs the complete logged `/pin?uniqueid=...` URL; bare `/pin` fails.
+It provides the request-specific approval token used by `/submit-pin`, which
+requires `uniqueid`, `pin` and `request`.
 
-```sh
-ssh -L 47989:localhost:47989 user@host
-# then open http://localhost:47989/pin on this machine
-```
-
-See [Security administration](SECURITY_ADMINISTRATION.md) for pending limits,
-identity recovery, state migration and authorized revocation.
+Operator approval routes require a loopback peer and a loopback `Host` on the
+configured HTTP port; browser Origin/site checks also apply. For SSH forwarding,
+keep the local and remote port equal to `webserver.port`. A different local
+port is rejected by Host/origin validation. See
+[Security administration](SECURITY_ADMINISTRATION.md) for request lifetimes,
+identity recovery and revocation.
 
 ## `[stream]`
 
@@ -336,9 +339,9 @@ capture selection retains the NVIDIA/AMD/other preference and stable node sortin
 Commands are argument arrays rather than shell scripts. For shell syntax,
 variable expansion, pipes, or redirection, explicitly run a shell, for example
 `["/usr/bin/bash", "-c", "your script"]`. Do not assume `~` or `$HOME` expands
-in arbitrary argument strings or boxart paths. Empty hooks and hooks whose
-executables cannot be resolved are skipped. TLS paths and scanner source
-paths explicitly support shell-style path expansion.
+in arbitrary argument strings or boxart paths. Empty or unresolvable hook
+commands fail launch, with the entry named in the log. TLS paths and scanner
+source paths explicitly support shell-style path expansion.
 
 Applications inherit `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT`, and
 `MOONSHINE_CLIENT_FRAMERATE`; these are runtime environment variables, not TOML
@@ -414,8 +417,12 @@ For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-insi
 
 ## Diagnostics outside config.toml
 
-Use `pyroshine healthcheck` to inspect host capabilities. Logging is controlled
-by `MOONSHINE_LOG`, and an explicit PyroWave library can be selected with
+With the service stopped, use `pyroshine /absolute/path/config.toml healthcheck`
+to inspect the same configuration as the service. The config path is positional;
+there is no `--config` option. This check binds ports, so it reports conflicts
+if the server is running. See [healthcheck troubleshooting](TIPS.md#healthcheck-fails).
+
+Logging is controlled by `MOONSHINE_LOG`, and an explicit PyroWave library can be selected with
 `MOONSHINE_PYROWAVE_LIBRARY`. For service environment changes, use a systemd
 `[Service]` override with `Environment=...` and restart. Detailed library and
 GPU validation guidance lives in [PYROWAVE.md](PYROWAVE.md); build and installation

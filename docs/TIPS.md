@@ -1,25 +1,150 @@
 # Tips and troubleshooting
 
-Practical recipes for common Pyroshine setups and problems.
-Each tip shows a real-world use of `pre_command` / `post_command` (or other configuration) to solve a common problem.
-See the [configuration reference](CONFIGURATION.md) for the full schema of these fields.
+Start with the symptom below. Commands assume a native/portable installation
+running for your current user. [NixOS](NIXOS.md) uses `moonshine.service`.
+If journal access is denied, prefix `journalctl` with `sudo`.
 
-## Contents
+| Problem | First action |
+| --- | --- |
+| Host missing or connection fails | [Check address and firewall](#host-not-found-or-connection-fails). |
+| Server fails to start | Read `journalctl -u "pyroshine@$USER" -b -n 100 --no-pager`, then [check the host](#healthcheck-fails). |
+| Pairing does not finish | [Use a fresh request and correct approval URL](#pairing-does-not-complete). |
+| Steam opens locally / client reports 503 | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
+| Steam or games missing / cannot launch | [Check default applications](#steam-or-games-are-missing). |
+| Keyboard, mouse or gamepad unavailable | [Check input access](#keyboard-mouse-or-gamepads-do-not-work). |
+| Desktop app unavailable / no tray | [GUI troubleshooting](DESKTOP.md#troubleshooting); browser pairing still works. |
+| New settings have no effect | Restart the service after saving; this ends an active session. |
 
-- [Close a desktop Steam before streaming Steam](#close-a-desktop-steam-before-streaming-steam)
-- [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
-- [Run games in high-performance mode](#run-games-in-high-performance-mode)
-- [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
-- [Match a game's fullscreen resolution to the stream](#match-a-games-fullscreen-resolution-to-the-stream)
-- [Run Flatpak Steam inside Pyroshine's compositor](#run-flatpak-steam-inside-pyroshines-compositor)
-- [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
-- [Debug a failing application](#debug-a-failing-application)
+## Host not found or connection fails
+
+1. Check the [service status and ready message](INSTALLATION.md#service-diagnostics).
+2. Run `hostname -I` on the host. In Moonlight/Pyrolight, add its LAN or VPN IP
+   manually. Choose the address reachable from that device, not a container
+   address. Default listeners use IPv4 (`0.0.0.0`).
+3. Check the [firewall ports](INSTALLATION.md#network-and-firewall). Host discovery
+   uses multicast and may not cross VLANs/subnets or a VPN. A manually added IP
+   can work even when discovery does not. Guest Wi-Fi/client isolation can block
+   both discovery and streaming.
+4. If pairing works but streaming fails, check UDP 47998–48000 as well as TCP
+   48010. Client and host must share a compatible advertised codec. Start with
+   SDR and a codec listed by the host's **Diagnostics** or healthcheck.
+
+Do not solve discovery problems by exposing ports on a public router; use a VPN.
+
+## Healthcheck fails
+
+The standalone healthcheck binds the configured ports. Stop the server before
+running it, as your streaming user; this ends any active stream:
+
+```sh
+sudo systemctl stop "pyroshine@$USER"
+pyroshine "$HOME/.config/moonshine/config.toml" healthcheck
+```
+
+For portable installations, replace `pyroshine` with
+`/opt/pyroshine/start-pyroshine.sh`. For a service override, use its actual config
+path. There is no `--config` option. Fix `FAIL` results, then start again:
+
+```sh
+sudo systemctl start "pyroshine@$USER"
+```
+
+| Report | Corrective action |
+| --- | --- |
+| Ports in use | If the server is stopped, inspect `sudo ss -lntup` for another listener (for example Sunshine/Moonshine). Stop the conflicting service or configure distinct ports; do not run two servers on the defaults. |
+| Render nodes / GPU / EGL / Vulkan / DMA-BUF / Codecs | Install the current hardware driver for your GPU using your distribution's instructions, then repeat the check. A GPU name alone does not guarantee the required capabilities. No usable encode profile or DMA-BUF support means this host cannot stream with the current setup. |
+| Render access denied | Inspect `ls -l /dev/dri/renderD*` and the group named in the check. Give the streaming user that device group's access, then log out/in (reboot if the headless user manager retains old groups). Do not use world-writable device permissions. |
+| Capture/Vulkan device mismatch | The capture and encoder must use the same physical GPU. Follow [GPU selection](CONFIGURATION.md#compositor), using the identities in the error. There is no cross-GPU copy fallback. |
+| Runtime dir / waiting for D-Bus | Use a regular desktop login or enable [lingering](INSTALLATION.md#headless-setup); the packaged wrapper sets the runtime/bus paths. Do not run the server as root. |
+| kcmp(2) blocked/unavailable | Run on the host outside a restrictive sandbox, or correct the kernel/seccomp restriction described in the error. It is required for buffer validation. |
+| PyroWave unavailable | Optional if a conventional codec passes; use H.264/HEVC/AV1. For PyroWave, keep the package's matching library and compatible Pyrolight client; see [PyroWave](PYROWAVE.md). |
+| Sleep inhibit warning | The native/portable service grants the `pyroshine` group; a direct terminal check may lack it. See [sleep inhibition](#prevent-the-host-from-suspending-while-streaming) rather than following the check's inherited `moonshine` group hint. NixOS uses `moonshine`. |
+| input group warning | Needed for gamepads when logged out; follow [headless setup](INSTALLATION.md#headless-setup). Not required with working active-seat ACLs. |
+
+Passing the standalone check verifies host prerequisites; it does not test an
+actual client, game or stream. Startup runs its own check before listening.
+Read the latest startup log or the GUI's **Diagnostics** while the server is
+running instead of repeating the port-binding check.
+
+## Pairing does not complete
+
+- Start pairing in the client first. An empty **Clients** page or "No pending
+  pairing request" can mean the request expired, disconnected or was replaced.
+  Retry and use the latest PIN/link.
+- Without the GUI, run `pyroshine pair` as the server's user, without sudo.
+  If the command cannot connect, check the service and lingering/session bus.
+  For [browser pairing](INSTALLATION.md#browser-pairing), use the complete
+  logged URL; bare `/pin` cannot select a request.
+- A 403 on approval means loopback/Host/origin validation failed. Open the URL
+  on the host or use an SSH tunnel with the configured HTTP port at both ends.
+  A host LAN address or a different local forwarding port will not work.
+- If new requests are disabled, enable **Allow new pairings** in GUI settings
+  (or `webserver.enable_pairing`), save, and restart before retrying.
+- **PIN accepted** is not proof that pairing completed. Wait for the client's
+  application list; a wrong PIN can still fail the later handshake.
+
+## Steam or games are missing
+
+Fresh configurations already include **Steam** and a scanner for
+`$HOME/.local/share/Steam`, launching `/usr/bin/steam`. Install and sign in to
+Steam as the service's user, and install games before starting Pyroshine.
+The scanner reads Steam's library locations and runs at server startup; restart
+to pick up newly installed games. Pyroshine does not install games for you.
+
+If Steam is listed but cannot launch, check that `/usr/bin/steam` exists and
+quit any Steam already running on the local desktop. For Flatpak Steam, use the
+[Flatpak recipe](#run-flatpak-steam-inside-pyroshines-compositor). For NixOS use
+its [Steam configuration](NIXOS.md#install-and-configure). For other launchers,
+set applications/scanners in the GUI or [configuration reference](CONFIGURATION.md#application).
+Keep executable paths absolute when outside the service's PATH.
+For crashes or launch timeouts, capture [application logs](#debug-a-failing-application).
+
+## Keyboard, mouse or gamepads do not work
+
+Native packages and the portable installer provide input-device rules and load
+`uinput`/`uhid`. If the healthcheck reports missing modules, load them with
+`sudo modprobe uinput uhid`. If they are loaded but access is denied, check the
+installed rules: `/usr/lib/udev/rules.d/60-pyroshine.rules` for native packages,
+`/etc/udev/rules.d/60-pyroshine.rules` for portable installs. The healthcheck's
+inherited `60-moonshine.rules` hint applies to NixOS, not native Pyroshine packages.
+After correcting integration, reload with `sudo udevadm control --reload-rules`
+and `sudo udevadm trigger`, or reboot.
+
+Without an active desktop seat, [input group membership](INSTALLATION.md#headless-setup)
+is needed. Ensure the user's systemd manager and streamed games have the new
+groups, not only a new shell. Do not make devices world-writable.
+
+## Missing libraries or an older system
+
+If startup reports `GLIBC_2.39 not found`, upgrade the distribution or
+[build from source](../CONTRIBUTING.md#manually-building-the-app). If a `.so` is missing, native
+package users should check that the package manager resolved its dependencies;
+portable users must supply [host runtime libraries](INSTALLATION.md#portable-installer-and-steamos).
+`ldd /opt/pyroshine/bin/pyroshine` lists direct missing libraries for a portable
+install, but Vulkan/EGL/encoder libraries loaded at runtime also need to work.
+The [compatibility guide](INSTALLATION.md#platform-compatibility) distinguishes package
+availability from verified compatibility.
+
+## Application recipes
+
+These are optional adjustments. Edit existing application entries rather than
+adding a second Steam entry with the same title. Restart after configuration
+changes. See the [reference](CONFIGURATION.md) for command fields and scanners.
+
+- [Close local Steam automatically](#close-a-desktop-steam-before-streaming-steam)
+- [Prevent suspend](#prevent-the-host-from-suspending-while-streaming)
+- [GameMode](#run-games-in-high-performance-mode)
+- [Gamescope resolution](#use-gamescope-with-the-clients-resolution)
+- [Game fullscreen resolution](#match-a-games-fullscreen-resolution-to-the-stream)
+- [Flatpak Steam](#run-flatpak-steam-inside-pyroshines-compositor)
+- [A full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
+- [Application logs](#debug-a-failing-application)
 
 ## Close a desktop Steam before streaming Steam
 
-### How to
-
-Add a `pre_command` that shuts down any running desktop Steam before the stream starts, so Pyroshine's instance becomes the primary one:
+Steam is single-instance per user. An existing desktop instance takes over the
+streamed launch, opening Big Picture locally and causing a 503 error.
+Quit it manually, or edit the existing Steam entry to close it automatically:
 
 ```toml
 [[application]]
@@ -30,149 +155,107 @@ pre_command = [
 ]
 ```
 
-This asks any running Steam to shut down and waits (up to ~30s) for it to exit before the streaming instance launches.
-
-### Details
-
-This is the recommended workaround from issue [#134](https://github.com/hgaiser/moonshine/issues/134).
-Steam is single-instance per user, so when Pyroshine launches Steam inside its own compositor while a desktop Steam is already running on the host, the `steam://` URL (for example "open big picture") is forwarded to the existing desktop instance instead of running inside Pyroshine's compositor.
-The result is that Big Picture opens on the host's physical desktop and the streaming session fails (Moonlight sees a 503 error).
-Note that this closes your desktop Steam session when a stream starts.
+This closes local Steam and waits up to 30 seconds before streaming it.
+See [upstream issue #134](https://github.com/hgaiser/moonshine/issues/134).
 
 ## Prevent the host from suspending while streaming
 
-### How to
+The native/portable service grants the `pyroshine` group and inhibits sleep
+automatically during streams. [NixOS](NIXOS.md#headless-input-and-sleep)
+requires membership in `moonshine`. For direct binary launches:
 
-The packaged service grants the `pyroshine` group and blocks sleep automatically
-for the duration of every stream. If you launch the binary directly, join the
-group with `sudo usermod -aG pyroshine "$USER"`, then log out and back in.
-If you want to disable this, set `inhibit_sleep = false` at the top of your configuration:
+```sh
+sudo usermod -aG pyroshine "$USER"
+```
+
+Log out/in to refresh groups. Manual installs also need the shipped policy and
+group; follow [manual installation](../CONTRIBUTING.md#manual-installation-and-upgrade).
+A sleep-inhibition warning does not prevent streaming, but the host may suspend.
+To disable inhibition, set at the top of the configuration:
 
 ```toml
-name = "Pyroshine"
 inhibit_sleep = false
 ```
 
-### Details
-
-Pyroshine asks logind (over D-Bus) to inhibit sleep when a session starts and releases it when the session ends.
-This is the same thing `systemd-inhibit` does, but handled by Pyroshine itself, so you do not have to wrap each application's `command` with it.
-It requires the polkit rule shipped with Pyroshine (`/usr/share/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules`) and membership in the `pyroshine` group it is scoped to.
-The package creates the group via its sysusers.d drop-in, and the packaged
-service grants it through `SupplementaryGroups=pyroshine`. Manual installations
-must also install the policy and create the group; follow the
-[manual installation guide](../CONTRIBUTING.md#manual-installation-and-upgrade).
-If the user is not in the `pyroshine` group (and has no active session), Pyroshine logs a warning and streaming still works, but the host may suspend mid-stream.
-
 ## Run games in high-performance mode
 
-### How to
+Install [GameMode](https://github.com/FeralInteractive/gamemode), then set each
+game's Steam launch option:
 
-Install the `gamemode` package for your distribution.
-Then for each Steam game you want to optimize (or globally in Steam's launch options), set the game's launch option to:
-
-```
+```sh
 gamemoderun %command%
 ```
 
-Do **not** use `gamemoderun` with Steam anywhere in Pyroshine's configuration, since that launches Steam itself under `LD_PRELOAD`, which leaks into Steam's child processes and can prevent the session from launching.
+Use it for games, not Steam's application command: Steam can pass its
+`LD_PRELOAD` into child processes and prevent launch. The daemon normally starts
+through D-Bus. Check with `gamemoded -t`; if your package requires the `gamemode`
+group, join it and log out/in:
 
-### Details
+```sh
+sudo usermod -aG gamemode "$USER"
+```
 
-[GameMode](https://github.com/FeralInteractive/gamemode) applies a set of temporary system optimizations (CPU governor, I/O priority, scheduler tweaks, etc.) while a game is running, then reverts them when it exits.
-GameMode consists of a daemon (`gamemoded`) and a client library; `gamemoderun` asks the daemon to enable optimizations for the process it launches.
-The daemon is normally started automatically via D-Bus the first time a game requests it, so no manual step is needed beyond installing the package — you can verify it with `gamemoded -t`.
-
-### Requirements
-
-Make sure your user is in the `gamemode` group: `sudo usermod -aG gamemode $USER`.
-Without it, `gamemoderun` will not be able to communicate with the daemon and will silently skip applying optimizations.
-
-If the daemon is not installed or not running, `gamemoderun` simply launches the game without applying any optimizations.
+Without a working daemon, games may run without the requested optimizations.
 
 ## Use Gamescope with the client's resolution
 
-### How to
+Install Gamescope and set the game's Steam launch option:
 
-Set the game's Steam launch option (or the app's `command`) to wrap the game in Gamescope, using the client's resolution from the environment:
-
-```
+```sh
 /usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w "$MOONSHINE_CLIENT_WIDTH" -h "$MOONSHINE_CLIENT_HEIGHT" -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
 ```
 
-For supersampling, render above the output resolution — here 1.5x the client resolution:
+Pyroshine supplies these variables to streamed applications and their children.
+`-W/-H` set output size, `-w/-h` set game render size, and `-r` sets refresh rate.
+Lower render sizes upscale; higher ones supersample. For 1.5× supersampling:
 
-```
+```sh
 /usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w $((MOONSHINE_CLIENT_WIDTH * 3 / 2)) -h $((MOONSHINE_CLIENT_HEIGHT * 3 / 2)) -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
 ```
 
-Pyroshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHINE_CLIENT_FRAMERATE` on the environment of the launched application, so they are inherited by Gamescope, Steam and `%command%`.
-
-### Details
-
-- `-W`/`-H` set the output resolution; set them to the client's resolution so the stream is filled.
-- `-w`/`-h` set the resolution the game actually renders at. Rendering below the output resolution upscales (bilinear or FSR); rendering above it downsamples for supersampling. You can play with the values to trade quality against performance — when they match the client resolution you get a 1:1 image.
-- `-r` sets the refresh rate, e.g. from `MOONSHINE_CLIENT_FRAMERATE`.
-
-Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Pyroshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
-
-Note that these environment variables are only set when the app is launched by Pyroshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run the same command outside a stream.
+Gamescope can also help with focus/scaling problems. Outside a stream, provide
+fallbacks such as `${MOONSHINE_CLIENT_WIDTH:-2560}`; Pyroshine's variables are absent.
 
 ## Match a game's fullscreen resolution to the stream
 
-Games remember their fullscreen resolution, often from a different monitor or an
-earlier stream. Under Proton, a saved mode that the current stream does not offer
-can leave the game believing in a different display size than the window it
-renders into. Civilization VI, for example, then animates its main-menu buttons
-outside the visible area: the background renders but the menu is missing, with or
-without the Vulkan XWayland bypass. Set the in-game resolution to the client's
-resolution (or use borderless/windowed at that size); Pyroshine already scales a
-smaller window to fill the stream. Use the Gamescope wrapper above to render at a
-different internal resolution.
+Set the in-game resolution to the client's resolution, or use borderless/windowed
+mode at that size. A saved fullscreen mode from another monitor can hide menus
+or render at the wrong size (for example in Civilization VI under Proton).
+Pyroshine scales smaller windows; use [Gamescope above](#use-gamescope-with-the-clients-resolution)
+to render at a different internal resolution.
 
 ## Run Flatpak Steam inside Pyroshine's compositor
 
-### How to
-
-Wrap the `command` with `dbus-run-session`:
+Replace the native Steam entry with:
 
 ```toml
 [[application]]
 title = "Steam Flatpak"
 command = [
-	"dbus-run-session", "--",
-	"flatpak", "run",
-	"com.valvesoftware.Steam",
-	"steam://open/bigpicture",
+    "dbus-run-session", "--", "flatpak", "run",
+    "com.valvesoftware.Steam", "steam://open/bigpicture",
 ]
 ```
 
-For games launched through Steam's application scanner:
+For Flatpak Steam game scanning:
 
 ```toml
 [[application_scanner]]
 type = "steam"
 library = "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
 command = [
-	"dbus-run-session", "--",
-	"flatpak", "run",
-	"com.valvesoftware.Steam",
-	"steam://rungameid/{game_id}",
+    "dbus-run-session", "--", "flatpak", "run",
+    "com.valvesoftware.Steam", "steam://rungameid/{game_id}",
 ]
 ```
 
-### Details
-
-The root cause is in how Flatpak's portal infrastructure interacts with the desktop environment.
-Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Pyroshine sets. This causes Steam to render on the host's physical desktop instead of inside Pyroshine's headless compositor.
-
-`dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Pyroshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
+The separate D-Bus session prevents host portals from redirecting Flatpak to the
+physical desktop. It keeps Pyroshine's display and audio environment effective.
+Quit any existing Flatpak Steam before launching the stream.
 
 ## Run a desktop environment for a full remote desktop
 
-### How to
-
-Add the desktop environment as a regular application. For Plasma:
+Add your installed desktop as an application, for example Plasma:
 
 ```toml
 [[application]]
@@ -181,14 +264,7 @@ command = ["/usr/bin/startplasma-wayland"]
 output_scale = 1.5
 ```
 
-`output_scale` is optional; omit it for the default scale of `1.0`. It is a
-generic per-application Wayland output setting, so it can be used with any
-application or nested compositor. The video stream remains at the Moonlight
-client's physical resolution while applications receive a correspondingly
-smaller logical output and render at the requested scale.
-
-Log out of any existing local Plasma session before launching it. Other desktop
-environments use the same generic mechanism; for example:
+Or COSMIC:
 
 ```toml
 [[application]]
@@ -196,39 +272,23 @@ title = "COSMIC Desktop"
 command = ["/usr/bin/start-cosmic"]
 ```
 
-### Details
+Other nested compositors use the same mechanism, such as `/usr/bin/sway`.
+The packaged service supplies the runtime directory and session bus; Plasma
+needs no extra wrapper. Log out of local Plasma first: two full sessions for
+one user conflict through D-Bus and user services.
 
-Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Pyroshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
+`output_scale` is optional (default `1.0`); it changes logical desktop size while
+preserving the client's physical stream resolution. Fully stop/relaunch after
+changing it. Use this setting rather than nested `kscreen-doctor` changes or
+`QT_SCALE_FACTOR`, which can produce mismatched geometry/clipped panels.
 
-`startplasma-wayland` sets the Plasma identity and session variables itself. The
-packaged Pyroshine service already supplies the user's runtime directory and
-session bus, so no Plasma-specific wrapper or `dbus-run-session` prefix is
-needed for the supported single-session case.
-
-Set the scale in Pyroshine's application entry before starting the session and
-fully stop and relaunch the stream after changing it. In a nested session, KWin
-gets its output size and preferred fractional scale from the outer Pyroshine
-compositor. Changing the nested `WL-0` output with `kscreen-doctor` is therefore
-not effective. Avoid `QT_SCALE_FACTOR`: it scales Qt processes independently of
-the output geometry, which can produce mixed-size applications and clipped
-desktop panels.
-
-A full Plasma session uses per-user D-Bus names and systemd user services, so a
-second full session for the same user conflicts with the local one. Pyroshine
-does not isolate, clone, or manage Plasma state; log out locally before starting
-the streamed desktop.
-
-This application entry starts the already-authenticated user's session. It
-cannot show a real login screen. A display manager such as Plasma Login Manager
-or SDDM owns PAM authentication, logind/seat state, a VT, and the graphical
-session lifecycle, so it cannot be embedded safely as an ordinary Pyroshine
-application. Keep the system display manager responsible for host logins.
+This starts an already-authenticated user's desktop. A display manager/login
+screen cannot run as a streamed application; keep host logins managed by the
+system display manager.
 
 ## Debug a failing application
 
-### How to
-
-Set the application's `stdout` and `stderr` to `"journal"` so its output is captured by systemd's journal instead of being discarded (the default is `null`):
+Applications discard output by default. Capture it by editing the existing entry:
 
 ```toml
 [[application]]
@@ -238,16 +298,11 @@ stdout = "journal"
 stderr = "journal"
 ```
 
-After a failed run, inspect the logs for the session's unit:
+Restart, retry the launch, then read its logs:
 
+```sh
+journalctl --user -u moonshine-session.service -e
 ```
-journalctl --user -u moonshine-session.service
-```
 
-You can also add `-e` to jump to the end of the log and `-f` to follow it live while retrying the launch.
-
-### Details
-
-By default Pyroshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
-
-These fields are also available on `[[application_scanner]]` configs for games launched through Steam/Lutris/Heroic. Instead of the journal you can also redirect to a file, e.g. `stdout = "file:/path/to/log.txt"`; any systemd `StandardOutput`/`StandardError` value (`journal`, `file:/path`, `append:/path`, `inherit`, ...) is accepted.
+Add `-f` to follow retries. Scanners also accept `stdout`/`stderr`; file output
+such as `"append:/path/to/log.txt"` and other systemd output values are supported.

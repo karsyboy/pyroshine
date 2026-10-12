@@ -551,9 +551,10 @@ in-flight launch/resume/cancel requests and stops the active session.
 
 `management/` exports `io.github.karsyboy.Pyroshine` (interface
 `…Pyroshine.Management1`) on the service user's D-Bus session bus. The
-optional desktop app (`pyroshine-ui/`) is its client; the contract (names,
-JSON documents, error names, proxies) lives in `moonshine-management` so both
-sides build against one definition.
+optional desktop app (`pyroshine-ui/`) and terminal pairing (`src/pair.rs`) are
+clients; the contract lives in `moonshine-management`. The CLI pins the current
+unique bus owner and matches completion by client ID and request token. A
+restart requires a new invocation; PIN submission alone never reports success.
 
 ```text
 pyroshine-ui (desktop session)              pyroshine (service)

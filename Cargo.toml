@@ -16,11 +16,18 @@ edition = "2024"
 [dependencies]
 async-shutdown = "0.2.2"
 clap = { version = "4.6.1", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
 moonshine-core = { path = "moonshine-core" }
+moonshine-management = { path = "moonshine-management" }
+serde = "1.0.228"
+serde_json = "1.0.149"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zbus = "5.18.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 # Keep the upstream Rust API; patch only its native backend at the locked revision.
 [patch."https://github.com/games-on-whales/inputtino"]
