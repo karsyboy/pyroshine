@@ -1,8 +1,8 @@
-//! Capture/encode identity contract. Pixelforge v0.9.1 has no device selector;
+//! Capture/encode identity contract. Select and independently verify the capture GPU;
 //! never infer identity from enumeration order, vendor IDs, or device names.
 use ash::vk;
 use ash::vk::TaggedStructure;
-use pixelforge::{VideoContext, VideoContextBuilder};
+use pixelforge::{DeviceSelector, VideoContext, VideoContextBuilder};
 use std::ffi::CStr;
 use std::fs::File;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -58,8 +58,17 @@ pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 	let capture = CaptureIdentity::from_file(file)?;
 	let context = VideoContextBuilder::new()
 		.app_name("Pyroshine")
+		.device_selector(DeviceSelector {
+			drm_render_node: capture.render,
+			pci_bus: capture.pci,
+		})
 		.build()
-		.map_err(|e| format!("Failed to initialize Vulkan: {e}"))?;
+		.map_err(|e| {
+			format!(
+				"Failed to initialize Vulkan on capture DRM {:?} (PCI {:?}): {e}",
+				capture.render, capture.pci
+			)
+		})?;
 	let extensions = unsafe {
 		context
 			.instance()
@@ -93,7 +102,7 @@ pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 		has(ash::ext::pci_bus_info::NAME).then_some((pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function));
 	if !capture.matches(drm_id, pci_id) {
 		return Err(format!(
-			"Capture DRM {}:{} (PCI {:?}) does not match or cannot be verified against Vulkan '{name}' (DRM {drm_id:?}, PCI {pci_id:?}). Cross-device capture/encoding is not validated. Set compositor.gpu or MOONSHINE_RENDER_NODE to this Vulkan GPU's render node, or configure the Vulkan loader/ICD selection to expose the capture GPU. Pixelforge v0.9.1 has no device-selector API; no cross-GPU fallback is attempted.",
+			"Capture DRM {}:{} (PCI {:?}) does not match or cannot be verified against Vulkan '{name}' (DRM {drm_id:?}, PCI {pci_id:?}). Cross-device capture/encoding is not validated. Ensure compositor.gpu or MOONSHINE_RENDER_NODE identifies a render node whose Vulkan driver exposes DRM or PCI identity. No cross-GPU fallback is attempted.",
 			capture.render.0, capture.render.1, capture.pci
 		));
 	}
@@ -222,6 +231,58 @@ impl ImportableModifiers {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	#[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
+	fn capture_device_selection_on_gpu() {
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
+			"set MOONSHINE_TEST_GPU=1"
+		);
+		let path = std::env::var("MOONSHINE_TEST_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+		let file = File::open(path).unwrap();
+		// capture_context independently queries and verifies the selected GPU.
+		let context = capture_context(&file).unwrap();
+		assert!(
+			[pixelforge::Codec::H264, pixelforge::Codec::H265, pixelforge::Codec::AV1]
+				.into_iter()
+				.any(|codec| context.supports_encode(codec))
+		);
+		// An impossible DRM identity cannot silently select the usable adapter.
+		let result = VideoContextBuilder::new()
+			.device_selector(DeviceSelector {
+				drm_render_node: (i64::MAX, i64::MAX),
+				pci_bus: None,
+			})
+			.build();
+		let Err(pixelforge::PixelForgeError::NoSuitableDevice(message)) = result else {
+			panic!("unknown capture identity must be rejected");
+		};
+		assert!(message.contains("no other GPU is eligible"));
+	}
+
+	#[test]
+	#[ignore = "needs a GPU without Vulkan Video encode: MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE=<node>"]
+	fn capture_device_without_encode_support_never_falls_back_on_gpu() {
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
+			"set MOONSHINE_TEST_GPU=1"
+		);
+		let path = std::env::var("MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE")
+			.expect("set MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE");
+		let file = File::open(path).unwrap();
+		let capture = CaptureIdentity::from_file(&file).unwrap();
+		let result = VideoContextBuilder::new()
+			.device_selector(DeviceSelector {
+				drm_render_node: capture.render,
+				pci_bus: capture.pci,
+			})
+			.build();
+		let Err(pixelforge::PixelForgeError::NoSuitableDevice(message)) = result else {
+			panic!("the requested non-encoding GPU must not fall back to another adapter");
+		};
+		assert!(message.contains("no other GPU is eligible"));
+	}
+
 	#[test]
 	fn drm_identity_overrides_enumeration_and_pci_guessing() {
 		let capture = CaptureIdentity {

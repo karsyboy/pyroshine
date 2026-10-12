@@ -193,7 +193,7 @@ fn color_space_code(color_space: ColorSpace) -> u32 {
 /// cheap to encode. Any further granularity padding keeps the zeros Pixelforge
 /// cleared the image with.
 pub(crate) fn conversion_extent(codec: Codec, width: u32, height: u32) -> Result<(u32, u32), String> {
-	let unit = super::encode_caps::block_size(codec);
+	let unit = pixelforge::codec_block_size(codec);
 	match (
 		width.checked_next_multiple_of(unit),
 		height.checked_next_multiple_of(unit),

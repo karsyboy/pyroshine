@@ -353,10 +353,10 @@ impl H265 {
             )
         };
         if result != vk::Result::SUCCESS {
-            return Err(PixelForgeError::SessionParametersCreation(format!(
-                "{:?}",
-                result
-            )));
+            return Err(PixelForgeError::vulkan(
+                "session parameters creation",
+                result,
+            ));
         }
         Ok(session_params)
     }

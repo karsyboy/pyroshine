@@ -67,7 +67,7 @@ pub fn create_converter(
         .bindings(&bindings);
 
     let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("resource creation", e))?;
 
     // Create pipeline layout with push constants.
     let push_constant_range = vk::PushConstantRange::default()
@@ -80,14 +80,14 @@ pub fn create_converter(
         .push_constant_ranges(std::slice::from_ref(&push_constant_range));
 
     let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("resource creation", e))?;
 
     // Create compute shader module.
     let shader_code = get_spirv_code()?;
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
 
     let shader_module = unsafe { device.create_shader_module(&shader_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("resource creation", e))?;
 
     // Create compute pipeline.
     let entry_point = std::ffi::CString::new("main").unwrap();
@@ -103,7 +103,7 @@ pub fn create_converter(
     let pipeline = unsafe {
         device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
     }
-    .map_err(|(_, e)| PixelForgeError::ResourceCreation(e.to_string()))?[0];
+    .map_err(|(_, e)| PixelForgeError::vulkan("resource creation", e))?[0];
 
     // Destroy shader module (no longer needed after pipeline creation)
     unsafe { device.destroy_shader_module(shader_module, None) };
@@ -123,7 +123,7 @@ pub fn create_converter(
         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
 
     let sampler = unsafe { device.create_sampler(&sampler_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("sampler creation: {}", e)))?;
+        .map_err(|e| PixelForgeError::vulkan("sampler creation", e))?;
 
     // Create output buffer (device local for compute shader output, transfer
     // source for image copy). Needs SHADER_DEVICE_ADDRESS so we can query a
@@ -226,9 +226,7 @@ pub fn create_converter(
                 vk::WHOLE_SIZE,
                 vk::MemoryMapFlags::empty(),
             )
-            .map_err(|e| {
-                PixelForgeError::ResourceCreation(format!("map descriptor buffer: {}", e))
-            })?
+            .map_err(|e| PixelForgeError::vulkan("map descriptor buffer", e))?
     };
     let descriptor_buffer_ptr = descriptor_buffer_ptr as *mut u8;
 
@@ -238,7 +236,7 @@ pub fn create_converter(
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
     let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
     // Allocate command buffer.
     let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -247,12 +245,12 @@ pub fn create_converter(
         .command_buffer_count(1);
 
     let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?[0];
+        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?[0];
 
     // Create fence for synchronization.
     let fence_info = vk::FenceCreateInfo::default();
     let fence = unsafe { device.create_fence(&fence_info, None) }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
     Ok(ColorConverter {
         context,
@@ -299,7 +297,7 @@ fn create_buffer(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
+        .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
 
     let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
 
@@ -320,10 +318,10 @@ fn create_buffer(
         .memory_type_index(memory_type_index);
 
     let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
     unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
     Ok((buffer, memory))
 }

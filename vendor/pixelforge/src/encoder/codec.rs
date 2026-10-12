@@ -18,9 +18,9 @@ use crate::encoder::dpb::MAX_DPB_SLOTS;
 use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
 use crate::encoder::pipeline::{EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata};
 use crate::encoder::resources::{
-    EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
-    create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
-    query_supported_video_formats, upload_image_to_input,
+    EncoderTeardown, UploadParams, allocate_session_memory, create_command_resources,
+    create_dpb_images, destroy_encoder_resources, get_video_format, query_supported_video_formats,
+    upload_image_to_input,
 };
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
@@ -44,6 +44,8 @@ pub(crate) struct EncoderCommon {
 
     /// Coded extent (display dimensions aligned to the codec block size and the
     /// device's picture-access granularity).
+    pub capabilities: super::EncoderCapabilities,
+    pub input_image_extent: vk::Extent2D,
     pub aligned_width: u32,
     pub aligned_height: u32,
 
@@ -422,8 +424,6 @@ pub(crate) struct CommonInitRequest<'a> {
     pub profile_info: &'a vk::VideoProfileInfoKHR<'a>,
     /// Device capabilities for this profile, resolved by [`query_video_caps`].
     pub caps: &'a DeviceVideoCaps,
-    /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
-    pub align_unit: u32,
     /// Upper bound on active reference pictures the codec's syntax allows.
     pub max_active_refs_cap: usize,
     pub bitstream_buffer_size: usize,
@@ -449,19 +449,34 @@ pub(crate) struct DeviceVideoCaps {
     pub max_active_reference_pictures: u32,
     pub flags: vk::VideoCapabilityFlagsKHR,
     pub std_header_version: vk::ExtensionProperties,
+    pub av1_coded_picture_alignment: Option<vk::Extent2D>,
 }
 
 /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
 /// generic init needs.
 ///
-/// The driver *requires* the codec's `VideoEncode*CapabilitiesKHR` chained into
-/// `pNext`, so the codec builds the `capabilities` chain (the only codec-specific
-/// part) and passes it in already populated with its encode/codec caps structs.
+/// Chain the required codec-specific output structure alongside general encode
+/// capabilities. Query and initialization use this same profile/output chain.
 pub(crate) fn query_video_caps(
     context: &VideoContext,
     profile_info: &vk::VideoProfileInfoKHR,
-    capabilities: &mut vk::VideoCapabilitiesKHR,
 ) -> Result<DeviceVideoCaps> {
+    use ash::vk::TaggedStructure;
+    let mut encode = vk::VideoEncodeCapabilitiesKHR::default();
+    let mut h264 = vk::VideoEncodeH264CapabilitiesKHR::default();
+    let mut h265 = vk::VideoEncodeH265CapabilitiesKHR::default();
+    let mut av1 = vk::VideoEncodeAV1CapabilitiesKHR::default();
+    let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut encode);
+    let mut capabilities = match profile_info.video_codec_operation {
+        vk::VideoCodecOperationFlagsKHR::ENCODE_H264 => capabilities.push(&mut h264),
+        vk::VideoCodecOperationFlagsKHR::ENCODE_H265 => capabilities.push(&mut h265),
+        vk::VideoCodecOperationFlagsKHR::ENCODE_AV1 => capabilities.push(&mut av1),
+        _ => {
+            return Err(PixelForgeError::InvalidInput(
+                "Unknown encode profile operation".into(),
+            ));
+        }
+    };
     let video_queue_instance =
         ash::khr::video_queue::Instance::load(context.entry(), context.instance());
     let result = unsafe {
@@ -470,14 +485,14 @@ pub(crate) fn query_video_caps(
             .get_physical_device_video_capabilities_khr)(
             context.physical_device(),
             profile_info,
-            capabilities,
+            &mut capabilities,
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::NoSuitableDevice(format!(
-            "Failed to query Vulkan Video encode capabilities: {:?}",
-            result
-        )));
+        return Err(PixelForgeError::vulkan(
+            "query Vulkan Video encode capabilities",
+            result,
+        ));
     }
     Ok(DeviceVideoCaps {
         picture_access_granularity: capabilities.picture_access_granularity,
@@ -487,6 +502,9 @@ pub(crate) fn query_video_caps(
         max_active_reference_pictures: capabilities.max_active_reference_pictures,
         flags: capabilities.flags,
         std_header_version: capabilities.std_header_version,
+        av1_coded_picture_alignment: (profile_info.video_codec_operation
+            == vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
+            .then_some(av1.coded_picture_alignment),
     })
 }
 
@@ -527,35 +545,13 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     // capability struct, required by the driver) via [`query_video_caps`].
     let capabilities = req.caps;
 
-    // Align the coded extent to lcm(codec block size, device granularity), then
-    // clamp up to the device minimum and re-align.
+    let public_caps = super::EncoderCapabilities::from_caps(capabilities);
+    let coded_extent = public_caps.coded_extent(config.codec, width, height)?;
+    let input_image_extent = public_caps.input_image_extent(config.codec, width, height)?;
+    let aligned_width = coded_extent.width;
+    let aligned_height = coded_extent.height;
     let gran_w = capabilities.picture_access_granularity.width.max(1);
     let gran_h = capabilities.picture_access_granularity.height.max(1);
-    let align_w = lcm(req.align_unit, gran_w);
-    let align_h = lcm(req.align_unit, gran_h);
-    let aligned_width = align_up(
-        align_up(width, align_w).max(capabilities.min_coded_extent.width),
-        align_w,
-    );
-    let aligned_height = align_up(
-        align_up(height, align_h).max(capabilities.min_coded_extent.height),
-        align_h,
-    );
-    if aligned_width > capabilities.max_coded_extent.width
-        || aligned_height > capabilities.max_coded_extent.height
-    {
-        return Err(PixelForgeError::InvalidInput(format!(
-            "Requested coded extent {}x{} (aligned to {}x{} with granularity {}x{}) exceeds device max {}x{} for this profile",
-            width,
-            height,
-            aligned_width,
-            aligned_height,
-            gran_w,
-            gran_h,
-            capabilities.max_coded_extent.width,
-            capabilities.max_coded_extent.height
-        )));
-    }
     tracing::info!(
         "Using coded extent {}x{} (granularity {}x{}, min {}x{}, max {}x{})",
         aligned_width,
@@ -655,10 +651,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::VideoSessionCreation(format!(
-            "{:?}",
-            result
-        )));
+        return Err(PixelForgeError::vulkan("video session creation", result));
     }
     let session_memory = allocate_session_memory(context, session, &video_queue_fn)?;
 
@@ -688,7 +681,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let pipeline = EncodePipeline::new(&PipelineConfig {
         context,
         aligned_height,
-        input_width: input_image_width(aligned_width, capabilities.max_coded_extent.width),
+        input_width: input_image_extent.width,
         picture_format,
         pixel_format: config.pixel_format,
         bit_depth: config.bit_depth,
@@ -713,6 +706,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         session,
         session_params: vk::VideoSessionParametersKHR::null(),
         session_memory,
+        capabilities: public_caps,
+        input_image_extent,
         aligned_width,
         aligned_height,
         pipeline,

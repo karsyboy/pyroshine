@@ -254,7 +254,7 @@ impl EncodePipeline {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(ENCODE_PIPELINE_DEPTH as u32);
         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
         // Timestamp queries are only legal on a queue family with non-zero
         // `timestampValidBits` (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
@@ -315,7 +315,7 @@ impl EncodePipeline {
             let fence_create_info =
                 vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             let encode_fence = unsafe { device.create_fence(&fence_create_info, None) }
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
             let mut profile = *config.profile_info;
             let query_pool = create_encode_feedback_query_pool(context, &mut profile)?;

@@ -405,10 +405,11 @@ fn converter_timing_on_gpu() {
 }
 
 mod gpu {
-	use pixelforge::{EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, RateControlMode, VideoContextBuilder};
+	use pixelforge::{EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, RateControlMode};
 
 	use super::*;
-	use crate::session::stream::video::pipeline::encode_caps::EncodeCaps;
+	use crate::session::stream::video::pipeline::encode_caps::check_frame;
+	use pixelforge::EncoderCapabilities;
 
 	pub(super) fn require() {
 		assert!(
@@ -428,19 +429,11 @@ mod gpu {
 		}
 	}
 
-	/// A context on the first Vulkan Video encode device (select one with
-	/// `VK_DRIVER_FILES`), for any conventional codec.
+	/// Use the opened capture GPU, exactly as production setup does.
 	fn context() -> VideoContext {
-		[Codec::H265, Codec::H264, Codec::AV1]
-			.into_iter()
-			.find_map(|codec| {
-				VideoContextBuilder::new()
-					.app_name("convert-fixture")
-					.require_encode(codec)
-					.build()
-					.ok()
-			})
-			.expect("a Vulkan Video encode device")
+		let path = std::env::var("MOONSHINE_TEST_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+		let file = std::fs::File::open(path).expect("open capture render node");
+		crate::gpu::capture_context(&file).expect("a verified capture/encode GPU")
 	}
 
 	fn device_name(context: &VideoContext) -> String {
@@ -1491,11 +1484,8 @@ mod gpu {
 	];
 
 	fn codec_context(codec: Codec) -> Option<VideoContext> {
-		VideoContextBuilder::new()
-			.app_name("convert-fixture")
-			.require_encode(codec)
-			.build()
-			.ok()
+		let context = context();
+		context.supports_encode(codec).then_some(context)
 	}
 
 	fn encoder(case: CodecCase, (w, h): (u32, u32)) -> Option<(VideoContext, Encoder)> {
@@ -1509,10 +1499,30 @@ mod gpu {
 		(w, h): (u32, u32),
 		stream: bool,
 	) -> Option<(VideoContext, Encoder)> {
-		EncodeCaps::query(&context, case.codec, case.pixel_format, case.depth)
-			.ok()?
-			.check_frame(case.codec, w, h)
+		let config = encoder_config(case, (w, h), stream);
+		let caps = EncoderCapabilities::query(&context, &config).ok()?;
+		check_frame(&caps, case.codec, w, h).ok()?;
+		let encoder = Encoder::new(context.clone(), config)
+			.map_err(|error| {
+				eprintln!(
+					"{:?} {:?} {:?} {w}x{h}: encoder creation failed: {error}",
+					case.codec, case.pixel_format, case.depth
+				);
+			})
 			.ok()?;
+		assert_eq!(
+			encoder.input_image_extent(),
+			caps.input_image_extent(case.codec, w, h).unwrap()
+		);
+		assert_eq!(encoder.coded_extent(), caps.coded_extent(case.codec, w, h).unwrap());
+		let conversion = conversion_extent(case.codec, w, h).unwrap();
+		let input = encoder.input_image_extent();
+		assert!(conversion.0 <= input.width && conversion.1 <= input.height);
+
+		Some((context, encoder))
+	}
+
+	fn encoder_config(case: CodecCase, (w, h): (u32, u32), stream: bool) -> EncodeConfig {
 		let config = match case.codec {
 			Codec::H264 => EncodeConfig::h264(w, h),
 			Codec::H265 => EncodeConfig::h265(w, h),
@@ -1525,27 +1535,19 @@ mod gpu {
 		.with_quality_level(12)
 		.with_gop_size(0)
 		.with_b_frames(0);
-		let config = if stream {
+		if stream {
 			config
 				.with_encoder_tuning_mode(pixelforge::EncoderTuningMode::LowLatency)
 				.with_rate_control(RateControlMode::Cbr)
-				.with_target_bitrate(125_000_000)
+				// RTX 3080 H.264 caps maxBitrate at 120 Mbps.
+				.with_target_bitrate(100_000_000)
 				.with_frame_rate(116, 1)
 				.with_max_reference_frames(1)
 				.with_virtual_buffer_size_ms(1000 / 116)
 				.with_initial_virtual_buffer_size_ms(0)
 		} else {
 			config
-		};
-		let encoder = Encoder::new(context.clone(), config)
-			.map_err(|error| {
-				eprintln!(
-					"{:?} {:?} {:?} {w}x{h}: encoder creation failed: {error}",
-					case.codec, case.pixel_format, case.depth
-				);
-			})
-			.ok()?;
-		Some((context, encoder))
+		}
 	}
 
 	/// Planar Y, Cb and Cr samples of one decoded frame.
@@ -1640,6 +1642,9 @@ mod gpu {
 	pub(super) fn encode_decode_matrix(stream_config: bool) {
 		let mut failures = Vec::new();
 		let mut checked = 0;
+		// Production shares one capture device across codecs and stream epochs.
+		// Avoid repeated instance/device creation masking encoder coverage.
+		let capture_context = context();
 		let frame_count = if stream_config { 12 } else { 3 };
 		let color = Color {
 			full_range: stream_config,
@@ -1676,8 +1681,8 @@ mod gpu {
 					case.codec, case.pixel_format, case.depth, frame.0, frame.1
 				);
 				if frame == (1920, 1080)
-					&& let Some(caps) = codec_context(case.codec)
-						.and_then(|c| EncodeCaps::query(&c, case.codec, case.pixel_format, case.depth).ok())
+					&& let Some(caps) =
+						EncoderCapabilities::query(&capture_context, &encoder_config(case, frame, stream_config)).ok()
 				{
 					eprintln!(
 						"{:?} {:?} {:?} capabilities: {caps:?}",
@@ -1693,17 +1698,18 @@ mod gpu {
 					// (the stream negotiation rejects these).
 					continue;
 				}
-				let Some(context) = codec_context(case.codec) else {
+				if !capture_context.supports_encode(case.codec) {
 					eprintln!("{label}: not encoded by this GPU; skipped");
 					continue;
 				};
-				let Ok(caps) = EncodeCaps::query(&context, case.codec, case.pixel_format, case.depth) else {
+				let context = capture_context.clone();
+				let Ok(caps) = EncoderCapabilities::query(&context, &encoder_config(case, frame, stream_config)) else {
 					eprintln!("{label}: not encoded by this GPU; skipped");
 					continue;
 				};
 				// The stream setup's capability check: frames below the minimum
 				// coded extent get a precise error (encoding them can hang the GPU).
-				if let Err(e) = caps.check_frame(case.codec, frame.0, frame.1) {
+				if let Err(e) = check_frame(&caps, case.codec, frame.0, frame.1) {
 					eprintln!("{label}: rejected as the stream setup does: {e}");
 					continue;
 				}

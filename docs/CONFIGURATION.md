@@ -300,12 +300,13 @@ GPU selection is verified against the opened capture node before codecs are
 advertised and before a session becomes ready. Vulkan must expose the same DRM
 render device, or the same complete PCI address when DRM identity properties are
 unavailable. Names, vendor IDs and enumeration order are not identity proofs.
-Pixelforge v0.9.1 has no render-node/device selector; an override selects GBM/EGL
-capture and does not reorder Vulkan adapters. If its default Vulkan device differs,
-startup fails with both identities. Select the matching capture node or configure
-the Vulkan loader/ICD device selection for the server. Cross-device encoding is
-currently unvalidated and rejected; there is no implicit copy fallback. Automatic
-capture selection retains the NVIDIA/AMD/other preference and stable node sorting.
+The opened capture device also selects the Vulkan adapter, so `compositor.gpu`
+and `MOONSHINE_RENDER_NODE` apply to capture and encoding together. If that
+adapter is unavailable to Vulkan, cannot be identified or lacks video/compute
+support, setup fails with the requested identity. Check its Vulkan driver and
+loader/ICD configuration. Cross-device encoding is currently unvalidated and
+rejected; there is no implicit copy fallback. Automatic capture selection
+retains the NVIDIA/AMD/other preference and stable node sorting.
 
 ### `[compositor.keyboard]`
 

@@ -14,6 +14,11 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Changed
+
+- Select the Vulkan capture/encode adapter by the opened DRM render node, with complete PCI identity fallback and independent verification. Multi-GPU systems can use the configured capture GPU without reordering Vulkan adapters; an unavailable or incompatible GPU fails setup without choosing another device.
+- Use Pixelforge's shared encode capabilities and actual input-image bounds during stream setup, retaining the NVIDIA width fix and AV1 minimum-frame guard. Preserve typed Vulkan results for device-loss recovery and share color signaling between setup and later updates.
+
 ### Fixed
 
 - Fix repeatedly flashing black HEVC 4:4:4 streams on Intel hardware decoding in Pyrolight and Moonlight. NVIDIA Vulkan encoding omitted the profile constraint flags needed to identify Main 4:4:4; cached VPS/SPS headers now declare the correct 8-bit or 10-bit profile.

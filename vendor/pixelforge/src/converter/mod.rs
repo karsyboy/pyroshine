@@ -573,14 +573,14 @@ impl ColorConverter {
         unsafe {
             device
                 .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
             device
                 .begin_command_buffer(self.command_buffer, &begin_info)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
             // --- Phase 1: Transition source image for shader read ---
 
@@ -869,25 +869,25 @@ impl ColorConverter {
 
             device
                 .end_command_buffer(self.command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
         }
 
         // Submit and wait.
         unsafe {
             device
                 .reset_fences(&[self.fence])
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
             let command_buffers = [self.command_buffer];
             let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
 
             device
                 .queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
             device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
         }
 
         let elapsed = start.elapsed();
@@ -923,7 +923,7 @@ impl ColorConverter {
             });
 
         let view = unsafe { self.context.device().create_image_view(&view_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
+            .map_err(|e| PixelForgeError::vulkan("source image view", e))?;
 
         self.cached_src_view = Some((src_image, view));
         Ok(view)

@@ -16,6 +16,9 @@ source of `pixelforge`. Nix builds it as part of the source tree.
 | --- | --- | --- |
 | `0001-encoder-64-align-input-image-widths-for-NVIDIA-8-bit.patch` | Encoder input images are 64 texels wide-aligned (within `maxCodedExtent`); pictures keep the coded width through `codedExtent`. | NVIDIA's encoder reads the chroma plane of 8-bit 2-plane 4:4:4 inputs with twice the 64-aligned luma pitch; at widths with `width % 64` in 1..=32 (1360, 1440, 2400, ...) the decoded chroma was sheared. Verified on an RTX 3080 (driver 615.78). |
 | `0002-h265-complete-main-444-profile-constraints.patch` | Complete the VPS/SPS Range Extensions bit-depth and lower-bit-rate constraints for HEVC 4:4:4 before caching the headers. | Vulkan StdVideo does not expose these flags; NVIDIA writes zeros, so FFmpeg cannot select Intel VAAPI Main 4:4:4 hardware decoding. Normalizing the headers enables 8/10-bit decoding without changing coded pictures. |
+| `0003-encoder-capabilities-and-image-extents.patch` | Share profile/capability construction across codec setup and public queries; expose coded and allocated input-image extents. | Pyroshine uses the actual image bounds without duplicating profiles or the maintained NVIDIA padding rule. Extent arithmetic rejects overflow and device-limit violations before allocating resources. |
+| `0004-preserve-typed-vulkan-errors.patch` | Preserve driver result codes with operation context and expose `vulkan_result()`. | Device-loss classification uses `ERROR_DEVICE_LOST`, independent of error wording. Fault-injection tests cover submission, fence wait and encode feedback. |
+| `0005-select-capture-device-by-drm-and-pci-identity.patch` | Add a DRM/PCI selector to context construction and clean up the instance on failed setup. | Select the opened capture GPU, with no fallback to another GPU when support or identity is unavailable. Pyroshine independently verifies the resulting device. |
 
 ## Updating
 
@@ -35,7 +38,8 @@ and HEVC profile contracts described above.
 ## Validation
 
 `scripts/vendor-pixelforge.sh --test` runs the crate's unit tests, including
-the width rule in `src/encoder/resources.rs` and HEVC profile/header regression
+profile/capability chains, coded/image bounds, typed driver failures, strict device
+identity selection, the width rule in `src/encoder/resources.rs` and HEVC profile/header regression
 tests in `src/encoder/h265/profile.rs`, from a temporary copy. The
 hardware check is the conventional encode/decode fixture on an NVIDIA GPU, whose
 default extents include affected widths:
@@ -51,3 +55,30 @@ GPU. Require VAAPI output and a `hwdownload` filter to prevent FFmpeg from hidin
 a hardware failure with software fallback. Check both 8-bit and 10-bit, and
 repeat 4:2:0, initial connection and reconnect in Pyrolight/Moonlight. See
 [the pipeline validation guide](../../docs/PIPELINE_OPTIMIZATION.md#measurement-and-changes-needing-more-proof).
+
+Validate selection on each GPU host with the opened render node (use a different
+path when needed):
+
+```sh
+MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_RENDER_NODE=/dev/dri/renderD128 \
+  cargo test -p moonshine-core capture_device_selection_on_gpu -- --ignored --nocapture
+```
+
+The converter/encode fixtures use that same selected capture context. Run them
+on AMD and NVIDIA, including the streaming configuration, input-slot rotation
+and static recovery. Client initial connection/reconnect, SDR/HDR and both
+encoder families remain hardware acceptance checks. The selector does not
+create a cross-device capture path.
+
+On a multi-GPU host where one adapter lacks Vulkan Video encode, verify that
+requesting it fails without selecting the encoding adapter:
+
+```sh
+MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE=/dev/dri/renderD129 \
+  cargo test -p moonshine-core capture_device_without_encode_support -- --ignored --nocapture
+```
+
+The encode/decode matrix shares a capture context across cases, like production,
+and its streaming fixture uses 100 Mbps (within the RTX 3080's 120 Mbps H.264
+profile limit). Vulkan validation can be forced with
+`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`.

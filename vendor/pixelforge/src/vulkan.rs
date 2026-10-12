@@ -7,6 +7,83 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
+/// Select a physical device by its capture DRM render node, with PCI fallback.
+///
+/// DRM identity is authoritative when the driver exposes a render node. PCI is
+/// used only when DRM identity is unavailable. Unknown or mismatching devices
+/// are never eligible, even if they support the required codecs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceSelector {
+    /// Major and minor device numbers of the opened DRM render node.
+    pub drm_render_node: (i64, i64),
+    /// PCI domain, bus, device and function, if known.
+    pub pci_bus: Option<(u32, u32, u32, u32)>,
+}
+
+impl DeviceSelector {
+    fn matches(self, drm: Option<(i64, i64)>, pci: Option<(u32, u32, u32, u32)>) -> bool {
+        match drm {
+            Some(render) => self.drm_render_node == render,
+            None => self.pci_bus.is_some() && self.pci_bus == pci,
+        }
+    }
+
+    fn matches_device(
+        self,
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        extensions: &[vk::ExtensionProperties],
+    ) -> bool {
+        let has = |name: &CStr| {
+            extensions.iter().any(|ext| {
+                // SAFETY: Vulkan extension names are null-terminated strings.
+                (unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) }) == name
+            })
+        };
+        let has_drm = has(ash::ext::physical_device_drm::NAME);
+        let has_pci = has(ash::ext::pci_bus_info::NAME);
+        let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceProperties2::default();
+        if has_drm {
+            props = props.push(&mut drm);
+        }
+        if has_pci {
+            props = props.push(&mut pci);
+        }
+        // SAFETY: only supported property structures are chained and remain live.
+        unsafe {
+            instance.get_physical_device_properties2(device, &mut props);
+        }
+        self.matches(
+            (has_drm && drm.has_render != 0).then_some((drm.render_major, drm.render_minor)),
+            has_pci.then_some((
+                pci.pci_domain,
+                pci.pci_bus,
+                pci.pci_device,
+                pci.pci_function,
+            )),
+        )
+    }
+}
+
+/// Destroy the instance if context initialization fails before ownership transfers.
+struct InstanceGuard<'a> {
+    instance: &'a ash::Instance,
+    armed: bool,
+}
+impl Drop for InstanceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: initialization owns this instance; no logical device was
+            // created on failure, and the guard is disarmed on success.
+            unsafe {
+                self.instance.destroy_instance(None);
+            }
+        }
+    }
+}
+
 /// Builder for creating a VideoContext.
 #[must_use]
 pub struct VideoContextBuilder {
@@ -14,6 +91,7 @@ pub struct VideoContextBuilder {
     app_version: (u32, u32, u32),
     enable_validation: bool,
     required_encode_codecs: Vec<Codec>,
+    device_selector: Option<DeviceSelector>,
 }
 
 impl Default for VideoContextBuilder {
@@ -30,6 +108,7 @@ impl VideoContextBuilder {
             app_version: (1, 0, 0),
             enable_validation: false,
             required_encode_codecs: Vec::new(),
+            device_selector: None,
         }
     }
 
@@ -54,6 +133,15 @@ impl VideoContextBuilder {
     /// Require video encode support for a codec.
     pub fn require_encode(mut self, codec: Codec) -> Self {
         self.required_encode_codecs.push(codec);
+        self
+    }
+
+    /// Restrict selection to the capture device with this DRM/PCI identity.
+    ///
+    /// Fails if that device cannot satisfy the required video/compute support;
+    /// no other GPU is selected. Without a selector, selection is unchanged.
+    pub fn device_selector(mut self, selector: DeviceSelector) -> Self {
+        self.device_selector = Some(selector);
         self
     }
 
@@ -196,7 +284,7 @@ impl VideoContext {
         let mut enable_validation = builder.enable_validation;
         if enable_validation {
             let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
-                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
             let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
             let has_validation_layer = available_layers.iter().any(|layer| {
                 let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
@@ -221,7 +309,7 @@ impl VideoContext {
             let available_exts = unsafe {
                 entry.enumerate_instance_extension_properties(Some(validation_layer_name))
             }
-            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
             let validation_features_name = c"VK_EXT_validation_features";
             let has_validation_features = available_exts.iter().any(|ext| {
                 let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
@@ -240,13 +328,18 @@ impl VideoContext {
             .enabled_extension_names(&instance_extensions);
 
         let instance = unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+
+        let mut instance_guard = InstanceGuard {
+            instance: &instance,
+            armed: true,
+        };
 
         info!("Created Vulkan instance");
 
         // Find physical device with video support.
         let physical_devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("Vulkan device query", e))?;
 
         let mut selected_device = None;
         let mut selected_device_exts = None;
@@ -320,6 +413,13 @@ impl VideoContext {
                 }
             };
 
+            if builder.device_selector.is_some_and(|selector| {
+                !selector.matches_device(&instance, physical_device, &available_extensions)
+            }) {
+                debug!("Device {} does not match the capture identity", device_name);
+                continue;
+            }
+
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
             if let Some(eq) = encode_queue {
@@ -391,6 +491,11 @@ impl VideoContext {
         }
 
         let physical_device = selected_device.ok_or_else(|| {
+            if let Some(selector) = builder.device_selector {
+                return PixelForgeError::NoSuitableDevice(format!(
+                    "Capture device DRM {:?} (PCI {:?}) is unavailable or lacks required Vulkan video/compute support for {:?}; no other GPU is eligible",
+                    selector.drm_render_node, selector.pci_bus, builder.required_encode_codecs));
+            }
             PixelForgeError::NoSuitableDevice(
                 "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
             )
@@ -580,7 +685,7 @@ impl VideoContext {
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
-            .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("Vulkan device creation", e))?;
 
         // Get queues.
         let video_encode_queue =
@@ -595,6 +700,8 @@ impl VideoContext {
         info!("Compute queue family: {}", compute_queue_family);
         info!("Created Vulkan device with video support");
 
+        instance_guard.armed = false;
+        drop(instance_guard);
         Ok(Self {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
@@ -814,5 +921,50 @@ impl VideoContext {
                     .property_flags
                     .contains(properties)
         })
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn drm_is_authoritative_and_pci_requires_known_identity() {
+        let selector = DeviceSelector {
+            drm_render_node: (226, 129),
+            pci_bus: Some((0, 3, 0, 0)),
+        };
+        assert!(selector.matches(Some((226, 129)), None));
+        assert!(!selector.matches(Some((226, 128)), selector.pci_bus));
+        assert!(selector.matches(None, selector.pci_bus));
+        assert!(!selector.matches(None, Some((0, 4, 0, 0))));
+        assert!(!selector.matches(None, None));
+        assert!(
+            !DeviceSelector {
+                pci_bus: None,
+                ..selector
+            }
+            .matches(None, None)
+        );
+    }
+
+    #[test]
+    fn codec_support_on_another_gpu_never_satisfies_selection() {
+        let selector = DeviceSelector {
+            drm_render_node: (226, 129),
+            pci_bus: None,
+        };
+        let devices = [(Some((226, 128)), true), (Some((226, 129)), false)];
+        let selected = devices
+            .iter()
+            .position(|&(drm, encodes)| selector.matches(drm, None) && encodes);
+        assert_eq!(selected, None);
+        let devices = [(Some((226, 128)), true), (Some((226, 129)), true)];
+        assert_eq!(
+            devices
+                .iter()
+                .position(|&(drm, encodes)| selector.matches(drm, None) && encodes),
+            Some(1)
+        );
     }
 }

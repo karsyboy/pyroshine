@@ -161,9 +161,19 @@ extent; stream validation rejects those (4:4:4 and AV1 accept them).
 The vendored Pixelforge patch also rounds the input image width up to 64 texels
 within the GPU's maximum coded width. This keeps NVIDIA's 8-bit 4:4:4 chroma
 pitch consistent at widths such as 1360, 1440 and 2400. The picture's coded
-extent and cropping metadata retain the negotiated size; the additional image
-columns are outside the picture. See
+extent stays aligned to codec blocks and device granularity; cropping/render
+metadata retains the negotiated frame size. Additional image columns are
+outside the picture. See
 [local dependency maintenance](../vendor/pixelforge/LOCAL_CHANGES.md).
+
+Pixelforge owns profile construction and capability/extent calculations. Setup
+queries the exact encoder configuration, including usage hints, then checks
+Pyroshine's AV1 minimum-frame policy before allocation. Conversion bounds use
+`Encoder::input_image_extent()` from the created encoder, separately from its
+`coded_extent()`; GPU fixtures compare both with the queried capabilities.
+Encoder driver errors preserve their `vk::Result` and operation context.
+`ERROR_DEVICE_LOST` stops the session; rendered error text does not decide
+recovery. The existing source-release and IDR recovery rules still apply.
 
 The shader writes each block sample by sample without private arrays or
 loops. Every converter first converts a small edge-padded pattern on its queue

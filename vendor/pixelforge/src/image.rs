@@ -111,7 +111,7 @@ impl InputImage {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         let image = unsafe { device.create_image(&image_create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
+            .map_err(|e| PixelForgeError::vulkan("image creation", e))?;
 
         // Get memory requirements and allocate.
         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
@@ -130,10 +130,10 @@ impl InputImage {
             .memory_type_index(memory_type_index);
 
         let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe { device.bind_image_memory(image, memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         // Create staging buffer for uploads.
         // Size depends on pixel format, bit depth, and alignment padding between planes.
@@ -156,7 +156,7 @@ impl InputImage {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
+            .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
 
         let staging_mem_requirements =
             unsafe { device.get_buffer_memory_requirements(staging_buffer) };
@@ -177,10 +177,10 @@ impl InputImage {
             .memory_type_index(staging_memory_type);
 
         let staging_memory = unsafe { device.allocate_memory(&staging_alloc_info, None) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         // Create command pool and buffer for transfers.
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -188,7 +188,7 @@ impl InputImage {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
@@ -196,13 +196,13 @@ impl InputImage {
             .command_buffer_count(1);
 
         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
         let command_buffer = command_buffers[0];
 
         // Create fence for synchronization.
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.create_fence(&fence_info, None) }
-            .map_err(|e| PixelForgeError::ResourceCreation(format!("fence creation: {}", e)))?;
+            .map_err(|e| PixelForgeError::vulkan("fence creation", e))?;
 
         Ok(Self {
             context,
@@ -254,7 +254,7 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe {
             match self.bit_depth {
@@ -342,7 +342,7 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe {
             let dst = std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
@@ -398,7 +398,7 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe {
             // Source is yuv420p10le (10-bit in lower bits of 16-bit words)
@@ -468,7 +468,7 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe {
             match self.bit_depth {
@@ -543,7 +543,7 @@ impl InputImage {
                 vk::MemoryMapFlags::empty(),
             )
         }
-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
 
         unsafe {
             match self.bit_depth {
@@ -639,12 +639,12 @@ impl InputImage {
         unsafe {
             device.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
         }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
         // Transition image to transfer destination.
         let barrier = vk::ImageMemoryBarrier::default()
@@ -803,20 +803,20 @@ impl InputImage {
         }
 
         unsafe { device.end_command_buffer(self.command_buffer) }
-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
 
         // Submit and wait.
         let submit_info =
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 
         unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("Queue submit failed: {}", e)))?;
+            .map_err(|e| PixelForgeError::vulkan("Queue submit failed", e))?;
 
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("synchronization operation", e))?;
 
         unsafe { device.reset_fences(&[self.fence]) }
-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+            .map_err(|e| PixelForgeError::vulkan("synchronization operation", e))?;
 
         Ok(())
     }

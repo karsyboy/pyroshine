@@ -530,7 +530,7 @@ impl H265 {
 
             device
                 .end_command_buffer(command_buffer)
-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
         }
 
         common.submit_frame()

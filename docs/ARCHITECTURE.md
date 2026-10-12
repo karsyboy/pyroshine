@@ -124,7 +124,8 @@ probes GPU capabilities, and the server refuses to start without DMA-BUF import.
 Advertised codecs and HDR come from encoder and profile probes, not from finding
 a library or extension name:
 
-- `gpu.rs` verifies the selected Vulkan device matches the GBM/EGL render node
+- `gpu.rs` selects the Vulkan device by the opened capture node and independently
+  verifies it matches the GBM/EGL render node
   used for capture (`VK_EXT_physical_device_drm`, with the complete PCI address
   as a fallback). An unresolvable or mismatched identity advertises no codec,
   HDR or DMA-BUF capability and prevents launch. No cross-device

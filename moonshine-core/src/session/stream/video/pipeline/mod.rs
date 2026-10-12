@@ -132,13 +132,7 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 /// operation fails the same way, so the encoding loop must exit (shutting the
 /// session down) instead of retrying forever and freezing the stream.
 fn is_device_lost(e: &PixelForgeError) -> bool {
-	match e {
-		PixelForgeError::Vulkan(result) => *result == vk::Result::ERROR_DEVICE_LOST,
-		// Other variants (e.g. CommandBuffer) stringify the underlying
-		// vk::Result, whose ash display text is "The logical device has been
-		// lost. See <...>".
-		_ => e.to_string().contains("device has been lost"),
-	}
+	e.vulkan_result() == Some(vk::Result::ERROR_DEVICE_LOST)
 }
 
 /// Classify a pixelforge error from a step after the source was converted.
@@ -1002,13 +996,7 @@ impl VideoPipelineInner {
 			BitDepth::Ten => pixelforge::EncodeBitDepth::Ten,
 		};
 
-		// Select color description for VUI signaling.
-		let color_description = match (ctx.format.primaries, ctx.format.transfer) {
-			(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
-			(ColorPrimaries::Bt2020, TransferFunction::Pq) => ColorDescription::bt2020_pq(),
-			_ => return Err(format!("Unsupported color description: {:?}", ctx.format)),
-		};
-		let color_description = color_description.with_full_range(ctx.format.range == ColorRange::Full);
+		let color_description = color_description_for(ctx.format)?;
 
 		// Create encode configuration.
 		let target_bitrate = u32::try_from(ctx.bitrate)
@@ -1034,11 +1022,9 @@ impl VideoPipelineInner {
 
 		// Pixelforge pads the coded extent up to the device minimum but keeps
 		// the frame size, which drivers do not support below that minimum.
-		let caps = encode_caps::EncodeCaps::query(&context, codec, pixel_format, bit_depth)?;
-		caps.check_frame(codec, ctx.width, ctx.height)?;
-		let input_extent = caps
-			.input_image_extent(codec, ctx.width, ctx.height)
-			.ok_or_else(|| format!("{}x{} has no coded extent", ctx.width, ctx.height))?;
+		let caps = pixelforge::EncoderCapabilities::query(&context, &config)
+			.map_err(|e| format!("Failed to query encoder capabilities: {e}"))?;
+		encode_caps::check_frame(&caps, codec, ctx.width, ctx.height)?;
 		if let Some(alignment) = caps.av1_coded_picture_alignment
 			&& (!ctx.width.is_multiple_of(alignment.width.max(1))
 				|| !ctx.height.is_multiple_of(alignment.height.max(1)))
@@ -1054,7 +1040,8 @@ impl VideoPipelineInner {
 
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
 
-		Ok((context, encoder, input_extent))
+		let extent = encoder.input_image_extent();
+		Ok((context, encoder, (extent.width, extent.height)))
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -2348,22 +2335,25 @@ mod tests {
 	}
 
 	#[test]
-	fn device_lost_is_detected_in_both_error_shapes() {
-		// Structured variant.
+	fn device_lost_is_detected_by_driver_result() {
 		assert!(is_device_lost(&PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)));
-		// String variant: pixelforge wraps the vk::Result display text, e.g.
-		// CommandBuffer("The logical device has been lost. See <...>") —
-		// the shape observed when a stale DMA-BUF import faults the GPU.
-		assert!(is_device_lost(&PixelForgeError::CommandBuffer(
-			vk::Result::ERROR_DEVICE_LOST.to_string()
-		)));
+		for operation in ["submit encode", "wait encode fence", "read encode feedback"] {
+			assert!(is_device_lost(&PixelForgeError::vulkan(
+				operation,
+				vk::Result::ERROR_DEVICE_LOST
+			)));
+		}
 	}
 
 	#[test]
-	fn recoverable_errors_are_not_device_lost() {
+	fn recoverable_errors_and_text_are_not_device_lost() {
 		assert!(!is_device_lost(&PixelForgeError::Vulkan(vk::Result::TIMEOUT)));
+		assert!(!is_device_lost(&PixelForgeError::vulkan(
+			"wait encode fence",
+			vk::Result::TIMEOUT
+		)));
 		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
-			"submit failed".to_string()
+			vk::Result::ERROR_DEVICE_LOST.to_string()
 		)));
 	}
 

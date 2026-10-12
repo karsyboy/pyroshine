@@ -6,6 +6,8 @@
 //! - Frame reordering for B-frame support (`reorder` module) - reusable for H.264/H.265.
 
 pub mod av1;
+mod capabilities;
+pub use capabilities::{EncoderCapabilities, codec_block_size};
 pub mod bitwriter;
 pub(crate) mod codec;
 pub mod dpb;
@@ -561,6 +563,9 @@ pub struct EncodedPacket {
 /// One blanket impl covers all codecs, so [`Encoder`] can hold any of them
 /// behind a single boxed pointer instead of an enum that re-dispatches by hand.
 trait EncoderApi: Send {
+    fn capabilities(&self) -> EncoderCapabilities;
+    fn coded_extent(&self) -> vk::Extent2D;
+    fn input_image_extent(&self) -> vk::Extent2D;
     fn input_image(&self) -> vk::Image;
     fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
@@ -570,6 +575,19 @@ trait EncoderApi: Send {
 }
 
 impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
+    fn capabilities(&self) -> EncoderCapabilities {
+        self.common.capabilities
+    }
+    fn coded_extent(&self) -> vk::Extent2D {
+        vk::Extent2D {
+            width: self.common.aligned_width,
+            height: self.common.aligned_height,
+        }
+    }
+    fn input_image_extent(&self) -> vk::Extent2D {
+        self.common.input_image_extent
+    }
+
     fn input_image(&self) -> vk::Image {
         codec::CodecEncoder::input_image(self)
     }
@@ -598,6 +616,21 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
 pub struct Encoder(Box<dyn EncoderApi>);
 
 impl Encoder {
+    /// Capabilities queried during creation for this encoder's exact profile.
+    pub fn capabilities(&self) -> EncoderCapabilities {
+        self.0.capabilities()
+    }
+
+    /// Coded picture extent, distinct from the requested frame and allocated image.
+    pub fn coded_extent(&self) -> vk::Extent2D {
+        self.0.coded_extent()
+    }
+
+    /// Actual extent of every internal input slot, including NVIDIA width padding.
+    pub fn input_image_extent(&self) -> vk::Extent2D {
+        self.0.input_image_extent()
+    }
+
     /// Create a new encoder for the codec named in `config`.
     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
         let inner: Box<dyn EncoderApi> = match config.codec {

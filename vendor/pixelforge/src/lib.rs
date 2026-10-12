@@ -208,11 +208,12 @@ pub use encoder::{
     BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
     DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,
     DEFAULT_TARGET_BITRATE, EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint,
-    EncodedPacket, Encoder, EncoderTuningMode, FrameType, PixelFormat, RateControlMode,
+    EncodedPacket, Encoder, EncoderCapabilities, EncoderTuningMode, FrameType, PixelFormat,
+    RateControlMode, codec_block_size,
 };
 pub use error::PixelForgeError;
 pub use image::InputImage;
-pub use vulkan::VideoContextBuilder;
+pub use vulkan::{DeviceSelector, VideoContextBuilder};
 
 /// Re-export VideoContext for convenience.
 pub use vulkan::VideoContext;
