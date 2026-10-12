@@ -110,15 +110,20 @@ Add other applications in GUI **Settings** or [configuration](docs/CONFIGURATION
 
 ## More help
 
-[Installation/headless/upgrades](docs/INSTALLATION.md) · [Desktop app](docs/DESKTOP.md) ·
-[Troubleshooting](docs/TIPS.md) · [Configuration](docs/CONFIGURATION.md) ·
-[Security/recovery](docs/SECURITY_ADMINISTRATION.md) · [All docs](docs/README.md)
+- [Installation/headless/upgrades](docs/INSTALLATION.md)
+- [Desktop app](docs/DESKTOP.md)
+- [Troubleshooting](docs/TIPS.md) 
+- [Configuration](docs/CONFIGURATION.md)
+- [Security/recovery](docs/SECURITY_ADMINISTRATION.md)
+- [All docs](docs/README.md)
 
 ## Features
 
-Hardware H.264/HEVC/AV1; PyroWave 4:2:0/4:4:4; [native HDR](docs/NATIVE_PRESENTATION.md)
-and VRR with compatible clients/displays. Keyboard, mouse, touch, pen,
-controllers, haptics and surround audio. Optional desktop pairing, settings and status.
+- Hardware H.264/HEVC/AV1
+- PyroWave 4:2:0/4:4:4
+- [native HDR](docs/NATIVE_PRESENTATION.md) and VRR with compatible clients ([Pyrolight](https://github.com/karsyboy/pyrolight)) / displays. 
+- Keyboard, mouse, touch, pen, controllers, haptics and surround audio. 
+- Optional desktop pairing, settings and status.
 
 ## AI-assisted development
 
