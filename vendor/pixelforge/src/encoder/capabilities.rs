@@ -93,6 +93,32 @@ impl EncoderCapabilities {
         Ok(extent)
     }
 
+    /// AV1 frame size (`max_frame_*` and every picture's `codedExtent`): the
+    /// requested size on the implementation's coded picture grid, within the
+    /// coded extent. `render_size` carries the requested size.
+    ///
+    /// Implementations code AV1 pictures on that grid regardless, but only
+    /// read the source within `codedExtent` and fill the rest themselves:
+    /// RADV (8x2 grid) coded a 1365x767 frame as 1368x768 with a black last
+    /// row. Covering the whole grid encodes the caller's padding instead,
+    /// which decoders that ignore `render_size` display.
+    pub fn av1_frame_extent(&self, width: u32, height: u32) -> Result<vk::Extent2D> {
+        let coded = self.coded_extent(Codec::AV1, width, height)?;
+        let grid = self.av1_coded_picture_alignment.unwrap_or(vk::Extent2D {
+            width: 1,
+            height: 1,
+        });
+        let on_grid = |value: u32, unit: u32, limit: u32| {
+            value
+                .checked_next_multiple_of(unit.max(1))
+                .map_or(limit, |aligned| aligned.min(limit))
+        };
+        Ok(vk::Extent2D {
+            width: on_grid(width, grid.width, coded.width),
+            height: on_grid(height, grid.height, coded.height),
+        })
+    }
+
     /// Allocated input-image extent, including the maintained NVIDIA width
     /// padding. This can be wider than the coded picture; it never exceeds max.
     pub fn input_image_extent(
@@ -232,6 +258,33 @@ mod tests {
                 .width,
             4080
         );
+    }
+
+    #[test]
+    fn av1_frames_cover_the_coded_picture_grid() {
+        let mut limits = caps((1, 1), (1, 1), 8192);
+        // Without a reported grid the frame keeps the requested size.
+        let extent = limits.av1_frame_extent(1365, 767).unwrap();
+        assert_eq!((extent.width, extent.height), (1365, 767));
+        // RADV: 8x2.
+        limits.av1_coded_picture_alignment = Some(vk::Extent2D {
+            width: 8,
+            height: 2,
+        });
+        let extent = limits.av1_frame_extent(1365, 767).unwrap();
+        assert_eq!((extent.width, extent.height), (1368, 768));
+        let extent = limits.av1_frame_extent(1366, 766).unwrap();
+        assert_eq!((extent.width, extent.height), (1368, 766));
+        let extent = limits.av1_frame_extent(1920, 1080).unwrap();
+        assert_eq!((extent.width, extent.height), (1920, 1080));
+        // Never beyond the coded extent (64x64 superblocks: 1408x768).
+        limits.av1_coded_picture_alignment = Some(vk::Extent2D {
+            width: 256,
+            height: 256,
+        });
+        let extent = limits.av1_frame_extent(1366, 766).unwrap();
+        assert_eq!((extent.width, extent.height), (1408, 768));
+        assert!(limits.av1_frame_extent(0, 766).is_err());
     }
 
     #[test]

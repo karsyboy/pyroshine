@@ -19,6 +19,9 @@ source of `pixelforge`. Nix builds it as part of the source tree.
 | `0003-encoder-capabilities-and-image-extents.patch` | Share profile/capability construction across codec setup and public queries; expose coded and allocated input-image extents. | Pyroshine uses the actual image bounds without duplicating profiles or the maintained NVIDIA padding rule. Extent arithmetic rejects overflow and device-limit violations before allocating resources. |
 | `0004-preserve-typed-vulkan-errors.patch` | Preserve driver result codes with operation context and expose `vulkan_result()`. | Device-loss classification uses `ERROR_DEVICE_LOST`, independent of error wording. Fault-injection tests cover submission, fence wait and encode feedback. |
 | `0005-select-capture-device-by-drm-and-pci-identity.patch` | Add a DRM/PCI selector to context construction and clean up the instance on failed setup. | Select the opened capture GPU, with no fallback to another GPU when support or identity is unavailable. Pyroshine independently verifies the resulting device. |
+| `0006-encoder-allocate-DPB-images-at-the-input-image-width.patch` | DPB images use the 64-aligned input-image width; pictures keep the coded extent. | NVIDIA writes reconstructed 8-bit 4:4:4 chroma with the same mis-computed pitch as patch 0001. At coded width the writes overran the DPB image: reference corruption growing over P frames (chroma errors of ~200 codes at 1440x768 H.264 4:4:4) and, when the overrun reached unmapped memory, an NVENC MMU fault (Xid 31) and `ERROR_DEVICE_LOST`. Verified on an RTX 3080 (driver 615.78). |
+| `0007-av1-code-frames-on-the-coded-picture-grid.patch` | AV1 `max_frame_*` and picture `codedExtent` use the requested size rounded up to `codedPictureAlignment` (within the coded extent); `render_size` keeps the requested size. Exposes `EncoderCapabilities::av1_frame_extent`. | Implementations code AV1 on that grid but read the source only within `codedExtent`. RADV (8x2) coded 1365x767 as 1368x768 with a black last row, which clients that ignore `render_size` display. |
+| `0008-encoder-order-reconstructed-writes-after-DPB-setup-barrier.patch` | The setup slot's DPB barrier makes prior writes available and the transition visible to later reads and writes. | Its empty access masks left the reconstructed-picture write unordered after the layout transition and the slot's previous encode (`SYNC-HAZARD-WRITE-AFTER-WRITE` on RADV and NVIDIA). |
 
 ## Updating
 
@@ -80,5 +83,13 @@ MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE=/dev/dri/renderD129 
 
 The encode/decode matrix shares a capture context across cases, like production,
 and its streaming fixture uses 100 Mbps (within the RTX 3080's 120 Mbps H.264
-profile limit). Vulkan validation can be forced with
-`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`.
+profile limit). Run it as one process with the default extents on NVIDIA: the
+H.264 4:4:4 1360-then-1440 sequence is the one that lost the device before patch
+0006, and the twelve-frame streaming run exposes reference corruption. Check
+`journalctl -k` for NVRM Xid messages afterwards. Run the GPU tests with
+synchronization validation; they are expected to report no messages:
+
+```sh
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_KHRONOS_VALIDATION_VALIDATE_SYNC=1 \
+  MOONSHINE_TEST_GPU=1 cargo test --release -p moonshine-core gpu -- --ignored --test-threads 1
+```

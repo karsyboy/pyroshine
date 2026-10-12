@@ -519,6 +519,13 @@ pub(crate) fn query_video_caps(
 /// The two differ when `width % 64` is 1..=32 (e.g. 1360, 1440, 2400), and the
 /// decoded chroma comes out sheared. With a 64-aligned image width they are
 /// always equal; other formats and implementations ignore the extra columns.
+///
+/// The encoder writes reconstructed pictures into the DPB with the same pitch,
+/// so DPB images use this width as well. At a coded width the chroma writes
+/// overran the image: references were corrupted (decoded chroma errors of
+/// ~200 codes growing over P frames at 1440x768 H.264 4:4:4) and, when the
+/// overrun reached unmapped memory, NVENC faulted (Xid 31, `VIRT_WRITE`) and
+/// the device was lost.
 pub(crate) fn input_image_width(coded_width: u32, max_coded_width: u32) -> u32 {
     const INPUT_IMAGE_WIDTH_ALIGNMENT: u32 = 64;
     coded_width
@@ -665,9 +672,12 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         tracing::info!("Using layered DPB (driver does not support separate reference images)");
     }
 
+    // DPB images use the input-image width too: NVIDIA writes reconstructed
+    // 8-bit 4:4:4 chroma with the same mis-computed pitch (see
+    // `input_image_width`), past the end of a coded-width image.
     let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
         context,
-        aligned_width,
+        input_image_extent.width,
         aligned_height,
         reference_picture_format,
         dpb_slot_count,

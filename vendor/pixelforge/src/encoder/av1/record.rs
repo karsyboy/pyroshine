@@ -80,10 +80,15 @@ impl Av1 {
 
         // Without MOTION_VECTOR_SCALING all picture resource codedExtents must
         // match and equal the sequence header's max_frame dimensions.
-        let frame_extent = vk::Extent2D {
-            width: common.config.dimensions.width,
-            height: common.config.dimensions.height,
-        };
+        let frame_extent = self.frame_extent;
+        if (frame_extent.width, frame_extent.height)
+            != (
+                common.config.dimensions.width,
+                common.config.dimensions.height,
+            )
+        {
+            picture_info_flags.set_render_and_frame_size_different(1);
+        }
 
         let setup_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })

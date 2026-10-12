@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 12 Oct 2026 18:19:57 -0400
+Subject: [PATCH 2/2] av1: code the frame on the implementation's picture grid
+
+Implementations code AV1 pictures on their codedPictureAlignment grid but
+read the source image only within the picture resource's codedExtent and
+fill the remainder themselves. With the requested size as codedExtent,
+RADV (8x2 grid) coded a 1365x767 frame as 1368x768 whose last row was black
+(Y=16), so decoders that ignore render_size showed a black line instead of
+the caller's edge padding.
+
+Use the requested size rounded up to the grid, within the coded extent,
+as max_frame_* and every picture's codedExtent, and signal the requested
+size with render_and_frame_size_different and render_size. Expose the
+extent as EncoderCapabilities::av1_frame_extent.
+---
+ src/encoder/av1/init.rs           |  4 +++
+ src/encoder/av1/mod.rs            |  3 ++
+ src/encoder/av1/record.rs         | 13 +++++---
+ src/encoder/av1/session_params.rs |  4 +--
+ src/encoder/capabilities.rs       | 53 +++++++++++++++++++++++++++++++
+ 5 files changed, 71 insertions(+), 6 deletions(-)
+
+diff --git a/src/encoder/av1/init.rs b/src/encoder/av1/init.rs
+index 3ef765d..9df63e8 100644
+--- a/src/encoder/av1/init.rs
++++ b/src/encoder/av1/init.rs
+@@ -49,6 +49,9 @@ impl Av1 {
+         })?;
+         let active_reference_count = init.active_reference_count;
+         let common = init.common;
++        let frame_extent = common
++            .capabilities
++            .av1_frame_extent(config.dimensions.width, config.dimensions.height)?;
+ 
+         let codec = Av1 {
+             frame_num: 0,
+@@ -56,6 +59,7 @@ impl Av1 {
+             header_data: None,
+             references: Vec::new(),
+             active_reference_count,
++            frame_extent,
+         };
+ 
+         let mut encoder = CodecEncoder { common, codec };
+diff --git a/src/encoder/av1/mod.rs b/src/encoder/av1/mod.rs
+index 2dbdc08..6426341 100644
+--- a/src/encoder/av1/mod.rs
++++ b/src/encoder/av1/mod.rs
+@@ -45,6 +45,9 @@ pub(crate) struct Av1 {
+     references: Vec<ReferenceInfo>,
+     /// Negotiated number of active references kept for prediction.
+     active_reference_count: u32,
++    /// Frame size on the coded picture grid; see
++    /// [`EncoderCapabilities::av1_frame_extent`](crate::EncoderCapabilities::av1_frame_extent).
++    frame_extent: vk::Extent2D,
+ }
+ 
+ impl VideoCodec for Av1 {
+diff --git a/src/encoder/av1/record.rs b/src/encoder/av1/record.rs
+index d89292a..d7bc9b5 100644
+--- a/src/encoder/av1/record.rs
++++ b/src/encoder/av1/record.rs
+@@ -80,10 +80,15 @@ impl Av1 {
+ 
+         // Without MOTION_VECTOR_SCALING all picture resource codedExtents must
+         // match and equal the sequence header's max_frame dimensions.
+-        let frame_extent = vk::Extent2D {
+-            width: common.config.dimensions.width,
+-            height: common.config.dimensions.height,
+-        };
++        let frame_extent = self.frame_extent;
++        if (frame_extent.width, frame_extent.height)
++            != (
++                common.config.dimensions.width,
++                common.config.dimensions.height,
++            )
++        {
++            picture_info_flags.set_render_and_frame_size_different(1);
++        }
+ 
+         let setup_picture_resource = vk::VideoPictureResourceInfoKHR::default()
+             .coded_offset(vk::Offset2D { x: 0, y: 0 })
+diff --git a/src/encoder/av1/session_params.rs b/src/encoder/av1/session_params.rs
+index b5307c5..6e892f5 100644
+--- a/src/encoder/av1/session_params.rs
++++ b/src/encoder/av1/session_params.rs
+@@ -18,8 +18,8 @@ impl Av1 {
+         desc: &ColorDescription,
+     ) -> Result<vk::VideoSessionParametersKHR> {
+         let config = &common.config;
+-        let width = config.dimensions.width;
+-        let height = config.dimensions.height;
++        let width = self.frame_extent.width;
++        let height = self.frame_extent.height;
+ 
+         let frame_width_bits = 32 - (width - 1).leading_zeros();
+         let frame_height_bits = 32 - (height - 1).leading_zeros();
+diff --git a/src/encoder/capabilities.rs b/src/encoder/capabilities.rs
+index 7293a5c..2558749 100644
+--- a/src/encoder/capabilities.rs
++++ b/src/encoder/capabilities.rs
+@@ -93,6 +93,32 @@ impl EncoderCapabilities {
+         Ok(extent)
+     }
+ 
++    /// AV1 frame size (`max_frame_*` and every picture's `codedExtent`): the
++    /// requested size on the implementation's coded picture grid, within the
++    /// coded extent. `render_size` carries the requested size.
++    ///
++    /// Implementations code AV1 pictures on that grid regardless, but only
++    /// read the source within `codedExtent` and fill the rest themselves:
++    /// RADV (8x2 grid) coded a 1365x767 frame as 1368x768 with a black last
++    /// row. Covering the whole grid encodes the caller's padding instead,
++    /// which decoders that ignore `render_size` display.
++    pub fn av1_frame_extent(&self, width: u32, height: u32) -> Result<vk::Extent2D> {
++        let coded = self.coded_extent(Codec::AV1, width, height)?;
++        let grid = self.av1_coded_picture_alignment.unwrap_or(vk::Extent2D {
++            width: 1,
++            height: 1,
++        });
++        let on_grid = |value: u32, unit: u32, limit: u32| {
++            value
++                .checked_next_multiple_of(unit.max(1))
++                .map_or(limit, |aligned| aligned.min(limit))
++        };
++        Ok(vk::Extent2D {
++            width: on_grid(width, grid.width, coded.width),
++            height: on_grid(height, grid.height, coded.height),
++        })
++    }
++
+     /// Allocated input-image extent, including the maintained NVIDIA width
+     /// padding. This can be wider than the coded picture; it never exceeds max.
+     pub fn input_image_extent(
+@@ -234,6 +260,33 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn av1_frames_cover_the_coded_picture_grid() {
++        let mut limits = caps((1, 1), (1, 1), 8192);
++        // Without a reported grid the frame keeps the requested size.
++        let extent = limits.av1_frame_extent(1365, 767).unwrap();
++        assert_eq!((extent.width, extent.height), (1365, 767));
++        // RADV: 8x2.
++        limits.av1_coded_picture_alignment = Some(vk::Extent2D {
++            width: 8,
++            height: 2,
++        });
++        let extent = limits.av1_frame_extent(1365, 767).unwrap();
++        assert_eq!((extent.width, extent.height), (1368, 768));
++        let extent = limits.av1_frame_extent(1366, 766).unwrap();
++        assert_eq!((extent.width, extent.height), (1368, 766));
++        let extent = limits.av1_frame_extent(1920, 1080).unwrap();
++        assert_eq!((extent.width, extent.height), (1920, 1080));
++        // Never beyond the coded extent (64x64 superblocks: 1408x768).
++        limits.av1_coded_picture_alignment = Some(vk::Extent2D {
++            width: 256,
++            height: 256,
++        });
++        let extent = limits.av1_frame_extent(1366, 766).unwrap();
++        assert_eq!((extent.width, extent.height), (1408, 768));
++        assert!(limits.av1_frame_extent(0, 766).is_err());
++    }
++
+     #[test]
+     fn rejects_zero_overflow_and_aligned_extent_past_maximum() {
+         let limits = caps((1, 1), (1, 1), 8192);
+-- 
+2.56.0
+

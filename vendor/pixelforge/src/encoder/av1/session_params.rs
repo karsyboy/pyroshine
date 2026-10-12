@@ -18,8 +18,8 @@ impl Av1 {
         desc: &ColorDescription,
     ) -> Result<vk::VideoSessionParametersKHR> {
         let config = &common.config;
-        let width = config.dimensions.width;
-        let height = config.dimensions.height;
+        let width = self.frame_extent.width;
+        let height = self.frame_extent.height;
 
         let frame_width_bits = 32 - (width - 1).leading_zeros();
         let frame_height_bits = 32 - (height - 1).leading_zeros();

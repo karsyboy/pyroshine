@@ -49,6 +49,9 @@ impl Av1 {
         })?;
         let active_reference_count = init.active_reference_count;
         let common = init.common;
+        let frame_extent = common
+            .capabilities
+            .av1_frame_extent(config.dimensions.width, config.dimensions.height)?;
 
         let codec = Av1 {
             frame_num: 0,
@@ -56,6 +59,7 @@ impl Av1 {
             header_data: None,
             references: Vec::new(),
             active_reference_count,
+            frame_extent,
         };
 
         let mut encoder = CodecEncoder { common, codec };

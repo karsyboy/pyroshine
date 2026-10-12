@@ -45,6 +45,9 @@ pub(crate) struct Av1 {
     references: Vec<ReferenceInfo>,
     /// Negotiated number of active references kept for prediction.
     active_reference_count: u32,
+    /// Frame size on the coded picture grid; see
+    /// [`EncoderCapabilities::av1_frame_extent`](crate::EncoderCapabilities::av1_frame_extent).
+    frame_extent: vk::Extent2D,
 }
 
 impl VideoCodec for Av1 {

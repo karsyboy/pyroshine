@@ -1204,8 +1204,11 @@ pub(crate) unsafe fn record_dpb_barriers(
             base_array_layer: dpb_base_array_layer,
             layer_count: 1,
         })
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::empty());
+        // The encode writes the reconstructed picture after this transition
+        // and after the slot's previous encode (write-after-write). Legacy
+        // barriers have no video-encode access flags; MEMORY_* covers them.
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
 
     let mut all_barriers = vec![dpb_barrier];
 
