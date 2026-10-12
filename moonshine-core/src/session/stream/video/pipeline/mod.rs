@@ -5,8 +5,10 @@
 
 mod convert;
 pub(super) mod dmabuf;
+mod encode_caps;
 pub(super) mod failure;
 mod hdr_sei;
+mod padding;
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -43,8 +45,8 @@ use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
 use pixelforge::{
-	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
-	EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
+	Codec, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder, EncoderTuningMode, OutputFormat,
+	PixelForgeError, PixelFormat, RateControlMode, VideoContext,
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
@@ -97,7 +99,7 @@ fn import_overlay(
 		})
 		.next()
 		.ok_or("layer DMA-BUF has no planes")?;
-	let format = drm_fourcc_to_input(dmabuf.format().code as u32).1;
+	let format = drm_fourcc_to_vk(dmabuf.format().code as u32)?;
 	// The frame owns a strong reference to `dmabuf`, so the descriptor stays
 	// open for this call; the importer duplicates what it keeps.
 	importer
@@ -114,29 +116,15 @@ const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 /// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
 const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
 
-/// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
-/// and Vulkan import format.
-fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
-	// DRM fourcc values (from drm_fourcc.h):
-	// ARGB8888 = 0x34325241, XRGB8888 = 0x34325258
-	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
-	// ABGR2101010 = 0x30334241, XBGR2101010 = 0x30334258
-	// ARGB2101010 = 0x30335241, XRGB2101010 = 0x30335258
-	// ABGR16161616F = 0x48344241, XBGR16161616F = 0x48344258
-	//
-	// X-variants share the same bit layout as their A-counterparts; the
-	// alpha bits are simply ignored. vkd3d-proton's swapchain typically
-	// allocates XBGR2101010 (XB30) for HDR — treating that as the BGRx
-	// fallback (8-bit BGRA) produces rainbow corruption when 10-bit
-	// packed data is read as 8-bit channels.
-	match fourcc {
-		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
-		0x30334241 | 0x30334258 => {
-			(InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32) // ABGR/XBGR 2101010
-		},
-		0x48344241 | 0x48344258 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                               // ARGB/XRGB8888 (fallback)
-	}
+/// Vulkan format of a source DMA-BUF (see [`crate::gpu::sampled_vk_format`]).
+///
+/// vkd3d-proton's swapchain typically allocates XBGR2101010 (XB30) for HDR
+/// and NVIDIA's WSI XBGR16161616F (XB4H) for scRGB; sampling either as 8-bit
+/// BGRA would garble every pixel, so an unknown code is an error rather than
+/// a guess.
+fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
+	crate::gpu::sampled_vk_format(fourcc)
+		.ok_or_else(|| format!("unsupported DRM fourcc 0x{fourcc:08x} for the conventional encoders"))
 }
 
 /// Whether a pixelforge error indicates Vulkan device loss.
@@ -145,13 +133,7 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 /// operation fails the same way, so the encoding loop must exit (shutting the
 /// session down) instead of retrying forever and freezing the stream.
 fn is_device_lost(e: &PixelForgeError) -> bool {
-	match e {
-		PixelForgeError::Vulkan(result) => *result == vk::Result::ERROR_DEVICE_LOST,
-		// Other variants (e.g. CommandBuffer) stringify the underlying
-		// vk::Result, whose ash display text is "The logical device has been
-		// lost. See <...>".
-		_ => e.to_string().contains("device has been lost"),
-	}
+	e.vulkan_result() == Some(vk::Result::ERROR_DEVICE_LOST)
 }
 
 /// Classify a pixelforge error from a step after the source was converted.
@@ -209,13 +191,14 @@ fn encode_static_recovery<E: EncoderInput>(
 	encoder.encode(image)
 }
 
-/// Which converter's output buffer holds the latest converted frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LastOutput {
-	/// The packed converter.
-	Packed,
-	/// Pixelforge's converter for this input format key.
-	Fallback(u32),
+/// Pixelforge's codec for a conventional stream codec.
+fn pixelforge_codec(codec: VideoCodec) -> Result<Codec, String> {
+	match codec {
+		VideoCodec::H264 => Ok(Codec::H264),
+		VideoCodec::Hevc => Ok(Codec::H265),
+		VideoCodec::Av1 => Ok(Codec::AV1),
+		VideoCodec::PyroWave => Err("PyroWave must use the PyroWave encoder backend".to_string()),
+	}
 }
 
 /// Apply a frame failure: release the source only if no GPU work can still
@@ -434,6 +417,7 @@ async fn run_packet_consumer(
 	mut fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 ) -> Result<(), String> {
 	let mut failures = FailurePolicy::default();
+	let mut logged_padding = false;
 	let network_queue = Arc::new(super::shard_batch::QueueDepth::default());
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
@@ -510,6 +494,17 @@ async fn run_packet_consumer(
 		};
 		let t_packet_ready = std::time::Instant::now();
 		let encode_wait_dur = t_packet_ready.saturating_duration_since(frame_context.submitted_at);
+
+		// Rate-control padding only consumes bandwidth (see `padding`).
+		let padding_bytes = padding::strip(&mut packet.data, ctx.format.codec);
+		if padding_bytes > 0 && !logged_padding {
+			logged_padding = true;
+			tracing::info!(
+				padding_bytes,
+				remaining_bytes = packet.data.len(),
+				"The encoder pads frames to its bitrate; padding is removed before transmission"
+			);
+		}
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
 		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
@@ -948,11 +943,12 @@ impl VideoPipelineInner {
 				)
 			} else {
 				match self.create_encoder() {
-					Ok((context, encoder)) => self.run_encoding_loop(
+					Ok((context, encoder, input_extent)) => self.run_encoding_loop(
 						&runtime,
 						&frame_rx,
 						context,
 						encoder,
+						input_extent,
 						packet_tx.clone(),
 						idr_tx.clone(),
 						&mut idr_frame_request_rx,
@@ -990,20 +986,16 @@ impl VideoPipelineInner {
 		tracing::debug!("Video pipeline stopped.");
 	}
 
-	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
+	/// Create the encoder for this epoch; also returns the extent of its input
+	/// images (the conversion must fit).
+	fn create_encoder(&self) -> Result<(VideoContext, Encoder, (u32, u32)), String> {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
 
 		// Reuse the compositor-verified device through every stream epoch.
 		let context = self.capture_context.clone();
 
-		// Convert our video format to pixelforge's codec.
-		let codec = match ctx.format.codec {
-			VideoCodec::H264 => Codec::H264,
-			VideoCodec::Hevc => Codec::H265,
-			VideoCodec::Av1 => Codec::AV1,
-			VideoCodec::PyroWave => return Err("PyroWave must use the PyroWave encoder backend".to_string()),
-		};
+		let codec = pixelforge_codec(ctx.format.codec)?;
 
 		// Convert pixel format.
 		let pixel_format = match ctx.format.chroma {
@@ -1017,13 +1009,7 @@ impl VideoPipelineInner {
 			BitDepth::Ten => pixelforge::EncodeBitDepth::Ten,
 		};
 
-		// Select color description for VUI signaling.
-		let color_description = match (ctx.format.primaries, ctx.format.transfer) {
-			(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
-			(ColorPrimaries::Bt2020, TransferFunction::Pq) => ColorDescription::bt2020_pq(),
-			_ => return Err(format!("Unsupported color description: {:?}", ctx.format)),
-		};
-		let color_description = color_description.with_full_range(ctx.format.range == ColorRange::Full);
+		let color_description = color_description_for(ctx.format)?;
 
 		// Create encode configuration.
 		let target_bitrate = u32::try_from(ctx.bitrate)
@@ -1047,9 +1033,28 @@ impl VideoPipelineInner {
 		.with_virtual_buffer_size_ms((1000 / ctx.fps).max(1))
 		.with_initial_virtual_buffer_size_ms(0);
 
+		// Pixelforge pads the coded extent up to the device minimum but keeps
+		// the frame size, which drivers do not support below that minimum.
+		let caps = pixelforge::EncoderCapabilities::query(&context, &config)
+			.map_err(|e| format!("Failed to query encoder capabilities: {e}"))?;
+		encode_caps::check_frame(&caps, codec, ctx.width, ctx.height)?;
+		if let Some(alignment) = caps.av1_coded_picture_alignment
+			&& (!ctx.width.is_multiple_of(alignment.width.max(1))
+				|| !ctx.height.is_multiple_of(alignment.height.max(1)))
+		{
+			tracing::info!(
+				width = ctx.width,
+				height = ctx.height,
+				alignment_width = alignment.width,
+				alignment_height = alignment.height,
+				"AV1 frames are coded on this GPU's picture grid; the stream signals the requested size as the render size"
+			);
+		}
+
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
 
-		Ok((context, encoder))
+		let extent = encoder.input_image_extent();
+		Ok((context, encoder, (extent.width, extent.height)))
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -1409,6 +1414,7 @@ impl VideoPipelineInner {
 		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
 		context: VideoContext,
 		mut encoder: Encoder,
+		input_extent: (u32, u32),
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
@@ -1487,56 +1493,40 @@ impl VideoPipelineInner {
 			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
 		};
 
-		// Pyroshine's packed converter: no atomics, preferably on the dedicated
-		// compute family, and able to composite the cursor of a direct export.
-		// Pixelforge's converter remains the fallback for extents it cannot pack.
-		let mut input_converter = if convert::supports_extent(ctx.width, ctx.height) {
-			match InputConverter::new(
-				context.clone(),
-				self.config.conversion_queue,
-				ctx.width,
-				ctx.height,
-				output_format,
-				if ctx.format.hdr {
-					ColorSpace::Bt2020
-				} else {
-					ColorSpace::Bt709
-				},
-				ctx.format.range == ColorRange::Full,
-			) {
-				Ok(converter) => {
-					tracing::info!(
-						async_compute = converter.async_compute,
-						"Using packed RGB to YCbCr converter with late cursor composition"
-					);
-					Some(converter)
-				},
-				Err(e) => {
-					tracing::warn!("Packed converter unavailable ({e}); using Pixelforge's converter");
-					None
-				},
-			}
-		} else {
-			tracing::info!(
-				width = ctx.width,
-				height = ctx.height,
-				"Stream extent is not word aligned; using Pixelforge's converter without late composition"
-			);
-			None
-		};
-		let _overlay_support = OverlaySupport::declare(
-			frame_rx,
-			if input_converter.is_some() {
-				OverlayCaps::PIXELS.union(OverlayCaps::DMABUF)
+		// The only RGB-to-YCbCr path of the conventional codecs: preferably on
+		// the dedicated compute family, compositing late layers (cursor and
+		// notification) and padding to the encoder's block alignment. A
+		// converter this GPU cannot run correctly fails the stream setup.
+		let (extent_width, extent_height) =
+			convert::conversion_extent(pixelforge_codec(ctx.format.codec)?, ctx.width, ctx.height)?;
+		if extent_width > input_extent.0 || extent_height > input_extent.1 {
+			return Err(format!(
+				"conversion extent {extent_width}x{extent_height} exceeds the encoder input {}x{}",
+				input_extent.0, input_extent.1
+			));
+		}
+		let mut input_converter = InputConverter::new(
+			context.clone(),
+			self.config.conversion_queue,
+			(ctx.width, ctx.height),
+			(extent_width, extent_height),
+			output_format,
+			if ctx.format.hdr {
+				ColorSpace::Bt2020
 			} else {
-				OverlayCaps::NONE
+				ColorSpace::Bt709
 			},
+			ctx.format.range == ColorRange::Full,
+		)
+		.map_err(|e| format!("Failed to create the YCbCr converter: {e}"))?;
+		tracing::info!(
+			async_compute = input_converter.async_compute,
+			conversion_width = extent_width,
+			conversion_height = extent_height,
+			"Using RGB to YCbCr converter with late cursor composition"
 		);
+		let _overlay_support = OverlaySupport::declare(frame_rx, OverlayCaps::PIXELS.union(OverlayCaps::DMABUF));
 		let mut convert_window = convert::ConvertWindow::default();
-
-		// Converter per input format, plus the source import whose view it caches.
-		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
-			std::collections::HashMap::new();
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -1547,8 +1537,8 @@ impl VideoPipelineInner {
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
-		// The converter output holding the latest frame, for static recovery.
-		let mut last_output: Option<LastOutput> = None;
+		// Whether the converter output holds the latest frame, for static recovery.
+		let mut last_output = false;
 		// A requested IDR not yet submitted. Persistent across iterations so a
 		// recovery that cannot be admitted yet (network credits) is retried.
 		let mut pending_idr = false;
@@ -1670,7 +1660,7 @@ impl VideoPipelineInner {
 					// re-encode the static scene from the latest converted frame
 					// (see `encode_static_recovery`).
 					if pending_idr
-						&& has_encoded && last_output.is_some()
+						&& has_encoded && last_output
 						&& conventional_can_admit(&in_flight)
 						&& self.demand.may_replay(2 * frame_interval)
 					{
@@ -1678,27 +1668,7 @@ impl VideoPipelineInner {
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
 						let restore = |_: &mut Encoder, target: vk::Image| -> Result<(), PixelForgeError> {
-							let restored = match last_output {
-								Some(LastOutput::Packed) => input_converter
-									.as_ref()
-									.map_or(Ok(false), |converter| converter.copy_last_output(target)),
-								Some(LastOutput::Fallback(key)) => match color_converters.get(&key) {
-									Some((converter, _)) => convert::copy_output_to_input(
-										&context,
-										context.compute_queue(),
-										context.compute_queue_family(),
-										converter.output_buffer(),
-										output_format,
-										ctx.width,
-										ctx.height,
-										target,
-									)
-									.map(|()| true),
-									None => Ok(false),
-								},
-								None => Ok(false),
-							};
-							match restored {
+							match input_converter.copy_last_output(target) {
 								Ok(true) => Ok(()),
 								Ok(false) => Err(PixelForgeError::CommandBuffer(
 									"no converted frame to recover from".to_string(),
@@ -1840,8 +1810,16 @@ impl VideoPipelineInner {
 					continue;
 				}
 
-				// Determine Vulkan format and input format from the frame's DRM fourcc.
-				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
+				// Vulkan format of the frame's DRM fourcc.
+				let import_vk_format = match drm_fourcc_to_vk(frame.format) {
+					Ok(format) => format,
+					Err(e) => {
+						let failure =
+							EncodeFailure::new(EncodeStage::Import, Recovery::DropFrame, SourceAccess::NotSubmitted, e);
+						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+						continue;
+					},
+				};
 
 				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
 				// The `Arc` pins the image while the converter caches a view of it.
@@ -1859,16 +1837,9 @@ impl VideoPipelineInner {
 							continue;
 						},
 					};
-				let source_image = source_import.image();
-
-				// First-time imports are in UNDEFINED layout; the converter
-				// will handle the transition inside its command buffer.
-				// Cached imports were left in GENERAL by the previous convert.
-				let src_layout = if needs_transition {
-					vk::ImageLayout::UNDEFINED
-				} else {
-					vk::ImageLayout::GENERAL
-				};
+				// First-time imports are in UNDEFINED layout and owned externally;
+				// the converter acquires them. Cached imports were left in
+				// GENERAL by the previous conversion.
 
 				let t2_imported = std::time::Instant::now();
 
@@ -1917,131 +1888,80 @@ impl VideoPipelineInner {
 					frame_color = Some((cs, full_range, sdr_white_nits));
 				}
 
-				let converted = if let Some(converter) = input_converter.as_mut() {
-					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
-						converter.set_color(cs, full_range, sdr_white_nits);
-					}
-					// DMA-BUF layers go through the same identity-checked import
-					// cache as the game source; the `Arc`s pin them for the call.
-					let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
-					let mut import_failed = None;
-					for (slot, layer) in frame.overlays.iter().enumerate() {
-						if let Some(FrameOverlay {
-							content: OverlayContent::Dmabuf { dmabuf, .. },
-							..
-						}) = layer
-						{
-							match import_overlay(importer, dmabuf) {
-								Ok(import) => layer_imports[slot] = Some(import),
-								Err(e) => import_failed = Some(e),
-							}
+				if let Some((cs, full_range, sdr_white_nits)) = frame_color {
+					input_converter.set_color(cs, full_range, sdr_white_nits);
+				}
+				// DMA-BUF layers go through the same identity-checked import
+				// cache as the game source; the `Arc`s pin them for the call.
+				let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
+				let mut import_failed = None;
+				for (slot, layer) in frame.overlays.iter().enumerate() {
+					if let Some(FrameOverlay {
+						content: OverlayContent::Dmabuf { dmabuf, .. },
+						..
+					}) = layer
+					{
+						match import_overlay(importer, dmabuf) {
+							Ok(import) => layer_imports[slot] = Some(import),
+							Err(e) => import_failed = Some(e),
 						}
 					}
-					if let Some(e) = import_failed {
-						let failure = EncodeFailure::new(
-							EncodeStage::Import,
-							Recovery::DropFrame,
-							SourceAccess::NotSubmitted,
-							format!("failed to import overlay DMA-BUF: {e}"),
-						);
-						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-						continue;
-					}
-					let layers: convert::Layers<'_> = std::array::from_fn(|slot| {
-						let layer = frame.overlays[slot].as_ref()?;
-						let input = match &layer.content {
-							OverlayContent::Pixels(image) => convert::LayerInput::Pixels(image),
-							OverlayContent::Dmabuf { dmabuf, opaque } => {
-								let (import, first_use) = layer_imports[slot].as_ref()?;
-								convert::LayerInput::Imported {
-									import,
-									format: drm_fourcc_to_input(
-										smithay::backend::allocator::Buffer::format(dmabuf).code as u32,
-									)
-									.1,
-									first_use: *first_use,
-									opaque: *opaque,
-								}
-							},
-						};
-						Some(convert::Layer {
-							input,
-							x: layer.x,
-							y: layer.y,
-							width: layer.width(),
-							height: layer.height(),
-							opacity: layer.opacity,
-						})
-					});
-					converter
-						.convert(
-							&source_import,
-							import_vk_format,
-							needs_transition,
-							&layers,
-							encoder.input_image(),
-						)
-						.map(|outcome| {
-							convert_window.record(outcome.gpu_ns, frame.has_overlays());
-						})
-						.map_err(PixelForgeError::Vulkan)
-				} else if frame.has_overlays() {
-					// Captured while this consumer still advertised overlays (an
-					// epoch switch raced the capture). Never encode it without its
-					// cursor: drop it; the next capture is composited by GLES.
-					convert_window.overlay_drops += 1;
-					frame.consumed.store(true, Ordering::Release);
+				}
+				if let Some(e) = import_failed {
+					let failure = EncodeFailure::new(
+						EncodeStage::Import,
+						Recovery::DropFrame,
+						SourceAccess::NotSubmitted,
+						format!("failed to import overlay DMA-BUF: {e}"),
+					);
+					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 					continue;
-				} else {
-					// Get (or build) a converter for this input format. Cached per
-					// format so switching render paths doesn't rebuild one each frame.
-					let (converter, cached_source) = match color_converters.entry(frame.format) {
-						std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-						std::collections::hash_map::Entry::Vacant(e) => {
-							let color_space = if ctx.format.hdr {
-								ColorSpace::Bt2020
-							} else {
-								ColorSpace::Bt709
-							};
-							let full_range = ctx.format.range == ColorRange::Full;
-							let mut config =
-								ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
-							config.color_space = color_space;
-							config.full_range = full_range;
-							match ColorConverter::new(context.clone(), config) {
-								Ok(conv) => {
-									tracing::debug!("Created color converter for input format {frame_input_format:?}");
-									e.insert((conv, None))
-								},
-								Err(e) => {
-									let failure = EncodeFailure::new(
-										EncodeStage::Setup,
-										Recovery::DropFrame,
-										SourceAccess::NotSubmitted,
-										format!("failed to create color converter: {e}"),
-									);
-									apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-									continue;
-								},
+				}
+				let layers: convert::Layers<'_> = std::array::from_fn(|slot| {
+					let layer = frame.overlays[slot].as_ref()?;
+					let input = match &layer.content {
+						OverlayContent::Pixels(image) => convert::LayerInput::Pixels(image),
+						OverlayContent::Dmabuf { dmabuf, opaque } => {
+							let (import, first_use) = layer_imports[slot].as_ref()?;
+							convert::LayerInput::Imported {
+								import,
+								// Known: the import above accepted it.
+								format: drm_fourcc_to_vk(
+									smithay::backend::allocator::Buffer::format(dmabuf).code as u32,
+								)
+								.ok()?,
+								first_use: *first_use,
+								opaque: *opaque,
 							}
 						},
 					};
-					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
-						converter.set_color_space(cs);
-						converter.set_full_range(full_range);
-						converter.set_sdr_reference_white_nits(sdr_white_nits);
-					}
-					// Retain the source image; the converter caches a view of it.
-					*cached_source = Some(Arc::clone(&source_import));
-					converter.convert(source_image, src_layout, encoder.input_image())
-				};
+					Some(convert::Layer {
+						input,
+						x: layer.x,
+						y: layer.y,
+						width: layer.width(),
+						height: layer.height(),
+						opacity: layer.opacity,
+					})
+				});
+				let converted = input_converter
+					.convert(
+						&source_import,
+						import_vk_format,
+						needs_transition,
+						&layers,
+						convert::Target::encoder_input(encoder.input_image()),
+					)
+					.map(|outcome| {
+						convert_window.record(outcome.gpu_ns, frame.has_overlays());
+					})
+					.map_err(PixelForgeError::Vulkan);
 
-				// Convert to YUV.
 				if converted.is_err() {
-					last_output = None;
+					last_output = false;
 				}
 				if let Err(e) = converted {
-					// Both converters submit the conversion and wait for its fence; an
+					// The converter submits the conversion and waits for its fence; an
 					// error may follow a submission whose reads are still pending.
 					// Establish completion before the compositor may reuse the source.
 					let failure = if is_device_lost(&e) {
@@ -2074,17 +1994,13 @@ impl VideoPipelineInner {
 					continue;
 				}
 				if self.config.log_stats {
-					convert_window.maybe_log(input_converter.as_ref().map(|c| c.async_compute));
+					convert_window.maybe_log(input_converter.async_compute);
 				}
 
 				// The DMA-BUF content has been read into the encoder's input
 				// image — signal the compositor that this GBM buffer is free.
 				frame.consumed.store(true, Ordering::Release);
-				last_output = Some(if input_converter.is_some() {
-					LastOutput::Packed
-				} else {
-					LastOutput::Fallback(frame.format)
-				});
+				last_output = true;
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
@@ -2236,9 +2152,9 @@ impl Drop for ConsumerTask<'_> {
 
 #[cfg(test)]
 mod tests {
-	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
+	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_vk, is_device_lost};
 	use ash::vk::{self, Handle};
-	use pixelforge::{InputFormat, PixelForgeError};
+	use pixelforge::PixelForgeError;
 
 	#[tokio::test]
 	async fn resume_ack_waits_for_transport_epoch_and_reports_activation_failure() {
@@ -2302,8 +2218,12 @@ mod tests {
 	// Layout: fourcc_code(a, b, c, d) = a | b<<8 | c<<16 | d<<24.
 	const ABGR8888: u32 = 0x34324241; // "AB24"
 	const XBGR8888: u32 = 0x34324258; // "XB24"
+	const ARGB8888: u32 = 0x34325241; // "AR24"
+	const XRGB8888: u32 = 0x34325258; // "XR24"
 	const ABGR2101010: u32 = 0x30334241; // "AB30"
 	const XBGR2101010: u32 = 0x30334258; // "XB30"
+	const ARGB2101010: u32 = 0x30335241; // "AR30"
+	const XRGB2101010: u32 = 0x30335258; // "XR30"
 	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
 	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
 
@@ -2334,22 +2254,25 @@ mod tests {
 	}
 
 	#[test]
-	fn drm_fourcc_abgr_xbgr_8bit_maps_to_rgba() {
-		// 8-bit ABGR/XBGR share the same bit layout (alpha vs. padding) and
-		// map to R8G8B8A8_UNORM.
+	fn drm_fourcc_8bit_formats_map_to_byte_order_views() {
+		// 8-bit ABGR/XBGR share the same bit layout (alpha vs. padding).
 		for fourcc in [ABGR8888, XBGR8888] {
-			let (fmt, vk) = drm_fourcc_to_input(fourcc);
-			assert_eq!(fmt, InputFormat::RGBA);
-			assert_eq!(vk, vk::Format::R8G8B8A8_UNORM);
+			assert_eq!(drm_fourcc_to_vk(fourcc), Ok(vk::Format::R8G8B8A8_UNORM));
+		}
+		for fourcc in [ARGB8888, XRGB8888] {
+			assert_eq!(drm_fourcc_to_vk(fourcc), Ok(vk::Format::B8G8R8A8_UNORM));
 		}
 	}
 
 	#[test]
-	fn drm_fourcc_abgr_xbgr_10bit_maps_to_a2b10g10r10() {
+	fn drm_fourcc_10bit_formats_map_to_packed_views() {
 		for fourcc in [ABGR2101010, XBGR2101010] {
-			let (fmt, vk) = drm_fourcc_to_input(fourcc);
-			assert_eq!(fmt, InputFormat::ABGR2101010);
-			assert_eq!(vk, vk::Format::A2B10G10R10_UNORM_PACK32);
+			assert_eq!(drm_fourcc_to_vk(fourcc), Ok(vk::Format::A2B10G10R10_UNORM_PACK32));
+		}
+		// Red in the low bits for AB30, blue for AR30: the same channel order
+		// as the Vulkan packed format names.
+		for fourcc in [ARGB2101010, XRGB2101010] {
+			assert_eq!(drm_fourcc_to_vk(fourcc), Ok(vk::Format::A2R10G10B10_UNORM_PACK32));
 		}
 	}
 
@@ -2357,22 +2280,19 @@ mod tests {
 	fn drm_fourcc_abgr_xbgr_fp16_maps_to_rgba16f() {
 		// Regression guard for the XBGR16161616F (XB4H) case: NVIDIA's Wayland
 		// WSI emits the X-variant for FP16 scRGB swapchains, and handling only
-		// the A-variant caused 16F buffers to fall through to the 8-bit BGRx
-		// fallback and produce garbled pixels.
+		// the A-variant caused 16F buffers to be sampled as 8-bit BGRA and
+		// produce garbled pixels.
 		for fourcc in [ABGR16161616F, XBGR16161616F] {
-			let (fmt, vk) = drm_fourcc_to_input(fourcc);
-			assert_eq!(fmt, InputFormat::RGBA16F);
-			assert_eq!(vk, vk::Format::R16G16B16A16_SFLOAT);
+			assert_eq!(drm_fourcc_to_vk(fourcc), Ok(vk::Format::R16G16B16A16_SFLOAT));
 		}
 	}
 
 	#[test]
-	fn drm_fourcc_unknown_falls_back_to_bgrx() {
-		// Anything outside the known set must fall back to the 8-bit BGRx
-		// assumption — matches the `_ =>` arm in the production match.
-		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
-		assert_eq!(fmt, InputFormat::BGRx);
-		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
+	fn drm_fourcc_unknown_is_rejected_instead_of_guessed() {
+		// NV12 ("NV12") and RGB565 ("RG16") must not be sampled as 8-bit BGRA.
+		for fourcc in [0x3231_564e, 0x3631_4752, 0xDEAD_BEEF] {
+			assert!(drm_fourcc_to_vk(fourcc).is_err(), "0x{fourcc:08x}");
+		}
 	}
 
 	/// ARCH-001: post-conversion failures keep the reference chain valid with
@@ -2428,22 +2348,25 @@ mod tests {
 	}
 
 	#[test]
-	fn device_lost_is_detected_in_both_error_shapes() {
-		// Structured variant.
+	fn device_lost_is_detected_by_driver_result() {
 		assert!(is_device_lost(&PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)));
-		// String variant: pixelforge wraps the vk::Result display text, e.g.
-		// CommandBuffer("The logical device has been lost. See <...>") —
-		// the shape observed when a stale DMA-BUF import faults the GPU.
-		assert!(is_device_lost(&PixelForgeError::CommandBuffer(
-			vk::Result::ERROR_DEVICE_LOST.to_string()
-		)));
+		for operation in ["submit encode", "wait encode fence", "read encode feedback"] {
+			assert!(is_device_lost(&PixelForgeError::vulkan(
+				operation,
+				vk::Result::ERROR_DEVICE_LOST
+			)));
+		}
 	}
 
 	#[test]
-	fn recoverable_errors_are_not_device_lost() {
+	fn recoverable_errors_and_text_are_not_device_lost() {
 		assert!(!is_device_lost(&PixelForgeError::Vulkan(vk::Result::TIMEOUT)));
+		assert!(!is_device_lost(&PixelForgeError::vulkan(
+			"wait encode fence",
+			vk::Result::TIMEOUT
+		)));
 		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
-			"submit failed".to_string()
+			vk::Result::ERROR_DEVICE_LOST.to_string()
 		)));
 	}
 

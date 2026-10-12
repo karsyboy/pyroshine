@@ -851,9 +851,6 @@ impl PyroWaveEncoder {
 			let mut modifier = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
 				.drm_format_modifier(desc.modifier)
 				.plane_layouts(&plane_layouts);
-			let mut external = vk::ExternalMemoryImageCreateInfo::default()
-				.handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-			external.p_next = (&mut modifier as *mut vk::ImageDrmFormatModifierExplicitCreateInfoEXT<'_>).cast();
 			let mut vk_info = vk::ImageCreateInfo::default()
 				.image_type(vk::ImageType::TYPE_2D)
 				.format(format)
@@ -869,7 +866,9 @@ impl PyroWaveEncoder {
 				.usage(vk::ImageUsageFlags::SAMPLED)
 				.sharing_mode(vk::SharingMode::EXCLUSIVE)
 				.initial_layout(vk::ImageLayout::UNDEFINED);
-			vk_info.p_next = (&mut external as *mut vk::ExternalMemoryImageCreateInfo<'_>).cast();
+			// PyroWave adds VkExternalMemoryImageCreateInfo from handle_type;
+			// supplying it here too duplicates an sType in the final chain.
+			vk_info.p_next = (&mut modifier as *mut vk::ImageDrmFormatModifierExplicitCreateInfoEXT<'_>).cast();
 			let info = ImageCreateInfo {
 				device: self.device.handle,
 				external_handle: imported_fd as usize,
@@ -1222,14 +1221,8 @@ impl Drop for PyroWaveEncoder {
 }
 
 fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
-	match fourcc {
-		0x34324241 | 0x34324258 => Ok(vk::Format::R8G8B8A8_UNORM),
-		0x34325241 | 0x34325258 => Ok(vk::Format::B8G8R8A8_UNORM),
-		0x30334241 | 0x30334258 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
-		0x30335241 | 0x30335258 => Ok(vk::Format::A2R10G10B10_UNORM_PACK32),
-		0x48344241 | 0x48344258 => Ok(vk::Format::R16G16B16A16_SFLOAT),
-		_ => Err(format!("unsupported compositor DRM fourcc 0x{fourcc:08x} for PyroWave")),
-	}
+	crate::gpu::sampled_vk_format(fourcc)
+		.ok_or_else(|| format!("unsupported compositor DRM fourcc 0x{fourcc:08x} for PyroWave"))
 }
 
 #[cfg(test)]
@@ -1381,6 +1374,211 @@ mod tests {
 			.expect("set MOONSHINE_PYROWAVE_LIBRARY to the pinned library under test");
 		Api::load().expect("the packaged authoritative PyroWave library must expose the pinned ABI");
 		eprintln!("pyrowave-ffi: loaded {}", std::path::Path::new(&library).display());
+	}
+
+	/// Compositor capture buffers must import into PyroWave and the
+	/// conventional pipeline: every modifier `gpu::ImportableModifiers` lists
+	/// for the SDR render formats, and the compositor's own allocation request
+	/// (EGL render modifiers filtered to that set). NVIDIA's EGL also offers
+	/// compressed block-linear modifiers Vulkan cannot import; requesting
+	/// those made every PyroWave import fail on an RTX 3080.
+	/// `MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_PYROWAVE=1 MOONSHINE_PYROWAVE_LIBRARY=<lib> cargo test -p moonshine-core pyrowave_imports_compositor -- --ignored --nocapture`
+	#[test]
+	#[ignore = "needs a GPU and the pinned PyroWave build: MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_PYROWAVE=1"]
+	fn pyrowave_imports_compositor_dmabufs_on_gpu() {
+		use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+		use crate::session::stream::video::{ColorRange, NegotiatedVideoFormat, VideoCodec};
+		use ash::vk::TaggedStructure;
+		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+		use smithay::backend::allocator::{Allocator, Fourcc, Modifier};
+		use std::sync::Arc;
+		use std::sync::atomic::AtomicBool;
+
+		for variable in [
+			"MOONSHINE_TEST_GPU",
+			"MOONSHINE_TEST_PYROWAVE",
+			"MOONSHINE_PYROWAVE_LIBRARY",
+		] {
+			assert!(std::env::var_os(variable).is_some(), "set {variable}");
+		}
+		const SIZE: u32 = 256;
+		let node = crate::healthcheck::find_render_node(&None).unwrap();
+		let file = std::fs::OpenOptions::new().read(true).write(true).open(&node).unwrap();
+		let context = crate::gpu::capture_context(&file).unwrap();
+		let mut allocator = GbmAllocator::new(GbmDevice::new(file).unwrap(), GbmBufferFlags::RENDERING);
+		let fd_props = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
+		let mut conventional =
+			crate::session::stream::video::pipeline::dmabuf::DmaBufImporter::new(context.clone(), false).unwrap();
+		let mut encoder = PyroWaveEncoder::new(
+			&context,
+			NegotiatedVideoFormat::sdr(
+				VideoCodec::PyroWave,
+				ChromaFormat::Yuv420,
+				BitDepth::Eight,
+				ColorRange::Full,
+			),
+			SIZE,
+			SIZE,
+			50_000_000,
+			60,
+			PyroWaveQueueMode::Auto,
+		)
+		.unwrap();
+
+		let importable = crate::gpu::ImportableModifiers::query(&context);
+		// The compositor's capture buffers: the modifiers its EGL renderer
+		// advertises for the format that Vulkan imports, in one request.
+		let egl_formats = {
+			use smithay::backend::egl::{EGLContext, EGLDisplay};
+			let fd = std::fs::OpenOptions::new().read(true).write(true).open(&node).unwrap();
+			// SAFETY: the display owns its GBM device; both live for this block.
+			let display = unsafe { EGLDisplay::new(GbmDevice::new(fd).unwrap()) }.unwrap();
+			EGLContext::new(&display).unwrap().dmabuf_render_formats().clone()
+		};
+		let compositor_modifiers = |fourcc: Fourcc| -> Vec<Modifier> {
+			egl_formats
+				.iter()
+				.filter(|f| f.code == fourcc && importable.contains(fourcc as u32, u64::from(f.modifier)))
+				.map(|f| f.modifier)
+				.collect()
+		};
+
+		let mut failures = Vec::new();
+		let mut checked = 0;
+		for (fourcc, vk_format) in [
+			(Fourcc::Abgr8888, vk::Format::R8G8B8A8_UNORM),
+			(Fourcc::Xrgb8888, vk::Format::B8G8R8A8_UNORM),
+		] {
+			// Every modifier Vulkan can sample this format with, as the
+			// compositor's renderer advertises them.
+			let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+			let mut properties = vk::FormatProperties2::default().push(&mut list);
+			// SAFETY: plain physical-device queries with a correctly sized array.
+			unsafe {
+				context.instance().get_physical_device_format_properties2(
+					context.physical_device(),
+					vk_format,
+					&mut properties,
+				)
+			};
+			let mut modifiers =
+				vec![vk::DrmFormatModifierPropertiesEXT::default(); list.drm_format_modifier_count as usize];
+			let mut list =
+				vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut modifiers);
+			let mut properties = vk::FormatProperties2::default().push(&mut list);
+			// SAFETY: as above.
+			unsafe {
+				context.instance().get_physical_device_format_properties2(
+					context.physical_device(),
+					vk_format,
+					&mut properties,
+				)
+			};
+			let sampled: Vec<Modifier> = modifiers
+				.iter()
+				.filter(|m| importable.contains(fourcc as u32, m.drm_format_modifier))
+				.map(|m| Modifier::from(m.drm_format_modifier))
+				.collect();
+			let compositor = compositor_modifiers(fourcc);
+			eprintln!(
+				"{fourcc:?}: compositor modifiers {:x?}",
+				compositor.iter().map(|m| u64::from(*m)).collect::<Vec<_>>()
+			);
+			if compositor.is_empty() {
+				failures.push(format!("{fourcc:?}: no EGL render modifier is importable"));
+			}
+			let requests = sampled
+				.into_iter()
+				.map(|modifier| (vec![modifier], false))
+				.chain((!compositor.is_empty()).then_some((compositor, true)));
+			for (request, is_compositor) in requests {
+				let Ok(buffer) = allocator.create_buffer(SIZE, SIZE, fourcc, &request) else {
+					if is_compositor {
+						failures.push(format!(
+							"{fourcc:?}: GBM cannot allocate the compositor request {request:?}"
+						));
+					}
+					eprintln!("{fourcc:?} {request:?}: GBM cannot allocate; skipped");
+					continue;
+				};
+				let dmabuf = smithay::backend::allocator::dmabuf::AsDmabuf::export(&buffer).unwrap();
+				let frame = ExportedFrame::from_dmabuf(
+					&dmabuf,
+					0,
+					Arc::new(AtomicBool::new(false)),
+					FrameColorSpace::Srgb,
+					None,
+				);
+				if !is_compositor && request.len() == 1 && frame.modifier != u64::from(request[0]) {
+					// NVIDIA's GBM answers a linear-only request with an implicit
+					// modifier. Explicit single-modifier probes can be skipped;
+					// the compositor request must allocate an importable buffer.
+					eprintln!(
+						"{fourcc:?} {request:?}: GBM substituted modifier {:#018x}; skipped",
+						frame.modifier
+					);
+					continue;
+				}
+				if !importable.contains(fourcc as u32, frame.modifier) {
+					failures.push(format!(
+						"{fourcc:?} {request:?}: GBM substituted unsupported modifier {:#018x}",
+						frame.modifier
+					));
+					continue;
+				}
+				let desc = DmabufDesc::from_frame(&frame).unwrap();
+				let mut fd_memory = vk::MemoryFdPropertiesKHR::default();
+				// SAFETY: the fd is open for the frame's lifetime.
+				unsafe {
+					fd_props.get_memory_fd_properties(
+						vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+						desc.planes()[0].0.as_raw_fd(),
+						&mut fd_memory,
+					)
+				}
+				.unwrap();
+				checked += 1;
+				let result = encoder.import(&desc).map(|_| ());
+				let planes: Vec<_> = frame
+					.planes()
+					.map(|plane| crate::session::stream::video::pipeline::dmabuf::DmaBufPlane {
+						fd: plane.fd.as_raw_fd(),
+						offset: plane.offset,
+						stride: plane.stride,
+						modifier: frame.modifier,
+					})
+					.collect();
+				let conventional_result = conventional
+					.import_or_reuse(planes[0].fd, SIZE, SIZE, vk_format, &planes)
+					.map(|_| ());
+				let line = format!(
+					"{fourcc:?} {} -> modifier {:#018x}: fd memory types {:#x}: conventional {}, PyroWave {}",
+					if is_compositor {
+						"compositor request"
+					} else {
+						"single request"
+					},
+					frame.modifier,
+					fd_memory.memory_type_bits,
+					match &conventional_result {
+						Ok(()) => "imported".to_string(),
+						Err(e) => format!("FAILED {e}"),
+					},
+					match &result {
+						Ok(()) => "imported".to_string(),
+						Err(e) => format!("FAILED {}", e.message),
+					}
+				);
+				eprintln!("{line}");
+				if result.is_err() || conventional_result.is_err() {
+					failures.push(line);
+				}
+				// Release the import before its buffer goes away.
+				encoder.images.entries.clear();
+			}
+		}
+		assert!(checked > 0, "no compositor format could be allocated");
+		assert!(failures.is_empty(), "Compositor imports failed: {failures:#?}");
 	}
 	#[test]
 	fn queue_config_defaults_to_graphics_and_compute_is_explicit() {

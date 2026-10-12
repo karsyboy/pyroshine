@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 12 Oct 2026 16:22:53 -0400
+Subject: [PATCH] dualsense edge paddles
+
+Preserve DualSense Edge paddle emission and ordinary DualSense isolation,
+track native sources for Cargo rebuilds, and retain hardware-independent tests.
+Reconstructed from the existing Pyroshine vendor tree at 1f39007.
+---
+ CMakeLists.txt                            | 10 ++++++++
+ bindings/rust/inputtino-sys/build.rs      |  5 ++++
+ src/uhid/include/uhid/dualsense_edge.hpp  | 23 +++++++++++++++++
+ src/uhid/include/uhid/protected_types.hpp |  1 +
+ src/uhid/include/uhid/ps5.hpp             |  6 ++++-
+ src/uhid/joypad_ps5.cpp                   |  3 +++
+ tests/dualsense_edge.cpp                  | 31 +++++++++++++++++++++++
+ 7 files changed, 78 insertions(+), 1 deletion(-)
+ create mode 100644 src/uhid/include/uhid/dualsense_edge.hpp
+ create mode 100644 tests/dualsense_edge.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2546b78..03a0230 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -185,3 +185,13 @@ set_target_properties(libinputtino PROPERTIES
+         VERSION ${PROJECT_VERSION}
+         PUBLIC_HEADER "${PUBLIC_HEADERS}")
+ set_target_properties(libinputtino PROPERTIES OUTPUT_NAME "libinputtino")
++
++# Hardware-independent regression coverage for the locally added Edge report bits.
++option(INPUTTINO_EDGE_TESTS "Test DualSense Edge input reports without UHID" OFF)
++if(INPUTTINO_EDGE_TESTS)
++    enable_testing()
++    add_executable(dualsense-edge-test tests/dualsense_edge.cpp)
++    target_include_directories(dualsense-edge-test PRIVATE src/uhid/include ${CMAKE_CURRENT_BINARY_DIR}/include)
++    target_link_libraries(dualsense-edge-test PRIVATE inputtino::libinputtino)
++    add_test(NAME dualsense-edge-report COMMAND dualsense-edge-test)
++endif()
+diff --git a/bindings/rust/inputtino-sys/build.rs b/bindings/rust/inputtino-sys/build.rs
+index c4d4b38..ef38986 100644
+--- a/bindings/rust/inputtino-sys/build.rs
++++ b/bindings/rust/inputtino-sys/build.rs
+@@ -18,6 +18,11 @@ fn main() {
+         .canonicalize()
+         .expect("cannot canonicalize path");
+ 
++    // Rebuild the native backend when the local patch changes.
++    for path in ["src", "include", "cmake", "CMakeLists.txt"] {
++        println!("cargo:rerun-if-changed={}", libdir_path.join(path).display());
++    }
++
+     // Compile the library using CMake
+     let dst = Config::new(libdir_path)
+         .define("BUILD_SHARED_LIBS", "OFF")
+diff --git a/src/uhid/include/uhid/dualsense_edge.hpp b/src/uhid/include/uhid/dualsense_edge.hpp
+new file mode 100644
+index 0000000..70fa697
+--- /dev/null
++++ b/src/uhid/include/uhid/dualsense_edge.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <cstdint>
++#include <inputtino/input.hpp>
++#include <uhid/ps5.hpp>
++
++namespace uhid {
++constexpr bool is_dualsense_edge(uint16_t vendor, uint16_t product) {
++  return vendor == 0x054c && product == 0x0df2;
++}
++
++// SDL2 -> Moonlight/inputtino -> DualSense buttons[2] (USB byte 10, BT byte 11).
++// Right rear -> PADDLE1 -> bit 7; left rear -> PADDLE2 -> bit 6;
++// right Fn -> PADDLE3 -> bit 5; left Fn -> PADDLE4 -> bit 4.
++// Source: SDL2 SDL_gamecontroller.c HIDAPI mapping and Linux hid-playstation.c.
++constexpr uint8_t edge_buttons(unsigned int pressed, bool is_edge) {
++  return is_edge ?
++      ((pressed & inputtino::Joypad::PADDLE1_FLAG ? EDGE_RIGHT_PADDLE : 0) |
++       (pressed & inputtino::Joypad::PADDLE2_FLAG ? EDGE_LEFT_PADDLE : 0) |
++       (pressed & inputtino::Joypad::PADDLE3_FLAG ? EDGE_RIGHT_FN : 0) |
++       (pressed & inputtino::Joypad::PADDLE4_FLAG ? EDGE_LEFT_FN : 0)) : 0;
++}
++}
+diff --git a/src/uhid/include/uhid/protected_types.hpp b/src/uhid/include/uhid/protected_types.hpp
+index effe6d5..3b3a14f 100644
+--- a/src/uhid/include/uhid/protected_types.hpp
++++ b/src/uhid/include/uhid/protected_types.hpp
+@@ -20,6 +20,7 @@ struct PS5JoypadState {
+    */
+   unsigned char mac_address[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+   uint16_t vendor_id;
++  bool is_edge = false;
+ 
+   uhid::dualsense_input_report current_state = {};
+   uint8_t last_touch_id = 0;
+diff --git a/src/uhid/include/uhid/ps5.hpp b/src/uhid/include/uhid/ps5.hpp
+index dd2561c..d8f18d0 100644
+--- a/src/uhid/include/uhid/ps5.hpp
++++ b/src/uhid/include/uhid/ps5.hpp
+@@ -415,7 +415,11 @@ enum DS_BUTTONS1 : uint8_t {
+ enum DS_BUTTONS2 : uint8_t {
+   PS_HOME = 0x01,
+   TOUCHPAD = 0x02,
+-  MIC_MUTE = 0x04
++  MIC_MUTE = 0x04,
++  EDGE_LEFT_FN = 0x10,
++  EDGE_RIGHT_FN = 0x20,
++  EDGE_LEFT_PADDLE = 0x40,
++  EDGE_RIGHT_PADDLE = 0x80
+ };
+ 
+ enum HAT_STATES : uint8_t {
+diff --git a/src/uhid/joypad_ps5.cpp b/src/uhid/joypad_ps5.cpp
+index 8a03fac..7b6fc41 100644
+--- a/src/uhid/joypad_ps5.cpp
++++ b/src/uhid/joypad_ps5.cpp
+@@ -10,6 +10,7 @@
+ #include <random>
+ #include <uhid/protected_types.hpp>
+ #include <uhid/ps5.hpp>
++#include <uhid/dualsense_edge.hpp>
+ #include <uhid/uhid.hpp>
+ 
+ namespace inputtino {
+@@ -273,6 +274,7 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
+     }
+   }
+   auto joypad = PS5Joypad(device.vendor_id, mac_address);
++  joypad._state->is_edge = uhid::is_dualsense_edge(device.vendor_id, device.product_id);
+ 
+   if (def.phys.empty()) {
+     def.phys = "INPUTTINO_BT_LINK";
+@@ -462,6 +464,7 @@ void PS5Joypad::set_pressed_buttons(unsigned int pressed) {
+       this->_state->current_state.buttons[2] |= uhid::PS_HOME;
+     if (MISC_FLAG & pressed)
+       this->_state->current_state.buttons[2] |= uhid::MIC_MUTE;
++    this->_state->current_state.buttons[2] |= uhid::edge_buttons(pressed, this->_state->is_edge);
+   }
+   send_report(*this->_state);
+ }
+diff --git a/tests/dualsense_edge.cpp b/tests/dualsense_edge.cpp
+new file mode 100644
+index 0000000..dffc82f
+--- /dev/null
++++ b/tests/dualsense_edge.cpp
+@@ -0,0 +1,31 @@
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#include <uhid/dualsense_edge.hpp>
++#include <cassert>
++#include <cstddef>
++
++int main() {
++  using inputtino::Joypad;
++  static_assert(sizeof(uhid::dualsense_input_report) == 63);
++  static_assert(offsetof(uhid::dualsense_input_report, buttons) == 7);
++  static_assert(sizeof(uhid::dualsense_input_report_bt_header) == 2);
++  static_assert(sizeof(uhid::dualsense_input_report_usb_header) == 1);
++  assert(uhid::is_dualsense_edge(0x054c, 0x0df2));
++  assert(!uhid::is_dualsense_edge(0x054c, 0x0ce6));
++  assert(!uhid::is_dualsense_edge(0x045e, 0x0df2));
++  const unsigned flags[] = {Joypad::PADDLE1_FLAG, Joypad::PADDLE2_FLAG,
++                            Joypad::PADDLE3_FLAG, Joypad::PADDLE4_FLAG};
++  const unsigned bits[] = {0x80, 0x40, 0x20, 0x10};
++  // All combinations prove independence, including simultaneous press/release.
++  for (unsigned combination = 0; combination < 16; ++combination) {
++    unsigned pressed = 0, expected = 0;
++    for (unsigned i = 0; i < 4; ++i) {
++      if (combination & (1u << i)) { pressed |= flags[i]; expected |= bits[i]; }
++    }
++    assert(uhid::edge_buttons(pressed, true) == expected);
++    assert(uhid::edge_buttons(pressed, false) == 0);
++    assert(uhid::edge_buttons(pressed | Joypad::A | Joypad::TOUCHPAD_FLAG | Joypad::MISC_FLAG, true) == expected);
++    assert(uhid::edge_buttons(0, true) == 0);
++  }
++}
+-- 
+2.56.0
+

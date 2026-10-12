@@ -11,6 +11,21 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  vendored-sources:
+    name: Vendored sources
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test vendor maintenance tooling
+        run: python3 -m unittest discover -s scripts -p 'test_vendor_dependency.py'
+      - name: Verify pinned sources and patch series
+        run: |
+          scripts/vendor-inputtino.sh --check
+          scripts/vendor-pixelforge.sh --check
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test vendored Pixelforge
+        run: scripts/vendor-pixelforge.sh --test
+
   changelog:
     name: Changelog
     runs-on: ubuntu-24.04

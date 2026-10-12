@@ -88,7 +88,11 @@ def checkout():
     pyrowave = dict(
         re.findall(r'^([A-Z_]+_REVISION)="([0-9a-f]+)"', (ROOT / "scripts" / "build-pyrowave.sh").read_text(), re.M)
     )
-    inputtino_base = re.search(r"at\s+`([0-9a-f]{40})`", (ROOT / "vendor" / "inputtino" / "LOCAL_CHANGES.md").read_text())
+    vendor_bases = {
+        name: dict(line.split(" ", 1) for line in
+                   (ROOT / f"vendor/{name}-patches/UPSTREAM").read_text().splitlines())["commit"]
+        for name in ("inputtino", "pixelforge")
+    }
     return {
         "sha": output(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
         "branch": output(["git", "-C", str(ROOT), "rev-parse", "--abbrev-ref", "HEAD"]),
@@ -102,7 +106,13 @@ def checkout():
         "pyrowave_patches": sorted(
             f"{path.name}:{sha256(path)[:16]}" for path in (ROOT / "nix" / "patches").glob("*.patch")
         ),
-        "inputtino_base": inputtino_base[1] if inputtino_base else None,
+        "inputtino_base": vendor_bases["inputtino"],
+        "pixelforge_base": vendor_bases["pixelforge"],
+        "vendor_patches": {
+            name: sorted(f"{path.name}:{sha256(path)}" for path in
+                         (ROOT / f"vendor/{name}-patches").glob("*.patch"))
+            for name in vendor_bases
+        },
     }
 
 

@@ -1,0 +1,1172 @@
+From 316047c11ed7171f6fc46c2dc83979673a1242c2 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 12 Oct 2026 16:42:22 -0400
+Subject: [PATCH] Preserve typed Vulkan errors through setup and encode
+ operations
+
+---
+ src/converter/mod.rs               |  14 +-
+ src/converter/pipeline.rs          |  26 ++--
+ src/encoder/av1/record.rs          |   2 +-
+ src/encoder/av1/session_params.rs  |   7 +-
+ src/encoder/codec.rs               |  13 +-
+ src/encoder/h264/record.rs         |   2 +-
+ src/encoder/h264/session_params.rs |   8 +-
+ src/encoder/h265/record.rs         |   2 +-
+ src/encoder/h265/session_params.rs |   8 +-
+ src/encoder/pipeline.rs            |   4 +-
+ src/encoder/resources.rs           | 239 +++++++++++++++++++++--------
+ src/error.rs                       |  67 ++++++++
+ src/image.rs                       |  40 ++---
+ src/vulkan.rs                      |  10 +-
+ 14 files changed, 302 insertions(+), 140 deletions(-)
+
+diff --git a/src/converter/mod.rs b/src/converter/mod.rs
+index 770a894..6264463 100644
+--- a/src/converter/mod.rs
++++ b/src/converter/mod.rs
+@@ -573,14 +573,14 @@ impl ColorConverter {
+         unsafe {
+             device
+                 .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+             let begin_info = vk::CommandBufferBeginInfo::default()
+                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+ 
+             device
+                 .begin_command_buffer(self.command_buffer, &begin_info)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+             // --- Phase 1: Transition source image for shader read ---
+ 
+@@ -869,25 +869,25 @@ impl ColorConverter {
+ 
+             device
+                 .end_command_buffer(self.command_buffer)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+         }
+ 
+         // Submit and wait.
+         unsafe {
+             device
+                 .reset_fences(&[self.fence])
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+             let command_buffers = [self.command_buffer];
+             let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+ 
+             device
+                 .queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+             device
+                 .wait_for_fences(&[self.fence], true, u64::MAX)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+         }
+ 
+         let elapsed = start.elapsed();
+@@ -923,7 +923,7 @@ impl ColorConverter {
+             });
+ 
+         let view = unsafe { self.context.device().create_image_view(&view_info, None) }
+-            .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("source image view", e))?;
+ 
+         self.cached_src_view = Some((src_image, view));
+         Ok(view)
+diff --git a/src/converter/pipeline.rs b/src/converter/pipeline.rs
+index fe135dc..30c9f11 100644
+--- a/src/converter/pipeline.rs
++++ b/src/converter/pipeline.rs
+@@ -67,7 +67,7 @@ pub fn create_converter(
+         .bindings(&bindings);
+ 
+     let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("resource creation", e))?;
+ 
+     // Create pipeline layout with push constants.
+     let push_constant_range = vk::PushConstantRange::default()
+@@ -80,14 +80,14 @@ pub fn create_converter(
+         .push_constant_ranges(std::slice::from_ref(&push_constant_range));
+ 
+     let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("resource creation", e))?;
+ 
+     // Create compute shader module.
+     let shader_code = get_spirv_code()?;
+     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
+ 
+     let shader_module = unsafe { device.create_shader_module(&shader_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("resource creation", e))?;
+ 
+     // Create compute pipeline.
+     let entry_point = std::ffi::CString::new("main").unwrap();
+@@ -103,7 +103,7 @@ pub fn create_converter(
+     let pipeline = unsafe {
+         device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+     }
+-    .map_err(|(_, e)| PixelForgeError::ResourceCreation(e.to_string()))?[0];
++    .map_err(|(_, e)| PixelForgeError::vulkan("resource creation", e))?[0];
+ 
+     // Destroy shader module (no longer needed after pipeline creation)
+     unsafe { device.destroy_shader_module(shader_module, None) };
+@@ -123,7 +123,7 @@ pub fn create_converter(
+         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+ 
+     let sampler = unsafe { device.create_sampler(&sampler_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("sampler creation: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("sampler creation", e))?;
+ 
+     // Create output buffer (device local for compute shader output, transfer
+     // source for image copy). Needs SHADER_DEVICE_ADDRESS so we can query a
+@@ -226,9 +226,7 @@ pub fn create_converter(
+                 vk::WHOLE_SIZE,
+                 vk::MemoryMapFlags::empty(),
+             )
+-            .map_err(|e| {
+-                PixelForgeError::ResourceCreation(format!("map descriptor buffer: {}", e))
+-            })?
++            .map_err(|e| PixelForgeError::vulkan("map descriptor buffer", e))?
+     };
+     let descriptor_buffer_ptr = descriptor_buffer_ptr as *mut u8;
+ 
+@@ -238,7 +236,7 @@ pub fn create_converter(
+         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+ 
+     let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     // Allocate command buffer.
+     let alloc_info = vk::CommandBufferAllocateInfo::default()
+@@ -247,12 +245,12 @@ pub fn create_converter(
+         .command_buffer_count(1);
+ 
+     let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?[0];
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?[0];
+ 
+     // Create fence for synchronization.
+     let fence_info = vk::FenceCreateInfo::default();
+     let fence = unsafe { device.create_fence(&fence_info, None) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     Ok(ColorConverter {
+         context,
+@@ -299,7 +297,7 @@ fn create_buffer(
+         .sharing_mode(vk::SharingMode::EXCLUSIVE);
+ 
+     let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
+ 
+     let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+ 
+@@ -320,10 +318,10 @@ fn create_buffer(
+         .memory_type_index(memory_type_index);
+ 
+     let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     Ok((buffer, memory))
+ }
+diff --git a/src/encoder/av1/record.rs b/src/encoder/av1/record.rs
+index 89fd403..d89292a 100644
+--- a/src/encoder/av1/record.rs
++++ b/src/encoder/av1/record.rs
+@@ -430,7 +430,7 @@ impl Av1 {
+ 
+             device
+                 .end_command_buffer(command_buffer)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+         }
+ 
+         common.submit_frame()
+diff --git a/src/encoder/av1/session_params.rs b/src/encoder/av1/session_params.rs
+index 2e1448b..b5307c5 100644
+--- a/src/encoder/av1/session_params.rs
++++ b/src/encoder/av1/session_params.rs
+@@ -161,12 +161,7 @@ impl Av1 {
+             common
+                 .video_queue_fn
+                 .create_video_session_parameters(&session_params_create_info, None)
+-                .map_err(|e| {
+-                    PixelForgeError::SessionParametersCreation(format!(
+-                        "Failed to create AV1 session parameters: {:?}",
+-                        e
+-                    ))
+-                })
++                .map_err(|e| PixelForgeError::vulkan("Failed to create AV1 session parameters", e))
+         }
+     }
+ 
+diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
+index 40112d7..3d1e337 100644
+--- a/src/encoder/codec.rs
++++ b/src/encoder/codec.rs
+@@ -489,10 +489,10 @@ pub(crate) fn query_video_caps(
+         )
+     };
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::NoSuitableDevice(format!(
+-            "Failed to query Vulkan Video encode capabilities: {:?}",
+-            result
+-        )));
++        return Err(PixelForgeError::vulkan(
++            "query Vulkan Video encode capabilities",
++            result,
++        ));
+     }
+     Ok(DeviceVideoCaps {
+         picture_access_granularity: capabilities.picture_access_granularity,
+@@ -651,10 +651,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+         )
+     };
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::VideoSessionCreation(format!(
+-            "{:?}",
+-            result
+-        )));
++        return Err(PixelForgeError::vulkan("video session creation", result));
+     }
+     let session_memory = allocate_session_memory(context, session, &video_queue_fn)?;
+ 
+diff --git a/src/encoder/h264/record.rs b/src/encoder/h264/record.rs
+index 04b00df..37f8b3a 100644
+--- a/src/encoder/h264/record.rs
++++ b/src/encoder/h264/record.rs
+@@ -534,7 +534,7 @@ impl H264 {
+ 
+             device
+                 .end_command_buffer(command_buffer)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+         }
+ 
+         let future = common.submit_frame()?;
+diff --git a/src/encoder/h264/session_params.rs b/src/encoder/h264/session_params.rs
+index d20ccd7..c4d5aa7 100644
+--- a/src/encoder/h264/session_params.rs
++++ b/src/encoder/h264/session_params.rs
+@@ -194,10 +194,10 @@ impl H264 {
+             )
+         };
+         if result != vk::Result::SUCCESS {
+-            return Err(PixelForgeError::SessionParametersCreation(format!(
+-                "{:?}",
+-                result
+-            )));
++            return Err(PixelForgeError::vulkan(
++                "session parameters creation",
++                result,
++            ));
+         }
+         Ok(session_params)
+     }
+diff --git a/src/encoder/h265/record.rs b/src/encoder/h265/record.rs
+index 70d50c7..528ef0b 100644
+--- a/src/encoder/h265/record.rs
++++ b/src/encoder/h265/record.rs
+@@ -530,7 +530,7 @@ impl H265 {
+ 
+             device
+                 .end_command_buffer(command_buffer)
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+         }
+ 
+         common.submit_frame()
+diff --git a/src/encoder/h265/session_params.rs b/src/encoder/h265/session_params.rs
+index ffe2ca4..d1f06c6 100644
+--- a/src/encoder/h265/session_params.rs
++++ b/src/encoder/h265/session_params.rs
+@@ -353,10 +353,10 @@ impl H265 {
+             )
+         };
+         if result != vk::Result::SUCCESS {
+-            return Err(PixelForgeError::SessionParametersCreation(format!(
+-                "{:?}",
+-                result
+-            )));
++            return Err(PixelForgeError::vulkan(
++                "session parameters creation",
++                result,
++            ));
+         }
+         Ok(session_params)
+     }
+diff --git a/src/encoder/pipeline.rs b/src/encoder/pipeline.rs
+index c0e2ce2..569fa47 100644
+--- a/src/encoder/pipeline.rs
++++ b/src/encoder/pipeline.rs
+@@ -254,7 +254,7 @@ impl EncodePipeline {
+             .level(vk::CommandBufferLevel::PRIMARY)
+             .command_buffer_count(ENCODE_PIPELINE_DEPTH as u32);
+         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+         // Timestamp queries are only legal on a queue family with non-zero
+         // `timestampValidBits` (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
+@@ -315,7 +315,7 @@ impl EncodePipeline {
+             let fence_create_info =
+                 vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+             let encode_fence = unsafe { device.create_fence(&fence_create_info, None) }
+-                .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+             let mut profile = *config.profile_info;
+             let query_pool = create_encode_feedback_query_pool(context, &mut profile)?;
+diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
+index 04f32d7..6dad1f7 100644
+--- a/src/encoder/resources.rs
++++ b/src/encoder/resources.rs
+@@ -47,10 +47,10 @@ pub(crate) fn query_supported_video_formats(
+     };
+ 
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::NoSuitableDevice(format!(
+-            "Failed to query video format properties for usage {:?}: {:?}",
+-            image_usage, result
+-        )));
++        return Err(PixelForgeError::vulkan(
++            "query video format properties",
++            result,
++        ));
+     }
+ 
+     if count == 0 {
+@@ -70,10 +70,10 @@ pub(crate) fn query_supported_video_formats(
+     };
+ 
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::NoSuitableDevice(format!(
+-            "Failed to enumerate video format properties for usage {:?}: {:?}",
+-            image_usage, result
+-        )));
++        return Err(PixelForgeError::vulkan(
++            "enumerate video format properties",
++            result,
++        ));
+     }
+ 
+     props.truncate(count as usize);
+@@ -122,7 +122,7 @@ pub(crate) fn create_buffer_with_device_address(
+         .sharing_mode(vk::SharingMode::EXCLUSIVE);
+ 
+     let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
+ 
+     let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+ 
+@@ -149,7 +149,7 @@ pub(crate) fn create_buffer_with_device_address(
+         Ok(m) => m,
+         Err(e) => {
+             unsafe { device.destroy_buffer(buffer, None) };
+-            return Err(PixelForgeError::MemoryAllocation(e.to_string()));
++            return Err(PixelForgeError::vulkan("memory operation", e));
+         }
+     };
+ 
+@@ -160,7 +160,7 @@ pub(crate) fn create_buffer_with_device_address(
+                 device.destroy_buffer(buffer, None);
+                 device.free_memory(memory, None);
+             }
+-            Err(PixelForgeError::MemoryAllocation(e.to_string()))
++            Err(PixelForgeError::vulkan("memory operation", e))
+         }
+     }
+ }
+@@ -193,7 +193,7 @@ pub(crate) fn create_bitstream_buffer(
+         .push(&mut profile_list);
+ 
+     let buffer = unsafe { context.device().create_buffer(&create_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
+ 
+     let mem_requirements = unsafe { context.device().get_buffer_memory_requirements(buffer) };
+ 
+@@ -211,10 +211,10 @@ pub(crate) fn create_bitstream_buffer(
+         .memory_type_index(memory_type_index);
+ 
+     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     unsafe { context.device().bind_buffer_memory(buffer, memory, 0) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     Ok((buffer, memory))
+ }
+@@ -226,7 +226,7 @@ pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Se
+     let create_info = vk::SemaphoreCreateInfo::default().push(&mut type_info);
+ 
+     unsafe { context.device().create_semaphore(&create_info, None) }
+-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
++        .map_err(|e| PixelForgeError::vulkan("synchronization operation", e))
+ }
+ 
+ pub(crate) fn create_encode_feedback_query_pool(
+@@ -252,7 +252,7 @@ pub(crate) fn create_encode_feedback_query_pool(
+             .device()
+             .create_query_pool(&query_pool_create_info, None)
+     }
+-    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
++    .map_err(|e| PixelForgeError::vulkan("query pool operation", e))
+ }
+ 
+ pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Result<vk::QueryPool> {
+@@ -265,7 +265,7 @@ pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Resu
+             .device()
+             .create_query_pool(&timestamp_query_pool_create_info, None)
+     }
+-    .map_err(|e| PixelForgeError::QueryPool(e.to_string()))
++    .map_err(|e| PixelForgeError::vulkan("query pool operation", e))
+ }
+ 
+ /// Create an image for video encoding (input or DPB).
+@@ -345,7 +345,7 @@ pub(crate) fn create_image(
+         .push(&mut profile_list);
+ 
+     let image = unsafe { context.device().create_image(&create_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("image creation", e))?;
+ 
+     let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
+ 
+@@ -363,10 +363,10 @@ pub(crate) fn create_image(
+         .memory_type_index(memory_type_index);
+ 
+     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     unsafe { context.device().bind_image_memory(image, memory, 0) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     let view_create_info = vk::ImageViewCreateInfo::default()
+         .image(image)
+@@ -387,7 +387,7 @@ pub(crate) fn create_image(
+         });
+ 
+     let view = unsafe { context.device().create_image_view(&view_create_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("image view creation: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("image view creation", e))?;
+ 
+     Ok((image, memory, view))
+ }
+@@ -412,7 +412,7 @@ pub(crate) fn allocate_session_memory(
+         )
+     };
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
++        return Err(PixelForgeError::vulkan("memory operation", result));
+     }
+ 
+     // Query actual requirements.
+@@ -429,7 +429,7 @@ pub(crate) fn allocate_session_memory(
+         )
+     };
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
++        return Err(PixelForgeError::vulkan("memory operation", result));
+     }
+ 
+     // Allocate and bind memory for each requirement.
+@@ -461,7 +461,7 @@ pub(crate) fn allocate_session_memory(
+             .memory_type_index(memory_type_index);
+ 
+         let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         bind_infos.push(
+             vk::BindVideoSessionMemoryInfoKHR::default()
+@@ -484,7 +484,7 @@ pub(crate) fn allocate_session_memory(
+         )
+     };
+     if result != vk::Result::SUCCESS {
+-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
++        return Err(PixelForgeError::vulkan("memory operation", result));
+     }
+ 
+     Ok(session_memory)
+@@ -523,7 +523,7 @@ pub(crate) fn create_command_resources(
+             .device()
+             .create_command_pool(&pool_create_info, None)
+     }
+-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++    .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     // Create command pool for upload commands (may be the same family).
+     let upload_command_pool = if upload_queue_family == encode_queue_family {
+@@ -537,7 +537,7 @@ pub(crate) fn create_command_resources(
+                 .device()
+                 .create_command_pool(&upload_pool_info, None)
+         }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?
+     };
+ 
+     // Allocate upload command buffer from the upload pool.
+@@ -551,14 +551,14 @@ pub(crate) fn create_command_resources(
+             .device()
+             .allocate_command_buffers(&upload_alloc_info)
+     }
+-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++    .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+     let upload_command_buffer = upload_command_buffers[0];
+ 
+     // Upload fence is created unsignaled. Per-slot encode fences are created by
+     // the encode pipeline (see `encoder::pipeline`).
+     let fence_create_info = vk::FenceCreateInfo::default();
+     let upload_fence = unsafe { context.device().create_fence(&fence_create_info, None) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     Ok(CommandResources {
+         command_pool,
+@@ -610,7 +610,7 @@ pub(crate) fn create_dpb_images(
+             .push(&mut profile_list);
+ 
+         let image = unsafe { context.device().create_image(&create_info, None) }
+-            .map_err(|e| PixelForgeError::ResourceCreation(format!("layered DPB image: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("layered DPB image", e))?;
+ 
+         let mem_requirements = unsafe { context.device().get_image_memory_requirements(image) };
+ 
+@@ -630,10 +630,10 @@ pub(crate) fn create_dpb_images(
+             .memory_type_index(memory_type_index);
+ 
+         let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe { context.device().bind_image_memory(image, memory, 0) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         // Create one view per array layer.
+         let mut dpb_image_views = Vec::with_capacity(count);
+@@ -657,12 +657,7 @@ pub(crate) fn create_dpb_images(
+                 });
+ 
+             let view = unsafe { context.device().create_image_view(&view_create_info, None) }
+-                .map_err(|e| {
+-                    PixelForgeError::ResourceCreation(format!(
+-                        "layered DPB image view layer {}: {}",
+-                        layer, e
+-                    ))
+-                })?;
++                .map_err(|e| PixelForgeError::vulkan("layered DPB image view", e))?;
+             dpb_image_views.push(view);
+         }
+ 
+@@ -698,9 +693,8 @@ pub(crate) fn map_bitstream_buffer(
+             vk::MemoryMapFlags::empty(),
+         )
+     }
+-    .map_err(|e| {
+-        PixelForgeError::MemoryAllocation(format!("Failed to map bitstream buffer: {}", e))
+-    })? as *mut u8;
++    .map_err(|e| PixelForgeError::vulkan("Failed to map bitstream buffer", e))?
++        as *mut u8;
+ 
+     Ok(ptr)
+ }
+@@ -757,7 +751,7 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
+         .sharing_mode(vk::SharingMode::EXCLUSIVE);
+ 
+     let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
+-        .map_err(|e| PixelForgeError::ResourceCreation(format!("staging buffer: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("staging buffer", e))?;
+ 
+     let mem_requirements = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+     let memory_type_index = find_memory_type(
+@@ -774,15 +768,15 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
+         .memory_type_index(memory_type_index);
+ 
+     let staging_memory = unsafe { device.allocate_memory(&alloc_info, None) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+     // Map and zero-fill.
+     let data_ptr =
+         unsafe { device.map_memory(staging_memory, 0, total_size, vk::MemoryMapFlags::empty()) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(format!("map staging buffer: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("map staging buffer", e))?;
+     unsafe { ptr::write_bytes(data_ptr as *mut u8, 0, total_size as usize) };
+     unsafe { device.unmap_memory(staging_memory) };
+ 
+@@ -790,12 +784,12 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
+     unsafe {
+         device.reset_command_buffer(params.command_buffer, vk::CommandBufferResetFlags::empty())
+     }
+-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++    .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     let begin_info =
+         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+     unsafe { device.begin_command_buffer(params.command_buffer, &begin_info) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     // Transition image from UNDEFINED to TRANSFER_DST.
+     let barrier = vk::ImageMemoryBarrier::default()
+@@ -910,19 +904,19 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
+     }
+ 
+     unsafe { device.end_command_buffer(params.command_buffer) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     // Submit and wait.
+     let submit_info =
+         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&params.command_buffer));
+     unsafe { device.reset_fences(&[params.fence]) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("reset fence", e))?;
+     unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(format!("submit clear: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("submit clear", e))?;
+     unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(format!("wait clear: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("wait clear", e))?;
+     unsafe { device.reset_fences(&[params.fence]) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence after clear: {}", e)))?;
++        .map_err(|e| PixelForgeError::vulkan("reset fence after clear", e))?;
+ 
+     // Clean up staging buffer.
+     unsafe {
+@@ -979,12 +973,12 @@ pub(crate) fn upload_image_to_input(
+             vk::CommandBufferResetFlags::empty(),
+         )
+     }
+-    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++    .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     let begin_info =
+         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+     unsafe { device.begin_command_buffer(params.upload_command_buffer, &begin_info) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     // Transition source image from GENERAL to TRANSFER_SRC.
+     let src_barrier = vk::ImageMemoryBarrier::default()
+@@ -1143,19 +1137,19 @@ pub(crate) fn upload_image_to_input(
+     }
+ 
+     unsafe { device.end_command_buffer(params.upload_command_buffer) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     let submit_info = vk::SubmitInfo::default()
+         .command_buffers(std::slice::from_ref(&params.upload_command_buffer));
+ 
+     unsafe { device.queue_submit(params.upload_queue, &[submit_info], params.upload_fence) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     unsafe { device.wait_for_fences(&[params.upload_fence], true, u64::MAX) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     unsafe { device.reset_fences(&[params.upload_fence]) }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+     Ok(())
+ }
+@@ -1269,7 +1263,7 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
+     unsafe {
+         device
+             .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+     }
+ 
+     let begin_info =
+@@ -1277,7 +1271,7 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
+     unsafe {
+         device
+             .begin_command_buffer(command_buffer, &begin_info)
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+     }
+ 
+     unsafe {
+@@ -1386,13 +1380,13 @@ pub(crate) unsafe fn submit_encode_only(
+     unsafe {
+         device
+             .reset_fences(&[fence])
+-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("reset encode fence", e))?;
+     }
+ 
+     unsafe {
+         device
+             .queue_submit2(encode_queue, &[submit_info], fence)
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("submit encode", e))?;
+     }
+ 
+     Ok(())
+@@ -1422,7 +1416,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
+     unsafe {
+         device
+             .wait_for_fences(&[fence], true, u64::MAX)
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("wait encode fence", e))?;
+     }
+ 
+     // Read query results (offset + bytes_written).
+@@ -1445,7 +1439,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
+                 &mut query_results,
+                 vk::QueryResultFlags::WAIT,
+             )
+-            .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("read encode feedback", e))?;
+     }
+ 
+     let offset = query_results[0].offset as usize;
+@@ -1583,9 +1577,10 @@ pub(crate) fn get_encoded_session_params(
+                 data_size = data.len();
+             }
+             err => {
+-                return Err(PixelForgeError::SessionParametersCreation(format!(
+-                    "Failed to get encoded session parameters: {err:?}"
+-                )));
++                return Err(PixelForgeError::vulkan(
++                    "get encoded session parameters",
++                    err,
++                ));
+             }
+         }
+     }
+@@ -1695,3 +1690,113 @@ mod tests {
+         assert_eq!(input_image_width(4080, 4080), 4080);
+     }
+ }
++
++#[cfg(test)]
++mod driver_error_tests {
++    use super::*;
++    use std::ffi::{CStr, c_void};
++
++    unsafe extern "system" fn reset(_: vk::Device, _: u32, _: *const vk::Fence) -> vk::Result {
++        vk::Result::SUCCESS
++    }
++    unsafe extern "system" fn submit(
++        _: vk::Queue,
++        _: u32,
++        _: *const vk::SubmitInfo2<'_>,
++        _: vk::Fence,
++    ) -> vk::Result {
++        vk::Result::ERROR_DEVICE_LOST
++    }
++    unsafe extern "system" fn wait_lost(
++        _: vk::Device,
++        _: u32,
++        _: *const vk::Fence,
++        _: vk::Bool32,
++        _: u64,
++    ) -> vk::Result {
++        vk::Result::ERROR_DEVICE_LOST
++    }
++    unsafe extern "system" fn wait_ok(
++        _: vk::Device,
++        _: u32,
++        _: *const vk::Fence,
++        _: vk::Bool32,
++        _: u64,
++    ) -> vk::Result {
++        vk::Result::SUCCESS
++    }
++    unsafe extern "system" fn query(
++        _: vk::Device,
++        _: vk::QueryPool,
++        _: u32,
++        _: u32,
++        _: usize,
++        _: *mut c_void,
++        _: vk::DeviceSize,
++        _: vk::QueryResultFlags,
++    ) -> vk::Result {
++        vk::Result::ERROR_DEVICE_LOST
++    }
++
++    fn device(fence_lost: bool) -> ash::Device {
++        // Only the functions invoked by these tests are loaded. The fake device
++        // owns no native resources; all stubs ignore their handles and pointers.
++        unsafe {
++            ash::Device::load_with(
++                |name: &CStr| match name.to_bytes() {
++                    b"vkResetFences" => reset as *const () as *const c_void,
++                    b"vkQueueSubmit2" => submit as *const () as *const c_void,
++                    b"vkWaitForFences" if fence_lost => wait_lost as *const () as *const c_void,
++                    b"vkWaitForFences" => wait_ok as *const () as *const c_void,
++                    b"vkGetQueryPoolResults" => query as *const () as *const c_void,
++                    _ => std::ptr::null(),
++                },
++                vk::Device::null(),
++            )
++        }
++    }
++
++    #[test]
++    fn submission_preserves_device_loss() {
++        // SAFETY: the fake function table never dereferences these handles.
++        let error = unsafe {
++            submit_encode_only(
++                &device(false),
++                vk::CommandBuffer::null(),
++                vk::Fence::null(),
++                vk::Queue::null(),
++                None,
++                None,
++            )
++        }
++        .unwrap_err();
++        assert_eq!(error.vulkan_result(), Some(vk::Result::ERROR_DEVICE_LOST));
++        assert!(error.to_string().contains("submit encode"));
++    }
++
++    #[test]
++    fn readback_preserves_fence_and_query_device_loss() {
++        for fence_lost in [true, false] {
++            let mut dst = vec![42];
++            // SAFETY: the injected error returns before accessing mapped memory.
++            let error = unsafe {
++                wait_and_read_bitstream(
++                    &device(fence_lost),
++                    vk::Fence::null(),
++                    vk::QueryPool::null(),
++                    std::ptr::null(),
++                    0,
++                    &mut dst,
++                )
++            }
++            .unwrap_err();
++            assert_eq!(error.vulkan_result(), Some(vk::Result::ERROR_DEVICE_LOST));
++            assert!(error.to_string().contains(if fence_lost {
++                "wait encode fence"
++            } else {
++                "read encode feedback"
++            }));
++            assert_eq!(dst, [42]);
++        }
++    }
++}
+diff --git a/src/error.rs b/src/error.rs
+index b5cc673..6518126 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -62,6 +62,15 @@ pub enum PixelForgeError {
+         capacity: usize,
+     },
+ 
++    /// Vulkan failure with the operation and original driver result preserved.
++    #[error("{operation}: {result}")]
++    VulkanOperation {
++        /// Operation that failed; static to avoid allocating on failure paths.
++        operation: &'static str,
++        /// Original Vulkan result, independent of its display wording.
++        result: ash::vk::Result,
++    },
++
+     /// Generic Vulkan error.
+     #[error("Vulkan error: {0}")]
+     Vulkan(ash::vk::Result),
+@@ -75,3 +84,61 @@ impl From<ash::vk::Result> for PixelForgeError {
+ 
+ /// Result type for PixelForge operations.
+ pub type Result<T> = std::result::Result<T, PixelForgeError>;
++
++impl PixelForgeError {
++    /// Wrap a driver failure without discarding its typed result.
++    pub fn vulkan(operation: &'static str, result: ash::vk::Result) -> Self {
++        Self::VulkanOperation { operation, result }
++    }
++
++    /// The original Vulkan result when this error came from the driver.
++    /// Non-driver errors return `None`; their text is never parsed.
++    pub fn vulkan_result(&self) -> Option<ash::vk::Result> {
++        match self {
++            Self::Vulkan(result) | Self::VulkanOperation { result, .. } => Some(*result),
++            _ => None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use ash::vk;
++
++    #[test]
++    fn preserves_driver_results_across_operations() {
++        for operation in [
++            "queue submission",
++            "fence wait",
++            "query readback",
++            "session creation",
++        ] {
++            for result in [
++                vk::Result::ERROR_DEVICE_LOST,
++                vk::Result::TIMEOUT,
++                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
++            ] {
++                let error = PixelForgeError::vulkan(operation, result);
++                assert_eq!(error.vulkan_result(), Some(result));
++                assert!(error.to_string().contains(operation));
++            }
++        }
++        assert_eq!(
++            PixelForgeError::from(vk::Result::ERROR_DEVICE_LOST).vulkan_result(),
++            Some(vk::Result::ERROR_DEVICE_LOST)
++        );
++    }
++
++    #[test]
++    fn error_text_never_becomes_a_driver_result() {
++        assert_eq!(
++            PixelForgeError::CommandBuffer("device has been lost".into()).vulkan_result(),
++            None
++        );
++        assert_eq!(
++            PixelForgeError::QueryPool("Encoder produced 0 bytes".into()).vulkan_result(),
++            None
++        );
++    }
++}
+diff --git a/src/image.rs b/src/image.rs
+index 23be508..db159ee 100644
+--- a/src/image.rs
++++ b/src/image.rs
+@@ -111,7 +111,7 @@ impl InputImage {
+             .initial_layout(vk::ImageLayout::UNDEFINED);
+ 
+         let image = unsafe { device.create_image(&image_create_info, None) }
+-            .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("image creation", e))?;
+ 
+         // Get memory requirements and allocate.
+         let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
+@@ -130,10 +130,10 @@ impl InputImage {
+             .memory_type_index(memory_type_index);
+ 
+         let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe { device.bind_image_memory(image, memory, 0) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         // Create staging buffer for uploads.
+         // Size depends on pixel format, bit depth, and alignment padding between planes.
+@@ -156,7 +156,7 @@ impl InputImage {
+             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+ 
+         let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
+-            .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
+ 
+         let staging_mem_requirements =
+             unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+@@ -177,10 +177,10 @@ impl InputImage {
+             .memory_type_index(staging_memory_type);
+ 
+         let staging_memory = unsafe { device.allocate_memory(&staging_alloc_info, None) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
+-            .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         // Create command pool and buffer for transfers.
+         let pool_info = vk::CommandPoolCreateInfo::default()
+@@ -188,7 +188,7 @@ impl InputImage {
+             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+ 
+         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+         let alloc_info = vk::CommandBufferAllocateInfo::default()
+             .command_pool(command_pool)
+@@ -196,13 +196,13 @@ impl InputImage {
+             .command_buffer_count(1);
+ 
+         let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+         let command_buffer = command_buffers[0];
+ 
+         // Create fence for synchronization.
+         let fence_info = vk::FenceCreateInfo::default();
+         let fence = unsafe { device.create_fence(&fence_info, None) }
+-            .map_err(|e| PixelForgeError::ResourceCreation(format!("fence creation: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("fence creation", e))?;
+ 
+         Ok(Self {
+             context,
+@@ -254,7 +254,7 @@ impl InputImage {
+                 vk::MemoryMapFlags::empty(),
+             )
+         }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe {
+             match self.bit_depth {
+@@ -342,7 +342,7 @@ impl InputImage {
+                 vk::MemoryMapFlags::empty(),
+             )
+         }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe {
+             let dst = std::slice::from_raw_parts_mut(data_ptr as *mut u8, self.staging_size);
+@@ -398,7 +398,7 @@ impl InputImage {
+                 vk::MemoryMapFlags::empty(),
+             )
+         }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe {
+             // Source is yuv420p10le (10-bit in lower bits of 16-bit words)
+@@ -468,7 +468,7 @@ impl InputImage {
+                 vk::MemoryMapFlags::empty(),
+             )
+         }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe {
+             match self.bit_depth {
+@@ -543,7 +543,7 @@ impl InputImage {
+                 vk::MemoryMapFlags::empty(),
+             )
+         }
+-        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+ 
+         unsafe {
+             match self.bit_depth {
+@@ -639,12 +639,12 @@ impl InputImage {
+         unsafe {
+             device.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+         }
+-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+         let begin_info = vk::CommandBufferBeginInfo::default()
+             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+         unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+         // Transition image to transfer destination.
+         let barrier = vk::ImageMemoryBarrier::default()
+@@ -803,20 +803,20 @@ impl InputImage {
+         }
+ 
+         unsafe { device.end_command_buffer(self.command_buffer) }
+-            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+ 
+         // Submit and wait.
+         let submit_info =
+             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
+ 
+         unsafe { device.queue_submit(self.context.transfer_queue(), &[submit_info], self.fence) }
+-            .map_err(|e| PixelForgeError::CommandBuffer(format!("Queue submit failed: {}", e)))?;
++            .map_err(|e| PixelForgeError::vulkan("Queue submit failed", e))?;
+ 
+         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
+-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("synchronization operation", e))?;
+ 
+         unsafe { device.reset_fences(&[self.fence]) }
+-            .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("synchronization operation", e))?;
+ 
+         Ok(())
+     }
+diff --git a/src/vulkan.rs b/src/vulkan.rs
+index ae2941b..452595c 100644
+--- a/src/vulkan.rs
++++ b/src/vulkan.rs
+@@ -196,7 +196,7 @@ impl VideoContext {
+         let mut enable_validation = builder.enable_validation;
+         if enable_validation {
+             let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
+-                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
++                .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+             let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
+             let has_validation_layer = available_layers.iter().any(|layer| {
+                 let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
+@@ -221,7 +221,7 @@ impl VideoContext {
+             let available_exts = unsafe {
+                 entry.enumerate_instance_extension_properties(Some(validation_layer_name))
+             }
+-            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+             let validation_features_name = c"VK_EXT_validation_features";
+             let has_validation_features = available_exts.iter().any(|ext| {
+                 let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+@@ -240,13 +240,13 @@ impl VideoContext {
+             .enabled_extension_names(&instance_extensions);
+ 
+         let instance = unsafe { entry.create_instance(&create_info, None) }
+-            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+ 
+         info!("Created Vulkan instance");
+ 
+         // Find physical device with video support.
+         let physical_devices = unsafe { instance.enumerate_physical_devices() }
+-            .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("Vulkan device query", e))?;
+ 
+         let mut selected_device = None;
+         let mut selected_device_exts = None;
+@@ -580,7 +580,7 @@ impl VideoContext {
+         }
+ 
+         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
+-            .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
++            .map_err(|e| PixelForgeError::vulkan("Vulkan device creation", e))?;
+ 
+         // Get queues.
+         let video_encode_queue =
+-- 
+2.56.0

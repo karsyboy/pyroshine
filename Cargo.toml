@@ -6,7 +6,7 @@ exclude = ["pyroshine-ui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.17.3"
+version = "0.17.4"
 
 [package]
 name = "moonshine"
@@ -32,3 +32,7 @@ tempfile = "3.27.0"
 # Keep the upstream Rust API; patch only its native backend at the locked revision.
 [patch."https://github.com/games-on-whales/inputtino"]
 inputtino-sys = { path = "vendor/inputtino/bindings/rust/inputtino-sys" }
+
+# Pixelforge v0.9.1 with Pyroshine's local changes; see vendor/pixelforge/LOCAL_CHANGES.md.
+[patch."https://github.com/hgaiser/pixelforge"]
+pixelforge = { path = "vendor/pixelforge" }

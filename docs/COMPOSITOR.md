@@ -14,6 +14,19 @@ is separately generation-tagged; see [capture admission](PIPELINE_OPTIMIZATION.m
 Service buffer releases and input even when capture is blocked or the scene is
 clean. [Architecture](ARCHITECTURE.md) explains session and stream ownership.
 
+Capture buffers are rendered by GLES and read in place by the encoders' Vulkan
+device, so they are allocated only with DRM modifiers both support:
+`gpu::ImportableModifiers` lists the (format, modifier) pairs the capture device
+imports as a DMA-BUF for sampling, and the compositor intersects its EGL render
+modifiers with that set for the SDR and HDR pools. A GPU's EGL can render to
+modifiers its Vulkan driver cannot import (NVIDIA's compressed block-linear
+kinds and the implicit modifier); PyroWave rejects those on every frame. Direct
+export and DMA-BUF overlay layers apply the same check to client buffers and
+composite anything else (`direct_reject_format`).
+The initial pool and resolution/HDR reconfiguration also check the actual
+exported buffers, since GBM can substitute an unrequested modifier. An
+unsupported allocation fails setup before any frames use it.
+
 The implementation is under `moonshine-core/src/session/`: event loop, state
 and protocol handlers in `compositor/{mod,state,handlers}.rs`, capture and
 eligibility in `compositor/{capture,admission,frame}.rs`, cursor in
@@ -108,7 +121,7 @@ Two scene elements can be composited after capture instead of rendering the
 whole frame through GLES: a Steam notification and, above it, the cursor. The
 active consumer declares which layer kinds it draws
 (`CaptureReceiver::set_overlay_caps`: CPU texels and/or client DMA-BUFs; the
-conventional codecs' packed converter and PyroWave's 1:1 scaler since fork C API 0.9
+conventional codecs' converter and PyroWave's 1:1 scaler since fork C API 0.9
 draw both). When the scene *without* those elements is directly exportable, the
 compositor exports the game's DMA-BUF with `ExportedFrame::overlays`, bottom to
 top, and the encoder blends each layer the way GLES would: texels premultiplied,
@@ -134,7 +147,7 @@ directly exportable.
 Every layer must be 1:1: one surface without subsurface content, buffer scale
 1, normal transform, no viewport crop or scale. Anything else (scaled output,
 fractional scale, interactive Steam overlays, dropdowns, decorations, cursor
-DMA-BUFs, multi-plane formats, extents the packed converter cannot represent)
+DMA-BUFs, multi-plane formats)
 keeps GLES composition; counters report `direct_reject_cursor` or
 `direct_reject_notification`. A frame whose layers a consumer can no longer draw
 (a racing epoch switch) is dropped, never encoded without them. PyroWave blends

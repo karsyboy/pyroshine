@@ -1,0 +1,851 @@
+From 2d7e5e2001cdf11310eab29834530cc8e6b8625c Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 12 Oct 2026 16:38:22 -0400
+Subject: [PATCH] Expose encoder capabilities and actual extents from shared
+ profile construction
+
+---
+ src/encoder/av1/init.rs     |  45 +-----
+ src/encoder/capabilities.rs | 282 ++++++++++++++++++++++++++++++++++++
+ src/encoder/codec.rs        |  74 +++++-----
+ src/encoder/h264/init.rs    |  47 +-----
+ src/encoder/h265/init.rs    |  61 +-------
+ src/encoder/mod.rs          |  33 +++++
+ src/encoder/resources.rs    |  42 ------
+ src/lib.rs                  |   3 +-
+ 8 files changed, 371 insertions(+), 216 deletions(-)
+ create mode 100644 src/encoder/capabilities.rs
+
+diff --git a/src/encoder/av1/init.rs b/src/encoder/av1/init.rs
+index b408257..3ef765d 100644
+--- a/src/encoder/av1/init.rs
++++ b/src/encoder/av1/init.rs
+@@ -1,13 +1,11 @@
+-use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
++use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE};
+ 
+ use crate::encoder::codec::{
+     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+ };
+-use crate::encoder::{ColorDescription, EncodeConfig, PixelFormat};
++use crate::encoder::{ColorDescription, EncodeConfig};
+ use crate::error::Result;
+ use crate::vulkan::VideoContext;
+-use ash::vk;
+-use ash::vk::TaggedStructure;
+ use tracing::info;
+ 
+ impl Av1 {
+@@ -24,52 +22,19 @@ impl Av1 {
+             config.dimensions.width, config.dimensions.height, config.pixel_format
+         );
+ 
+-        // AV1 profile from chroma subsampling: Main is 4:2:0, High adds 4:4:4.
+-        let profile = match config.pixel_format {
+-            PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+-            _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
+-        };
+-
+-        let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
+-        let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
+-
+-        // Get encoder tuning mode, usage and content hints.
+-        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+-        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+-        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+-
+-        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+-            .video_usage_hints(encode_usage_hint)
+-            .video_content_hints(encode_content_hint)
+-            .tuning_mode(encoder_tuning_mode);
+-
+-        let mut av1_profile_info = vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile);
+-        let profile_info = vk::VideoProfileInfoKHR::default()
+-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
+-            .chroma_subsampling(chroma_subsampling)
+-            .luma_bit_depth(bit_depth)
+-            .chroma_bit_depth(bit_depth)
+-            .push(&mut av1_profile_info)
+-            .push(&mut video_encode_usage_info);
++        let mut profile = super::super::capabilities::EncodeProfile::new(&config)?;
++        let profile_info = profile.info();
+ 
+         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
+             .max(config.dimensions.width as usize * config.dimensions.height as usize);
+ 
+-        // Query device capabilities with the AV1-specific capability struct
+-        // chained in (required by the driver).
+-        let mut av1_caps = vk::VideoEncodeAV1CapabilitiesKHR::default();
+-        let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+-            .push(&mut encode_caps)
+-            .push(&mut av1_caps);
+-        let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
++        let caps = query_video_caps(&context, &profile_info)?;
+ 
+         let init = build_encoder_common(&CommonInitRequest {
+             context: &context,
+             config: &config,
+             profile_info: &profile_info,
+             caps: &caps,
+-            align_unit: SUPERBLOCK_SIZE,
+             // AV1 has NUM_REF_FRAMES = 8 DPB slots, and `refresh_frame_flags`
+             // is an 8-bit syntax element. `build_encoder_common` adds one setup
+             // slot on top of the active count, so cap active refs at 7 to keep
+diff --git a/src/encoder/capabilities.rs b/src/encoder/capabilities.rs
+new file mode 100644
+index 0000000..7293a5c
+--- /dev/null
++++ b/src/encoder/capabilities.rs
+@@ -0,0 +1,282 @@
++//! Profile construction and frame/image extents shared by queries and encoders.
++use ash::vk;
++use ash::vk::TaggedStructure;
++
++use super::codec::{DeviceVideoCaps, input_image_width, query_video_caps};
++use super::resources::gcd;
++use super::{BitDepth, Codec, EncodeConfig, PixelFormat};
++use crate::VideoContext;
++use crate::error::{PixelForgeError, Result};
++
++/// Codec syntax block used when aligning coded pictures.
++pub const fn codec_block_size(codec: Codec) -> u32 {
++    match codec {
++        Codec::H264 => super::h264::MB_SIZE,
++        Codec::H265 => super::h265::CTB_SIZE,
++        Codec::AV1 => super::av1::SUPERBLOCK_SIZE,
++    }
++}
++
++/// Device limits for the exact chroma, bit depth and usage of an encode profile.
++#[derive(Clone, Copy, Debug)]
++pub struct EncoderCapabilities {
++    /// Minimum coded picture extent supported by the device.
++    pub min_coded_extent: vk::Extent2D,
++    /// Maximum coded picture extent supported by the device.
++    pub max_coded_extent: vk::Extent2D,
++    /// Device image-access granularity used along with the codec block size.
++    pub picture_access_granularity: vk::Extent2D,
++    /// AV1's picture grid. Other codecs crop directly to the requested frame.
++    pub av1_coded_picture_alignment: Option<vk::Extent2D>,
++}
++
++impl EncoderCapabilities {
++    /// Query without allocating a session or encoder images. Uses the same
++    /// profile, usage hints and capability chain as encoder initialization.
++    pub fn query(context: &VideoContext, config: &EncodeConfig) -> Result<Self> {
++        let mut profile = EncodeProfile::new(config)?;
++        let caps = query_video_caps(context, &profile.info())?;
++        Ok(Self::from_caps(&caps))
++    }
++
++    pub(crate) fn from_caps(caps: &DeviceVideoCaps) -> Self {
++        Self {
++            min_coded_extent: caps.min_coded_extent,
++            max_coded_extent: caps.max_coded_extent,
++            picture_access_granularity: caps.picture_access_granularity,
++            av1_coded_picture_alignment: caps.av1_coded_picture_alignment,
++        }
++    }
++
++    /// Align to both codec blocks and device granularity, clamp to the minimum
++    /// and re-align. Reject zero dimensions, overflow and extents above the max.
++    pub fn coded_extent(&self, codec: Codec, width: u32, height: u32) -> Result<vk::Extent2D> {
++        let align = |value: u32, granularity: u32, minimum: u32| {
++            let block = codec_block_size(codec);
++            let granularity = granularity.max(1);
++            let unit = (block / gcd(block, granularity)).checked_mul(granularity)?;
++            value
++                .checked_next_multiple_of(unit)?
++                .max(minimum)
++                .checked_next_multiple_of(unit)
++        };
++        let extent = match (
++            align(
++                width,
++                self.picture_access_granularity.width,
++                self.min_coded_extent.width,
++            ),
++            align(
++                height,
++                self.picture_access_granularity.height,
++                self.min_coded_extent.height,
++            ),
++        ) {
++            (Some(w), Some(h))
++                if width != 0
++                    && height != 0
++                    && w <= self.max_coded_extent.width
++                    && h <= self.max_coded_extent.height =>
++            {
++                vk::Extent2D {
++                    width: w,
++                    height: h,
++                }
++            }
++            _ => {
++                return Err(PixelForgeError::InvalidInput(format!(
++                    "{codec:?} on this GPU encodes frames of at most {}x{}; {width}x{height} has no valid coded extent",
++                    self.max_coded_extent.width, self.max_coded_extent.height
++                )));
++            }
++        };
++        Ok(extent)
++    }
++
++    /// Allocated input-image extent, including the maintained NVIDIA width
++    /// padding. This can be wider than the coded picture; it never exceeds max.
++    pub fn input_image_extent(
++        &self,
++        codec: Codec,
++        width: u32,
++        height: u32,
++    ) -> Result<vk::Extent2D> {
++        let coded = self.coded_extent(codec, width, height)?;
++        Ok(vk::Extent2D {
++            width: input_image_width(coded.width, self.max_coded_extent.width),
++            height: coded.height,
++        })
++    }
++}
++
++/// Own every structure referenced by the profile chain until the Vulkan call
++/// or encoder initialization completes. Never expose pointers beyond this borrow.
++pub(crate) struct EncodeProfile {
++    codec: Codec,
++    chroma: vk::VideoChromaSubsamplingFlagsKHR,
++    depth: vk::VideoComponentBitDepthFlagsKHR,
++    pub(crate) profile_idc: u32,
++    h264: vk::VideoEncodeH264ProfileInfoKHR<'static>,
++    h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
++    av1: vk::VideoEncodeAV1ProfileInfoKHR<'static>,
++    usage: vk::VideoEncodeUsageInfoKHR<'static>,
++}
++
++impl EncodeProfile {
++    pub(crate) fn new(config: &EncodeConfig) -> Result<Self> {
++        let profile_idc = match (config.codec, config.pixel_format, config.bit_depth) {
++            (Codec::H264, PixelFormat::Yuv444, _) => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE,
++            (Codec::H264, _, _) => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
++            (Codec::H265, PixelFormat::Yuv420, BitDepth::Eight) => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
++            (Codec::H265, PixelFormat::Yuv420, BitDepth::Ten) => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10,
++            (Codec::H265, PixelFormat::Yuv444, _) => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS,
++            (Codec::H265, _, _) => return Err(PixelForgeError::InvalidInput(format!(
++                "Unsupported pixel format / bit depth for H.265: {:?} / {:?}", config.pixel_format, config.bit_depth))),
++            (Codec::AV1, PixelFormat::Yuv420, _) => vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
++            (Codec::AV1, _, _) => vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
++        };
++        Ok(Self {
++            codec: config.codec,
++            chroma: config.pixel_format.into(),
++            depth: config.bit_depth.into(),
++            profile_idc,
++            h264: vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc),
++            h265: vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc),
++            av1: vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile_idc),
++            usage: vk::VideoEncodeUsageInfoKHR::default()
++                .video_usage_hints(config.encode_usage_hint.into())
++                .video_content_hints(config.encode_content_hint.into())
++                .tuning_mode(config.encoder_tuning_mode.into()),
++        })
++    }
++
++    pub(crate) fn info(&mut self) -> vk::VideoProfileInfoKHR<'_> {
++        let info = vk::VideoProfileInfoKHR::default()
++            .chroma_subsampling(self.chroma)
++            .luma_bit_depth(self.depth)
++            .chroma_bit_depth(self.depth);
++        let info = match self.codec {
++            Codec::H264 => info
++                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
++                .push(&mut self.h264),
++            Codec::H265 => info
++                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
++                .push(&mut self.h265),
++            Codec::AV1 => info
++                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
++                .push(&mut self.av1),
++        };
++        info.push(&mut self.usage)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn caps(minimum: (u32, u32), granularity: (u32, u32), max_width: u32) -> EncoderCapabilities {
++        EncoderCapabilities {
++            min_coded_extent: vk::Extent2D {
++                width: minimum.0,
++                height: minimum.1,
++            },
++            max_coded_extent: vk::Extent2D {
++                width: max_width,
++                height: 8192,
++            },
++            picture_access_granularity: vk::Extent2D {
++                width: granularity.0,
++                height: granularity.1,
++            },
++            av1_coded_picture_alignment: None,
++        }
++    }
++
++    #[test]
++    fn coded_and_allocated_extents_are_distinct() {
++        let limits = caps((1, 1), (1, 1), 8192);
++        let coded = limits.coded_extent(Codec::H265, 1440, 1080).unwrap();
++        let image = limits.input_image_extent(Codec::H265, 1440, 1080).unwrap();
++        assert_eq!((coded.width, coded.height), (1440, 1088));
++        assert_eq!((image.width, image.height), (1472, 1088));
++        assert_eq!(
++            limits
++                .input_image_extent(Codec::H264, 1360, 768)
++                .unwrap()
++                .width,
++            1408
++        );
++        assert_eq!(
++            limits
++                .input_image_extent(Codec::H265, 2400, 1080)
++                .unwrap()
++                .width,
++            2432
++        );
++    }
++
++    #[test]
++    fn respects_minimum_granularity_and_maximum() {
++        let limits = caps((1, 1), (64, 16), 8192);
++        let extent = limits.coded_extent(Codec::H265, 130, 130).unwrap();
++        assert_eq!((extent.width, extent.height), (192, 160));
++        let extent = limits.input_image_extent(Codec::H264, 1920, 1080).unwrap();
++        assert_eq!((extent.width, extent.height), (1920, 1088));
++        let minimum = caps((128, 128), (16, 16), 8192);
++        let extent = minimum.coded_extent(Codec::AV1, 3, 5).unwrap();
++        assert_eq!((extent.width, extent.height), (128, 128));
++        assert_eq!(
++            caps((1, 1), (1, 1), 4080)
++                .input_image_extent(Codec::H264, 4080, 1080)
++                .unwrap()
++                .width,
++            4080
++        );
++    }
++
++    #[test]
++    fn rejects_zero_overflow_and_aligned_extent_past_maximum() {
++        let limits = caps((1, 1), (1, 1), 8192);
++        for (w, h) in [(0, 1), (1, 0), (u32::MAX, 1), (1, u32::MAX), (8193, 1)] {
++            assert!(limits.coded_extent(Codec::H264, w, h).is_err());
++        }
++        assert!(
++            caps((1, 1), (u32::MAX, 1), 8192)
++                .coded_extent(Codec::H265, 1, 1)
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn profile_chain_preserves_chroma_depth_and_usage_hints() {
++        for codec in [Codec::H264, Codec::H265, Codec::AV1] {
++            for chroma in [PixelFormat::Yuv420, PixelFormat::Yuv444] {
++                for depth in [BitDepth::Eight, BitDepth::Ten] {
++                    let mut config = EncodeConfig::h264(1920, 1080);
++                    config.codec = codec;
++                    config.pixel_format = chroma;
++                    config.bit_depth = depth;
++                    config.encoder_tuning_mode = super::super::EncoderTuningMode::LowLatency;
++                    let mut profile = EncodeProfile::new(&config).unwrap();
++                    let info = profile.info();
++                    assert_eq!(info.chroma_subsampling, chroma.into());
++                    assert_eq!(info.luma_bit_depth, depth.into());
++                    assert_eq!(info.chroma_bit_depth, depth.into());
++                    // SAFETY: info borrows profile; these are the exact structures it owns.
++                    let usage = unsafe { &*info.p_next.cast::<vk::VideoEncodeUsageInfoKHR>() };
++                    assert_eq!(usage.video_usage_hints, config.encode_usage_hint.into());
++                    assert_eq!(usage.video_content_hints, config.encode_content_hint.into());
++                    assert_eq!(usage.tuning_mode, vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
++                    assert!(!usage.p_next.is_null());
++                    let codec_info = unsafe { &*usage.p_next.cast::<vk::BaseInStructure>() };
++                    let expected = match codec {
++                        Codec::H264 => vk::StructureType::VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
++                        Codec::H265 => vk::StructureType::VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
++                        Codec::AV1 => vk::StructureType::VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
++                    };
++                    assert_eq!(codec_info.s_type, expected);
++                }
++            }
++        }
++    }
++}
+diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
+index e7006cf..40112d7 100644
+--- a/src/encoder/codec.rs
++++ b/src/encoder/codec.rs
+@@ -18,9 +18,9 @@ use crate::encoder::dpb::MAX_DPB_SLOTS;
+ use crate::encoder::gop::{GopFrameType, GopPosition, GopStructure};
+ use crate::encoder::pipeline::{EncodeFuture, EncodePipeline, PipelineConfig, SlotPacketMetadata};
+ use crate::encoder::resources::{
+-    EncoderTeardown, UploadParams, align_up, allocate_session_memory, create_command_resources,
+-    create_dpb_images, destroy_encoder_resources, get_video_format, lcm,
+-    query_supported_video_formats, upload_image_to_input,
++    EncoderTeardown, UploadParams, allocate_session_memory, create_command_resources,
++    create_dpb_images, destroy_encoder_resources, get_video_format, query_supported_video_formats,
++    upload_image_to_input,
+ };
+ use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
+ use crate::error::{PixelForgeError, Result};
+@@ -44,6 +44,8 @@ pub(crate) struct EncoderCommon {
+ 
+     /// Coded extent (display dimensions aligned to the codec block size and the
+     /// device's picture-access granularity).
++    pub capabilities: super::EncoderCapabilities,
++    pub input_image_extent: vk::Extent2D,
+     pub aligned_width: u32,
+     pub aligned_height: u32,
+ 
+@@ -422,8 +424,6 @@ pub(crate) struct CommonInitRequest<'a> {
+     pub profile_info: &'a vk::VideoProfileInfoKHR<'a>,
+     /// Device capabilities for this profile, resolved by [`query_video_caps`].
+     pub caps: &'a DeviceVideoCaps,
+-    /// Codec block size for coded-extent alignment (macroblock / CTB / superblock).
+-    pub align_unit: u32,
+     /// Upper bound on active reference pictures the codec's syntax allows.
+     pub max_active_refs_cap: usize,
+     pub bitstream_buffer_size: usize,
+@@ -449,19 +449,34 @@ pub(crate) struct DeviceVideoCaps {
+     pub max_active_reference_pictures: u32,
+     pub flags: vk::VideoCapabilityFlagsKHR,
+     pub std_header_version: vk::ExtensionProperties,
++    pub av1_coded_picture_alignment: Option<vk::Extent2D>,
+ }
+ 
+ /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
+ /// generic init needs.
+ ///
+-/// The driver *requires* the codec's `VideoEncode*CapabilitiesKHR` chained into
+-/// `pNext`, so the codec builds the `capabilities` chain (the only codec-specific
+-/// part) and passes it in already populated with its encode/codec caps structs.
++/// Chain the required codec-specific output structure alongside general encode
++/// capabilities. Query and initialization use this same profile/output chain.
+ pub(crate) fn query_video_caps(
+     context: &VideoContext,
+     profile_info: &vk::VideoProfileInfoKHR,
+-    capabilities: &mut vk::VideoCapabilitiesKHR,
+ ) -> Result<DeviceVideoCaps> {
++    use ash::vk::TaggedStructure;
++    let mut encode = vk::VideoEncodeCapabilitiesKHR::default();
++    let mut h264 = vk::VideoEncodeH264CapabilitiesKHR::default();
++    let mut h265 = vk::VideoEncodeH265CapabilitiesKHR::default();
++    let mut av1 = vk::VideoEncodeAV1CapabilitiesKHR::default();
++    let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut encode);
++    let mut capabilities = match profile_info.video_codec_operation {
++        vk::VideoCodecOperationFlagsKHR::ENCODE_H264 => capabilities.push(&mut h264),
++        vk::VideoCodecOperationFlagsKHR::ENCODE_H265 => capabilities.push(&mut h265),
++        vk::VideoCodecOperationFlagsKHR::ENCODE_AV1 => capabilities.push(&mut av1),
++        _ => {
++            return Err(PixelForgeError::InvalidInput(
++                "Unknown encode profile operation".into(),
++            ));
++        }
++    };
+     let video_queue_instance =
+         ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+     let result = unsafe {
+@@ -470,7 +485,7 @@ pub(crate) fn query_video_caps(
+             .get_physical_device_video_capabilities_khr)(
+             context.physical_device(),
+             profile_info,
+-            capabilities,
++            &mut capabilities,
+         )
+     };
+     if result != vk::Result::SUCCESS {
+@@ -487,6 +502,9 @@ pub(crate) fn query_video_caps(
+         max_active_reference_pictures: capabilities.max_active_reference_pictures,
+         flags: capabilities.flags,
+         std_header_version: capabilities.std_header_version,
++        av1_coded_picture_alignment: (profile_info.video_codec_operation
++            == vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
++            .then_some(av1.coded_picture_alignment),
+     })
+ }
+ 
+@@ -527,35 +545,13 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+     // capability struct, required by the driver) via [`query_video_caps`].
+     let capabilities = req.caps;
+ 
+-    // Align the coded extent to lcm(codec block size, device granularity), then
+-    // clamp up to the device minimum and re-align.
++    let public_caps = super::EncoderCapabilities::from_caps(capabilities);
++    let coded_extent = public_caps.coded_extent(config.codec, width, height)?;
++    let input_image_extent = public_caps.input_image_extent(config.codec, width, height)?;
++    let aligned_width = coded_extent.width;
++    let aligned_height = coded_extent.height;
+     let gran_w = capabilities.picture_access_granularity.width.max(1);
+     let gran_h = capabilities.picture_access_granularity.height.max(1);
+-    let align_w = lcm(req.align_unit, gran_w);
+-    let align_h = lcm(req.align_unit, gran_h);
+-    let aligned_width = align_up(
+-        align_up(width, align_w).max(capabilities.min_coded_extent.width),
+-        align_w,
+-    );
+-    let aligned_height = align_up(
+-        align_up(height, align_h).max(capabilities.min_coded_extent.height),
+-        align_h,
+-    );
+-    if aligned_width > capabilities.max_coded_extent.width
+-        || aligned_height > capabilities.max_coded_extent.height
+-    {
+-        return Err(PixelForgeError::InvalidInput(format!(
+-            "Requested coded extent {}x{} (aligned to {}x{} with granularity {}x{}) exceeds device max {}x{} for this profile",
+-            width,
+-            height,
+-            aligned_width,
+-            aligned_height,
+-            gran_w,
+-            gran_h,
+-            capabilities.max_coded_extent.width,
+-            capabilities.max_coded_extent.height
+-        )));
+-    }
+     tracing::info!(
+         "Using coded extent {}x{} (granularity {}x{}, min {}x{}, max {}x{})",
+         aligned_width,
+@@ -688,7 +684,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+     let pipeline = EncodePipeline::new(&PipelineConfig {
+         context,
+         aligned_height,
+-        input_width: input_image_width(aligned_width, capabilities.max_coded_extent.width),
++        input_width: input_image_extent.width,
+         picture_format,
+         pixel_format: config.pixel_format,
+         bit_depth: config.bit_depth,
+@@ -713,6 +709,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+         session,
+         session_params: vk::VideoSessionParametersKHR::null(),
+         session_memory,
++        capabilities: public_caps,
++        input_image_extent,
+         aligned_width,
+         aligned_height,
+         pipeline,
+diff --git a/src/encoder/h264/init.rs b/src/encoder/h264/init.rs
+index ea41f5e..0755da6 100644
+--- a/src/encoder/h264/init.rs
++++ b/src/encoder/h264/init.rs
+@@ -1,11 +1,11 @@
+-use super::{H264, MB_SIZE};
++use super::H264;
+ 
+ use crate::encoder::codec::{
+     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+ };
+ use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
+ use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
+-use crate::encoder::{ColorDescription, EncodeConfig, PixelFormat};
++use crate::encoder::{ColorDescription, EncodeConfig};
+ use crate::error::Result;
+ use crate::vulkan::VideoContext;
+ use ash::vk;
+@@ -27,49 +27,15 @@ impl H264 {
+             config.dimensions.width, config.dimensions.height, config.pixel_format
+         );
+ 
+-        // Select the profile based on chroma subsampling.
+-        let profile_idc = match config.pixel_format {
+-            PixelFormat::Yuv444 => {
+-                ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+-            }
+-            _ => ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
+-        };
+-
+-        let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
+-        let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
+-
+-        // Get encoder tuning mode, usage and content hints.
+-        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+-        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+-        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+-
+-        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+-            .video_usage_hints(encode_usage_hint)
+-            .video_content_hints(encode_content_hint)
+-            .tuning_mode(encoder_tuning_mode);
+-
+-        let mut h264_profile_info =
+-            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+-        let profile_info = vk::VideoProfileInfoKHR::default()
+-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+-            .chroma_subsampling(chroma_subsampling)
+-            .luma_bit_depth(bit_depth)
+-            .chroma_bit_depth(bit_depth)
+-            .push(&mut h264_profile_info)
+-            .push(&mut video_encode_usage_info);
++        let mut profile = super::super::capabilities::EncodeProfile::new(&config)?;
++        let profile_idc = profile.profile_idc;
++        let profile_info = profile.info();
+ 
+         // The driver's preferred entropy mode is H.264-specific (some require
+         // CAVLC for High 4:4:4 Predictive).
+         let preferred_entropy_cabac = query_preferred_entropy_cabac(&context, &profile_info);
+ 
+-        // Query device capabilities with the H.264-specific capability struct
+-        // chained in (required by the driver).
+-        let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
+-        let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+-            .push(&mut encode_caps)
+-            .push(&mut h264_caps);
+-        let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
++        let caps = query_video_caps(&context, &profile_info)?;
+ 
+         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
+         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
+@@ -80,7 +46,6 @@ impl H264 {
+             config: &config,
+             profile_info: &profile_info,
+             caps: &caps,
+-            align_unit: MB_SIZE,
+             max_active_refs_cap: 32,
+             bitstream_buffer_size,
+             allow_layered_dpb: true,
+diff --git a/src/encoder/h265/init.rs b/src/encoder/h265/init.rs
+index 7d3082e..c166141 100644
+--- a/src/encoder/h265/init.rs
++++ b/src/encoder/h265/init.rs
+@@ -1,15 +1,13 @@
+-use super::{CTB_SIZE, H265};
++use super::H265;
+ 
+ use crate::encoder::codec::{
+     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
+ };
+ use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
+ use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
+-use crate::encoder::{BitDepth, ColorDescription, EncodeConfig, PixelFormat};
+-use crate::error::{PixelForgeError, Result};
++use crate::encoder::{ColorDescription, EncodeConfig};
++use crate::error::Result;
+ use crate::vulkan::VideoContext;
+-use ash::vk;
+-use ash::vk::TaggedStructure;
+ use tracing::info;
+ 
+ impl H265 {
+@@ -26,55 +24,11 @@ impl H265 {
+             config.dimensions.width, config.dimensions.height, config.pixel_format
+         );
+ 
+-        let profile_idc = match (config.pixel_format, config.bit_depth) {
+-            (PixelFormat::Yuv420, BitDepth::Eight) => {
+-                ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
+-            }
+-            (PixelFormat::Yuv420, BitDepth::Ten) => {
+-                ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+-            }
+-            (PixelFormat::Yuv444, _) => {
+-                ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS
+-            }
+-            _ => {
+-                return Err(PixelForgeError::InvalidInput(format!(
+-                    "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
+-                    config.pixel_format, config.bit_depth
+-                )));
+-            }
+-        };
+-
+-        let chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR = config.pixel_format.into();
+-        let bit_depth: vk::VideoComponentBitDepthFlagsKHR = config.bit_depth.into();
+-
+-        // Get encoder tuning mode, usage and content hints.
+-        let encode_usage_hint: vk::VideoEncodeUsageFlagsKHR = config.encode_usage_hint.into();
+-        let encode_content_hint: vk::VideoEncodeContentFlagsKHR = config.encode_content_hint.into();
+-        let encoder_tuning_mode: vk::VideoEncodeTuningModeKHR = config.encoder_tuning_mode.into();
+-
+-        let mut video_encode_usage_info = vk::VideoEncodeUsageInfoKHR::default()
+-            .video_usage_hints(encode_usage_hint)
+-            .video_content_hints(encode_content_hint)
+-            .tuning_mode(encoder_tuning_mode);
+-
+-        let mut h265_profile_info =
+-            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+-        let profile_info = vk::VideoProfileInfoKHR::default()
+-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+-            .chroma_subsampling(chroma_subsampling)
+-            .luma_bit_depth(bit_depth)
+-            .chroma_bit_depth(bit_depth)
+-            .push(&mut h265_profile_info)
+-            .push(&mut video_encode_usage_info);
++        let mut profile = super::super::capabilities::EncodeProfile::new(&config)?;
++        let profile_idc = profile.profile_idc;
++        let profile_info = profile.info();
+ 
+-        // Query device capabilities with the H.265-specific capability struct
+-        // chained in (required by the driver).
+-        let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+-        let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+-            .push(&mut encode_caps)
+-            .push(&mut h265_caps);
+-        let caps = query_video_caps(&context, &profile_info, &mut capabilities)?;
++        let caps = query_video_caps(&context, &profile_info)?;
+ 
+         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
+         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
+@@ -85,7 +39,6 @@ impl H265 {
+             config: &config,
+             profile_info: &profile_info,
+             caps: &caps,
+-            align_unit: CTB_SIZE,
+             max_active_refs_cap: 15,
+             bitstream_buffer_size,
+             allow_layered_dpb: true,
+diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
+index c4a4497..4c74e57 100644
+--- a/src/encoder/mod.rs
++++ b/src/encoder/mod.rs
+@@ -6,6 +6,8 @@
+ //! - Frame reordering for B-frame support (`reorder` module) - reusable for H.264/H.265.
+ 
+ pub mod av1;
++mod capabilities;
++pub use capabilities::{EncoderCapabilities, codec_block_size};
+ pub mod bitwriter;
+ pub(crate) mod codec;
+ pub mod dpb;
+@@ -561,6 +563,9 @@ pub struct EncodedPacket {
+ /// One blanket impl covers all codecs, so [`Encoder`] can hold any of them
+ /// behind a single boxed pointer instead of an enum that re-dispatches by hand.
+ trait EncoderApi: Send {
++    fn capabilities(&self) -> EncoderCapabilities;
++    fn coded_extent(&self) -> vk::Extent2D;
++    fn input_image_extent(&self) -> vk::Extent2D;
+     fn input_image(&self) -> vk::Image;
+     fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
+     fn flush(&mut self) -> Result<()>;
+@@ -570,6 +575,19 @@ trait EncoderApi: Send {
+ }
+ 
+ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
++    fn capabilities(&self) -> EncoderCapabilities {
++        self.common.capabilities
++    }
++    fn coded_extent(&self) -> vk::Extent2D {
++        vk::Extent2D {
++            width: self.common.aligned_width,
++            height: self.common.aligned_height,
++        }
++    }
++    fn input_image_extent(&self) -> vk::Extent2D {
++        self.common.input_image_extent
++    }
++
+     fn input_image(&self) -> vk::Image {
+         codec::CodecEncoder::input_image(self)
+     }
+@@ -598,6 +616,21 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
+ pub struct Encoder(Box<dyn EncoderApi>);
+ 
+ impl Encoder {
++    /// Capabilities queried during creation for this encoder's exact profile.
++    pub fn capabilities(&self) -> EncoderCapabilities {
++        self.0.capabilities()
++    }
++
++    /// Coded picture extent, distinct from the requested frame and allocated image.
++    pub fn coded_extent(&self) -> vk::Extent2D {
++        self.0.coded_extent()
++    }
++
++    /// Actual extent of every internal input slot, including NVIDIA width padding.
++    pub fn input_image_extent(&self) -> vk::Extent2D {
++        self.0.input_image_extent()
++    }
++
+     /// Create a new encoder for the codec named in `config`.
+     pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
+         let inner: Box<dyn EncoderApi> = match config.codec {
+diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
+index 284ada9..04f32d7 100644
+--- a/src/encoder/resources.rs
++++ b/src/encoder/resources.rs
+@@ -18,24 +18,6 @@ pub(crate) fn gcd(mut a: u32, mut b: u32) -> u32 {
+     a
+ }
+ 
+-/// Compute least common multiple of two values.
+-pub(crate) fn lcm(a: u32, b: u32) -> u32 {
+-    if a == 0 || b == 0 {
+-        0
+-    } else {
+-        (a / gcd(a, b)).saturating_mul(b)
+-    }
+-}
+-
+-/// Align a value up to the next multiple of the given alignment.
+-pub(crate) fn align_up(value: u32, alignment: u32) -> u32 {
+-    if alignment <= 1 {
+-        value
+-    } else {
+-        value.div_ceil(alignment) * alignment
+-    }
+-}
+-
+ pub(crate) fn query_supported_video_formats(
+     context: &VideoContext,
+     profile_info: &vk::VideoProfileInfoKHR,
+@@ -1700,16 +1682,6 @@ mod tests {
+         assert_eq!(gcd(5, 0), 5);
+     }
+ 
+-    #[test]
+-    fn test_lcm() {
+-        assert_eq!(lcm(32, 64), 64);
+-        assert_eq!(lcm(16, 12), 48);
+-        assert_eq!(lcm(4, 6), 12);
+-        assert_eq!(lcm(0, 5), 0);
+-        assert_eq!(lcm(5, 0), 0);
+-        assert_eq!(lcm(7, 7), 7);
+-    }
+-
+     #[test]
+     fn input_images_are_64_aligned_within_the_device_maximum() {
+         use crate::encoder::codec::input_image_width;
+@@ -1722,18 +1694,4 @@ mod tests {
+         // Never wider than the device allows, never narrower than coded.
+         assert_eq!(input_image_width(4080, 4080), 4080);
+     }
+-
+-    #[test]
+-    fn test_align_up() {
+-        assert_eq!(align_up(130, 64), 192);
+-        assert_eq!(align_up(128, 64), 128);
+-        assert_eq!(align_up(1, 64), 64);
+-        assert_eq!(align_up(0, 64), 0);
+-        assert_eq!(align_up(100, 1), 100);
+-        assert_eq!(align_up(100, 0), 100);
+-        // AMD-realistic case: align 320 to lcm(32, 64) = 64.
+-        assert_eq!(align_up(320, lcm(32, 64)), 320);
+-        // AMD-realistic case: align 130 to lcm(32, 16) = 32.
+-        assert_eq!(align_up(130, lcm(32, 16)), 160);
+-    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index cbb8269..9c18f1d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -208,7 +208,8 @@ pub use encoder::{
+     BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
+     DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,
+     DEFAULT_TARGET_BITRATE, EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint,
+-    EncodedPacket, Encoder, EncoderTuningMode, FrameType, PixelFormat, RateControlMode,
++    EncodedPacket, Encoder, EncoderCapabilities, EncoderTuningMode, FrameType, PixelFormat,
++    RateControlMode, codec_block_size,
+ };
+ pub use error::PixelForgeError;
+ pub use image::InputImage;
+-- 
+2.56.0

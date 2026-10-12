@@ -65,6 +65,12 @@ Use the installation steps below before validating streaming. When the optional
 PyroWave library cannot load or has the wrong C API version, conventional codecs
 remain available.
 
+## Vendored dependency maintenance
+
+Inputtino and Pixelforge use the same pinned-source and numbered-patch workflow.
+See [vendor maintenance](vendor/README.md) before editing patches or updating
+upstream pins. CI checks both trees and their Cargo declarations for drift.
+
 ## Manual installation and upgrade
 
 These instructions install local build outputs into the same system paths used

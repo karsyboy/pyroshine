@@ -116,6 +116,10 @@ Direct export requires complete-scene eligibility from
 [COMPOSITOR.md](COMPOSITOR.md#scene-and-input-decisions). Visible cursors, overlays,
 scaling and other scene content can require GLES composition. Rejection diagnostics
 record the first blocking condition with fixed counters, avoiding per-frame strings.
+Direct export also needs a single-plane RGB buffer the encoders sample (8-bit,
+10-bit or FP16, either channel order) with a modifier their Vulkan device imports
+([capture buffers](COMPOSITOR.md#ownership-and-frame-handoff)); anything else,
+such as a video player's NV12 surface, is composited (`direct_reject_format`).
 
 Composition submits GLES, waits for its SyncPoint, then exports the image to the
 Vulkan consumer. PyroWave packet pacing starts before compositor preparation and
@@ -136,21 +140,67 @@ scaling needs an explicit transform contract and pixel comparisons.
 
 ## Encoding, caches and queue selection
 
-Conventional conversion uses `pipeline/convert.rs`: one compute dispatch writes
-Pixelforge's packed NV12/P010/4:4:4 layout as whole words (4x2 pixels per
-invocation, no atomics or buffer clear), optionally compositing the cursor,
-then one buffer-to-image copy fills the encoder input slot. Its arithmetic
-mirrors Pixelforge's shader; the GPU fixture
-`packed_converter_matches_pixelforge_on_gpu` compares both converters' output
-for every format, color mode and range. It submits to the dedicated compute
-family by default (`conversion_queue`), which measured lower game-FPS impact
-than the graphics queue alongside a GPU-bound game; `graphics` remains available
-for A/B comparison. Pixelforge shares the input image
-concurrently with that family. The conversion still ends with a CPU fence wait
-before `Encoder::encode`, whose API takes no wait semaphore, and releases the
-source only after that wait. Pixelforge's converter is the fallback for widths
-not divisible by four and odd heights. Edit `pipeline/shaders/convert.comp`
-and regenerate the embedded SPIR-V with `scripts/build-shaders.sh`.
+Conventional conversion uses `pipeline/convert.rs`, the only RGB-to-YCbCr
+path of H.264, HEVC and AV1: one compute dispatch writes NV12, P010, 4:4:4 or
+4:4:4 10-bit planes into a buffer as whole 32-bit words (4x2 pixels per
+invocation, no atomics or buffer clear), optionally compositing the cursor and
+a notification, then one buffer-to-image copy fills the encoder input slot.
+
+The converter keeps three extents apart. The *frame* is the negotiated stream
+size. The *conversion extent* rounds it up to the codec's block size
+(macroblock, CTB or superblock); it always fits Pixelforge's input image, whose
+coded extent is aligned to that block and the device granularity, and its extra
+pixels replicate the nearest frame edge, so alignment padding is deterministic
+and cheap to encode while the codec's cropping metadata hides it. The *buffer
+extent* rounds up to whole 4x2 blocks: every plane row starts on a word and is
+a whole number of words, and the copy regions address the conversion extent
+with `bufferRowLength`, so any extent works without partial-word writes and the
+samples past it are never copied. H.264 and HEVC cannot crop 4:2:0 to an odd
+extent; stream validation rejects those (4:4:4 and AV1 accept them).
+
+The vendored Pixelforge patches also round the input and DPB image widths up
+to 64 texels within the GPU's maximum coded width. This keeps NVIDIA's 8-bit
+4:4:4 chroma pitch consistent at widths such as 1360, 1440 and 2400: input
+chroma is read, and reconstructed chroma written, inside the image. The
+picture's coded extent stays aligned to codec blocks and device granularity;
+cropping/render metadata retains the negotiated frame size. Additional image
+columns are outside the picture. AV1 frames are coded on the implementation's
+picture grid (`codedPictureAlignment`, 8x2 on RADV) with the negotiated size as
+render size, so the encoder reads the converter's edge padding instead of
+filling the grid remainder itself. See
+[local dependency maintenance](../vendor/pixelforge/LOCAL_CHANGES.md).
+
+In CBR mode some encoders pad every frame to the per-frame bit budget with
+filler data (H.264 NAL type 12, HEVC `FD_NUT`, AV1 `OBU_PADDING`); RADV does so
+for all three codecs. With the one-frame virtual buffer that would send every
+frame at the negotiated bitrate. The packet consumer removes these units
+(`pipeline/padding.rs`) before HDR metadata injection and packetization, so the
+transmitted size follows the encoded content; decoders discard padding, and
+the remaining bytes are unchanged.
+
+Pixelforge owns profile construction and capability/extent calculations. Setup
+queries the exact encoder configuration, including usage hints, then checks
+Pyroshine's AV1 minimum-frame policy before allocation. Conversion bounds use
+`Encoder::input_image_extent()` from the created encoder, separately from its
+`coded_extent()`; GPU fixtures compare both with the queried capabilities.
+Encoder driver errors preserve their `vk::Result` and operation context.
+`ERROR_DEVICE_LOST` stops the session; rendered error text does not decide
+recovery. The existing source-release and IDR recovery rules still apply.
+
+The shader writes each block sample by sample without private arrays or
+loops. Every converter first converts a small edge-padded pattern on its queue
+and compares it with the CPU reference in `convert::reference` (standard
+BT.709/BT.2020/PQ equations, round-to-nearest quantization); a mismatch fails
+the stream setup with an error naming the plane and block column, rather than
+streaming corrupted color. Edit `pipeline/shaders/convert.comp` and regenerate
+the embedded SPIR-V with `scripts/build-shaders.sh`.
+
+The conversion submits to the dedicated compute family by default
+(`conversion_queue`), which measured lower game-FPS impact than the graphics
+queue alongside a GPU-bound game; `graphics` remains available for A/B
+comparison. Pixelforge shares the input image concurrently with that family.
+The conversion ends with a CPU fence wait before `Encoder::encode`, whose API
+takes no wait semaphore, and releases the source only after that wait.
 
 Conventional encoding uses Pixelforge's asynchronous pipeline with three owned
 completion credits spanning submission, readback, packetization, queue residence
@@ -163,9 +213,9 @@ The three credits retain the existing encode/send overlap on healthy links.
 A requested IDR on a static scene (no new capture within a frame interval) is
 replayed from the converter, not from the encoder's input image: Pixelforge
 rotates two input slots and advances on every encode, so the current slot
-holds an older frame or none. The packed converter's output buffer (or
-Pixelforge's converter's, for unaligned extents) still holds the last
-completed conversion and is copied into the current slot before it is encoded.
+holds an older frame or none. The converter's output buffer still holds the
+last completed conversion and is copied into the current slot before it is
+encoded.
 The IDR stays pending across loop iterations until a recovery or a new frame is
 actually submitted, including while network credits are exhausted.
 
@@ -275,6 +325,69 @@ Deferred work needs specific evidence before implementation:
 | RGB conversion/DWT fusion | Equivalent rounding/dithering/HDR output and lower GPU cost across representative devices; a previously measured candidate failed quality/performance checks |
 | Import-cache aliasing | Measured duplicate-fd churn plus preserved identity/layout checks |
 | Capture/send overlap | Tightly bounded work without stale scenes, extra admission credits or epoch leakage |
+
+Converter changes need the GPU fixtures on every available vendor (select a
+device with `VK_DRIVER_FILES`), plus a decoded stream from a real client:
+
+```sh
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core converter_matches_reference -- --ignored --nocapture
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encode_decode_matches_reference -- --ignored --nocapture
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core static_recovery_decodes -- --ignored --nocapture
+MOONSHINE_TEST_GPU=1 cargo test --release -p moonshine-core converter_timing -- --ignored --nocapture
+```
+
+The first compares the dimension matrix (1x1 to 8K, odd and unaligned
+extents), every source format, color conversion and range, edge padding, late
+layers at the frame edges and the copy into planar images with the CPU
+reference; the second encodes, removes rate-control padding as production
+does, decodes with `ffmpeg` and checks decoded size, mean error, chroma bias
+and the largest per-sample error per codec, chroma format and bit depth. The
+per-sample bound catches localized corruption and unencoded padding rows,
+which averages hide; the mean error applies to planes of at least one 8x8
+transform block (a 2x2 4:2:0 frame has a single chroma sample). On a host that
+only runs the packaged daemon, the converter self-check at stream start covers
+the same store and layout path: a failure is logged as `Failed to create the
+YCbCr converter` with the differing plane and block column.
+
+The encode/decode matrix includes the NVIDIA 8-bit 4:4:4 width regressions at
+1360, 1440 and 2400. Run it on NVIDIA hardware when updating the Pixelforge
+patches, as one process with the default extents: H.264 4:4:4 at 1440 after
+1360 is the sequence whose DPB overrun lost the device. The streaming variant
+uses full-range color, low-latency CBR and twelve frames instead of the CQP
+quality fixture, so reference corruption that grows over P frames is visible:
+
+```sh
+MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_E2E_SAVE_DIR=/tmp/streams \
+  cargo test --release -p moonshine-core stream_encode_decode_matches_reference -- --ignored --nocapture
+```
+
+`MOONSHINE_TEST_E2E_FRAMES=2880x1920` selects extents and
+`MOONSHINE_TEST_E2E_FILTER='H265 Yuv444 Eight'` selects a profile. Saved elementary
+streams can be copied to the intended client to test its hardware decoder.
+For Intel VAAPI 8-bit 4:4:4, require hardware frames throughout:
+
+```sh
+ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+  -hwaccel_output_format vaapi -i /tmp/streams/H265-Yuv444-Eight-2880x1920.hevc \
+  -vf hwdownload,format=vuyx -f null -
+```
+
+Use `format=xv30` for 10-bit 4:4:4 and `format=nv12` for 8-bit 4:2:0.
+An FFmpeg exit code alone does not establish hardware decoding: without this
+filter it can silently fall back to software after rejecting a profile. HEVC
+4:4:4 needs the VPS/SPS Range Extensions constraints that Vulkan StdVideo cannot
+express; the vendored patch fills them once before caching the header. Test both
+bit depths, plus 4:2:0 and the client reconnect matrix.
+
+To check the actual EGL/GBM capture requests against both encoders:
+
+```sh
+MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_PYROWAVE=1 \
+  MOONSHINE_PYROWAVE_LIBRARY=/path/to/libpyrowave-shared.so.1 \
+  cargo test -p moonshine-core pyrowave_imports_compositor -- --ignored --nocapture
+scripts/vendor-pixelforge.sh --check
+scripts/vendor-pixelforge.sh --test
+```
 
 Use [GPU validation](PYROWAVE.md#validation-matrix), compositor/Steam acceptance
 and [reconnect checks](reconnect-validation.md) after pipeline changes. Loopback

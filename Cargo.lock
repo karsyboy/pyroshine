@@ -1989,7 +1989,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8"
+source = "git+https://github.com/games-on-whales/inputtino?rev=d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8#d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8"
 dependencies = [
  "inputtino-sys",
 ]
@@ -2345,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "0.17.3"
+version = "0.17.4"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-core"
-version = "0.17.3"
+version = "0.17.4"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-management"
-version = "0.17.3"
+version = "0.17.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-tools"
-version = "0.17.3"
+version = "0.17.4"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2809,7 +2809,6 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.9.1"
-source = "git+https://github.com/hgaiser/pixelforge?tag=v0.9.1#2ee4d7ac6e470cc34270e48d6e9d6f3fc1d7c379"
 dependencies = [
  "ash",
  "futures-channel",

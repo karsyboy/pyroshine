@@ -25,6 +25,7 @@ the guide for the area being changed:
 | Area | Guide |
 | --- | --- |
 | Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
+| Inputtino and Pixelforge patch maintenance | [Vendored dependencies](../vendor/README.md) |
 | Management interface and desktop app | [Architecture](ARCHITECTURE.md#desktop-management-interface), [pyroshine-ui](../pyroshine-ui/README.md) |
 | Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |

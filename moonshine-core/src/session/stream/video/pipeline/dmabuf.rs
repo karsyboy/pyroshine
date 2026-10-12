@@ -191,6 +191,11 @@ impl CachedImport {
 		self.image
 	}
 
+	/// Width and height of the imported image.
+	pub(crate) fn extent(&self) -> (u32, u32) {
+		(self.params.width, self.params.height)
+	}
+
 	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
 	fn is_same_buffer(&self, fd: RawFd) -> bool {
 		same_open_file(self.fd.as_raw_fd(), fd)

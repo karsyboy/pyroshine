@@ -279,7 +279,7 @@ allocator profiling and physical client latency require additional tooling.
 cargo test -p moonshine-core native_color_draw -- --ignored --nocapture
 cargo test -p moonshine-core invalid_native_color_constructors -- --ignored --nocapture
 cargo test -p moonshine-core xwayland_tests -- --ignored --test-threads=1
-MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core packed_converter -- --ignored --nocapture
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core converter_matches_reference -- --ignored --nocapture
 MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
   gpu_import_after_source_owner_teardown_and_fd_reuse -- --ignored --nocapture
 ```

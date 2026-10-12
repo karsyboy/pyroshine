@@ -20,7 +20,8 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 | `pyroshine-ui/` (separate workspace) | `pyroshine-ui` | Optional desktop app: tray, notifications, pairing, settings and dashboard |
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
-(Vulkan Video encoding), the optional PyroWave shared library (loaded at
+(Vulkan Video encoding, vendored at its upstream release plus the patches in
+`vendor/pixelforge-patches/`), the optional PyroWave shared library (loaded at
 runtime), the vendored Inputtino native backend (virtual input devices), and
 systemd/logind over D-Bus. Internal crate names, paths, environment variables
 and protocol identifiers keep the upstream `moonshine` spelling.
@@ -123,7 +124,8 @@ probes GPU capabilities, and the server refuses to start without DMA-BUF import.
 Advertised codecs and HDR come from encoder and profile probes, not from finding
 a library or extension name:
 
-- `gpu.rs` verifies the selected Vulkan device matches the GBM/EGL render node
+- `gpu.rs` selects the Vulkan device by the opened capture node and independently
+  verifies it matches the GBM/EGL render node
   used for capture (`VK_EXT_physical_device_drm`, with the complete PCI address
   as a fallback). An unresolvable or mismatched identity advertises no codec,
   HDR or DMA-BUF capability and prevents launch. No cross-device
@@ -432,7 +434,7 @@ transfer, primaries, matrix, range and HDR as independent negotiated properties.
 
 | Backend | Formats | Path |
 | --- | --- | --- |
-| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
+| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → rate-control padding removed (`pipeline/padding.rs`) → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
 | PyroWave (`pyrowave.rs`, `pyrowave_protocol.rs`) | Intra-only wavelet codec, 4:2:0/4:4:4, SDR/HDR10 | DMA-BUF import into a PyroWave-owned Vulkan device on the same GPU → GPU scale, color transform and encode → one frame at a time through send completion |
 
 PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a
