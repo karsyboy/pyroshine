@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 12 Oct 2026 16:22:53 -0400
+Subject: [PATCH] xbox elite paddles
+
+Expose Xbox Elite grip controls only for the supported Microsoft identities,
+with transition and generic-device isolation tests. The Rust API is unchanged.
+Reconstructed from the existing Pyroshine vendor change through 3c44293.
+---
+ CMakeLists.txt                                |  8 ++++
+ .../include/inputtino/protected_types.hpp     |  2 +-
+ src/uinput/include/inputtino/xbox_elite.hpp   | 39 ++++++++++++++++
+ src/uinput/joypad_xbox.cpp                    | 20 ++++++++-
+ tests/xbox_elite.cpp                          | 45 +++++++++++++++++++
+ 5 files changed, 111 insertions(+), 3 deletions(-)
+ create mode 100644 src/uinput/include/inputtino/xbox_elite.hpp
+ create mode 100644 tests/xbox_elite.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 03a0230..942a415 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -195,3 +195,11 @@ if(INPUTTINO_EDGE_TESTS)
+     target_link_libraries(dualsense-edge-test PRIVATE inputtino::libinputtino)
+     add_test(NAME dualsense-edge-report COMMAND dualsense-edge-test)
+ endif()
++
++option(INPUTTINO_ELITE_TESTS "Test Xbox Elite evdev capabilities without uinput" OFF)
++if(INPUTTINO_ELITE_TESTS)
++    enable_testing()
++    add_executable(xbox-elite-test tests/xbox_elite.cpp)
++    target_link_libraries(xbox-elite-test PRIVATE inputtino::libinputtino)
++    add_test(NAME xbox-elite-events COMMAND xbox-elite-test)
++endif()
+diff --git a/src/uinput/include/inputtino/protected_types.hpp b/src/uinput/include/inputtino/protected_types.hpp
+index 47a065a..5e0b988 100644
+--- a/src/uinput/include/inputtino/protected_types.hpp
++++ b/src/uinput/include/inputtino/protected_types.hpp
+@@ -48,7 +48,7 @@ struct BaseJoypadState {
+   std::optional<std::function<void(int low_freq, int high_freq)>> on_rumble = std::nullopt;
+ };
+ 
+-struct XboxOneJoypadState : BaseJoypadState {};
++struct XboxOneJoypadState : BaseJoypadState { bool is_elite = false; };
+ struct SwitchJoypadState : BaseJoypadState {};
+ 
+ struct KeyboardState {
+diff --git a/src/uinput/include/inputtino/xbox_elite.hpp b/src/uinput/include/inputtino/xbox_elite.hpp
+new file mode 100644
+index 0000000..4a2a3cd
+--- /dev/null
++++ b/src/uinput/include/inputtino/xbox_elite.hpp
+@@ -0,0 +1,39 @@
++#pragma once
++#include <cstdint>
++#include <inputtino/input.hpp>
++#include <libevdev/libevdev.h>
++#include <linux/input.h>
++
++// These codes were added after older distro headers. Their Linux UAPI values
++// are stable (input-event-codes.h); do not substitute BTN_TRIGGER_HAPPY.
++#ifndef BTN_GRIPL
++#define BTN_GRIPL 0x224
++#define BTN_GRIPR 0x225
++#define BTN_GRIPL2 0x226
++#define BTN_GRIPR2 0x227
++#endif
++
++namespace inputtino {
++static_assert(Joypad::PADDLE1_FLAG == 0x10000 && Joypad::PADDLE2_FLAG == 0x20000 &&
++              Joypad::PADDLE3_FLAG == 0x40000 && Joypad::PADDLE4_FLAG == 0x80000,
++              "Inputtino must retain the Moonlight paddle flags");
++constexpr bool is_xbox_elite(uint16_t vendor, uint16_t product) {
++  return vendor == 0x045e && (product == 0x02e3 || product == 0x0b00);
++}
++// SDL canonical order: upper right, upper left, lower right, lower left.
++constexpr unsigned int elite_flags[] = {
++    Joypad::PADDLE1_FLAG, Joypad::PADDLE2_FLAG, Joypad::PADDLE3_FLAG, Joypad::PADDLE4_FLAG};
++constexpr unsigned int elite_keys[] = {BTN_GRIPR, BTN_GRIPL, BTN_GRIPR2, BTN_GRIPL2};
++
++template <typename Emit>
++void emit_elite_changes(unsigned int pressed, unsigned int previous, bool elite, Emit emit) {
++  if (!elite) return;
++  for (unsigned int i = 0; i < 4; ++i) {
++    if ((pressed ^ previous) & elite_flags[i])
++      emit(elite_keys[i], (pressed & elite_flags[i]) ? 1 : 0);
++  }
++}
++
++// Owned by the caller; separated from uinput creation for capability tests.
++libevdev *xbox_evdev_definition(const DeviceDefinition &device);
++}
+diff --git a/src/uinput/joypad_xbox.cpp b/src/uinput/joypad_xbox.cpp
+index 7f26249..3ca386f 100644
+--- a/src/uinput/joypad_xbox.cpp
++++ b/src/uinput/joypad_xbox.cpp
+@@ -1,4 +1,5 @@
+ #include "joypad_utils.hpp"
++#include <inputtino/xbox_elite.hpp>
+ #include <cstring>
+ #include <inputtino/input.hpp>
+ #include <inputtino/protected_types.hpp>
+@@ -20,9 +21,8 @@ std::vector<std::string> XboxOneJoypad::get_nodes() const {
+   return nodes;
+ }
+ 
+-Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &device) {
++libevdev *xbox_evdev_definition(const DeviceDefinition &device) {
+   libevdev *dev = libevdev_new();
+-  libevdev_uinput *uidev;
+ 
+   libevdev_set_name(dev, device.name.c_str());
+   libevdev_set_id_vendor(dev, device.vendor_id);
+@@ -43,6 +43,11 @@ Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &devic
+   libevdev_enable_event_code(dev, EV_KEY, BTN_MODE, nullptr);
+   libevdev_enable_event_code(dev, EV_KEY, BTN_START, nullptr);
+ 
++  if (is_xbox_elite(device.vendor_id, device.product_id)) {
++    for (auto key : elite_keys)
++      libevdev_enable_event_code(dev, EV_KEY, key, nullptr);
++  }
++
+   libevdev_enable_event_type(dev, EV_ABS);
+ 
+   input_absinfo dpad{0, -1, 1, 0, 0, 0};
+@@ -67,6 +72,12 @@ Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &devic
+   libevdev_enable_event_code(dev, EV_FF, FF_RAMP, nullptr);
+   libevdev_enable_event_code(dev, EV_FF, FF_GAIN, nullptr);
+ 
++  return dev;
++}
++
++Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition &device) {
++  libevdev *dev = xbox_evdev_definition(device);
++  libevdev_uinput *uidev;
+   auto err = libevdev_uinput_create_from_device(dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &uidev);
+   libevdev_free(dev);
+   if (err != 0) {
+@@ -95,6 +106,7 @@ Result<XboxOneJoypad> XboxOneJoypad::create(const DeviceDefinition &device) {
+ 
+   XboxOneJoypad joypad;
+   joypad._state->joy = std::move(*joy_el);
++  joypad._state->is_elite = is_xbox_elite(device.vendor_id, device.product_id);
+ 
+   auto event_thread = std::thread(event_listener, joypad._state);
+   joypad._state->events_thread = std::move(event_thread);
+@@ -146,6 +158,10 @@ void XboxOneJoypad::set_pressed_buttons(unsigned int newly_pressed) {
+         libevdev_uinput_write_event(controller, EV_KEY, BTN_WEST, bf_new & Y ? 1 : 0);
+     }
+ 
++    emit_elite_changes(bf_new, this->_state->currently_pressed_btns, this->_state->is_elite,
++                       [controller](unsigned int key, int value) {
++                         libevdev_uinput_write_event(controller, EV_KEY, key, value);
++                       });
+     libevdev_uinput_write_event(controller, EV_SYN, SYN_REPORT, 0);
+   }
+   this->_state->currently_pressed_btns = bf_new;
+diff --git a/tests/xbox_elite.cpp b/tests/xbox_elite.cpp
+new file mode 100644
+index 0000000..6e55344
+--- /dev/null
++++ b/tests/xbox_elite.cpp
+@@ -0,0 +1,45 @@
++#ifdef NDEBUG
++#undef NDEBUG
++#endif
++#include <inputtino/xbox_elite.hpp>
++#include <cassert>
++#include <vector>
++#include <utility>
++
++int main() {
++  using namespace inputtino;
++  for (auto product : {0x02dd, 0x02e3, 0x0b00}) {
++    DeviceDefinition device{"Elite capability test", 0x045e, (uint16_t)product, 0x100};
++    auto dev = xbox_evdev_definition(device);
++    assert(dev);
++    assert(libevdev_get_id_vendor(dev) == 0x045e);
++    assert(libevdev_get_id_product(dev) == product);
++    for (auto key : elite_keys)
++      assert(libevdev_has_event_code(dev, EV_KEY, key) == (product != 0x02dd));
++    assert(libevdev_has_event_code(dev, EV_KEY, BTN_SOUTH));
++    assert(libevdev_has_event_code(dev, EV_ABS, ABS_Z));
++    assert(libevdev_has_event_code(dev, EV_FF, FF_RUMBLE));
++    libevdev_free(dev);
++  }
++  assert(!is_xbox_elite(0x28de, 0x0b00));
++  // Exhaust every state transition, including full neutralization and reuse.
++  for (unsigned previous = 0; previous < 16; ++previous) {
++    for (unsigned pressed = 0; pressed < 16; ++pressed) {
++      std::vector<std::pair<unsigned, int>> events;
++      emit_elite_changes(pressed << 16, previous << 16, true,
++                        [&](unsigned key, int value) { events.emplace_back(key, value); });
++      unsigned event = 0;
++      for (unsigned i = 0; i < 4; ++i) {
++        if ((pressed ^ previous) & (1 << i)) {
++          assert(events[event].first == elite_keys[i]);
++          assert(events[event++].second == ((pressed >> i) & 1));
++        }
++      }
++      assert(event == events.size());
++      emit_elite_changes((pressed << 16) | Joypad::A, (pressed << 16), true,
++                        [](unsigned, int) { assert(false); });
++      emit_elite_changes(pressed << 16, previous << 16, false,
++                        [](unsigned, int) { assert(false); });
++    }
++  }
++}
+-- 
+2.56.0
+

@@ -19,25 +19,18 @@ source of `pixelforge`. Nix builds it as part of the source tree.
 
 ## Updating
 
-Never edit this directory by hand.
+Never edit this directory by hand. Follow the shared
+[maintenance workflow](../README.md) for patch creation, upstream review,
+regeneration, Cargo/Nix coordination and drift checks.
 
 ```sh
-# Change a local fix: edit it in an upstream checkout, `git format-patch` it into
-# vendor/pixelforge-patches/ with a four-digit prefix, then regenerate.
 scripts/vendor-pixelforge.sh
-
-# Move to a new upstream release (fails if a patch no longer applies).
-scripts/vendor-pixelforge.sh v0.10.0
-cargo update -p pixelforge   # after updating the tag in moonshine-core/Cargo.toml
-
-# Verify the committed tree is upstream plus the patches, and run its tests.
 scripts/vendor-pixelforge.sh --check
 scripts/vendor-pixelforge.sh --test
 ```
 
-When upstream includes a fix, delete its patch and regenerate. Once no patches
-remain, delete this directory, `vendor/pixelforge-patches/` and the `[patch]`
-entry, and depend on the upstream release directly.
+Remove a patch only when upstream provides its behavior, retaining the width
+and HEVC profile contracts described above.
 
 ## Validation
 

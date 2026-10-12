@@ -1,18 +1,52 @@
-# Local inputtino backend patch
+# Local Inputtino patches
 
-Base: https://github.com/games-on-whales/inputtino at
-`d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8` (also upstream HEAD when checked
-2026-09-30). The native sources, build files, Rust bindings and upstream tests
-are copied with their MIT license. This directory is a maintained local patch,
-not a replacement upstream or an unpinned fork.
+Base: https://github.com/games-on-whales/inputtino, the revision recorded in
+`../inputtino-patches/UPSTREAM`
+(`d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8`). The native sources, build files,
+bindings and upstream tests are copied with their MIT license. This directory
+is generated: it is exactly that revision plus the numbered patches in
+`../inputtino-patches/`.
 
-The public Rust `inputtino` dependency remains the upstream Git crate at that
-revision. The workspace patches only `inputtino-sys` to this source tree.
-Cargo.lock changes only the source of `inputtino-sys`; no dependency revision
+The public Rust `inputtino` dependency remains the upstream Git crate explicitly
+pinned with `rev` to that same revision. The workspace patches only `inputtino-sys` to this source tree.
+Cargo.lock uses the local source for `inputtino-sys`; no dependency revision
 was upgraded. Nix includes this directory in its source and no longer needs to
 graft another copy of the upstream native library into the Cargo vendor tree.
 
-Changes from upstream:
+## Changes from upstream
+
+| Patch | Change | Why |
+| --- | --- | --- |
+| `0001-dualsense-edge-paddles.patch` | Edge paddle bits, native-source rebuild tracking and report tests. | Preserve Sony Edge controls without changing the public Rust API. |
+| `0002-xbox-elite-paddles.patch` | Elite identity, grip mapping and transition tests. | Emit native Elite controls while generic Xbox devices ignore paddles. |
+| `0003-dualsense-report-bounds-and-tests.patch` | Validate feature/output reports and add pipe-based regression tests. | Prevent unsupported queries from reading outside the reply buffer. |
+| `0004-joined-native-worker-threads.patch` | Own and join UHID/uinput workers, guard shared state and test device lifetimes. | Prevent races and worker access after device destruction. |
+
+## Updating
+
+Never edit this directory by hand. Follow the shared
+[maintenance workflow](../README.md) for patch creation, upstream review,
+regeneration, Cargo/Nix coordination and drift checks.
+
+```sh
+scripts/vendor-inputtino.sh
+scripts/vendor-inputtino.sh --check
+scripts/vendor-inputtino.sh --test
+```
+
+Remove a patch only when upstream provides its behavior, retaining the native
+controller and worker-ownership contracts described below.
+
+## Validation
+
+`--test` runs the hardware-independent Edge, Elite and PS5 feature/output report
+suite under ASan/UBSan. Device lifetime checks need `/dev/uhid` and `/dev/uinput`
+and run separately under TSan via `scripts/known_defects.py --native-devices`.
+Physical controller and client acceptance remains in
+[native controllers](../../docs/NATIVE_CONTROLLERS.md).
+
+## DualSense Edge mapping
+
 
 - `src/uhid/include/uhid/ps5.hpp`: name Edge bits 4–7 of `buttons[2]`.
 - `src/uhid/include/uhid/dualsense_edge.hpp`: identity check and explicit,
@@ -39,15 +73,11 @@ Sources:
 - [Packaged SDL3 mapping](https://github.com/libsdl-org/SDL/blob/ddba673cddfa79ce798eca5ba402e0f1a2a2a243/src/joystick/SDL_gamepad.c)
 - [Linux hid-playstation](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c)
 
-When updating inputtino, compare these specific changes against upstream first.
-If upstream implements the same mapping, remove this patch and update the pinned
-Git dependency and Nix packaging together. Preserve `LICENSE` when redistributing.
 
 ## Xbox Elite uinput extension
 
-Upstream HEAD remains `d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8` when
-checked for this implementation. Upstream has neither Elite paddle emission nor
-a Valve backend; no dependency revision was upgraded.
+The pinned base has neither Elite paddle emission nor a Valve backend; no
+dependency revision was upgraded.
 
 - `src/uinput/include/inputtino/xbox_elite.hpp`: native USB identity guard,
   canonical SDL paddle to Linux grip mapping, shared press/release iterator.
@@ -71,7 +101,7 @@ implementation was available to establish that result from source inspection.
 Valve support lives in Pyroshine's `gamepad/valve.rs` beside the host input
 adapter. It uses Linux UHID and the existing gamepad Tokio runtime. This avoids
 changing the pinned public Inputtino crate or adding C/Rust ABI extensions.
-Keep both local patches in comparisons when updating Inputtino.
+Keep the complete patch series in comparisons when updating Inputtino.
 
 ## DualSense UHID report bounds
 

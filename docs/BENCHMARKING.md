@@ -104,7 +104,7 @@ python3 scripts/record_baseline.py --out ~/pyroshine-baselines/$(git rev-parse -
 ```
 
 `manifest.json` identifies the commit (refusing an uncommitted tree unless
-`--allow-dirty`), Cargo.lock hash, Git-pinned crates, PyroWave and Inputtino
+`--allow-dirty`), Cargo.lock hash, Git-pinned crates, PyroWave, Inputtino and Pixelforge
 pins, toolchain, kernel, CPU, memory, governor, GPU/driver and the PyroWave
 library found. The script rebuilds `moonshine-bench` immediately before
 measuring and records its hash, so a stale binary is never measured. It then

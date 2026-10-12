@@ -1989,7 +1989,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8"
+source = "git+https://github.com/games-on-whales/inputtino?rev=d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8#d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8"
 dependencies = [
  "inputtino-sys",
 ]

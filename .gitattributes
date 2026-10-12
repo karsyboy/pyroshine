@@ -1,0 +1,2 @@
+# Mail-format patches contain blank context lines and a "-- " signature delimiter.
+vendor/*-patches/*.patch -whitespace
