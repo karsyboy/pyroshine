@@ -183,26 +183,6 @@ impl FrameOverlay {
 /// Late-composition layers per frame: a Steam notification, then the cursor.
 pub(crate) const MAX_OVERLAYS: usize = 2;
 
-/// Single-plane DRM formats both encoder families sample directly (8-bit,
-/// 10-bit and FP16 RGB in either channel order, with or without alpha).
-/// Direct export of any other client buffer would hand the encoder a format
-/// it cannot read, so such scenes are composited instead.
-pub(crate) fn encoder_samples_fourcc(fourcc: u32) -> bool {
-	matches!(
-		fourcc,
-		0x3432_4241 // AB24
-			| 0x3432_4258 // XB24
-			| 0x3432_5241 // AR24
-			| 0x3432_5258 // XR24
-			| 0x3033_4241 // AB30
-			| 0x3033_4258 // XB30
-			| 0x3033_5241 // AR30
-			| 0x3033_5258 // XR30
-			| 0x4834_4241 // AB4H
-			| 0x4834_4258 // XB4H
-	)
-}
-
 /// Layers bottom to top; `None` entries are skipped.
 pub(crate) type FrameOverlays = [Option<FrameOverlay>; MAX_OVERLAYS];
 

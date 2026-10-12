@@ -360,7 +360,16 @@ fn converter_matches_reference_on_gpu() {
 #[ignore = "needs a Vulkan Video GPU and ffmpeg: MOONSHINE_TEST_GPU=1"]
 fn encode_decode_matches_reference_on_gpu() {
 	gpu::require();
-	gpu::encode_decode_matrix();
+	gpu::encode_decode_matrix(false);
+}
+
+/// The stream's low-latency CBR configuration must also produce decodable
+/// reference frames; CQP-only checks do not exercise its rate-control path.
+#[test]
+#[ignore = "needs a Vulkan Video GPU and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn stream_encode_decode_matches_reference_on_gpu() {
+	gpu::require();
+	gpu::encode_decode_matrix(true);
 }
 
 /// Pins the Pixelforge input-slot contract modelled by `FakeSlots` in the
@@ -1490,11 +1499,16 @@ mod gpu {
 	}
 
 	fn encoder(case: CodecCase, (w, h): (u32, u32)) -> Option<(VideoContext, Encoder)> {
-		encoder_on(codec_context(case.codec)?, case, (w, h))
+		encoder_on(codec_context(case.codec)?, case, (w, h), false)
 	}
 
 	/// An encoder on `context`, if the GPU encodes this case at this extent.
-	fn encoder_on(context: VideoContext, case: CodecCase, (w, h): (u32, u32)) -> Option<(VideoContext, Encoder)> {
+	fn encoder_on(
+		context: VideoContext,
+		case: CodecCase,
+		(w, h): (u32, u32),
+		stream: bool,
+	) -> Option<(VideoContext, Encoder)> {
 		EncodeCaps::query(&context, case.codec, case.pixel_format, case.depth)
 			.ok()?
 			.check_frame(case.codec, w, h)
@@ -1506,12 +1520,31 @@ mod gpu {
 		}
 		.with_pixel_format(case.pixel_format)
 		.with_bit_depth(case.depth)
-		.with_color_description(pixelforge::ColorDescription::bt709().with_full_range(false))
+		.with_color_description(pixelforge::ColorDescription::bt709().with_full_range(stream))
 		.with_rate_control(RateControlMode::Cqp)
 		.with_quality_level(12)
 		.with_gop_size(0)
 		.with_b_frames(0);
-		let encoder = Encoder::new(context.clone(), config).ok()?;
+		let config = if stream {
+			config
+				.with_encoder_tuning_mode(pixelforge::EncoderTuningMode::LowLatency)
+				.with_rate_control(RateControlMode::Cbr)
+				.with_target_bitrate(125_000_000)
+				.with_frame_rate(116, 1)
+				.with_max_reference_frames(1)
+				.with_virtual_buffer_size_ms(1000 / 116)
+				.with_initial_virtual_buffer_size_ms(0)
+		} else {
+			config
+		};
+		let encoder = Encoder::new(context.clone(), config)
+			.map_err(|error| {
+				eprintln!(
+					"{:?} {:?} {:?} {w}x{h}: encoder creation failed: {error}",
+					case.codec, case.pixel_format, case.depth
+				);
+			})
+			.ok()?;
 		Some((context, encoder))
 	}
 
@@ -1604,9 +1637,14 @@ mod gpu {
 		}
 	}
 
-	pub(super) fn encode_decode_matrix() {
+	pub(super) fn encode_decode_matrix(stream_config: bool) {
 		let mut failures = Vec::new();
 		let mut checked = 0;
+		let frame_count = if stream_config { 12 } else { 3 };
+		let color = Color {
+			full_range: stream_config,
+			..BT709_LIMITED
+		};
 		// `MOONSHINE_TEST_E2E_FRAMES="1344x768,1408x768"` replaces the extents.
 		let frames: Vec<(u32, u32)> = match std::env::var("MOONSHINE_TEST_E2E_FRAMES") {
 			Ok(list) => list
@@ -1614,8 +1652,13 @@ mod gpu {
 				.filter_map(|f| f.split_once('x'))
 				.map(|(w, h)| (w.trim().parse().unwrap(), h.trim().parse().unwrap()))
 				.collect(),
+			// 1440 and 2400 (width % 64 == 32) caught NVIDIA reading 8-bit 4:4:4
+			// chroma with the wrong pitch (vendor/pixelforge-patches/0001).
 			Err(_) => vec![
 				(1920, 1080),
+				(1360, 768),
+				(1440, 768),
+				(2400, 1080),
 				(1366, 768),
 				(1280, 720),
 				(2880, 1920),
@@ -1664,7 +1707,7 @@ mod gpu {
 					eprintln!("{label}: rejected as the stream setup does: {e}");
 					continue;
 				}
-				let Some((context, mut encoder)) = encoder_on(context, case, frame) else {
+				let Some((context, mut encoder)) = encoder_on(context, case, frame, stream_config) else {
 					eprintln!("{label}: not encoded by this GPU; skipped");
 					continue;
 				};
@@ -1687,11 +1730,11 @@ mod gpu {
 					extent,
 					case.output,
 					ColorSpace::Bt709,
-					false,
+					color.full_range,
 				)
 				.unwrap();
 				let mut stream = Vec::new();
-				for _ in 0..3 {
+				for _ in 0..frame_count {
 					converter
 						.convert(
 							&source,
@@ -1703,6 +1746,12 @@ mod gpu {
 						.unwrap();
 					let image = encoder.input_image();
 					stream.extend(block_on(encoder.encode(image).unwrap()).unwrap().data);
+				}
+				if let Some(directory) = std::env::var_os("MOONSHINE_TEST_E2E_SAVE_DIR") {
+					std::fs::create_dir_all(&directory).unwrap();
+					let path =
+						std::path::Path::new(&directory).join(format!("{}.{}", label.replace(' ', "-"), case.demuxer));
+					std::fs::write(path, &stream).unwrap();
 				}
 				let (w, h, frames) = match decode(&stream, case) {
 					Ok(decoded) => decoded,
@@ -1721,14 +1770,14 @@ mod gpu {
 					),
 					None => frame,
 				};
-				if (w, h) != coded || frames.len() != 3 {
+				if (w, h) != coded || frames.len() != frame_count {
 					failures.push(format!(
 						"{label}: decoded {} frames of {w}x{h}, expected {coded:?}",
 						frames.len()
 					));
 					continue;
 				}
-				let expected = reference::convert(case.output, BT709_LIMITED, frame, coded, &decoded_rgb, &|_| true);
+				let expected = reference::convert(case.output, color, frame, coded, &decoded_rgb, &|_| true);
 				let expected_planes = [
 					expected.luma.clone(),
 					expected.chroma.iter().map(|c| c[0]).collect::<Vec<_>>(),
@@ -1800,7 +1849,7 @@ mod gpu {
 					n += 1;
 				}
 			}
-			sum as f64 / n.max(1) as f64
+			if n == 0 { f64::INFINITY } else { sum as f64 / n as f64 }
 		};
 		let mut best = (f64::MAX, 0, 0);
 		for dy in -4..=4 {
@@ -1811,13 +1860,14 @@ mod gpu {
 				}
 			}
 		}
-		let rows: Vec<String> = (0..4)
+		let row_samples = 8.min(w - w / 2) as usize;
+		let rows: Vec<String> = (0..4.min(h - h / 2))
 			.map(|y| {
 				let y = (h / 2 + y) * w + w / 2;
 				format!(
 					"{:?} vs {:?}",
-					&got[y as usize..y as usize + 8],
-					&want[y as usize..y as usize + 8]
+					&got[y as usize..y as usize + row_samples],
+					&want[y as usize..y as usize + row_samples]
 				)
 			})
 			.collect();

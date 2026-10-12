@@ -117,8 +117,9 @@ Direct export requires complete-scene eligibility from
 scaling and other scene content can require GLES composition. Rejection diagnostics
 record the first blocking condition with fixed counters, avoiding per-frame strings.
 Direct export also needs a single-plane RGB buffer the encoders sample (8-bit,
-10-bit or FP16, either channel order); anything else, such as a video player's
-NV12 surface, is composited (`direct_reject_format`).
+10-bit or FP16, either channel order) with a modifier their Vulkan device imports
+([capture buffers](COMPOSITOR.md#ownership-and-frame-handoff)); anything else,
+such as a video player's NV12 surface, is composited (`direct_reject_format`).
 
 Composition submits GLES, waits for its SyncPoint, then exports the image to the
 Vulkan consumer. PyroWave packet pacing starts before compositor preparation and
@@ -156,6 +157,13 @@ a whole number of words, and the copy regions address the conversion extent
 with `bufferRowLength`, so any extent works without partial-word writes and the
 samples past it are never copied. H.264 and HEVC cannot crop 4:2:0 to an odd
 extent; stream validation rejects those (4:4:4 and AV1 accept them).
+
+The vendored Pixelforge patch also rounds the input image width up to 64 texels
+within the GPU's maximum coded width. This keeps NVIDIA's 8-bit 4:4:4 chroma
+pitch consistent at widths such as 1360, 1440 and 2400. The picture's coded
+extent and cropping metadata retain the negotiated size; the additional image
+columns are outside the picture. See
+[local dependency maintenance](../vendor/pixelforge/LOCAL_CHANGES.md).
 
 The shader writes each block sample by sample without private arrays or
 loops. Every converter first converts a small edge-padded pattern on its queue
@@ -314,6 +322,44 @@ error and chroma bias per codec, chroma format and bit depth. On a host that
 only runs the packaged daemon, the converter self-check at stream start covers
 the same store and layout path: a failure is logged as `Failed to create the
 YCbCr converter` with the differing plane and block column.
+
+The encode/decode matrix includes the NVIDIA 8-bit 4:4:4 width regressions at
+1360, 1440 and 2400. Run it on NVIDIA hardware when updating the Pixelforge
+patch. The streaming variant uses full-range color, low-latency CBR and multiple
+frames instead of the CQP quality fixture:
+
+```sh
+MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_E2E_SAVE_DIR=/tmp/streams \
+  cargo test --release -p moonshine-core stream_encode_decode_matches_reference -- --ignored --nocapture
+```
+
+`MOONSHINE_TEST_E2E_FRAMES=2880x1920` selects extents and
+`MOONSHINE_TEST_E2E_FILTER='H265 Yuv444 Eight'` selects a profile. Saved elementary
+streams can be copied to the intended client to test its hardware decoder.
+For Intel VAAPI 8-bit 4:4:4, require hardware frames throughout:
+
+```sh
+ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+  -hwaccel_output_format vaapi -i /tmp/streams/H265-Yuv444-Eight-2880x1920.hevc \
+  -vf hwdownload,format=vuyx -f null -
+```
+
+Use `format=xv30` for 10-bit 4:4:4 and `format=nv12` for 8-bit 4:2:0.
+An FFmpeg exit code alone does not establish hardware decoding: without this
+filter it can silently fall back to software after rejecting a profile. HEVC
+4:4:4 needs the VPS/SPS Range Extensions constraints that Vulkan StdVideo cannot
+express; the vendored patch fills them once before caching the header. Test both
+bit depths, plus 4:2:0 and the client reconnect matrix.
+
+To check the actual EGL/GBM capture requests against both encoders:
+
+```sh
+MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_PYROWAVE=1 \
+  MOONSHINE_PYROWAVE_LIBRARY=/path/to/libpyrowave-shared.so.1 \
+  cargo test -p moonshine-core pyrowave_imports_compositor -- --ignored --nocapture
+scripts/vendor-pixelforge.sh --check
+scripts/vendor-pixelforge.sh --test
+```
 
 Use [GPU validation](PYROWAVE.md#validation-matrix), compositor/Steam acceptance
 and [reconnect checks](reconnect-validation.md) after pipeline changes. Loopback

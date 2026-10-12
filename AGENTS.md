@@ -125,10 +125,14 @@ Other workspace and integration areas:
 
 ## Dependencies and configuration
 
-- Root `Cargo.toml` patches only `inputtino-sys` to the vendored native backend;
-  the public Rust `inputtino` API stays on the pinned upstream Git dependency.
-  Do not replace or reorganize this arrangement casually. Follow `LOCAL_CHANGES.md`
-  when updating it, comparing the patch with upstream and coordinating Nix.
+- Root `Cargo.toml` patches only `inputtino-sys` to the vendored native backend
+  and `pixelforge` to `vendor/pixelforge`; the public Rust `inputtino` API and the
+  `moonshine-core` Pixelforge dependency stay on their pinned upstream Git tags.
+  Do not replace or reorganize this arrangement casually. Follow each
+  `LOCAL_CHANGES.md` when updating, comparing the patch with upstream and
+  coordinating Nix. `vendor/pixelforge` is generated: never edit it by hand; add
+  a patch to `vendor/pixelforge-patches/` and run `scripts/vendor-pixelforge.sh`
+  (`--check` verifies it, `--test` runs its unit tests).
 - For PyroWave pins, C API assumptions or build changes, follow the pinned
   dependency process in `docs/PYROWAVE.md`. Keep Rust provenance/API requirements,
   `scripts/build-pyrowave.sh`, `nix/pyrowave.nix` and documented pins synchronized.
@@ -229,8 +233,10 @@ the `upstream` remote (branch `main`); `origin` is the fork. Verify with
 v0.16.1 (see `docs/UPSTREAM_CHANGELOG.md`). Pinned third-party sources have
 their own upstreams: PyroWave (`karsyboy/pyrowave`, derived from
 `Themaister/pyrowave`; see `docs/PYROWAVE.md`), Inputtino
-(`games-on-whales/inputtino`; see `vendor/inputtino/LOCAL_CHANGES.md`), and the
-Git-pinned Smithay, Pixelforge and ash revisions in `Cargo.toml`.
+(`games-on-whales/inputtino`; see `vendor/inputtino/LOCAL_CHANGES.md`), Pixelforge
+(`hgaiser/pixelforge`, vendored with local patches; see
+`vendor/pixelforge/LOCAL_CHANGES.md`), and the Git-pinned Smithay and ash
+revisions in `Cargo.toml`.
 
 Staying reasonably compatible with upstream is an ongoing goal. Bug fixes,
 security fixes, performance, compatibility and maintenance improvements, useful

@@ -14,6 +14,13 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix repeatedly flashing black HEVC 4:4:4 streams on Intel hardware decoding in Pyrolight and Moonlight. NVIDIA Vulkan encoding omitted the profile constraint flags needed to identify Main 4:4:4; cached VPS/SPS headers now declare the correct 8-bit or 10-bit profile.
+- Fix sheared colors in NVIDIA HEVC 8-bit 4:4:4 streams at widths such as 1360, 1440 and 2400. Encoder input images now use a 64-texel-aligned width while the bitstream keeps the negotiated picture size, through a maintained local Pixelforge patch.
+- Allocate compositor capture buffers only with DMA-BUF modifiers supported by both EGL rendering and Vulkan import. NVIDIA's EGL also offers modifiers Vulkan cannot import, which caused PyroWave streams to produce no video. Fullscreen buffers and late overlay layers with unsupported modifiers now use GLES composition; an incompatible GBM allocation fails setup with a precise error.
+- Remove a duplicate external-memory structure from PyroWave's DMA-BUF import request. The library adds it from the supplied handle type; passing another copy violated Vulkan's image-creation rules.
+
 ## [v0.17.4] - 2026-10-12
 
 ### Fixed

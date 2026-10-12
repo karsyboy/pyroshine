@@ -356,6 +356,8 @@ pub(crate) struct MoonshineCompositor {
 	pub render_modifiers: Vec<Modifier>,
 	sdr_render_format: (Fourcc, Vec<Modifier>),
 	hdr_render_format: Option<(Fourcc, Vec<Modifier>)>,
+	/// Client DMA-BUFs the encoders can read in place (direct export, layers).
+	importable: crate::gpu::ImportableModifiers,
 
 	// -- Buffer pool --
 	pub(crate) buffer_pool: Vec<GbmBufferSlot>,
@@ -578,6 +580,20 @@ impl ClientData for ClientState {
 	}
 }
 
+/// GBM may substitute a modifier it was not asked for (NVIDIA's GBM answers a
+/// linear-only request with an implicit-modifier buffer). The encoders cannot
+/// import such a capture buffer, so reject setup before publishing any frames.
+fn require_importable(importable: &crate::gpu::ImportableModifiers, dmabuf: &Dmabuf) -> Result<(), String> {
+	let format = dmabuf.format();
+	if dmabuf.num_planes() != 1 || !importable.contains(format.code as u32, format.modifier.into()) {
+		return Err(format!(
+			"GBM allocated a capture buffer ({format:?}, {} planes) that the encoders' Vulkan device cannot import",
+			dmabuf.num_planes()
+		));
+	}
+	Ok(())
+}
+
 impl MoonshineCompositor {
 	/// Whether the live output already has this mode.
 	pub(crate) fn output_mode_matches(&self, width: u32, height: u32, refresh_rate: u32, hdr: bool) -> bool {
@@ -623,6 +639,7 @@ impl MoonshineCompositor {
 				let dmabuf = buffer
 					.export()
 					.map_err(|error| format!("failed to export reconfigured GBM buffer {index}: {error}"))?;
+				require_importable(&self.importable, &dmabuf)?;
 				replacement.push(GbmBufferSlot {
 					dmabuf,
 					consumed: Arc::new(AtomicBool::new(true)),
@@ -679,6 +696,7 @@ impl MoonshineCompositor {
 		render_modifiers: Vec<Modifier>,
 		sdr_render_format: (Fourcc, Vec<Modifier>),
 		hdr_render_format: Option<(Fourcc, Vec<Modifier>)>,
+		importable: crate::gpu::ImportableModifiers,
 		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
@@ -688,7 +706,7 @@ impl MoonshineCompositor {
 		keyboard_config: KeyboardConfig,
 		capture_mode: super::CaptureMode,
 		log_stats: bool,
-	) -> (Self, Display<Self>) {
+	) -> Result<(Self, Display<Self>), String> {
 		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
 		let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
@@ -812,6 +830,7 @@ impl MoonshineCompositor {
 			let dmabuf = buffer
 				.export()
 				.unwrap_or_else(|e| panic!("Failed to export GBM buffer {i}: {e}"));
+			require_importable(&importable, &dmabuf)?;
 			buffer_pool.push(GbmBufferSlot {
 				dmabuf,
 				consumed: Arc::new(AtomicBool::new(true)),
@@ -822,7 +841,7 @@ impl MoonshineCompositor {
 		// Native color descriptions remain available for SDR sessions too.
 		let color_management = Some(super::color_management::ColorManagementState::new(&display_handle, hdr));
 
-		(
+		Ok((
 			Self {
 				display_handle,
 				compositor_state,
@@ -894,6 +913,7 @@ impl MoonshineCompositor {
 				render_modifiers,
 				sdr_render_format,
 				hdr_render_format,
+				importable,
 				buffer_pool,
 				retired_buffer_pools: Vec::new(),
 				next_buffer_index: 0,
@@ -952,7 +972,7 @@ impl MoonshineCompositor {
 				last_scanout_buffer_desc: None,
 			},
 			display,
-		)
+		))
 	}
 
 	/// Render the actual compositor scene in classified stacking order.
@@ -1472,7 +1492,11 @@ impl MoonshineCompositor {
 				Fourcc::Xrgb8888 | Fourcc::Xbgr8888 => true,
 				_ => return Err(()),
 			};
-			if dmabuf.num_planes() != 1 {
+			if dmabuf.num_planes() != 1
+				|| !self
+					.importable
+					.contains(dmabuf.format().code as u32, dmabuf.format().modifier.into())
+			{
 				return Err(());
 			}
 			let layer = super::frame::FrameOverlay {
@@ -2462,10 +2486,13 @@ impl MoonshineCompositor {
 			return false;
 		};
 		let client_dmabuf = client_dmabuf.clone();
-		// Both encoder families sample single-plane RGB formats only; GLES
-		// composition converts anything else.
-		if client_dmabuf.num_planes() != 1 || !super::frame::encoder_samples_fourcc(client_dmabuf.format().code as u32)
-		{
+		// The encoders read single-plane RGB buffers whose modifier their
+		// Vulkan device imports; GLES composition converts anything else.
+		if client_dmabuf.num_planes() != 1
+			|| !self.importable.contains(
+				client_dmabuf.format().code as u32,
+				client_dmabuf.format().modifier.into(),
+			) {
 			if self.log_stats {
 				self.direct_rejections[DirectReject::Format as usize] += 1;
 			}
@@ -3017,7 +3044,27 @@ fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Opt
 
 #[cfg(test)]
 mod tests {
-	use super::select_surface_source_size;
+	use super::{require_importable, select_surface_source_size};
+
+	#[test]
+	fn capture_allocation_rejects_substituted_modifiers_and_extra_planes() {
+		use crate::gpu::ImportableModifiers;
+		use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+		use smithay::backend::allocator::{Fourcc, Modifier};
+		let importable = ImportableModifiers::from_pairs(vec![(Fourcc::Xrgb8888 as u32, 0)]);
+		let buffer = |modifier, planes| {
+			let mut builder = Dmabuf::builder((64, 64), Fourcc::Xrgb8888, modifier, DmabufFlags::empty());
+			for _ in 0..planes {
+				let fd: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+				assert!(builder.add_plane(fd, 0, 256));
+			}
+			builder.build().unwrap()
+		};
+		assert!(require_importable(&importable, &buffer(Modifier::Linear, 1)).is_ok());
+		let substituted = require_importable(&importable, &buffer(Modifier::Invalid, 1)).unwrap_err();
+		assert!(substituted.contains("cannot import"), "{substituted}");
+		assert!(require_importable(&importable, &buffer(Modifier::Linear, 2)).is_err());
+	}
 
 	#[test]
 	fn viewport_destination_wins_over_buffer_size() {

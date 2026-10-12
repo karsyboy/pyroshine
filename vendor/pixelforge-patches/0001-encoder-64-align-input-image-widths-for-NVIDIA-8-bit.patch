@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Mon, 12 Oct 2026 14:29:17 -0400
+Subject: [PATCH] encoder: 64-align input image widths for NVIDIA 8-bit 4:4:4
+
+NVIDIA's encoder (RTX 3080, driver 615.78) reads the chroma plane of 8-bit
+2-plane 4:4:4 inputs (G8_B8R8_2PLANE_444_UNORM) with a row pitch of twice
+the 64-aligned luma pitch, while the image's chroma pitch is the 64-aligned
+doubled width. They differ when width % 64 is 1..=32 (e.g. 1360, 1440,
+2400), and decoded chroma comes out sheared. Create input images 64 texels
+wide-aligned (within maxCodedExtent); pictures keep the coded width through
+the picture resource's codedExtent, and other formats ignore the extra
+columns.
+---
+ src/encoder/codec.rs     | 22 +++++++++++++++++++++-
+ src/encoder/pipeline.rs  |  8 +++++---
+ src/encoder/resources.rs | 13 +++++++++++++
+ 3 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
+index 581c452..e7006cf 100644
+--- a/src/encoder/codec.rs
++++ b/src/encoder/codec.rs
+@@ -490,6 +490,26 @@ pub(crate) fn query_video_caps(
+     })
+ }
+ 
++/// Width of the encoder input images for a coded width.
++///
++/// Pyroshine local change: input images are 64 texels wide-aligned (within
++/// the device maximum) while pictures keep the coded width (the picture
++/// resource's `codedExtent`). NVIDIA's encoder (verified on an RTX 3080,
++/// driver 615.78) reads the chroma plane of 8-bit 2-plane 4:4:4 inputs
++/// (`G8_B8R8_2PLANE_444_UNORM`) with a row pitch of twice the 64-aligned luma
++/// pitch, while the image's real chroma pitch is the 64-aligned doubled width.
++/// The two differ when `width % 64` is 1..=32 (e.g. 1360, 1440, 2400), and the
++/// decoded chroma comes out sheared. With a 64-aligned image width they are
++/// always equal; other formats and implementations ignore the extra columns.
++pub(crate) fn input_image_width(coded_width: u32, max_coded_width: u32) -> u32 {
++    const INPUT_IMAGE_WIDTH_ALIGNMENT: u32 = 64;
++    coded_width
++        .checked_next_multiple_of(INPUT_IMAGE_WIDTH_ALIGNMENT)
++        .unwrap_or(coded_width)
++        .min(max_coded_width)
++        .max(coded_width)
++}
++
+ /// Query capabilities, create the video session, DPB images, command resources,
+ /// the encode pipeline and the GOP structure — the ~85% of encoder
+ /// initialization that is identical across codecs.
+@@ -667,8 +687,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+ 
+     let pipeline = EncodePipeline::new(&PipelineConfig {
+         context,
+-        aligned_width,
+         aligned_height,
++        input_width: input_image_width(aligned_width, capabilities.max_coded_extent.width),
+         picture_format,
+         pixel_format: config.pixel_format,
+         bit_depth: config.bit_depth,
+diff --git a/src/encoder/pipeline.rs b/src/encoder/pipeline.rs
+index 1922c51..c0e2ce2 100644
+--- a/src/encoder/pipeline.rs
++++ b/src/encoder/pipeline.rs
+@@ -202,8 +202,10 @@ pub(crate) struct EncodeSlot {
+ /// Configuration for building an [`EncodePipeline`].
+ pub(crate) struct PipelineConfig<'a> {
+     pub context: &'a VideoContext,
+-    pub aligned_width: u32,
+     pub aligned_height: u32,
++    /// Width of the input images: the coded width, or wider (see
++    /// `input_image_width`). Pictures are still encoded at `aligned_width`.
++    pub input_width: u32,
+     pub picture_format: vk::Format,
+     pub pixel_format: PixelFormat,
+     pub bit_depth: BitDepth,
+@@ -274,7 +276,7 @@ impl EncodePipeline {
+         for &encode_command_buffer in &command_buffers {
+             let (input_image, input_image_memory, input_image_view) = create_image(
+                 context,
+-                config.aligned_width,
++                config.input_width,
+                 config.aligned_height,
+                 config.picture_format,
+                 false,
+@@ -301,7 +303,7 @@ impl EncodePipeline {
+                     fence: config.upload_fence,
+                     queue: context.transfer_queue(),
+                     image: input_image,
+-                    width: config.aligned_width,
++                    width: config.input_width,
+                     height: config.aligned_height,
+                     pixel_format: config.pixel_format,
+                     bit_depth: config.bit_depth,
+diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
+index a44c981..284ada9 100644
+--- a/src/encoder/resources.rs
++++ b/src/encoder/resources.rs
+@@ -1710,6 +1710,19 @@ mod tests {
+         assert_eq!(lcm(7, 7), 7);
+     }
+ 
++    #[test]
++    fn input_images_are_64_aligned_within_the_device_maximum() {
++        use crate::encoder::codec::input_image_width;
++        // Widths whose 8-bit 4:4:4 chroma NVIDIA misread at the coded width.
++        for (coded, input) in [(1360, 1408), (1440, 1472), (2400, 2432), (160, 192)] {
++            assert_eq!(input_image_width(coded, 8192), input);
++        }
++        assert_eq!(input_image_width(1920, 8192), 1920);
++        assert_eq!(input_image_width(4080, 4096), 4096);
++        // Never wider than the device allows, never narrower than coded.
++        assert_eq!(input_image_width(4080, 4080), 4080);
++    }
++
+     #[test]
+     fn test_align_up() {
+         assert_eq!(align_up(130, 64), 192);
+-- 
+2.56.0
+

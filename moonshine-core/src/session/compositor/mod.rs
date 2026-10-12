@@ -413,7 +413,9 @@ fn run_compositor(
 
 	// Resolve against the actual opened device before publishing readiness or
 	// launching an application. Clones retain this GPU across stream epochs.
-	frame_tx.set_context(crate::gpu::capture_context(&render_fd_alloc)?);
+	let capture_context = crate::gpu::capture_context(&render_fd_alloc)?;
+	let importable = crate::gpu::ImportableModifiers::query(&capture_context);
+	frame_tx.set_context(capture_context);
 
 	// Clone the file handle for the EGL display's GBM device.
 	// GbmDevice takes ownership of the file, so we need a separate handle.
@@ -458,11 +460,14 @@ fn run_compositor(
 	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
 	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
 	// GL to incorrectly swap red/blue channels during blit operations.
+	// Capture buffers are rendered by GLES and read by the encoders' Vulkan
+	// device, so only modifiers both support are usable (see
+	// `gpu::ImportableModifiers`).
 	let select_format = |preferred_fourccs: &[Fourcc]| {
 		preferred_fourccs.iter().find_map(|&fourcc| {
 			let modifiers: Vec<Modifier> = render_formats
 				.iter()
-				.filter(|f| f.code == fourcc)
+				.filter(|f| f.code == fourcc && importable.contains(fourcc as u32, u64::from(f.modifier)))
 				.map(|f| f.modifier)
 				.collect();
 			if modifiers.is_empty() {
@@ -473,18 +478,14 @@ fn run_compositor(
 		})
 	};
 	let sdr_render_format = select_format(&[Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888])
-		.or_else(|| {
-			// Fall back to first available format, collecting all its modifiers.
-			let first = render_formats.iter().next()?;
-			let fourcc = first.code;
-			let modifiers: Vec<Modifier> = render_formats
-				.iter()
-				.filter(|f| f.code == fourcc)
-				.map(|f| f.modifier)
-				.collect();
-			Some((fourcc, modifiers))
-		})
-		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
+		.ok_or_else(|| {
+			format!(
+				"No 8-bit RGB DMA-BUF format is both renderable by EGL and importable by Vulkan \
+				 ({} EGL render formats, {} Vulkan-importable format modifiers)",
+				render_formats.iter().count(),
+				importable.len()
+			)
+		})?;
 	let hdr_render_format = config
 		.hdr
 		.then(|| select_format(&[Fourcc::Abgr16161616f, Fourcc::Abgr2101010]))
@@ -582,6 +583,7 @@ fn run_compositor(
 		render_modifiers,
 		sdr_render_format,
 		hdr_render_format,
+		importable,
 		ready_tx,
 		&render_node,
 		hdr,
@@ -591,7 +593,7 @@ fn run_compositor(
 		config.keyboard.clone(),
 		config.capture_mode,
 		context.log_stats,
-	);
+	)?;
 
 	// Insert the Wayland display as a calloop event source so client
 	// messages (including XWayland's protocol handshake) are dispatched

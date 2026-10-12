@@ -115,26 +115,15 @@ const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 /// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
 const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
 
-/// Vulkan format that samples a single-plane DRM fourcc with its channels in
-/// RGBA order (DRM codes name channels from the most significant bits;
-/// Vulkan packed formats likewise, byte formats from the lowest address).
+/// Vulkan format of a source DMA-BUF (see [`crate::gpu::sampled_vk_format`]).
 ///
-/// X-variants share the bit layout of their A-counterparts; the converter
-/// never reads their alpha. vkd3d-proton's swapchain typically allocates
-/// XBGR2101010 (XB30) for HDR and NVIDIA's WSI XBGR16161616F (XB4H) for scRGB;
-/// sampling either as 8-bit BGRA would garble every pixel, so an unknown code
-/// is an error rather than a guess.
+/// vkd3d-proton's swapchain typically allocates XBGR2101010 (XB30) for HDR
+/// and NVIDIA's WSI XBGR16161616F (XB4H) for scRGB; sampling either as 8-bit
+/// BGRA would garble every pixel, so an unknown code is an error rather than
+/// a guess.
 fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
-	match fourcc {
-		0x34324241 | 0x34324258 => Ok(vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
-		0x34325241 | 0x34325258 => Ok(vk::Format::B8G8R8A8_UNORM), // ARGB/XRGB8888
-		0x30334241 | 0x30334258 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR/XBGR2101010
-		0x30335241 | 0x30335258 => Ok(vk::Format::A2R10G10B10_UNORM_PACK32), // ARGB/XRGB2101010
-		0x48344241 | 0x48344258 => Ok(vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
-		_ => Err(format!(
-			"unsupported DRM fourcc 0x{fourcc:08x} for the conventional encoders"
-		)),
-	}
+	crate::gpu::sampled_vk_format(fourcc)
+		.ok_or_else(|| format!("unsupported DRM fourcc 0x{fourcc:08x} for the conventional encoders"))
 }
 
 /// Whether a pixelforge error indicates Vulkan device loss.
@@ -2303,32 +2292,6 @@ mod tests {
 		// NV12 ("NV12") and RGB565 ("RG16") must not be sampled as 8-bit BGRA.
 		for fourcc in [0x3231_564e, 0x3631_4752, 0xDEAD_BEEF] {
 			assert!(drm_fourcc_to_vk(fourcc).is_err(), "0x{fourcc:08x}");
-		}
-	}
-
-	/// The compositor directly exports exactly the formats this mapping
-	/// samples, so a direct-exported frame can never fail its import format.
-	#[test]
-	fn direct_export_formats_are_exactly_the_sampled_formats() {
-		use crate::session::compositor::frame::encoder_samples_fourcc;
-		let known = [
-			ABGR8888,
-			XBGR8888,
-			ARGB8888,
-			XRGB8888,
-			ABGR2101010,
-			XBGR2101010,
-			ARGB2101010,
-			XRGB2101010,
-			ABGR16161616F,
-			XBGR16161616F,
-		];
-		for fourcc in known.into_iter().chain([0x3231_564e, 0x3631_4752, 0x3432_4752]) {
-			assert_eq!(
-				encoder_samples_fourcc(fourcc),
-				drm_fourcc_to_vk(fourcc).is_ok(),
-				"0x{fourcc:08x}"
-			);
 		}
 	}
 

@@ -102,6 +102,123 @@ pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 	Ok(context)
 }
 
+/// Vulkan format that samples a single-plane DRM fourcc with its channels in
+/// RGBA order: the compositor formats both encoder families read directly.
+///
+/// DRM codes name channels from the most significant bits; Vulkan packed
+/// formats likewise, byte formats from the lowest address. X-variants share
+/// the layout of their A-counterparts (the alpha is never read).
+pub(crate) fn sampled_vk_format(fourcc: u32) -> Option<vk::Format> {
+	match fourcc {
+		0x3432_4241 | 0x3432_4258 => Some(vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
+		0x3432_5241 | 0x3432_5258 => Some(vk::Format::B8G8R8A8_UNORM), // ARGB/XRGB8888
+		0x3033_4241 | 0x3033_4258 => Some(vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR/XBGR2101010
+		0x3033_5241 | 0x3033_5258 => Some(vk::Format::A2R10G10B10_UNORM_PACK32), // ARGB/XRGB2101010
+		0x4834_4241 | 0x4834_4258 => Some(vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
+		_ => None,
+	}
+}
+
+/// Every fourcc [`sampled_vk_format`] maps.
+const SAMPLED_FOURCCS: [u32; 10] = [
+	0x3432_4241,
+	0x3432_4258,
+	0x3432_5241,
+	0x3432_5258,
+	0x3033_4241,
+	0x3033_4258,
+	0x3033_5241,
+	0x3033_5258,
+	0x4834_4241,
+	0x4834_4258,
+];
+
+/// Image usage both encoder families request for an imported source.
+const IMPORT_USAGE: vk::ImageUsageFlags =
+	vk::ImageUsageFlags::from_raw(vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw());
+
+/// Single-plane (fourcc, DRM modifier) pairs the capture device imports as a
+/// DMA-BUF image with the encoders' usage.
+///
+/// A GL renderer can render to modifiers the same GPU's Vulkan driver cannot
+/// import: NVIDIA's EGL also offers its compressed block-linear kinds
+/// (`0x0300000000e080xx`) and the implicit `DRM_FORMAT_MOD_INVALID`, which
+/// `vkGetPhysicalDeviceImageFormatProperties2` rejects. PyroWave checks that
+/// before importing and fails on every frame; creating the image anyway (as
+/// NVIDIA tolerates) is invalid usage. Capture buffers, direct exports and
+/// DMA-BUF overlay layers therefore use only pairs listed here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImportableModifiers(Vec<(u32, u64)>);
+
+impl ImportableModifiers {
+	/// Query every sampled format's modifiers on `context`'s physical device.
+	pub(crate) fn query(context: &VideoContext) -> Self {
+		let instance = context.instance();
+		let gpu = context.physical_device();
+		let mut pairs = Vec::new();
+		for fourcc in SAMPLED_FOURCCS {
+			let Some(format) = sampled_vk_format(fourcc) else {
+				continue;
+			};
+			let mut count = vk::DrmFormatModifierPropertiesListEXT::default();
+			let mut properties = vk::FormatProperties2::default().push(&mut count);
+			// SAFETY: plain physical-device query.
+			unsafe { instance.get_physical_device_format_properties2(gpu, format, &mut properties) };
+			let mut modifiers =
+				vec![vk::DrmFormatModifierPropertiesEXT::default(); count.drm_format_modifier_count as usize];
+			let mut list =
+				vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut modifiers);
+			let mut properties = vk::FormatProperties2::default().push(&mut list);
+			// SAFETY: as above, with an array of the reported size.
+			unsafe { instance.get_physical_device_format_properties2(gpu, format, &mut properties) };
+			let required = vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_SRC;
+			for modifier in modifiers.iter().filter(|m| {
+				m.drm_format_modifier_plane_count == 1 && m.drm_format_modifier_tiling_features.contains(required)
+			}) {
+				let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+					.drm_format_modifier(modifier.drm_format_modifier)
+					.sharing_mode(vk::SharingMode::EXCLUSIVE);
+				let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+					.handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+				let info = vk::PhysicalDeviceImageFormatInfo2::default()
+					.format(format)
+					.ty(vk::ImageType::TYPE_2D)
+					.tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+					.usage(IMPORT_USAGE)
+					.push(&mut external_info)
+					.push(&mut modifier_info);
+				let mut external = vk::ExternalImageFormatProperties::default();
+				let mut result = vk::ImageFormatProperties2::default().push(&mut external);
+				// SAFETY: valid input and output chains that live for the call.
+				let supported =
+					unsafe { instance.get_physical_device_image_format_properties2(gpu, &info, &mut result) };
+				if supported.is_ok()
+					&& external
+						.external_memory_properties
+						.external_memory_features
+						.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+				{
+					pairs.push((fourcc, modifier.drm_format_modifier));
+				}
+			}
+		}
+		Self(pairs)
+	}
+
+	pub(crate) fn contains(&self, fourcc: u32, modifier: u64) -> bool {
+		self.0.contains(&(fourcc, modifier))
+	}
+
+	pub(crate) fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn from_pairs(pairs: Vec<(u32, u64)>) -> Self {
+		Self(pairs)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -130,6 +247,26 @@ mod tests {
 		assert_eq!(parse_pci("not-pci"), None);
 		assert_eq!(parse_pci("0000:03:00.g"), None);
 	}
+	#[test]
+	fn every_sampled_fourcc_maps_and_others_are_rejected() {
+		for fourcc in SAMPLED_FOURCCS {
+			assert!(sampled_vk_format(fourcc).is_some(), "0x{fourcc:08x}");
+		}
+		// NV12 and RGB565 are never sampled as RGB.
+		assert_eq!(sampled_vk_format(0x3231_564e), None);
+		assert_eq!(sampled_vk_format(0x3631_4752), None);
+	}
+
+	#[test]
+	fn importable_modifiers_match_format_and_modifier_exactly() {
+		let importable = ImportableModifiers::from_pairs(vec![(0x3432_4241, 0x0300_0000_0060_6010)]);
+		assert!(importable.contains(0x3432_4241, 0x0300_0000_0060_6010));
+		// NVIDIA's EGL-only compressed kind and the implicit modifier.
+		assert!(!importable.contains(0x3432_4241, 0x0300_0000_00e0_8014));
+		assert!(!importable.contains(0x3432_4241, 0x00ff_ffff_ffff_ffff));
+		assert!(!importable.contains(0x3432_5258, 0x0300_0000_0060_6010));
+	}
+
 	#[test]
 	fn regular_files_cannot_masquerade_as_render_nodes() {
 		let file = tempfile::tempfile().unwrap();

@@ -20,7 +20,8 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 | `pyroshine-ui/` (separate workspace) | `pyroshine-ui` | Optional desktop app: tray, notifications, pairing, settings and dashboard |
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
-(Vulkan Video encoding), the optional PyroWave shared library (loaded at
+(Vulkan Video encoding, vendored at its upstream release plus the patches in
+`vendor/pixelforge-patches/`), the optional PyroWave shared library (loaded at
 runtime), the vendored Inputtino native backend (virtual input devices), and
 systemd/logind over D-Bus. Internal crate names, paths, environment variables
 and protocol identifiers keep the upstream `moonshine` spelling.

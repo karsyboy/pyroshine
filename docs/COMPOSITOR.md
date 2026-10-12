@@ -14,6 +14,19 @@ is separately generation-tagged; see [capture admission](PIPELINE_OPTIMIZATION.m
 Service buffer releases and input even when capture is blocked or the scene is
 clean. [Architecture](ARCHITECTURE.md) explains session and stream ownership.
 
+Capture buffers are rendered by GLES and read in place by the encoders' Vulkan
+device, so they are allocated only with DRM modifiers both support:
+`gpu::ImportableModifiers` lists the (format, modifier) pairs the capture device
+imports as a DMA-BUF for sampling, and the compositor intersects its EGL render
+modifiers with that set for the SDR and HDR pools. A GPU's EGL can render to
+modifiers its Vulkan driver cannot import (NVIDIA's compressed block-linear
+kinds and the implicit modifier); PyroWave rejects those on every frame. Direct
+export and DMA-BUF overlay layers apply the same check to client buffers and
+composite anything else (`direct_reject_format`).
+The initial pool and resolution/HDR reconfiguration also check the actual
+exported buffers, since GBM can substitute an unrequested modifier. An
+unsupported allocation fails setup before any frames use it.
+
 The implementation is under `moonshine-core/src/session/`: event loop, state
 and protocol handlers in `compositor/{mod,state,handlers}.rs`, capture and
 eligibility in `compositor/{capture,admission,frame}.rs`, cursor in

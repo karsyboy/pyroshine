@@ -1,0 +1,25 @@
+[package]
+name = "pixelforge"
+version = "0.9.1"
+edition = "2024"
+description = "A Vulkan-based video encoding library for Rust"
+license = "BSD-2-Clause"
+repository = "https://github.com/hgaiser/pixelforge"
+keywords = ["vulkan", "video", "encoding", "h264", "h265"]
+categories = ["multimedia::video", "graphics"]
+readme = "README.md"
+
+[features]
+default = []
+dmabuf = []
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649", features = ["loaded"] }
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
+env_logger = "0.11"
+pollster = "1.0"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
