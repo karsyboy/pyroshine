@@ -23,6 +23,18 @@ modifiers its Vulkan driver cannot import (NVIDIA's compressed block-linear
 kinds and the implicit modifier); PyroWave rejects those on every frame. Direct
 export and DMA-BUF overlay layers apply the same check to client buffers and
 composite anything else (`direct_reject_format`).
+
+Clients choose their buffer formats from the `wp_linux_dmabuf_v1` feedback.
+It lists every format EGL can sample, with the pairs in `ImportableModifiers`
+first, in a preference tranche flagged `scanout`. Without that preference,
+NVIDIA's allocators choose the compressed block-linear modifier
+(`0x0300000000e08014`), so Vulkan and Xwayland clients were composited on every
+frame while only native Wayland GL was exported directly. The `scanout` flag is
+what reaches X11 games: Xwayland reports only scanout tranches to DRI3 clients
+as the window's modifiers, and a sampling-only preference changes only native
+Wayland clients. Direct export is this compositor's scanout, since the encoder
+reads the buffer unchanged.
+
 The initial pool and resolution/HDR reconfiguration also check the actual
 exported buffers, since GBM can substitute an unrequested modifier. An
 unsupported allocation fails setup before any frames use it.

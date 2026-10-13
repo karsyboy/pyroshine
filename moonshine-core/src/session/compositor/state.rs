@@ -580,6 +580,53 @@ impl ClientData for ClientState {
 	}
 }
 
+/// The `wp_linux_dmabuf_v1` feedback: every format EGL can sample, with the
+/// ones the encoders can also import directly (see [`directly_exportable`])
+/// first, in a preference tranche.
+///
+/// Without the preference, a client may choose any EGL format. NVIDIA's
+/// allocators choose a compressed block-linear modifier (`0x0300000000e08014`)
+/// that NVIDIA's Vulkan driver cannot import, so every frame of such a client
+/// is composited (`DirectReject::Format`): measured on an RTX 3080, about
+/// 1.4 ms of capture delay and 0.25 ms of compositor GPU time per 720p frame.
+///
+/// The tranche is flagged `scanout` because direct export is this
+/// compositor's scanout: the buffer goes to the encoder unchanged. The flag
+/// also matters for X11 games: Xwayland reports only scanout tranches to DRI3
+/// clients as the window's modifiers, so a sampling-only preference reaches
+/// native Wayland clients but not Xwayland ones (GL or Vulkan, including
+/// Proton/DXVK). The other formats stay available after it, and a buffer the
+/// encoders cannot import is still composited.
+fn dmabuf_feedback(
+	render_node: libc::dev_t,
+	formats: &smithay::backend::allocator::format::FormatSet,
+	importable: &crate::gpu::ImportableModifiers,
+) -> std::io::Result<dmabuf::DmabufFeedback> {
+	use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
+	let preferred = directly_exportable(formats.iter().copied(), importable);
+	tracing::debug!(
+		preferred = preferred.len(),
+		total = formats.iter().count(),
+		"DMA-BUF feedback prefers formats the encoders import"
+	);
+	let mut feedback = DmabufFeedbackBuilder::new(render_node, formats.iter().copied());
+	if !preferred.is_empty() {
+		feedback = feedback.add_preference_tranche(render_node, TrancheFlags::Scanout, preferred, 3..=6);
+	}
+	feedback.build()
+}
+
+/// The `formats` the encoders' Vulkan device imports, in their order.
+fn directly_exportable(
+	formats: impl IntoIterator<Item = smithay::backend::allocator::Format>,
+	importable: &crate::gpu::ImportableModifiers,
+) -> Vec<smithay::backend::allocator::Format> {
+	formats
+		.into_iter()
+		.filter(|format| importable.contains(format.code as u32, u64::from(format.modifier)))
+		.collect()
+}
+
 /// GBM may substitute a modifier it was not asked for (NVIDIA's GBM answers a
 /// linear-only request with an implicit-modifier buffer). The encoders cannot
 /// import such a capture buffer, so reject setup before publishing any frames.
@@ -806,9 +853,8 @@ impl MoonshineCompositor {
 				m.rdev()
 			})
 			.expect("Failed to get render node device id");
-		let default_feedback = DmabufFeedbackBuilder::new(render_node_dev, dmabuf_formats.clone())
-			.build()
-			.expect("Failed to build DmabufFeedback");
+		let default_feedback =
+			dmabuf_feedback(render_node_dev, &dmabuf_formats, &importable).expect("Failed to build DmabufFeedback");
 
 		let mut dmabuf_state = DmabufState::new();
 		let dmabuf_global =
@@ -3047,7 +3093,44 @@ fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Opt
 
 #[cfg(test)]
 mod tests {
-	use super::{require_importable, select_surface_source_size};
+	use super::{directly_exportable, require_importable, select_surface_source_size};
+
+	/// Found on an RTX 3080 (2026-10-13): clients picked NVIDIA's compressed
+	/// block-linear modifier, which EGL renders but Vulkan cannot import, and
+	/// were composited every frame. Only importable pairs are preferred.
+	#[test]
+	fn only_formats_the_encoders_import_are_preferred() {
+		use crate::gpu::ImportableModifiers;
+		use smithay::backend::allocator::{Format, Fourcc, Modifier};
+		const COMPRESSED_BLOCK_LINEAR: u64 = 0x0300_0000_00e0_8014;
+		const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6014;
+		let format = |code, modifier: u64| Format {
+			code,
+			modifier: Modifier::from(modifier),
+		};
+		let egl = [
+			format(Fourcc::Xrgb8888, COMPRESSED_BLOCK_LINEAR),
+			format(Fourcc::Xrgb8888, BLOCK_LINEAR),
+			format(Fourcc::Xrgb8888, u64::from(Modifier::Linear)),
+			format(Fourcc::Abgr2101010, COMPRESSED_BLOCK_LINEAR),
+			format(Fourcc::Abgr2101010, BLOCK_LINEAR),
+			format(Fourcc::Nv12, u64::from(Modifier::Linear)),
+		];
+		let importable = ImportableModifiers::from_pairs(vec![
+			(Fourcc::Xrgb8888 as u32, BLOCK_LINEAR),
+			(Fourcc::Xrgb8888 as u32, u64::from(Modifier::Linear)),
+			(Fourcc::Abgr2101010 as u32, BLOCK_LINEAR),
+		]);
+		assert_eq!(
+			directly_exportable(egl, &importable),
+			[
+				format(Fourcc::Xrgb8888, BLOCK_LINEAR),
+				format(Fourcc::Xrgb8888, u64::from(Modifier::Linear)),
+				format(Fourcc::Abgr2101010, BLOCK_LINEAR),
+			]
+		);
+		assert!(directly_exportable(egl, &ImportableModifiers::default()).is_empty());
+	}
 
 	#[test]
 	fn capture_allocation_rejects_substituted_modifiers_and_extra_planes() {
