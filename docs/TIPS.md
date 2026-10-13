@@ -9,6 +9,7 @@ If journal access is denied, prefix `journalctl` with `sudo`.
 | Host missing or connection fails | [Check address and firewall](#host-not-found-or-connection-fails). |
 | Server fails to start | Read `journalctl -u "pyroshine@$USER" -b -n 100 --no-pager`, then [check the host](#healthcheck-fails). |
 | Pairing does not finish | [Use a fresh request and correct approval URL](#pairing-does-not-complete). |
+| Launch or stream fails with an error | Read the client's error message, then **Diagnostics → Recent problems** in the desktop app; [details](#read-why-a-launch-or-stream-failed). |
 | Steam opens locally / client reports 503 | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
 | Steam or games missing / cannot launch | [Check default applications](#steam-or-games-are-missing). |
 | Keyboard, mouse or gamepad unavailable | [Check input access](#keyboard-mouse-or-gamepads-do-not-work). |
@@ -54,17 +55,20 @@ sudo systemctl start "pyroshine@$USER"
 | Ports in use | If the server is stopped, inspect `sudo ss -lntup` for another listener (for example Sunshine/Moonshine). Stop the conflicting service or configure distinct ports; do not run two servers on the defaults. |
 | Render nodes / GPU / EGL / Vulkan / DMA-BUF / Codecs | Install the current hardware driver for your GPU using your distribution's instructions, then repeat the check. A GPU name alone does not guarantee the required capabilities. No usable encode profile or DMA-BUF support means this host cannot stream with the current setup. |
 | Render access denied | Inspect `ls -l /dev/dri/renderD*` and the group named in the check. Give the streaming user that device group's access, then log out/in (reboot if the headless user manager retains old groups). Do not use world-writable device permissions. |
+| Color conversion warning/failure | The GPU converted the check pattern to the listed format with wrong colors, so those profiles are not offered (streams would show wrong colors). This is a Pyroshine or driver bug, not a setting: report it with the check output or **Copy diagnostics**. Meanwhile use the profiles the check still lists, or PyroWave. |
 | Capture/Vulkan device mismatch | The capture and encoder must use the same physical GPU. Follow [GPU selection](CONFIGURATION.md#compositor), using the identities in the error. There is no cross-GPU copy fallback. |
 | Runtime dir / waiting for D-Bus | Use a regular desktop login or enable [lingering](INSTALLATION.md#headless-setup); the packaged wrapper sets the runtime/bus paths. Do not run the server as root. |
 | kcmp(2) blocked/unavailable | Run on the host outside a restrictive sandbox, or correct the kernel/seccomp restriction described in the error. It is required for buffer validation. |
 | PyroWave unavailable | Optional if a conventional codec passes; use H.264/HEVC/AV1. For PyroWave, keep the package's matching library and compatible Pyrolight client; see [PyroWave](PYROWAVE.md). |
-| Sleep inhibit warning | The native/portable service grants the `pyroshine` group; a direct terminal check may lack it. See [sleep inhibition](#prevent-the-host-from-suspending-while-streaming) rather than following the check's inherited `moonshine` group hint. NixOS uses `moonshine`. |
+| Sleep inhibit warning | The native/portable service grants the `pyroshine` group; a direct terminal check may lack it. See [sleep inhibition](#prevent-the-host-from-suspending-while-streaming). NixOS uses `moonshine`. |
 | input group warning | Needed for gamepads when logged out; follow [headless setup](INSTALLATION.md#headless-setup). Not required with working active-seat ACLs. |
 
 Passing the standalone check verifies host prerequisites; it does not test an
 actual client, game or stream. Startup runs its own check before listening.
-Read the latest startup log or the GUI's **Diagnostics** while the server is
-running instead of repeating the port-binding check.
+While the server runs, use **Run checks** on the GUI's **Diagnostics** page
+instead: it repeats the checks without stopping the server, treats the server's
+own listeners as in use by it, and repeats the GPU probes only while no session
+streams. Each failed check shows what to change.
 
 ## Pairing does not complete
 
@@ -285,6 +289,28 @@ changing it. Use this setting rather than nested `kscreen-doctor` changes or
 This starts an already-authenticated user's desktop. A display manager/login
 screen cannot run as a streamed application; keep host logins managed by the
 system display manager.
+
+## Read why a launch or stream failed
+
+Pyroshine reports the cause of a failure where you can see it:
+
+- **Launch failures** (missing command, failed hook, an application that exits
+  right away, a port held by another program) are returned to the client, which
+  shows them in its error dialog, for example *The application command 'heroic'
+  was not found*. An application that exits during launch names its exit status
+  or signal.
+- **Rejected stream settings** (a codec, 4:4:4 or HDR combination the GPU did not
+  pass at startup, invalid audio settings) reach Moonlight only as an RTSP error
+  code. The desktop app's **Diagnostics → Recent problems** lists the exact
+  request and the profiles that work.
+- **Sessions that end unexpectedly** show the cause on the dashboard: the
+  application's exit status or signal and how long after launch it ended, or
+  the encoder failure that stopped the stream.
+
+The desktop app also notifies about these when its window is closed.
+**Copy diagnostics** on the Diagnostics page copies the host checks, session,
+latest stream statistics and recent problems as one JSON report for a bug report;
+it contains no keys, PINs or certificates.
 
 ## Debug a failing application
 

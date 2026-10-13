@@ -14,10 +14,13 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use moonshine_management::dto::{CaptureStats, StageStats, StreamStats};
+use moonshine_management::dto::{CapturePathStats, CaptureStats, CompositionReason, StageStats, StreamStats};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 use tokio::sync::watch;
 
+use super::findings::{self, StreamTarget};
+use crate::session::compositor::DirectReject;
+use crate::session::compositor::frame::CapturePath;
 use crate::session::stream::video::FrameStats;
 
 /// How often buffered samples are read. The channel holds 256 frames, enough
@@ -111,6 +114,10 @@ pub(crate) struct StatsWindow {
 	interval_steps: u64,
 	/// Frame time of the previous new frame; carried across windows.
 	last_interval: Option<f64>,
+	/// Frames per [`CapturePath`]: direct, direct with late layers, composited.
+	path_frames: [u64; 3],
+	/// Composited frames per [`DirectReject`].
+	composition_reasons: [u64; DirectReject::COUNT],
 }
 
 impl StatsWindow {
@@ -134,6 +141,8 @@ impl StatsWindow {
 			uneven_steps: 0,
 			interval_steps: 0,
 			last_interval: None,
+			path_frames: [0; 3],
+			composition_reasons: [0; DirectReject::COUNT],
 		}
 	}
 
@@ -151,6 +160,15 @@ impl StatsWindow {
 		}
 		self.captured_frames += 1;
 		self.vrr_frames += u64::from(stats.vrr_capture);
+		let origin = stats.capture_origin;
+		self.path_frames[match origin.path {
+			CapturePath::Direct => 0,
+			CapturePath::DirectLate => 1,
+			CapturePath::Composited => 2,
+		}] += 1;
+		if let Some(reason) = origin.composition_reason {
+			self.composition_reasons[reason as usize] += 1;
+		}
 		self.content_ages.push(stats.content_age.as_secs_f64() * 1e6);
 		// Replays and the first frame of an epoch have no frame time.
 		if !stats.source_interval.is_zero() {
@@ -217,10 +235,39 @@ impl StatsWindow {
 			},
 			content_age_p50_us: percentile(&self.content_ages, 0.5),
 			content_age_p95_us: percentile(&self.content_ages, 0.95),
+			path: Some(self.path_stats()),
 		};
 		self.intervals.clear();
 		self.content_ages.clear();
 		Some(stats)
+	}
+
+	fn path_stats(&self) -> CapturePathStats {
+		let [direct, late, composited] = self.path_frames;
+		let current = match (direct, late, composited) {
+			(_, 0, 0) => "direct",
+			(0, _, 0) => "direct_late",
+			(0, 0, _) => "composited",
+			_ => "mixed",
+		};
+		let mut composition_reasons: Vec<CompositionReason> = DirectReject::ALL
+			.iter()
+			.filter(|reason| self.composition_reasons[**reason as usize] != 0)
+			.map(|reason| CompositionReason {
+				id: reason.id().into(),
+				label: reason.label().into(),
+				hint: reason.hint().map(Into::into),
+				frames: self.composition_reasons[*reason as usize],
+			})
+			.collect();
+		composition_reasons.sort_by_key(|reason| std::cmp::Reverse(reason.frames));
+		CapturePathStats {
+			current: current.into(),
+			direct_frames: direct,
+			direct_late_frames: late,
+			composited_frames: composited,
+			composition_reasons,
+		}
 	}
 
 	/// Samples overwritten before they were read. They are still frames the
@@ -235,7 +282,7 @@ impl StatsWindow {
 	}
 
 	/// Summarize the window and start the next one.
-	pub(crate) fn finish(&mut self, now: Instant, epoch: u64) -> StreamStats {
+	pub(crate) fn finish(&mut self, now: Instant, epoch: u64, target: &StreamTarget) -> StreamStats {
 		let window = self.elapsed(now).max(Duration::from_millis(1));
 		let seconds = window.as_secs_f64();
 		let sampled = self.frames - self.samples_dropped;
@@ -269,7 +316,7 @@ impl StatsWindow {
 			})
 			.collect();
 		let capture = self.finish_capture();
-		let stats = StreamStats {
+		let mut stats = StreamStats {
 			epoch,
 			at_ms: unix_millis(SystemTime::now()),
 			window_ms: window.as_millis() as u64,
@@ -287,7 +334,9 @@ impl StatsWindow {
 			samples_dropped: self.samples_dropped,
 			stages,
 			capture,
+			findings: Vec::new(),
 		};
+		stats.findings = findings::analyze(&stats, target);
 		let buffers = std::mem::take(&mut self.stage_micros);
 		let intervals = std::mem::take(&mut self.intervals);
 		let content_ages = std::mem::take(&mut self.content_ages);
@@ -315,6 +364,7 @@ pub(crate) fn unix_millis(time: SystemTime) -> u64 {
 pub(crate) async fn aggregate(
 	mut receiver: broadcast::Receiver<FrameStats>,
 	epoch: u64,
+	target: StreamTarget,
 	mut active: watch::Receiver<bool>,
 	latest: &watch::Sender<Option<StreamStats>>,
 	mut publish: impl FnMut(&StreamStats),
@@ -343,7 +393,7 @@ pub(crate) async fn aggregate(
 		}
 		let now = Instant::now();
 		if window.elapsed(now) >= WINDOW {
-			let stats = window.finish(now, epoch);
+			let stats = window.finish(now, epoch, &target);
 			publish(&stats);
 			latest.send_replace(Some(stats));
 		}
@@ -354,6 +404,11 @@ pub(crate) async fn aggregate(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const TARGET: StreamTarget = StreamTarget {
+		fps: 60,
+		bitrate_bps: 20_000_000,
+	};
 
 	fn frame(encoded: usize, wire: usize, encode_us: u64, key: bool) -> FrameStats {
 		FrameStats {
@@ -378,6 +433,7 @@ mod tests {
 			source_interval: Duration::from_micros(8_333),
 			content_age: Duration::from_micros(40),
 			vrr_capture: false,
+			capture_origin: Default::default(),
 		}
 	}
 
@@ -399,7 +455,10 @@ mod tests {
 		replay.source_interval = Duration::ZERO;
 		replay.content_age = Duration::ZERO;
 		window.record(&replay);
-		let capture = window.finish(start + Duration::from_secs(1), 1).capture.unwrap();
+		let capture = window
+			.finish(start + Duration::from_secs(1), 1, &TARGET)
+			.capture
+			.unwrap();
 		assert_eq!(capture.pacing, "vrr");
 		assert!((capture.source_fps - 100.0).abs() < 1e-6, "{}", capture.source_fps);
 		assert!((capture.interval_stddev_us - 3_000.0).abs() < 1e-6);
@@ -414,13 +473,21 @@ mod tests {
 			stats.source_interval = Duration::from_millis(13);
 			window.record(&stats);
 		}
-		let capture = window.finish(start + Duration::from_secs(2), 1).capture.unwrap();
+		let capture = window
+			.finish(start + Duration::from_secs(2), 1, &TARGET)
+			.capture
+			.unwrap();
 		assert_eq!(capture.pacing, "mixed");
 		// Only the step from the previous window's last 13 ms frame is compared.
 		assert_eq!(capture.uneven_percent, 0.0);
 		assert_eq!(capture.interval_p50_us, 13_000.0);
 
-		assert!(window.finish(start + Duration::from_secs(3), 1).capture.is_none());
+		assert!(
+			window
+				.finish(start + Duration::from_secs(3), 1, &TARGET)
+				.capture
+				.is_none()
+		);
 	}
 
 	#[test]
@@ -430,7 +497,7 @@ mod tests {
 		for index in 0..100u64 {
 			window.record(&frame(10_000, 12_000, 1_000 + index * 10, index == 0));
 		}
-		let stats = window.finish(start + Duration::from_secs(1), 7);
+		let stats = window.finish(start + Duration::from_secs(1), 7, &TARGET);
 		assert_eq!(stats.epoch, 7);
 		assert_eq!(stats.frames, 100);
 		assert!((stats.fps - 100.0).abs() < 1e-9);
@@ -451,7 +518,7 @@ mod tests {
 		assert!((encode.max_us - 1_990.0).abs() < 1e-6);
 
 		// The next window starts empty and reuses its buffers.
-		let next = window.finish(start + Duration::from_secs(2), 7);
+		let next = window.finish(start + Duration::from_secs(2), 7, &TARGET);
 		assert_eq!(next.frames, 0);
 		assert!(next.stages.is_empty());
 		assert!(next.transport_overhead_percent.is_none());
@@ -465,7 +532,7 @@ mod tests {
 			window.record(&frame(10_000, 10_000, 1_000, false));
 		}
 		window.lagged(50);
-		let stats = window.finish(start + Duration::from_secs(1), 1);
+		let stats = window.finish(start + Duration::from_secs(1), 1, &TARGET);
 		assert_eq!(stats.frames, 100);
 		assert_eq!(stats.samples_dropped, 50);
 		assert!((stats.encoded_bitrate_bps - 8_000_000.0).abs() < 1e-3);
@@ -489,7 +556,7 @@ mod tests {
 		let (active_tx, active) = watch::channel(true);
 		let (latest, mut latest_rx) = watch::channel(None);
 		let task = tokio::spawn(async move {
-			aggregate(receiver, 3, active, &latest, |_| {}).await;
+			aggregate(receiver, 3, TARGET, active, &latest, |_| {}).await;
 		});
 		tokio::time::timeout(Duration::from_secs(5), latest_rx.wait_for(Option::is_some))
 			.await
@@ -504,5 +571,61 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		assert!(latest_rx.borrow().is_none(), "stopping clears the last summary");
+	}
+
+	/// Each frame's capture path is counted, and composition reasons are
+	/// listed most frequent first with their operator text.
+	#[test]
+	fn capture_paths_and_composition_reasons_are_counted() {
+		use crate::session::compositor::frame::CaptureOrigin;
+		let start = Instant::now();
+		let mut window = StatsWindow::new(start);
+		let origin = |path, reason| CaptureOrigin {
+			path,
+			composition_reason: reason,
+		};
+		let frames = [
+			origin(CapturePath::Direct, None),
+			origin(CapturePath::DirectLate, None),
+			origin(CapturePath::Composited, Some(DirectReject::Overlay)),
+			origin(CapturePath::Composited, Some(DirectReject::Scaling)),
+			origin(CapturePath::Composited, Some(DirectReject::Scaling)),
+		];
+		for capture_origin in frames {
+			let mut stats = frame(100, 120, 1000, false);
+			stats.capture_origin = capture_origin;
+			window.record(&stats);
+		}
+		let path = window
+			.finish(start + Duration::from_secs(1), 1, &TARGET)
+			.capture
+			.unwrap()
+			.path
+			.unwrap();
+		assert_eq!(path.current, "mixed");
+		assert_eq!(
+			(path.direct_frames, path.direct_late_frames, path.composited_frames),
+			(1, 1, 3)
+		);
+		let reasons: Vec<_> = path
+			.composition_reasons
+			.iter()
+			.map(|reason| (reason.id.as_str(), reason.frames))
+			.collect();
+		assert_eq!(reasons, [("scaling", 2), ("steam_overlay", 1)]);
+		assert!(path.composition_reasons[0].hint.is_some());
+
+		// The next window starts empty and reports a single path by name.
+		let mut stats = frame(100, 120, 1000, false);
+		stats.capture_origin = origin(CapturePath::Direct, None);
+		window.record(&stats);
+		let path = window
+			.finish(start + Duration::from_secs(2), 1, &TARGET)
+			.capture
+			.unwrap()
+			.path
+			.unwrap();
+		assert_eq!((path.current.as_str(), path.direct_frames), ("direct", 1));
+		assert!(path.composition_reasons.is_empty());
 	}
 }

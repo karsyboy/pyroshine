@@ -57,9 +57,12 @@ pub(super) struct SceneExtras {
 
 /// First blocking reason in deterministic scene order. One counter increment
 /// per attempted capture; no strings, allocations, or atomics in classification.
+/// The first condition that kept a frame from direct DMA-BUF export, so it
+/// was composited. Counted per reason in diagnostics and reported per frame
+/// to management telemetry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
-pub(super) enum DirectReject {
+pub(crate) enum DirectReject {
 	ForcedComposition,
 	Cursor,
 	Overlay,
@@ -82,6 +85,99 @@ pub(super) enum DirectReject {
 }
 impl DirectReject {
 	pub const COUNT: usize = 18;
+	/// Every reason, indexed by its discriminant.
+	pub const ALL: [Self; Self::COUNT] = {
+		use DirectReject::*;
+		[
+			ForcedComposition,
+			Cursor,
+			Overlay,
+			Notification,
+			ExternalOverlay,
+			Dropdown,
+			Decoration,
+			Scaling,
+			FractionalScale,
+			OutputOrigin,
+			NotOpaque,
+			SurfaceTree,
+			Transform,
+			Crop,
+			Size,
+			NoSurface,
+			NotDmabuf,
+			Format,
+		]
+	};
+
+	/// Stable identifier for the management interface.
+	pub(crate) fn id(self) -> &'static str {
+		use DirectReject::*;
+		match self {
+			ForcedComposition => "forced_composition",
+			Cursor => "cursor",
+			Overlay => "steam_overlay",
+			Notification => "notification",
+			ExternalOverlay => "external_overlay",
+			Dropdown => "popup",
+			Decoration => "decoration",
+			Scaling => "scaling",
+			FractionalScale => "fractional_scale",
+			OutputOrigin => "window_offset",
+			NotOpaque => "transparent",
+			SurfaceTree => "subsurfaces",
+			Transform => "transform",
+			Crop => "crop",
+			Size => "size_mismatch",
+			NoSurface => "no_window",
+			NotDmabuf => "shared_memory",
+			Format => "pixel_format",
+		}
+	}
+
+	/// What the operator sees, for example on the dashboard.
+	pub(crate) fn label(self) -> &'static str {
+		use DirectReject::*;
+		match self {
+			ForcedComposition => "Composition is forced by the configuration",
+			Cursor => "A cursor the encoder cannot draw itself is visible",
+			Overlay => "The Steam overlay is open",
+			Notification => "A Steam notification is visible",
+			ExternalOverlay => "An overlay window is visible",
+			Dropdown => "A menu or popup is open",
+			Decoration => "The window has decorations",
+			Scaling => "The game renders at a different resolution than the stream",
+			FractionalScale => "The output uses a fractional scale",
+			OutputOrigin => "The game window is not at the screen origin",
+			NotOpaque => "The game window is not opaque",
+			SurfaceTree => "The game window has several surfaces",
+			Transform => "The game window is rotated or flipped",
+			Crop => "The game window's content is cropped",
+			Size => "The game's buffer size differs from the stream",
+			NoSurface => "No application window is shown",
+			NotDmabuf => "The application draws with CPU buffers",
+			Format => "The application's pixel format needs conversion",
+		}
+	}
+
+	/// What the operator can change to allow direct export, where a setting
+	/// or habit decides it. Transient scene content (menus, overlays) has none.
+	pub(crate) fn hint(self) -> Option<&'static str> {
+		use DirectReject::*;
+		Some(match self {
+			ForcedComposition => "Set compositor.capture_mode to \"auto\" in the configuration to allow direct export.",
+			Scaling | Size | OutputOrigin => {
+				"Run the game fullscreen at the stream's resolution so its frames can be exported without scaling."
+			},
+			FractionalScale => "Remove output_scale from the application entry, or use a whole-number scale.",
+			Decoration => "Run the game fullscreen or borderless.",
+			NotDmabuf => {
+				"Software-rendered and many 2D applications draw with CPU buffers; composition is required for them."
+			},
+			Format => "Video players and some games present YUV or other formats that must be converted.",
+			_ => return None,
+		})
+	}
 }
 
 impl SceneExtras {
@@ -314,6 +410,16 @@ mod tests {
 			.requires_composition(CaptureMode::Auto)
 		);
 	}
+	#[test]
+	fn every_rejection_has_a_stable_id_at_its_index() {
+		let mut ids = std::collections::HashSet::new();
+		for (index, reason) in DirectReject::ALL.iter().enumerate() {
+			assert_eq!(*reason as usize, index);
+			assert!(ids.insert(reason.id()), "duplicate id {}", reason.id());
+			assert!(!reason.label().is_empty());
+		}
+	}
+
 	#[test]
 	fn direct_rejections_classify_scene_and_surface_requirements() {
 		let scene = SceneExtras {

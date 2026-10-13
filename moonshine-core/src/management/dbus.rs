@@ -70,7 +70,7 @@ impl ManagementInterface {
 		#[zbus(header)] header: Header<'_>,
 	) -> Result<String, ManagementError> {
 		authorize(connection, &header).await?;
-		Ok(json(&self.management.server))
+		Ok(json(&self.management.server()))
 	}
 
 	async fn get_session(
@@ -294,6 +294,40 @@ impl ManagementInterface {
 		Ok(json(&*self.management.stats.borrow()))
 	}
 
+	async fn get_events(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<String, ManagementError> {
+		authorize(connection, &header).await?;
+		Ok(json(&self.management.events()))
+	}
+
+	/// Re-run the host checks (see `healthcheck::recheck_in_server`) and
+	/// publish the result with `HealthChanged`.
+	async fn run_health_check(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+		#[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+	) -> Result<String, ManagementError> {
+		authorize(connection, &header).await?;
+		let management = self.management.clone();
+		let report = on_runtime(&self.management, async move { Ok(management.run_health_check().await) }).await?;
+		let report = json(&report);
+		let _ = Self::health_changed(&emitter, &report).await;
+		Ok(report)
+	}
+
+	async fn get_diagnostic_report(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<String, ManagementError> {
+		authorize(connection, &header).await?;
+		Ok(json(&self.management.diagnostic_report()))
+	}
+
 	#[zbus(signal)]
 	pub(super) async fn session_changed(emitter: &SignalEmitter<'_>, snapshot: &str) -> zbus::Result<()>;
 	#[zbus(signal)]
@@ -310,4 +344,6 @@ impl ManagementInterface {
 	pub(super) async fn stats_updated(emitter: &SignalEmitter<'_>, stats: &str) -> zbus::Result<()>;
 	#[zbus(signal)]
 	pub(super) async fn server_event(emitter: &SignalEmitter<'_>, event: &str) -> zbus::Result<()>;
+	#[zbus(signal)]
+	pub(super) async fn health_changed(emitter: &SignalEmitter<'_>, report: &str) -> zbus::Result<()>;
 }

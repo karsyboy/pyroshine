@@ -30,6 +30,7 @@ use crate::{
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
 		application::ApplicationConfig,
+		failure::{Problem, SessionFailure},
 		manager::SessionManager,
 		negotiation::{self, DisplayMode},
 	},
@@ -841,6 +842,17 @@ impl Webserver {
 		response
 	}
 
+	/// Answer a failed `/launch` with the cause, which Moonlight shows in its
+	/// error dialog, and report it to the management interface.
+	fn launch_failed(&self, title: &str, failure: &SessionFailure) -> Response<Full<Bytes>> {
+		if failure.code != SessionFailure::cancelled().code {
+			let mut problem = Problem::from(failure);
+			problem.message = format!("Launching {title} failed: {}", failure.message);
+			self.session_manager.report_problem(problem);
+		}
+		xml_error(503, &failure.client_message())
+	}
+
 	async fn launch(
 		&self,
 		mut params: HashMap<String, String>,
@@ -945,8 +957,8 @@ impl Webserver {
 			})
 			.await;
 
-		if initialize_result.is_err() {
-			return xml_error(400, "Failed to start session");
+		if let Err(failure) = initialize_result {
+			return self.launch_failed(&application.title, &failure);
 		}
 
 		match tokio::time::timeout(
@@ -956,21 +968,25 @@ impl Webserver {
 		.await
 		{
 			Ok(Ok(())) => {},
-			Ok(Err(())) => {
+			Ok(Err(failure)) => {
 				let _ = self.session_manager.stop_session().await;
-				return xml_error(
-					503,
-					"Application failed to start (check Moonshine logs for more information).",
-				);
+				return self.launch_failed(&application.title, &failure);
 			},
 			Err(_) => {
 				tracing::error!("Timed out waiting for application launch result.");
 				// Clean up the partially-initialized session to allow retries.
 				let _ = self.session_manager.stop_session().await;
-				return xml_error(
-					503,
-					"Application failed to start (check Moonshine logs for more information).",
+				let failure = SessionFailure::new(
+					"launch_timeout",
+					format!(
+						"{} did not finish launching within {APP_LAUNCH_HTTP_TIMEOUT_SECS} seconds.",
+						application.title
+					),
+				)
+				.with_hint(
+					"A pre_command may be waiting for something; check the application's hooks and the service log.",
 				);
+				return self.launch_failed(&application.title, &failure);
 			},
 		}
 

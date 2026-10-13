@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub use moonshine_management::dto::SessionPhase;
 
+use crate::session::failure::StopCause;
 use crate::session::manager::SessionShutdownReason;
 
 /// Manager transition in progress, as visible to status consumers.
@@ -79,6 +80,8 @@ pub(crate) struct LiveStatus {
 pub(crate) struct StopRecord {
 	pub epoch: u64,
 	pub reason: SessionShutdownReason,
+	/// What ended the session, when the component that ended it said.
+	pub cause: Option<StopCause>,
 	/// Teardown released everything within its deadline.
 	pub completed: bool,
 	pub at: SystemTime,

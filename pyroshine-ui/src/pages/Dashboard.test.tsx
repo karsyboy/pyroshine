@@ -167,3 +167,154 @@ describe("audio stream", () => {
     expect(withAudio(null)).toContain("Negotiating stereo…");
   });
 });
+
+describe("diagnosis and capture path", () => {
+  const snapshot: SessionSnapshot = { ...fixture, phase: "streaming" };
+  const capture: CaptureStats = {
+    pacing: "fixed",
+    source_fps: 60,
+    interval_p50_us: 16_667,
+    interval_p95_us: 17_000,
+    interval_p99_us: 17_000,
+    interval_max_us: 17_500,
+    interval_stddev_us: 100,
+    uneven_percent: 0,
+    content_age_p50_us: 900,
+    content_age_p95_us: 1_400,
+  };
+  const stats = (extra: Partial<StreamStats>): StreamStats => ({
+    epoch: snapshot.session!.epoch,
+    at_ms: 0,
+    window_ms: 1000,
+    frames: 60,
+    fps: 60,
+    key_frames: 0,
+    encoded_bitrate_bps: 40_000_000,
+    wire_bitrate_bps: 44_000_000,
+    transport_overhead_percent: 10,
+    packets: 4_000,
+    failed_packets: 0,
+    discarded_packets: 0,
+    stale_frames_dropped: 0,
+    samples_dropped: 0,
+    stages: [],
+    ...extra,
+  });
+
+  function renderStats(value: StreamStats) {
+    daemon.stats = value as never;
+    try {
+      return render(snapshot);
+    } finally {
+      daemon.stats = null;
+    }
+  }
+
+  it("lists the daemon's findings with their hints", () => {
+    const html = renderStats(
+      stats({
+        findings: [
+          {
+            id: "encoder_bound",
+            severity: "warning",
+            title: "The encoder cannot keep up with 60 fps",
+            detail: "Encoding takes 22.0 ms per frame.",
+            hint: "Lower the resolution in the client.",
+          },
+        ],
+      }),
+    );
+    expect(html).toContain("Diagnosis");
+    expect(html).toContain("The encoder cannot keep up with 60 fps");
+    expect(html).toContain("Lower the resolution in the client.");
+  });
+
+  it("says when nothing on the host limits the stream, and stays silent for older daemons", () => {
+    expect(renderStats(stats({ findings: [] }))).toContain("Nothing on the host limits the stream");
+    expect(renderStats(stats({}))).not.toContain("Diagnosis");
+  });
+
+  it("names the capture path and the main reason frames are composited", () => {
+    const html = renderStats(
+      stats({
+        capture: {
+          ...capture,
+          path: {
+            current: "mixed",
+            direct_frames: 10,
+            direct_late_frames: 0,
+            composited_frames: 50,
+            composition_reasons: [{ id: "steam_overlay", label: "The Steam overlay is open", hint: null, frames: 50 }],
+          },
+        },
+      }),
+    );
+    expect(html).toContain("Capture path");
+    expect(html).toMatch(/>Mixed</);
+    expect(html).toContain("83 % composited: the Steam overlay is open.");
+    const direct = renderStats(
+      stats({
+        capture: {
+          ...capture,
+          path: { current: "direct", direct_frames: 60, direct_late_frames: 0, composited_frames: 0, composition_reasons: [] },
+        },
+      }),
+    );
+    expect(direct).toContain("Direct export");
+    expect(direct).toContain("The game&#x27;s own buffer goes straight to the encoder.");
+  });
+
+  it("shows the encoder backend and GPU", () => {
+    const session = snapshot.session!;
+    const html = render({
+      ...snapshot,
+      session: {
+        ...session,
+        video: {
+          codec: "hevc",
+          codec_label: "HEVC",
+          chroma: "4:2:0",
+          bit_depth: 8,
+          dynamic_range: "SDR",
+          transfer: "BT.709",
+          primaries: "BT.709",
+          matrix: "BT.709",
+          range: "limited",
+          width: 2880,
+          height: 1920,
+          fps: 120,
+          bitrate_bps: 80_000_000,
+          packet_size: 1392,
+          encrypted: true,
+          minimum_fec_packets: 2,
+          max_reference_frames: 1,
+          pyrowave_dialect: null,
+          encoder: { backend: "vulkan_video", backend_label: "Vulkan Video", gpu: "Intel Arc B390" },
+        },
+      },
+    });
+    expect(html).toContain("Vulkan Video on Intel Arc B390");
+  });
+});
+
+describe("last stop", () => {
+  it("explains an unexpected stop with its cause and what to do", () => {
+    const html = render({
+      phase: "idle",
+      session: null,
+      last_stop: {
+        epoch: 3,
+        reason: "application_stopped",
+        message: "The application exited.",
+        unexpected: true,
+        completed: true,
+        at_ms: 0,
+        detail: "Steam crashed (SIGSEGV, core dumped), 4 s after launch.",
+        hint: "Read its output with: `journalctl --user -u moonshine-session.service -e`",
+      },
+    });
+    expect(html).toContain("Steam crashed (SIGSEGV, core dumped), 4 s after launch.");
+    expect(html).not.toContain("The application exited.");
+    expect(html).toMatch(/<code[^>]*>journalctl --user -u moonshine-session.service -e<\/code>/);
+  });
+});

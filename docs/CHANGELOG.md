@@ -14,9 +14,20 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Explain why a launch fails. Moonlight and Pyrolight show the cause in their error dialog instead of "check Moonshine logs": a missing command, a failed hook, a UDP port held by another program, a compositor that cannot start, or an application that exits during launch with its exit status or signal, each with what to change. An application that exits cleanly right away is explained as a hand-off to an already-running instance.
+- Name what ended a session. The dashboard shows the application's exit status or crash signal and how long after launch it ended, or the encoder failure (GPU device loss, an encoder that cannot be created for the stream) that stopped the stream. A crash or a failing exit within 30 seconds of launch is reported as unexpected.
+- List recent problems in the desktop app. **Diagnostics → Recent problems** keeps the last 50 rejected launches, refused stream requests (for example a codec, 4:4:4 or HDR combination the GPU did not pass, with the profiles that work) and unexpected stops, with their causes and fixes. Clients see refused stream requests only as an RTSP status code.
+- Diagnose streams on the host. While streaming, the dashboard's **Diagnosis** names what limits the stream (a slow encoder, a game rendering below the stream rate, skipped frames, socket failures, packets the network could not carry, high pipeline latency, composited frames or uneven frame times), with the numbers and what to change.
+- Show the capture path. The dashboard reports whether frames are exported directly from the game, directly with the cursor or a notification drawn by the encoder, or composited, and the main reason for composition (for example scaling, the Steam overlay or a CPU-rendered application), plus the encoder backend and GPU.
+- Check color conversion at startup. The health check runs the stream converter's known-answer test for each output format a verified profile needs, so a GPU or driver that converts with wrong colors (as behind the green video in [#11](https://github.com/karsyboy/pyroshine/issues/11)) is reported before any client connects, and the affected profiles are no longer offered to clients. A stream stopped by the same test now says the conversion produced wrong colors and asks for a bug report, instead of suggesting a retry.
+- Re-run the host checks from the desktop app without restarting Pyroshine. Each failed check shows its fix. While a session streams the GPU probes are not repeated, and the server's own ports are not treated as conflicts. **Copy diagnostics** copies the checks, session, statistics and recent problems as one JSON report.
+
 ### Changed
 
 - Update the server's Rust dependencies to their current releases, including the new major versions of aes-gcm, sdp-types, libloading, mdns-sd, opus and dirs. Streaming, pairing and discovery behavior is unchanged.
+- Name the `pyroshine` group (NixOS: `moonshine`) in the healthcheck's sleep-inhibit hint instead of the upstream `moonshine` group.
 - Propose vendored dependency updates automatically. A daily workflow regenerates Inputtino or Pixelforge on a new upstream revision with the existing patch series and opens a pull request for review, or an issue when a patch no longer applies. Dependabot proposes Cargo, npm and GitHub Actions updates weekly.
 
 ## [v0.17.4] - 2026-10-12

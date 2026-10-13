@@ -15,9 +15,12 @@ import TableRow from "@mui/material/TableRow";
 import Typography from "@mui/material/Typography";
 import StopCircleOutlined from "@mui/icons-material/StopCircleOutlined";
 import AddLink from "@mui/icons-material/AddLink";
+import CheckCircleOutlined from "@mui/icons-material/CheckCircleOutlined";
+import InfoOutlined from "@mui/icons-material/InfoOutlined";
+import WarningAmber from "@mui/icons-material/WarningAmber";
 import { call, errorMessage } from "../api/bridge";
-import type { AudioDetails, CaptureStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
-import { ConfirmDialog, Facts, PageHeader, StatusDot, phaseLabels } from "../components/common";
+import type { AudioDetails, CapturePathStats, CaptureStats, Finding, SessionDetails, SessionPhase, StreamStats } from "../api/types";
+import { ConfirmDialog, Facts, Hint, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
 import { bitrate, channels, duration, micros } from "../util/format";
@@ -46,6 +49,75 @@ const pacingLabels: Record<CaptureStats["pacing"], string> = {
   fixed: "Fixed refresh",
   mixed: "Changing",
 };
+
+const pathLabels: Record<CapturePathStats["current"], string> = {
+  direct: "Direct export",
+  direct_late: "Direct export + overlay",
+  composited: "Composited",
+  mixed: "Mixed",
+};
+
+/// What the capture path means for the operator, with the main reason for composition.
+function pathDetail(path: CapturePathStats): string {
+  const reason = path.composition_reasons[0];
+  switch (path.current) {
+    case "direct":
+      return "The game's own buffer goes straight to the encoder.";
+    case "direct_late":
+      return "Direct export; the encoder draws the cursor or a notification.";
+    case "composited":
+      return reason ? `${reason.label}.` : "The compositor renders every frame first.";
+    case "mixed": {
+      const total = path.direct_frames + path.direct_late_frames + path.composited_frames;
+      const share = total ? Math.round((path.composited_frames * 100) / total) : 0;
+      return reason ? `${share} % composited: ${reason.label.charAt(0).toLowerCase()}${reason.label.slice(1)}.` : `${share} % composited.`;
+    }
+  }
+}
+
+function FindingRow({ finding }: { finding: Finding }) {
+  const warning = finding.severity === "warning";
+  return (
+    <Stack direction="row" sx={{ gap: 1.5, alignItems: "flex-start" }}>
+      {warning ? <WarningAmber color="warning" fontSize="small" sx={{ mt: 0.25 }} /> : <InfoOutlined color="info" fontSize="small" sx={{ mt: 0.25 }} />}
+      <Box sx={{ minWidth: 0 }}>
+        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+          {finding.title}
+        </Typography>
+        <Typography variant="body2">{finding.detail}</Typography>
+        {finding.hint && <Hint text={finding.hint} />}
+      </Box>
+    </Stack>
+  );
+}
+
+/// The daemon's reading of the latest window: what limits the stream on the host.
+function Diagnosis({ findings }: { findings: Finding[] }) {
+  return (
+    <Card sx={{ mb: 3 }} aria-label="Diagnosis">
+      <CardContent>
+        <Typography variant="h6" sx={{ mb: 1.5 }}>
+          Diagnosis
+        </Typography>
+        {findings.length === 0 ? (
+          <Stack direction="row" sx={{ gap: 1.5, alignItems: "center" }}>
+            <CheckCircleOutlined color="success" fontSize="small" />
+            <Typography variant="body2" color="text.secondary">
+              Nothing on the host limits the stream right now. Problems on the client or network after the host are not
+              visible here.
+            </Typography>
+          </Stack>
+        ) : (
+          <Stack sx={{ gap: 2 }}>
+            {findings.map((finding) => (
+              <FindingRow key={finding.id} finding={finding} />
+            ))}
+          </Stack>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 function Hero({ onEnd, navigate }: { onEnd: () => void; navigate: (to: string) => void }) {
   const daemon = useDaemon();
@@ -260,6 +332,14 @@ function FramePacing({ capture, history, streamFps }: { capture: CaptureStats; h
           color={capture.pacing === "vrr" ? "success" : capture.pacing === "mixed" ? "warning" : "default"}
           variant="outlined"
         />
+        {capture.path && (
+          <Chip
+            label={pathLabels[capture.path.current]}
+            size="small"
+            color={capture.path.current === "composited" ? "warning" : capture.path.current === "mixed" ? "default" : "success"}
+            variant="outlined"
+          />
+        )}
       </Stack>
       <Stack direction="row" sx={{ gap: 2, flexWrap: "wrap", mb: 1 }}>
         <Tile
@@ -288,6 +368,7 @@ function FramePacing({ capture, history, streamFps }: { capture: CaptureStats; h
           value={micros(capture.content_age_p50_us)}
           detail={`p95 ${micros(capture.content_age_p95_us)} · new content to capture`}
         />
+        {capture.path && <Tile label="Capture path" value={pathLabels[capture.path.current]} detail={pathDetail(capture.path)} />}
       </Stack>
       <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
         {capture.pacing === "fixed"
@@ -365,6 +446,7 @@ function StreamDetails({ session }: { session: SessionDetails }) {
                 ["Bit depth", `${video.bit_depth}-bit`],
                 ["Dynamic range", video.dynamic_range],
                 ["Color", `${video.primaries} primaries · ${video.transfer} · ${video.matrix} · ${video.range} range`],
+                ...(video.encoder ? [["Encoder", `${video.encoder.backend_label} on ${video.encoder.gpu || "the capture GPU"}`] as [string, string]] : []),
                 ["Target bitrate", bitrate(video.bitrate_bps)],
                 ["Packet size", `${video.packet_size} bytes`],
                 ["Minimum FEC", `${video.minimum_fec_packets} packets per frame`],
@@ -424,8 +506,12 @@ export function DashboardPage({ navigate }: { navigate: (to: string) => void }) 
       <Hero onEnd={() => setConfirm(true)} navigate={navigate} />
       {daemon.session?.phase === "idle" && lastStop?.unexpected && (
         <Alert severity="warning" sx={{ mb: 3 }}>
-          The last session ended unexpectedly at {new Date(lastStop.at_ms).toLocaleTimeString()}: {lastStop.message}
+          The last session ended unexpectedly at {new Date(lastStop.at_ms).toLocaleTimeString()}: {lastStop.detail ?? lastStop.message}
+          {lastStop.hint && <Hint text={lastStop.hint} />}
         </Alert>
+      )}
+      {daemon.session?.phase === "streaming" && daemon.stats?.findings && daemon.stats.epoch === session?.epoch && (
+        <Diagnosis findings={daemon.stats.findings} />
       )}
       {daemon.session?.phase === "streaming" && daemon.stats && daemon.stats.epoch === session?.epoch && (
         <Performance stats={daemon.stats} history={daemon.history} />

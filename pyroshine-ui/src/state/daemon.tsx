@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { call, on } from "../api/bridge";
 import type {
   ClientsSnapshot,
+  HealthReport,
   Overview,
   PairingResolution,
   PairingSnapshot,
@@ -12,6 +13,8 @@ import type {
 
 /// Seconds of statistics kept for the dashboard's charts.
 export const HISTORY = 90;
+/// Events kept for the Diagnostics page (the daemon keeps 50).
+export const EVENTS = 50;
 
 interface Notice {
   id: number;
@@ -23,6 +26,8 @@ interface DaemonState extends Overview {
   /// The first overview arrived (avoids flashing "not running" at startup).
   loaded: boolean;
   history: StreamStats[];
+  /// Recent daemon events, oldest first.
+  events: ServerEvent[];
   notices: Notice[];
   /// The last pairing resolution, for the pairing page.
   resolution: PairingResolution | null;
@@ -50,6 +55,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   const [overview, setOverview] = useState<Overview>(empty);
   const [loaded, setLoaded] = useState(false);
   const [history, setHistory] = useState<StreamStats[]>([]);
+  const [events, setEvents] = useState<ServerEvent[]>([]);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [resolution, setResolution] = useState<PairingResolution | null>(null);
   const [configRevision, setConfigRevision] = useState<string | null>(null);
@@ -66,6 +72,12 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     setOverview(next);
     setLoaded(true);
     if (!next.stats) setHistory([]);
+    if (next.connected) {
+      // Older daemons do not keep events; the command then returns none.
+      call<ServerEvent[]>("events").then(setEvents, () => setEvents([]));
+    } else {
+      setEvents([]);
+    }
   }, []);
 
   const refresh = useCallback(async () => {
@@ -90,8 +102,12 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         if (outcome) notify(outcome[0], outcome[1]);
       }),
       on<{ revision: string }>("daemon://config-saved", (saved) => setConfigRevision(saved.revision)),
-      on<ServerEvent>("daemon://server-event", (event) =>
-        notify(event.level === "error" ? "error" : "warning", event.message),
+      on<ServerEvent>("daemon://server-event", (event) => {
+        notify(event.level === "error" ? "error" : "warning", event.message);
+        setEvents((current) => [...current.slice(-(EVENTS - 1)), event]);
+      }),
+      on<HealthReport>("daemon://health", (health) =>
+        setOverview((current) => (current.server ? { ...current, server: { ...current.server, health } } : current)),
       ),
     ];
     // Subscribe first, then read the cached state, so nothing falls between.
@@ -107,8 +123,8 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   }, [overview.session?.phase]);
 
   const value = useMemo(
-    () => ({ ...overview, loaded, history, notices, resolution, configRevision, notify, dismiss, refresh }),
-    [overview, loaded, history, notices, resolution, configRevision, notify, dismiss, refresh],
+    () => ({ ...overview, loaded, history, events, notices, resolution, configRevision, notify, dismiss, refresh }),
+    [overview, loaded, history, events, notices, resolution, configRevision, notify, dismiss, refresh],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }

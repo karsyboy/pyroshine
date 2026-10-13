@@ -2033,28 +2033,30 @@ impl MoonshineCompositor {
 			},
 			Err(reason) => Err(reason),
 		};
-		match direct {
-			Err(reason) => {
-				if self.log_stats {
-					self.direct_rejections[reason as usize] += 1;
-				}
-			},
+		let composition_reason = match direct {
+			Err(reason) => reason,
 			Ok((layers, hold)) => {
 				let late_notification = layers[0].is_some();
 				let late_cursor = layers[1].is_some();
-				if self.try_direct_scanout(&mut credit, send_callbacks, layers, hold) {
-					self.record_capture_path(if late_notification || late_cursor {
-						"direct+late"
-					} else {
-						"direct"
-					});
-					if self.log_stats {
-						self.late_cursor_frames += u64::from(late_cursor);
-						self.late_notification_frames += u64::from(late_notification);
-					}
-					return;
+				match self.try_direct_scanout(&mut credit, send_callbacks, layers, hold) {
+					Ok(()) => {
+						self.record_capture_path(if late_notification || late_cursor {
+							"direct+late"
+						} else {
+							"direct"
+						});
+						if self.log_stats {
+							self.late_cursor_frames += u64::from(late_cursor);
+							self.late_notification_frames += u64::from(late_notification);
+						}
+						return;
+					},
+					Err(reason) => reason,
 				}
 			},
+		};
+		if self.log_stats {
+			self.direct_rejections[composition_reason as usize] += 1;
 		}
 
 		// Pick the next buffer from the pre-allocated pool.
@@ -2103,6 +2105,10 @@ impl MoonshineCompositor {
 		// Composition must consume part of the capture-to-send pacing window.
 		// Preserve this origin when created_at is updated after the fence wait.
 		exported_frame.composition_started_at = Some(std::time::Instant::now());
+		exported_frame.origin = super::frame::CaptureOrigin {
+			path: super::frame::CapturePath::Composited,
+			composition_reason: Some(composition_reason),
+		};
 
 		// Compute the output scaling before binding the framebuffer, which
 		// borrows `self` mutably.
@@ -2429,8 +2435,9 @@ impl MoonshineCompositor {
 
 	/// Attempt direct DMA-BUF scanout, bypassing compositor rendering.
 	///
-	/// Returns `true` if a frame was successfully exported directly from
-	/// the client's DMA-BUF, skipping the GBM pool and GL compositing.
+	/// Returns `Ok` if a frame was successfully exported directly from
+	/// the client's DMA-BUF, skipping the GBM pool and GL compositing, or the
+	/// condition that ruled it out.
 	/// This preserves pixel-exact content (important for HDR/PQ) and
 	/// reduces GPU usage and latency.
 	///
@@ -2443,12 +2450,12 @@ impl MoonshineCompositor {
 		send_callbacks: bool,
 		overlays: super::frame::FrameOverlays,
 		overlay_hold: Option<HeldBuffer>,
-	) -> bool {
+	) -> Result<(), DirectReject> {
 		// Scene eligibility has proved that this opaque top window covers all
 		// other windows, except a notification composited as a layer. Clone
 		// just the candidate, without a per-frame Vec.
 		let Some(window) = self.direct_source_window(true).cloned() else {
-			return false;
+			return Err(DirectReject::NoSurface);
 		};
 		// Retain the origin safeguard inside the technical export path too.
 		if self
@@ -2456,10 +2463,10 @@ impl MoonshineCompositor {
 			.element_geometry(&window)
 			.is_none_or(|geo| geo.loc != Point::from((0, 0)))
 		{
-			return false;
+			return Err(DirectReject::OutputOrigin);
 		}
 		let Some(wl_surface) = window.wl_surface().map(|s| s.into_owned()) else {
-			return false;
+			return Err(DirectReject::NoSurface);
 		};
 
 		// Get the committed buffer and check if it's a DMA-BUF.
@@ -2472,18 +2479,12 @@ impl MoonshineCompositor {
 		});
 
 		let Some(Some(buffer)) = scanout_buffer else {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
-			}
 			tracing::trace!("Direct scanout: no committed buffer");
-			return false;
+			return Err(DirectReject::NotDmabuf);
 		};
 		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
-			}
 			tracing::trace!("Direct scanout: failed to get DMA-BUF from buffer");
-			return false;
+			return Err(DirectReject::NotDmabuf);
 		};
 		let client_dmabuf = client_dmabuf.clone();
 		// The encoders read single-plane RGB buffers whose modifier their
@@ -2493,20 +2494,14 @@ impl MoonshineCompositor {
 				client_dmabuf.format().code as u32,
 				client_dmabuf.format().modifier.into(),
 			) {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::Format as usize] += 1;
-			}
 			tracing::trace!("Direct scanout: unsupported format {:?}", client_dmabuf.format());
-			return false;
+			return Err(DirectReject::Format);
 		}
 
 		// The surface buffer must exactly match the output dimensions with
 		// no scaling or offset, otherwise the encoder would receive a
 		// partial or stretched frame.
 		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
-			if self.log_stats {
-				self.direct_rejections[DirectReject::Size as usize] += 1;
-			}
 			tracing::trace!(
 				"Direct scanout: size mismatch (client {}x{} vs output {}x{})",
 				client_dmabuf.width(),
@@ -2514,7 +2509,7 @@ impl MoonshineCompositor {
 				self.width,
 				self.height,
 			);
-			return false;
+			return Err(DirectReject::Size);
 		}
 
 		// Assign a stable buffer index for the encoder's import cache, keyed
@@ -2548,6 +2543,14 @@ impl MoonshineCompositor {
 			color_space,
 			hdr_metadata,
 		);
+		exported_frame.origin = super::frame::CaptureOrigin {
+			path: if overlays.iter().any(Option::is_some) {
+				super::frame::CapturePath::DirectLate
+			} else {
+				super::frame::CapturePath::Direct
+			},
+			composition_reason: None,
+		};
 		exported_frame.overlays = overlays;
 		let source_time = capture_source_time(
 			self.capture_pacing,
@@ -2622,7 +2625,7 @@ impl MoonshineCompositor {
 			tracing::error!("Failed to flush clients after scanout: {e}");
 		}
 
-		true
+		Ok(())
 	}
 
 	/// Clear all dropdown/override windows.

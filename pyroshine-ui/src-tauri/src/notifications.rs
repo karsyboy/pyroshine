@@ -233,8 +233,8 @@ impl Notifier {
 	/// Backend errors the operator should know about.
 	pub async fn server_event(&self, event: &Value) {
 		if event["level"] == "error" || event["level"] == "warning" {
-			let message = event["message"].as_str().unwrap_or("Pyroshine reported a problem.");
-			self.error("Pyroshine session ended", message).await;
+			let (summary, body) = server_event_text(event);
+			self.error(summary, &body).await;
 		}
 	}
 
@@ -250,5 +250,62 @@ impl Notifier {
 		state.last_error = Some(Instant::now());
 		let replaces = state.error;
 		state.error = Self::notify(inner, replaces, summary, message, 1).await.or(replaces);
+	}
+}
+
+/// Codes of events that report how a session ended; every other event is a
+/// launch or negotiation the daemon rejected.
+const STOP_CODES: &[&str] = &[
+	"application_stopped",
+	"video_transport_failed",
+	"video_encoder_failed",
+	"audio_transport_failed",
+	"audio_server_failed",
+	"audio_encoder_failed",
+	"control_stream_failed",
+	"input_failed",
+	"compositor_failed",
+	"transition_failed",
+	"service_shutdown",
+];
+
+/// Notification summary and body: the event's message, then what to do.
+fn server_event_text(event: &Value) -> (&'static str, String) {
+	let message = event["message"].as_str().unwrap_or("Pyroshine reported a problem.");
+	let summary = if event["code"].as_str().is_some_and(|code| STOP_CODES.contains(&code)) {
+		"Pyroshine session ended"
+	} else {
+		"Pyroshine could not start the stream"
+	};
+	let body = match event["hint"].as_str() {
+		Some(hint) => format!("{message}\n{hint}"),
+		None => message.to_string(),
+	};
+	(summary, body)
+}
+
+#[cfg(test)]
+mod server_event_tests {
+	use serde_json::json;
+
+	#[test]
+	fn notifications_name_the_kind_and_carry_the_hint() {
+		let (summary, body) = super::server_event_text(&json!({
+			"level": "error",
+			"code": "codec_unsupported",
+			"message": "The client requested AV1.",
+			"hint": "Choose H.264.",
+			"at_ms": 0,
+		}));
+		assert_eq!(summary, "Pyroshine could not start the stream");
+		assert_eq!(body, "The client requested AV1.\nChoose H.264.");
+		let (summary, body) = super::server_event_text(&json!({
+			"level": "warning",
+			"code": "application_stopped",
+			"message": "Steam crashed (SIGSEGV, core dumped), 4 s after launch.",
+			"at_ms": 0,
+		}));
+		assert_eq!(summary, "Pyroshine session ended");
+		assert_eq!(body, "Steam crashed (SIGSEGV, core dumped), 4 s after launch.");
 	}
 }

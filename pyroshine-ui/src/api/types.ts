@@ -52,6 +52,15 @@ export interface VideoDetails {
   minimum_fec_packets: number;
   max_reference_frames: number;
   pyrowave_dialect: string | null;
+  /** Encoder backend and GPU; absent from older daemons. */
+  encoder?: EncoderDetails | null;
+}
+
+export interface EncoderDetails {
+  /** `vulkan_video` or `pyrowave`. */
+  backend: string;
+  backend_label: string;
+  gpu: string;
 }
 
 export interface AudioDetails {
@@ -78,6 +87,10 @@ export interface LastStop {
   unexpected: boolean;
   completed: boolean;
   at_ms: number;
+  /** What ended the session, when known; absent from older daemons. */
+  detail?: string | null;
+  /** What to do about it. */
+  hint?: string | null;
 }
 
 export interface ServerInfo {
@@ -93,10 +106,7 @@ export interface ServerInfo {
     dma_buf: boolean;
     gpu: string;
   };
-  health: {
-    all_fatal_passed: boolean;
-    checks: { name: string; outcome: "passed" | "warning" | "failed"; message: string; duration_ms: number }[];
-  } | null;
+  health: HealthReport | null;
   listeners: {
     address: string;
     http_port: number;
@@ -107,6 +117,28 @@ export interface ServerInfo {
     control_port: number;
   };
   pairing_enabled: boolean;
+}
+
+export interface HealthCheck {
+  name: string;
+  outcome: "passed" | "warning" | "failed";
+  /** What the check found. */
+  message: string;
+  duration_ms: number;
+  /** The remaining fields are absent from older daemons. */
+  id?: string | null;
+  /** What to change when the check did not pass. */
+  hint?: string | null;
+  /** A failure keeps Pyroshine from starting. */
+  fatal?: boolean;
+}
+
+export interface HealthReport {
+  all_fatal_passed: boolean;
+  checks: HealthCheck[];
+  checked_at_ms?: number | null;
+  /** From "Run checks" rather than startup. */
+  rechecked?: boolean;
 }
 
 export interface PendingPairing {
@@ -173,6 +205,16 @@ export interface StreamStats {
   stages: StageStats[];
   /** Frame pacing of the captured content; absent from older daemons. */
   capture?: CaptureStats | null;
+  /** The daemon's reading of the window, warnings first; absent from older daemons. */
+  findings?: Finding[];
+}
+
+export interface Finding {
+  id: string;
+  severity: "info" | "warning";
+  title: string;
+  detail: string;
+  hint: string | null;
 }
 
 export interface CaptureStats {
@@ -189,6 +231,16 @@ export interface CaptureStats {
   uneven_percent: number;
   content_age_p50_us: number;
   content_age_p95_us: number;
+  /** How frames reached the encoder; absent from older daemons. */
+  path?: CapturePathStats | null;
+}
+
+export interface CapturePathStats {
+  current: "direct" | "direct_late" | "composited" | "mixed";
+  direct_frames: number;
+  direct_late_frames: number;
+  composited_frames: number;
+  composition_reasons: { id: string; label: string; hint: string | null; frames: number }[];
 }
 
 export interface ServerEvent {
@@ -196,6 +248,8 @@ export interface ServerEvent {
   code: string;
   message: string;
   at_ms: number;
+  /** What to do about it; absent from older daemons. */
+  hint?: string | null;
 }
 
 export interface AttachError {

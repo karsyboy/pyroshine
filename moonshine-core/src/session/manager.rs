@@ -39,6 +39,7 @@ use crate::session::application_unit_name;
 use crate::session::authorization::StreamAuthorization;
 use crate::session::compositor::CapturePacing;
 use crate::session::compositor::CompositorConfig;
+use crate::session::failure::{Problem, SessionFailure, StopCauseSlot};
 use crate::session::keys::KeyLedger;
 use crate::session::lifecycle::StartLatch;
 use crate::session::status::{
@@ -171,14 +172,18 @@ pub(crate) trait SessionBackend: Send + Sync + 'static {
 	type Launched: Send + 'static;
 	type Active: Send + 'static;
 
+	/// `cause` is the session's [`StopCauseSlot`]: workers that end the
+	/// session record why there.
 	fn initialize(
 		&self,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		cause: StopCauseSlot,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	) -> impl Future<Output = Result<Self::Initialized, ()>> + Send;
+	) -> impl Future<Output = Result<Self::Initialized, SessionFailure>> + Send;
 
-	fn launch(&self, session: Self::Initialized) -> impl Future<Output = Result<Self::Launched, ()>> + Send;
+	fn launch(&self, session: Self::Initialized)
+	-> impl Future<Output = Result<Self::Launched, SessionFailure>> + Send;
 
 	fn start(
 		&self,
@@ -272,6 +277,8 @@ struct SessionRecord {
 	/// Authorization generation created by the launch; later generations
 	/// come from `/resume`.
 	first_generation: Option<u64>,
+	/// Why the session ended, recorded by whatever ended it.
+	cause: StopCauseSlot,
 }
 
 struct LiveSession<B: SessionBackend> {
@@ -735,6 +742,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			transition,
 		} = live;
 		let epoch = record.epoch;
+		let cause = record.cause.clone();
 		tracing::info!(
 			epoch,
 			?reason,
@@ -781,6 +789,7 @@ impl<B: SessionBackend> SessionCore<B> {
 		guard.last_stop = Some(StopRecord {
 			epoch,
 			reason,
+			cause: cause.get(),
 			completed: result.is_ok(),
 			at: SystemTime::now(),
 		});
@@ -901,18 +910,24 @@ impl<B: SessionBackend> SessionCore<B> {
 	///
 	/// The session is not launched until `launch_session` is called. A
 	/// previous session that is still stopping is awaited first.
-	pub(crate) async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
-		let (ticket, keys_tx, foreground_tx) = loop {
+	pub(crate) async fn initialize_session(&self, mut context: SessionContext) -> Result<(), SessionFailure> {
+		let (ticket, keys_tx, foreground_tx, cause) = loop {
 			let mut guard = self.lock().await;
 			if self.shutdown.is_shutdown_triggered() {
 				tracing::warn!("Service is shutting down; rejecting InitializeSession command.");
-				return Err(());
+				return Err(SessionFailure::shutting_down());
 			}
 			match &guard.lifecycle {
 				Lifecycle::Idle => {},
 				Lifecycle::Live(_) => {
 					tracing::warn!("Session already initialized, rejecting InitializeSession command.");
-					return Err(());
+					return Err(SessionFailure::new(
+						"session_exists",
+						"Another session is already running on this host.",
+					)
+					.with_hint(
+						"Resume it from Moonlight, or end it (Moonlight's Quit, or End session in the Pyroshine app) first.",
+					));
 				},
 				Lifecycle::Stopping(waiter) => {
 					let waiter = waiter.clone();
@@ -923,7 +938,10 @@ impl<B: SessionBackend> SessionCore<B> {
 						Ok(Ok(()))
 					) {
 						tracing::warn!("Previous session did not stop; rejecting InitializeSession command.");
-						return Err(());
+						return Err(SessionFailure::see_log(
+							"previous_session_stuck",
+							"The previous session did not finish stopping.",
+						));
 					}
 					continue;
 				},
@@ -934,7 +952,10 @@ impl<B: SessionBackend> SessionCore<B> {
 				SessionKeys::Keys(data) => data,
 				SessionKeys::Rx(_) => {
 					tracing::error!("Session keys already initialized as a watch receiver");
-					return Err(());
+					return Err(SessionFailure::see_log(
+						"internal_error",
+						"Pyroshine rejected the session keys.",
+					));
 				},
 			};
 			let (tx, rx) = watch::channel(guard.key_ledger.publish(session_keys));
@@ -943,6 +964,7 @@ impl<B: SessionBackend> SessionCore<B> {
 			let epoch = guard.next_epoch;
 			guard.next_epoch += 1;
 			let stop = ShutdownManager::new();
+			let cause = StopCauseSlot::default();
 			let (foreground_tx, foreground) = watch::channel(None);
 			guard.lifecycle = Lifecycle::Live(Box::new(LiveSession {
 				record: SessionRecord {
@@ -955,13 +977,16 @@ impl<B: SessionBackend> SessionCore<B> {
 					start_latches: Vec::new(),
 					started_at: SystemTime::now(),
 					first_generation: None,
+					cause: cause.clone(),
 				},
 				state: None,
 				transition: None,
 			}));
-			let ticket = guard.begin_transition(TransitionKind::Initialize)?;
+			let ticket = guard
+				.begin_transition(TransitionKind::Initialize)
+				.map_err(|()| SessionFailure::busy("The new session could not be started."))?;
 			self.spawn_watchdog(epoch, stop);
-			break (ticket, tx, foreground_tx);
+			break (ticket, tx, foreground_tx, cause);
 		};
 
 		let client_ip = context.client_ip;
@@ -970,7 +995,10 @@ impl<B: SessionBackend> SessionCore<B> {
 		let task = tokio::spawn(async move {
 			let result = ticket
 				.stop
-				.wrap_cancel(core.backend.initialize(context, ticket.stop.clone(), foreground_tx))
+				.wrap_cancel(
+					core.backend
+						.initialize(context, ticket.stop.clone(), cause.clone(), foreground_tx),
+				)
 				.await;
 			let mut guard = core.lock().await;
 			let outcome = match result {
@@ -978,10 +1006,15 @@ impl<B: SessionBackend> SessionCore<B> {
 					let state = SessionState::Initialized(session);
 					if guard.committable(&ticket).is_none() {
 						guard.orphan(&ticket, state);
-						Err(())
+						Err(SessionFailure::cancelled())
 					} else if guard.rotate_authorization(client_ip, vrr_requested).is_err() {
+						let failure = SessionFailure::see_log(
+							"internal_error",
+							"Pyroshine could not authorize the client for the new session.",
+						);
+						cause.record(failure.stop_cause());
 						core.fail_transition(&mut guard, &ticket, Some(state));
-						Err(())
+						Err(failure)
 					} else {
 						// Set here so keys exist only for an initialized session.
 						guard.keys_tx = Some(keys_tx);
@@ -997,30 +1030,33 @@ impl<B: SessionBackend> SessionCore<B> {
 						Ok(())
 					}
 				},
-				Ok(Err(())) => {
+				Ok(Err(failure)) => {
+					cause.record(failure.stop_cause());
 					core.fail_transition(&mut guard, &ticket, None);
-					Err(())
+					Err(failure)
 				},
-				Err(_) => Err(()),
+				Err(_) => Err(SessionFailure::cancelled()),
 			};
 			drop(guard);
 			drop(ticket);
 			outcome
 		});
-		task.await
-			.map_err(|e| tracing::error!("Session initialization task failed: {e}"))?
+		task.await.map_err(|e| {
+			tracing::error!("Session initialization task failed: {e}");
+			SessionFailure::see_log("internal_error", "Session initialization failed unexpectedly.")
+		})?
 	}
 
 	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
 	///
 	/// The launch is owned by the manager: if the caller stops waiting (e.g.
 	/// an HTTP timeout), it still commits or is cancelled by a session stop.
-	pub(crate) async fn launch_session(&self) -> Result<(), ()> {
-		let (ticket, session) = {
+	pub(crate) async fn launch_session(&self) -> Result<(), SessionFailure> {
+		let (ticket, session, cause) = {
 			let mut guard = self.lock().await;
 			let Some(live) = guard.live() else {
 				tracing::warn!("LaunchSession rejected: no active session");
-				return Err(());
+				return Err(SessionFailure::cancelled());
 			};
 			if !matches!(live.state, Some(SessionState::Initialized(_))) || live.transition.is_some() {
 				tracing::warn!(
@@ -1028,16 +1064,18 @@ impl<B: SessionBackend> SessionCore<B> {
 					transition = ?live.transition.map(|t| t.kind),
 					"LaunchSession rejected: session is not waiting to be launched"
 				);
-				return Err(());
+				return Err(SessionFailure::busy("The session is not waiting to be launched."));
 			}
-			let ticket = guard.begin_transition(TransitionKind::Launch)?;
+			let ticket = guard
+				.begin_transition(TransitionKind::Launch)
+				.map_err(|()| SessionFailure::busy("The session could not be launched."))?;
 			let live = guard.live().expect("checked above");
 			// Recorded before anything can create the unit.
 			live.record.application_unit = Some(application_unit_name());
 			let Some(SessionState::Initialized(session)) = live.state.take() else {
 				unreachable!("checked above");
 			};
-			(ticket, session)
+			(ticket, session, live.record.cause.clone())
 		};
 
 		tracing::info!("Launching session (starting compositor and app).");
@@ -1058,26 +1096,29 @@ impl<B: SessionBackend> SessionCore<B> {
 						},
 						None => {
 							guard.orphan(&ticket, state);
-							Err(())
+							Err(SessionFailure::cancelled())
 						},
 					}
 				},
-				Ok(Err(())) => {
-					tracing::error!("Failed to launch session.");
+				Ok(Err(failure)) => {
+					tracing::error!(code = failure.code, %failure, "Failed to launch session.");
+					cause.record(failure.stop_cause());
 					core.fail_transition(&mut guard, &ticket, None);
-					Err(())
+					Err(failure)
 				},
 				Err(_) => {
 					tracing::info!("Session launch cancelled.");
-					Err(())
+					Err(SessionFailure::cancelled())
 				},
 			};
 			drop(guard);
 			drop(ticket);
 			outcome
 		});
-		task.await
-			.map_err(|e| tracing::error!("Session launch task failed: {e}"))?
+		task.await.map_err(|e| {
+			tracing::error!("Session launch task failed: {e}");
+			SessionFailure::see_log("internal_error", "Launching the session failed unexpectedly.")
+		})?
 	}
 
 	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE.
@@ -1514,6 +1555,8 @@ pub struct SessionManager {
 	stats_tx: broadcast::Sender<FrameStats>,
 	/// Control-stream ownership of the current generation (see `session::status`).
 	presence_tx: Arc<watch::Sender<ClientPresence>>,
+	/// Failures reported to the operator (see [`Problem`]).
+	problems_tx: broadcast::Sender<Problem>,
 }
 
 impl SessionManager {
@@ -1545,7 +1588,20 @@ impl SessionManager {
 			core: SessionCore::new(backend, shutdown)?,
 			stats_tx,
 			presence_tx,
+			problems_tx: broadcast::channel(32).0,
 		})
+	}
+
+	/// Report a failure the operator should see: a rejected launch or
+	/// negotiation. Logged here; delivered to the management interface when
+	/// it runs. Never blocks.
+	pub(crate) fn report_problem(&self, problem: Problem) {
+		tracing::warn!(code = problem.code, hint = problem.hint, "{}", problem.message);
+		let _ = self.problems_tx.send(problem);
+	}
+
+	pub(crate) fn subscribe_problems(&self) -> broadcast::Receiver<Problem> {
+		self.problems_tx.subscribe()
 	}
 
 	/// Follow the manager lifecycle (see `session::status`).
@@ -1641,12 +1697,12 @@ impl SessionManager {
 	/// Initialize a new session with the provided context.
 	///
 	/// The session is not launched until `launch_session` is called.
-	pub async fn initialize_session(&self, context: SessionContext) -> Result<(), ()> {
+	pub async fn initialize_session(&self, context: SessionContext) -> Result<(), SessionFailure> {
 		self.core.initialize_session(context).await
 	}
 
 	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
-	pub async fn launch_session(&self) -> Result<(), ()> {
+	pub async fn launch_session(&self) -> Result<(), SessionFailure> {
 		self.core.launch_session().await
 	}
 
@@ -1713,6 +1769,7 @@ impl SessionManager {
 				start_latches: Vec::new(),
 				started_at: SystemTime::now(),
 				first_generation: None,
+				cause: StopCauseSlot::default(),
 			},
 			state: None,
 			transition: None,

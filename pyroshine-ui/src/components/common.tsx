@@ -165,3 +165,30 @@ export function Facts({ rows }: { rows: [string, ReactNode][] }) {
     </Box>
   );
 }
+
+/// What the operator can do, as sent by the daemon. Text in backticks is a
+/// command; each line of a multi-line hint is its own step.
+export function Hint({ text }: { text: string }) {
+  return (
+    <Box sx={{ mt: 0.5 }}>
+      {text.split("\n").map((line, index) => (
+        <Typography key={index} variant="body2" color="text.secondary" sx={{ overflowWrap: "anywhere" }}>
+          {line.split(/(`[^`]+`)/).map((part, partIndex) =>
+            part.startsWith("`") && part.endsWith("`") && part.length > 2 ? (
+              <Box
+                key={partIndex}
+                component="code"
+                sx={{ fontFamily: "monospace", fontSize: "0.85em", bgcolor: "action.hover", borderRadius: 1, px: 0.5 }}
+              >
+                {part.slice(1, -1)}
+              </Box>
+            ) : (
+              part
+            ),
+          )}
+        </Typography>
+      ))}
+    </Box>
+  );
+}
+

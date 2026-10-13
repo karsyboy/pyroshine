@@ -134,9 +134,16 @@ a library or extension name:
   ready. Conventional encoding, DMA-BUF import and PyroWave device matching use
   that context for the whole session, including reconnects.
 - A conventional codec bit is set only after creating its exact Pixelforge
-  profile. PyroWave bits are set only after loading the pinned C API, matching
-  the Vulkan device and creating each SDR/HDR encoder. A missing or incompatible
-  PyroWave library leaves the conventional codecs available.
+  profile and after the stream converter's known-answer self-check passes for
+  the output format that profile encodes from (NV12, P010, YUV444 or
+  YUV444P10), on the configured conversion queue. A GPU that converts with
+  wrong colors keeps those profiles unadvertised and reports a **Color
+  conversion** warning, or a failure when no profile remains. Stream setup runs
+  the same self-check and stops the stream with a color-conversion cause
+  instead of sending corrupted video. PyroWave bits are set only after loading
+  the pinned C API, matching the Vulkan device and creating each SDR/HDR
+  encoder. A missing or incompatible PyroWave library leaves the conventional
+  codecs available.
 
 The server then constructs, in order, TLS identity, `SessionManager`,
 `ClientManager`, the management service, the RTSP server, the webserver and
@@ -584,6 +591,7 @@ implementation:
 | Revoke client | `ClientManager::revoke_and_stop_session`, shared with loopback `/unpair` |
 | Name a client | Optional, display-only metadata in `state.toml`, written through the state transaction |
 | Configuration | `config_store` (below) |
+| Run health check | `healthcheck::recheck_in_server` (below), serialized; published with `HealthChanged` |
 
 **Access.** The session bus admits only the user running the service; every
 method additionally checks the caller's Unix user. The interface is not
@@ -655,7 +663,47 @@ loses the oldest samples, which are counted, and with no receiver it remains
 the no-op it is on a headless server. Each sample also carries the frame's
 capture pacing, content age and content-time interval since the previous new
 frame (the frame time the client sees in RTP), summarized as the window's
-frame pacing.
+frame pacing, and its `CaptureOrigin`: direct export, direct export with late
+layers, or composition and the first `DirectReject` that required it (a fixed
+enum, never a per-frame string), summarized as the window's capture path.
+
+**Findings.** Each published window is read by `management/findings.rs`
+(`StreamStats.findings`): an encoder slower than the frame budget while frames
+are missed, a game rendering below the stream rate while every frame is
+delivered, skipped captures, socket failures or discarded packets, high
+pipeline latency, mostly composited frames, or uneven frame times under fixed
+pacing. Each finding has a stable ID, the window's numbers and a hint. Rules
+name a cause only when the numbers show it, and they see only the host: client
+decoding and display pacing are outside them. Analysis runs on the management
+task once per window, never on a media path.
+
+**Failure causes and events.** The launch path returns a typed
+`session::failure::SessionFailure` (stable code, message, optional hint)
+instead of a bare error: application spawning (empty or missing command, hook
+resolution, systemd refusal, an exit during launch with systemd's exit status),
+stream sockets, compositor start and manager state. `/launch` answers with it as
+`status_message`, which Moonlight shows in its error dialog. A failure that
+ends a created session is also recorded as that session's `StopCause` in its
+`StopCauseSlot`; so are the application's exit (`ExitStatus` from the unit's
+`Service` properties, subscribed before the unit starts because
+`CollectMode=inactive-or-failed` unloads it at exit) and a terminal encoder
+error. The first cause recorded before the stop wins; teardown copies it into
+`StopRecord`, and `LastStop` reports it as `detail` and `hint`. RTSP
+negotiation rejections, which stock clients show only as a status code, and
+launch failures are reported through `SessionManager::report_problem`.
+Management keeps the last 50 problems and unexpected stops as `ServerEvent`s
+(`GetEvents`), emits each as `ServerEvent`, and includes them in
+`GetDiagnosticReport` with the server, health, session and latest statistics.
+
+**Health checks.** `GetServer` carries the startup report; each check has a
+stable ID, the first line of its message, and the remaining lines (the remedy
+the command line prints indented) as its hint. `RunHealthCheck` runs
+`recheck_in_server`, which differs from the standalone check in two ways: it
+never binds the server's own TCP listeners (and the UDP stream ports only while
+idle), and while a session exists it repeats the previous GPU probe results
+instead of creating encoders next to the live stream. Capabilities advertised
+to clients stay those probed at startup; a recheck whose verified profiles
+differ adds a warning that a restart applies them.
 
 **Notifications.** While the UI owns `io.github.karsyboy.PyroshineUi` it
 receives `PairingRequested` and notifies the operator; the daemon's own

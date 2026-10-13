@@ -15,10 +15,12 @@ use tokio::net::TcpStream;
 
 use crate::ShutdownReason;
 use crate::healthcheck::{
-	CODEC_PYROWAVE, CODEC_PYROWAVE_444, CODEC_PYROWAVE_HDR, CODEC_PYROWAVE_MASK, supports_video_format,
+	CODEC_PYROWAVE, CODEC_PYROWAVE_444, CODEC_PYROWAVE_HDR, CODEC_PYROWAVE_MASK, codec_profile_labels,
+	supports_video_format,
 };
 use crate::ingress::Ingress;
 use crate::session::authorization::{ML_FF_SESSION_ID_V1, MediaStream, StreamAuthorization, canonical_ip};
+use crate::session::failure::{Problem, SEE_SERVICE_LOG};
 use crate::session::manager::SessionManager;
 use crate::session::negotiation;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
@@ -350,6 +352,14 @@ impl RtspServer {
 			.build(description.into_bytes())
 	}
 
+	/// Report a rejected negotiation to the operator. Clients show only the
+	/// RTSP status (stock Moonlight: "RTSP ANNOUNCE failed: 400"); the cause
+	/// reaches the desktop app.
+	fn report_rejection(&self, code: &'static str, message: impl Into<String>, hint: impl Into<String>) {
+		self.session_manager
+			.report_problem(Problem::new(code, message, Some(hint.into())));
+	}
+
 	async fn handle_announce_request(
 		&self,
 		request: &rtsp_types::Request<Vec<u8>>,
@@ -454,6 +464,11 @@ impl RtspServer {
 			Ok(dialect) => dialect,
 			Err(reason) => {
 				tracing::warn!(reason, "PyroWave ANNOUNCE rejected");
+				self.report_rejection(
+					"pyrowave_negotiation_failed",
+					format!("The client's PyroWave stream request was rejected: {reason}."),
+					"Update Pyrolight and Pyroshine to releases that speak the same PyroWave version.",
+				);
 				return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::BadRequest)
 					.header(headers::CSEQ, cseq.to_string())
 					.header(headers::CONTENT_TYPE, "text/plain")
@@ -465,6 +480,11 @@ impl RtspServer {
 			Ok(axes) => axes,
 			Err(()) => {
 				tracing::warn!("Client requested malformed or unsupported video profile attributes");
+				self.report_rejection(
+					"video_profile_invalid",
+					"The client requested a malformed or unsupported video profile (dynamic range, chroma or bit depth).",
+					"Reset the client's video settings, or update the client.",
+				);
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -514,6 +534,11 @@ impl RtspServer {
 		};
 		if let Err(reason) = format.validate() {
 			tracing::warn!(?format, reason, "Rejecting contradictory video format request");
+			self.report_rejection(
+				"video_format_invalid",
+				format!("The client requested a contradictory video format: {reason}."),
+				"Check the client's HDR, 4:4:4 and codec settings.",
+			);
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 		}
 		if !supports_video_format(self.supported_codecs, format) {
@@ -523,6 +548,22 @@ impl RtspServer {
 				bit_depth = format.bit_depth.bits(),
 				hdr = format.hdr,
 				"Requested video combination was not detected on this GPU/encoder; refusing silent fallback"
+			);
+			let verified = codec_profile_labels(self.supported_codecs);
+			self.report_rejection(
+				"codec_unsupported",
+				format!(
+					"The client requested {}, which this GPU did not pass at startup.",
+					requested_profile(format)
+				),
+				if verified.is_empty() {
+					"No codec profile passed the startup checks; see the Diagnostics page.".to_string()
+				} else {
+					format!(
+						"Choose a verified profile in the client: {}. Pyroshine never falls back silently.",
+						verified.join(", ")
+					)
+				},
 			);
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::UnsupportedMediaType);
 		}
@@ -561,6 +602,11 @@ impl RtspServer {
 		// Reject before the session manager pauses or reconfigures anything.
 		if let Err(reason) = video_stream_context.validate() {
 			tracing::warn!(reason, "Rejecting invalid video negotiation");
+			self.report_rejection(
+				"video_settings_invalid",
+				format!("The client's video settings were rejected: {reason}."),
+				"Change the resolution, frame rate or bitrate in the client.",
+			);
 			return bad_request(cseq, request.version(), &reason);
 		}
 
@@ -574,6 +620,11 @@ impl RtspServer {
 		// Unsupported durations used to fall back to 5 ms silently.
 		if let Err(reason) = negotiation::validate_audio_packet_duration(packet_duration) {
 			tracing::warn!(reason, "Rejecting invalid audio negotiation");
+			self.report_rejection(
+				"audio_settings_invalid",
+				format!("The client's audio settings were rejected: {reason}."),
+				"Reset the client's audio settings, or update the client.",
+			);
 			return bad_request(cseq, request.version(), &reason);
 		}
 		let audio_qos_type: String = match get_sdp_attribute(&sdp_session, "x-nv-aqos.qosTrafficType") {
@@ -598,6 +649,11 @@ impl RtspServer {
 				Ok(channels) => (channels, surround_mask),
 				Err(reason) => {
 					tracing::warn!(reason, "Rejecting invalid audio negotiation");
+					self.report_rejection(
+						"audio_settings_invalid",
+						format!("The client's audio settings were rejected: {reason}."),
+						"Choose stereo, 5.1 or 7.1 audio in the client.",
+					);
 					return bad_request(cseq, request.version(), &reason);
 				},
 			}
@@ -615,6 +671,11 @@ impl RtspServer {
 			Ok(requested) => requested,
 			Err(reason) => {
 				tracing::warn!(reason, "Rejecting invalid audio negotiation");
+				self.report_rejection(
+					"audio_settings_invalid",
+					format!("The client's audio settings were rejected: {reason}."),
+					"Reset the client's audio quality setting, or update the client.",
+				);
 				return bad_request(cseq, request.version(), reason);
 			},
 		};
@@ -649,6 +710,11 @@ impl RtspServer {
 			.await
 			.is_err()
 		{
+			self.report_rejection(
+				"stream_negotiation_failed",
+				"Pyroshine could not apply the client's stream settings to the session.",
+				SEE_SERVICE_LOG,
+			);
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
 		}
 
@@ -664,6 +730,14 @@ impl RtspServer {
 		grant: &StreamAuthorization,
 	) -> rtsp_types::Response<Vec<u8>> {
 		if self.session_manager.start_session(grant).await.is_err() {
+			self.report_rejection(
+				"stream_start_failed",
+				"The stream could not start after the client's settings were accepted.",
+				format!(
+					"A common cause is HDR requested while the host cannot present HDR (see HDR on the Diagnostics \
+					 page). {SEE_SERVICE_LOG}"
+				),
+			);
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
 		}
 
@@ -901,6 +975,17 @@ fn normalize_request_target(request: Vec<u8>) -> Vec<u8> {
 }
 
 /// A 400 response whose body tells the client which value was rejected.
+/// A requested format for the operator, for example "HEVC 4:4:4 10-bit HDR".
+fn requested_profile(format: crate::session::stream::video::NegotiatedVideoFormat) -> String {
+	format!(
+		"{} {} {}-bit{}",
+		format.codec,
+		format.chroma,
+		format.bit_depth.bits(),
+		if format.hdr { " HDR" } else { "" }
+	)
+}
+
 fn bad_request(cseq: i32, version: rtsp_types::Version, reason: &str) -> rtsp_types::Response<Vec<u8>> {
 	rtsp_types::Response::builder(version, rtsp_types::StatusCode::BadRequest)
 		.header(headers::CSEQ, cseq.to_string())
