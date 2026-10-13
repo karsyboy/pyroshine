@@ -20,6 +20,7 @@ import { FieldControl, FieldRow } from "../components/fields";
 import { ApplicationsEditor, ScannersEditor } from "../components/lists";
 import { changedFields, getPath, issueField, normalize, setPath } from "../config/draft";
 import { useDaemon } from "../state/daemon";
+import { setPreference, usePreferences } from "../state/preferences";
 
 function RestartNotice({ saved }: { saved: boolean }) {
   return (
@@ -30,6 +31,38 @@ function RestartNotice({ saved }: { saved: boolean }) {
         <CopyableCommand command='sudo systemctl restart "pyroshine@$USER"' />
       </Box>
     </Alert>
+  );
+}
+
+/// Preferences of this app shown beside the server's diagnostics settings.
+/// They apply at once and are not part of the configuration file.
+function DiagnosticsPreferences() {
+  const { infoFindings } = usePreferences();
+  return (
+    <Box sx={{ mt: 3 }}>
+      <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+        Desktop app
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+        Saved in this app and applied immediately; no restart needed.
+      </Typography>
+      <Card sx={{ px: 3 }}>
+        <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: { xs: 1, md: 3 }, py: 2, alignItems: { md: "center" } }}>
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+            <Typography variant="subtitle2">Informational findings</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+              Show the dashboard's informational findings, such as a game rendering below the stream rate or composited
+              frames. Warnings are always shown, and Copy diagnostics still includes every finding.
+            </Typography>
+          </Box>
+          <Switch
+            checked={infoFindings}
+            onChange={(event) => setPreference("infoFindings", event.target.checked)}
+            slotProps={{ input: { "aria-label": "Informational findings" } }}
+          />
+        </Stack>
+      </Card>
+    </Box>
   );
 }
 
@@ -269,6 +302,7 @@ export function SettingsPage() {
               Show {hiddenAdvanced} advanced {hiddenAdvanced === 1 ? "setting" : "settings"}
             </Button>
           )}
+          {current.id === "diagnostics" && <DiagnosticsPreferences />}
         </Box>
       </Stack>
 

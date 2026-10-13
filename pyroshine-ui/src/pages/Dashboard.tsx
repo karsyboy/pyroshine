@@ -23,6 +23,7 @@ import type { AudioDetails, CapturePathStats, CaptureStats, Finding, SessionDeta
 import { ConfirmDialog, Facts, Hint, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
+import { usePreferences } from "../state/preferences";
 import { bitrate, channels, duration, micros } from "../util/format";
 
 const headlines: Record<SessionPhase, string> = {
@@ -92,7 +93,11 @@ function FindingRow({ finding }: { finding: Finding }) {
 }
 
 /// The daemon's reading of the latest window: what limits the stream on the host.
-function Diagnosis({ findings }: { findings: Finding[] }) {
+/// Informational findings can be hidden under Settings → Diagnostics.
+function Diagnosis({ findings: all }: { findings: Finding[] }) {
+  const { infoFindings } = usePreferences();
+  const findings = infoFindings ? all : all.filter((finding) => finding.severity === "warning");
+  const hidden = all.length - findings.length;
   return (
     <Card sx={{ mb: 3 }} aria-label="Diagnosis">
       <CardContent>
@@ -103,8 +108,9 @@ function Diagnosis({ findings }: { findings: Finding[] }) {
           <Stack direction="row" sx={{ gap: 1.5, alignItems: "center" }}>
             <CheckCircleOutlined color="success" fontSize="small" />
             <Typography variant="body2" color="text.secondary">
-              Nothing on the host limits the stream right now. Problems on the client or network after the host are not
-              visible here.
+              {hidden > 0
+                ? "No warnings."
+                : "Nothing on the host limits the stream right now. Problems on the client or network after the host are not visible here."}
             </Typography>
           </Stack>
         ) : (
@@ -113,6 +119,11 @@ function Diagnosis({ findings }: { findings: Finding[] }) {
               <FindingRow key={finding.id} finding={finding} />
             ))}
           </Stack>
+        )}
+        {hidden > 0 && (
+          <Typography variant="caption" color="text.secondary" component="p" sx={{ mt: 1.5 }}>
+            {hidden} informational {hidden === 1 ? "finding is" : "findings are"} hidden; show them under Settings → Diagnostics.
+          </Typography>
         )}
       </CardContent>
     </Card>

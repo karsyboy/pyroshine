@@ -79,7 +79,9 @@ frame rate, packets the network could not carry, or frames that need
 composition, each with what to change. **Capture path** shows whether frames go
 straight from the game to the encoder (**Direct export**) or are composited
 first, and why. The host cannot see problems on the client or the network
-beyond its own socket.
+beyond its own socket. To list only warnings, turn off **Settings →
+Diagnostics → Informational findings**; this app preference applies at once and
+**Copy diagnostics** still includes every finding.
 
 When a session ends unexpectedly, the dashboard names the cause, such as the
 game's exit status or signal and how long after launch it ended.

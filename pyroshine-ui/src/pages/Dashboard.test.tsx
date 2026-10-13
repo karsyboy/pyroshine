@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../api/session.fixture.json";
 import type { AudioDetails, CaptureStats, SessionSnapshot, StreamStats } from "../api/types";
+import { setPreference } from "../state/preferences";
 import { DashboardPage } from "./Dashboard";
 
 const daemon = vi.hoisted(() => ({
@@ -227,6 +228,32 @@ describe("diagnosis and capture path", () => {
     expect(html).toContain("Diagnosis");
     expect(html).toContain("The encoder cannot keep up with 60 fps");
     expect(html).toContain("Lower the resolution in the client.");
+  });
+
+  it("hides informational findings when the preference is off, but keeps warnings", () => {
+    const findings = stats({
+      findings: [
+        { id: "encoder_bound", severity: "warning", title: "The encoder cannot keep up", detail: "Slow.", hint: null },
+        { id: "game_bound", severity: "info", title: "The game renders 45 fps", detail: "Limited.", hint: null },
+      ],
+    });
+    const onlyInfo = stats({
+      findings: [{ id: "composited", severity: "info", title: "Frames are composited", detail: "90 %.", hint: null }],
+    });
+    expect(renderStats(findings)).toContain("The game renders 45 fps");
+    setPreference("infoFindings", false);
+    try {
+      const html = renderStats(findings);
+      expect(html).toContain("The encoder cannot keep up");
+      expect(html).not.toContain("The game renders 45 fps");
+      expect(html).toContain("1 informational finding is hidden");
+      const quiet = renderStats(onlyInfo);
+      expect(quiet).not.toContain("Frames are composited");
+      expect(quiet).toContain("No warnings.");
+      expect(quiet).not.toContain("Nothing on the host limits the stream");
+    } finally {
+      setPreference("infoFindings", true);
+    }
   });
 
   it("says when nothing on the host limits the stream, and stays silent for older daemons", () => {
