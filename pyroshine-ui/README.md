@@ -50,8 +50,10 @@ npm run tauri:dev      # the real app against a running Pyroshine, with live rel
 ```
 
 The browser preview simulates a daemon (`src/api/mock.ts`); add `?mock=idle`,
-`?mock=retained`, `?mock=pairing` or `?mock=offline` to the URL for other
-states. Production builds exclude the mock.
+`?mock=retained`, `?mock=pairing`, `?mock=offline`, `?mock=composited`
+(findings and a composited capture path) or `?mock=crashed` (an unexpected
+stop with its cause) to the URL for other states. Production builds exclude
+the mock.
 
 ## Checks
 

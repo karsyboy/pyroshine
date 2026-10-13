@@ -19,20 +19,23 @@ mod config_store;
 mod dbus;
 #[cfg(test)]
 mod dbus_tests;
+mod findings;
 pub(crate) mod schema;
 pub(crate) mod telemetry;
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_shutdown::ShutdownManager;
 use futures_util::StreamExt;
 use moonshine_management::dto::{
-	ApplicationSummary, AudioDetails, Capabilities, ClientsSnapshot, CodecCapability, HealthCheck, HealthReport,
-	LastStop, Listeners, PairedClient, PairingOutcome, PairingResolution, PairingSnapshot, PendingPairing,
-	RequestedMode, ServerEvent, ServerInfo, SessionDetails, SessionPhase, SessionSnapshot, StreamStats, VideoDetails,
+	ApplicationSummary, AudioDetails, Capabilities, ClientsSnapshot, CodecCapability, DiagnosticReport, EncoderDetails,
+	HealthCheck, HealthReport, LastStop, Listeners, PairedClient, PairingOutcome, PairingResolution, PairingSnapshot,
+	PendingPairing, RequestedMode, ServerEvent, ServerInfo, SessionDetails, SessionPhase, SessionSnapshot, StreamStats,
+	VideoDetails,
 };
 use moonshine_management::{BUS_NAME, OBJECT_PATH, UI_BUS_NAME};
 use tokio::sync::{broadcast, watch};
@@ -62,12 +65,24 @@ pub struct ServerFacts {
 	pub health: Option<healthcheck::HealthReport>,
 }
 
+/// Events kept for `GetEvents` and the diagnostic report.
+const EVENT_LOG: usize = 50;
+
 /// Shared state behind the D-Bus interface and the event tasks.
 pub(crate) struct Management {
 	sessions: SessionManager,
 	clients: ClientManager,
 	config: ConfigStore,
-	server: ServerInfo,
+	/// `health` is replaced by `RunHealthCheck`; the rest is fixed at startup.
+	server: Mutex<ServerInfo>,
+	/// The running configuration, for re-running the health check.
+	running_config: Config,
+	/// The latest health check, from startup or `RunHealthCheck`.
+	health: Mutex<Option<healthcheck::HealthReport>>,
+	/// Serializes `RunHealthCheck`: GPU probes must not run concurrently.
+	health_running: tokio::sync::Mutex<()>,
+	/// Recent operator-relevant events, oldest first.
+	events: Mutex<VecDeque<ServerEvent>>,
 	pairing_enabled: bool,
 	/// How long a session waits for its client before it is reported as
 	/// disconnected (the configured stream timeout).
@@ -104,8 +119,36 @@ impl ManagementService {
 		clients: ClientManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Self {
-		let management = Arc::new(Management {
-			server: server_info(&facts, config),
+		let management = Arc::new(Management::new(facts, config, sessions, clients));
+		let task = tokio::spawn(async move {
+			let _ = shutdown.wrap_cancel(serve(management, management_bus())).await;
+		});
+		Self { tasks: vec![task] }
+	}
+}
+
+/// The bus the management interface is served on: the session bus, or
+/// `MOONSHINE_MANAGEMENT_BUS` (a D-Bus address) for a test instance that runs
+/// beside a live service on the same account and must not take over its name
+/// (applications still start through the session bus's systemd).
+fn management_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
+	match std::env::var("MOONSHINE_MANAGEMENT_BUS") {
+		Ok(address) => {
+			tracing::info!(address, "Serving the management interface on MOONSHINE_MANAGEMENT_BUS");
+			zbus::connection::Builder::address(address.as_str())
+		},
+		Err(_) => zbus::connection::Builder::session(),
+	}
+}
+
+impl Management {
+	fn new(facts: ServerFacts, config: &Config, sessions: SessionManager, clients: ClientManager) -> Self {
+		Self {
+			server: Mutex::new(server_info(&facts, config)),
+			running_config: config.clone(),
+			health: Mutex::new(facts.health),
+			health_running: tokio::sync::Mutex::new(()),
+			events: Mutex::new(VecDeque::with_capacity(EVENT_LOG)),
 			config: ConfigStore::open(facts.config_path),
 			pairing_enabled: config.webserver.enable_pairing,
 			client_patience: Duration::from_secs(config.stream.timeout.max(1)),
@@ -119,13 +162,69 @@ impl ManagementService {
 			runtime: tokio::runtime::Handle::current(),
 			sessions,
 			clients,
-		});
-		let task = tokio::spawn(async move {
-			let _ = shutdown
-				.wrap_cancel(serve(management, zbus::connection::Builder::session()))
-				.await;
-		});
-		Self { tasks: vec![task] }
+		}
+	}
+
+	fn server(&self) -> ServerInfo {
+		self.server.lock().unwrap().clone()
+	}
+
+	/// Keep `event` for `GetEvents` and emit it as `ServerEvent`.
+	async fn publish_event(&self, emitter: &zbus::object_server::SignalEmitter<'static>, event: ServerEvent) {
+		{
+			let mut events = self.events.lock().unwrap();
+			if events.len() == EVENT_LOG {
+				events.pop_front();
+			}
+			events.push_back(event.clone());
+		}
+		let _ = ManagementInterface::server_event(emitter, &json(&event)).await;
+	}
+
+	fn events(&self) -> Vec<ServerEvent> {
+		self.events.lock().unwrap().iter().cloned().collect()
+	}
+
+	/// Re-run the health check without disturbing a live session (see
+	/// [`healthcheck::recheck_in_server`]) and make it the reported one.
+	async fn run_health_check(&self) -> HealthReport {
+		let _running = self.health_running.lock().await;
+		let session_active = self.session.borrow().phase != SessionPhase::Idle;
+		let previous = self.health.lock().unwrap().clone();
+		let config = self.running_config.clone();
+		let advertised = self.server.lock().unwrap().capabilities.codecs.clone();
+		let report = tokio::task::spawn_blocking(move || {
+			healthcheck::recheck_in_server(&config, previous.as_ref(), session_active)
+		})
+		.await
+		.expect("health check task");
+		let mut dto = health_report(&report, true);
+		// Clients see the codecs probed at startup until Pyroshine restarts.
+		let now: Vec<_> = codec_capabilities(report.supported_codecs);
+		if !session_active && now != advertised {
+			dto.checks.push(HealthCheck {
+				name: "Advertised codecs".into(),
+				outcome: "warning".into(),
+				message: "The verified codec profiles changed since Pyroshine started.".into(),
+				duration_ms: 0,
+				id: Some("advertised_codecs".into()),
+				hint: Some("Restart Pyroshine so clients are offered the profiles this GPU now passes.".into()),
+				fatal: false,
+			});
+		}
+		*self.health.lock().unwrap() = Some(report);
+		self.server.lock().unwrap().health = Some(dto.clone());
+		dto
+	}
+
+	fn diagnostic_report(&self) -> DiagnosticReport {
+		DiagnosticReport {
+			generated_at_ms: unix_millis(SystemTime::now()),
+			server: self.server(),
+			session: self.session.borrow().clone(),
+			stats: self.stats.borrow().clone(),
+			events: self.events(),
+		}
 	}
 }
 
@@ -169,6 +268,7 @@ async fn serve(management: Arc<Management>, bus: zbus::Result<zbus::connection::
 		follow_sessions(&management, &emitter),
 		follow_pairing(&management, &emitter),
 		follow_stats(&management, &emitter, ui_rx),
+		follow_problems(&management, &emitter),
 	);
 }
 
@@ -234,22 +334,29 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 		}
 		if manager.last_stop != reported_stop {
 			reported_stop = manager.last_stop.clone();
+			// A launch failure's cause was already reported by the launch.
+			let reported = manager
+				.last_stop
+				.as_ref()
+				.and_then(|stop| stop.cause.as_ref())
+				.is_some_and(|cause| cause.reported);
 			if let Some(stop) = snapshot
 				.last_stop
 				.as_ref()
-				.filter(|stop| stop.unexpected || !stop.completed)
+				.filter(|stop| (stop.unexpected && !reported) || !stop.completed)
 			{
 				let event = ServerEvent {
 					level: if stop.completed { "warning" } else { "error" }.into(),
 					code: stop.reason.clone(),
 					message: if stop.completed {
-						stop.message.clone()
+						stop.detail.clone().unwrap_or_else(|| stop.message.clone())
 					} else {
 						"The session did not stop within its deadline; Pyroshine is restarting.".into()
 					},
 					at_ms: stop.at_ms,
+					hint: stop.hint.clone().filter(|_| stop.completed),
 				};
-				let _ = ManagementInterface::server_event(emitter, &json(&event)).await;
+				management.publish_event(emitter, event).await;
 			}
 		}
 
@@ -277,6 +384,29 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 			changed = presence.changed() => if changed.is_err() { return },
 			() = wait_patience => {},
 			() = wait_foreground => {},
+		}
+	}
+}
+
+/// Forward problems reported by the launch and negotiation paths.
+async fn follow_problems(management: &Management, emitter: &zbus::object_server::SignalEmitter<'static>) {
+	let mut problems = management.sessions.subscribe_problems();
+	loop {
+		match problems.recv().await {
+			Ok(problem) => {
+				let event = ServerEvent {
+					level: "error".into(),
+					code: problem.code.into(),
+					message: problem.message,
+					at_ms: unix_millis(problem.at),
+					hint: problem.hint,
+				};
+				management.publish_event(emitter, event).await;
+			},
+			Err(broadcast::error::RecvError::Lagged(missed)) => {
+				tracing::debug!(missed, "Management missed reported problems");
+			},
+			Err(broadcast::error::RecvError::Closed) => return,
 		}
 	}
 }
@@ -340,13 +470,22 @@ async fn follow_stats(
 		active_tx.send_replace(wanted.is_some());
 		if let Some(epoch) = wanted {
 			let receiver = management.sessions.frame_stats_receiver();
-			let aggregation = telemetry::aggregate(receiver, epoch, active.clone(), &management.stats, |stats| {
-				let message = json(stats);
-				let emitter = emitter.clone();
-				tokio::spawn(async move {
-					let _ = ManagementInterface::stats_updated(&emitter, &message).await;
+			let target = {
+				let snapshot = session.borrow();
+				let video = snapshot.session.as_ref().and_then(|session| session.video.as_ref());
+				findings::StreamTarget {
+					fps: video.map_or(0, |video| video.fps),
+					bitrate_bps: video.map_or(0, |video| video.bitrate_bps),
+				}
+			};
+			let aggregation =
+				telemetry::aggregate(receiver, epoch, target, active.clone(), &management.stats, |stats| {
+					let message = json(stats);
+					let emitter = emitter.clone();
+					tokio::spawn(async move {
+						let _ = ManagementInterface::stats_updated(&emitter, &message).await;
+					});
 				});
-			});
 			tokio::pin!(aggregation);
 			// Aggregate until the phase, epoch or UI presence changes.
 			loop {
@@ -380,7 +519,13 @@ impl Management {
 		let phase = status::derive_phase(manager, client, Instant::now(), self.client_patience);
 		let session = match phase {
 			SessionPhase::Idle | SessionPhase::Stopping | SessionPhase::Error => None,
-			_ => self.sessions.session_view().await.map(session_details),
+			_ => {
+				let gpu = self.server.lock().unwrap().capabilities.gpu.clone();
+				self.sessions
+					.session_view()
+					.await
+					.map(|view| session_details(view, &gpu))
+			},
 		};
 		SessionSnapshot {
 			phase,
@@ -391,9 +536,11 @@ impl Management {
 					epoch: stop.epoch,
 					reason: reason.into(),
 					message: message.into(),
-					unexpected,
+					unexpected: unexpected || stop.cause.as_ref().is_some_and(|cause| cause.unexpected),
 					completed: stop.completed,
 					at_ms: unix_millis(stop.at),
+					detail: stop.cause.as_ref().map(|cause| cause.detail.clone()),
+					hint: stop.cause.as_ref().and_then(|cause| cause.hint.clone()),
 				}
 			}),
 		}
@@ -456,7 +603,7 @@ fn pending_pairing(pending: crate::clients::PendingApproval) -> PendingPairing {
 	}
 }
 
-fn session_details(view: SessionView) -> SessionDetails {
+fn session_details(view: SessionView, gpu: &str) -> SessionDetails {
 	let (video, audio) = match view.streams {
 		Some((video, audio)) => (Some(video), Some(audio)),
 		None => (None, None),
@@ -520,6 +667,18 @@ fn session_details(view: SessionView) -> SessionDetails {
 				encrypted: video.encrypt_video,
 				minimum_fec_packets: video.minimum_fec_packets,
 				max_reference_frames: video.max_reference_frames,
+				encoder: Some(match format.codec {
+					VideoCodec::PyroWave => EncoderDetails {
+						backend: "pyrowave".into(),
+						backend_label: "PyroWave (Vulkan compute)".into(),
+						gpu: gpu.into(),
+					},
+					_ => EncoderDetails {
+						backend: "vulkan_video".into(),
+						backend_label: "Vulkan Video".into(),
+						gpu: gpu.into(),
+					},
+				}),
 				pyrowave_dialect: video.pyrowave_dialect.map(|dialect| {
 					match dialect {
 						crate::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1 => {
@@ -560,22 +719,75 @@ fn audio_details(audio: AudioStreamContext) -> AudioDetails {
 	}
 }
 
-/// Codec profiles in advertisement order, with their capability bits.
-const CODECS: &[(u32, &str, &str)] = &[
-	(healthcheck::CODEC_H264, "h264", "H.264"),
-	(healthcheck::CODEC_H264_HIGH_8444, "h264_444", "H.264 4:4:4"),
-	(healthcheck::CODEC_HEVC, "hevc", "HEVC"),
-	(healthcheck::CODEC_HEVC_MAIN10, "hevc_main10", "HEVC Main10"),
-	(healthcheck::CODEC_HEVC_REXT_8444, "hevc_444", "HEVC 4:4:4"),
-	(healthcheck::CODEC_HEVC_REXT_10444, "hevc_444_10", "HEVC 4:4:4 10-bit"),
-	(healthcheck::CODEC_AV1_MAIN8, "av1", "AV1"),
-	(healthcheck::CODEC_AV1_MAIN10, "av1_main10", "AV1 10-bit"),
-	(healthcheck::CODEC_AV1_HIGH_8444, "av1_444", "AV1 4:4:4"),
-	(healthcheck::CODEC_AV1_HIGH_10444, "av1_444_10", "AV1 4:4:4 10-bit"),
-	(healthcheck::CODEC_PYROWAVE, "pyrowave", "PyroWave"),
-	(healthcheck::CODEC_PYROWAVE_444, "pyrowave_444", "PyroWave 4:4:4"),
-	(healthcheck::CODEC_PYROWAVE_HDR, "pyrowave_hdr", "PyroWave HDR10"),
-];
+fn codec_capabilities(supported: u32) -> Vec<CodecCapability> {
+	healthcheck::CODEC_PROFILES
+		.iter()
+		.filter(|(bit, _, _)| supported & bit != 0)
+		.map(|(_, id, label)| CodecCapability {
+			id: (*id).into(),
+			label: (*label).into(),
+		})
+		.collect()
+}
+
+/// The health report for the desktop app. Each check's message is split into
+/// what it found (the first line) and what to do (the remaining lines, which
+/// the command-line report prints indented below it).
+fn health_report(report: &healthcheck::HealthReport, rechecked: bool) -> HealthReport {
+	HealthReport {
+		all_fatal_passed: report.all_fatal_passed,
+		checks: report
+			.checks
+			.iter()
+			.map(|check| {
+				let mut lines = check.message.lines().map(str::trim).filter(|line| !line.is_empty());
+				let message = lines.next().unwrap_or_default().to_string();
+				let rest: Vec<_> = lines.collect();
+				let hint = (check.outcome != CheckOutcome::Passed && !rest.is_empty()).then(|| rest.join("\n"));
+				HealthCheck {
+					name: check.name.into(),
+					outcome: match check.outcome {
+						CheckOutcome::Passed => "passed",
+						CheckOutcome::Warning => "warning",
+						CheckOutcome::Failed => "failed",
+					}
+					.into(),
+					message: if hint.is_some() || rest.is_empty() {
+						message
+					} else {
+						// A passed check keeps every line it reported.
+						std::iter::once(message.as_str())
+							.chain(rest)
+							.collect::<Vec<_>>()
+							.join("\n")
+					},
+					duration_ms: check.duration_ms,
+					id: Some(check_id(check.name)),
+					hint,
+					fatal: check.outcome == CheckOutcome::Failed,
+				}
+			})
+			.collect(),
+		checked_at_ms: Some(unix_millis(SystemTime::now())),
+		rechecked,
+	}
+}
+
+/// A check's stable identifier from its name: `"Render access"` is
+/// `render_access`, `"kcmp(2)"` is `kcmp`.
+fn check_id(name: &str) -> String {
+	let mut id = String::new();
+	for word in name
+		.split(|c: char| !c.is_ascii_alphabetic())
+		.filter(|word| !word.is_empty())
+	{
+		if !id.is_empty() {
+			id.push('_');
+		}
+		id.push_str(&word.to_ascii_lowercase());
+	}
+	id
+}
 
 fn server_info(facts: &ServerFacts, config: &Config) -> ServerInfo {
 	ServerInfo {
@@ -586,36 +798,12 @@ fn server_info(facts: &ServerFacts, config: &Config) -> ServerInfo {
 		started_at_ms: unix_millis(SystemTime::now()),
 		config_path: facts.config_path.display().to_string(),
 		capabilities: Capabilities {
-			codecs: CODECS
-				.iter()
-				.filter(|(bit, _, _)| facts.supported_codecs & bit != 0)
-				.map(|(_, id, label)| CodecCapability {
-					id: (*id).into(),
-					label: (*label).into(),
-				})
-				.collect(),
+			codecs: codec_capabilities(facts.supported_codecs),
 			hdr_advertised: facts.hdr_advertised,
 			dma_buf: facts.dma_buf,
 			gpu: facts.gpu_name.clone(),
 		},
-		health: facts.health.as_ref().map(|report| HealthReport {
-			all_fatal_passed: report.all_fatal_passed,
-			checks: report
-				.checks
-				.iter()
-				.map(|check| HealthCheck {
-					name: check.name.into(),
-					outcome: match check.outcome {
-						CheckOutcome::Passed => "passed",
-						CheckOutcome::Warning => "warning",
-						CheckOutcome::Failed => "failed",
-					}
-					.into(),
-					message: check.message.clone(),
-					duration_ms: check.duration_ms,
-				})
-				.collect(),
-		}),
+		health: facts.health.as_ref().map(|report| health_report(report, false)),
 		listeners: Listeners {
 			address: config.address.clone(),
 			http_port: config.webserver.port,
@@ -667,5 +855,94 @@ mod audio_details_tests {
 		assert!(surround.high_quality);
 		assert_eq!(surround.opus_bitrate_bps, 1_088_000);
 		assert_eq!((surround.opus_streams, surround.opus_coupled_streams), (8, 0));
+	}
+}
+
+#[cfg(test)]
+mod health_report_tests {
+	use super::*;
+	use crate::healthcheck::{CheckResult, HealthReport as CoreReport};
+
+	fn report(checks: Vec<CheckResult>) -> CoreReport {
+		CoreReport {
+			all_fatal_passed: checks.iter().all(|check| check.outcome != CheckOutcome::Failed),
+			checks,
+			supported_codecs: 0,
+			hdr_supported: false,
+			dma_buf_supported: false,
+			gpu_name: String::new(),
+			duration: Duration::ZERO,
+		}
+	}
+
+	fn check(name: &'static str, outcome: CheckOutcome, message: &str) -> CheckResult {
+		CheckResult {
+			name,
+			outcome,
+			message: message.into(),
+			duration_ms: 1,
+		}
+	}
+
+	/// The command line prints a check's remedy indented below its finding;
+	/// the desktop app receives the two separately.
+	#[test]
+	fn failed_checks_separate_the_finding_from_the_remedy() {
+		let dto = health_report(
+			&report(vec![
+				check(
+					"Render access",
+					CheckOutcome::Failed,
+					"  Cannot open /dev/dri/renderD128: Permission denied\n  The node is owned by group 'render'.\n  \
+					 Add your user to this group: `sudo usermod -aG render $USER`",
+				),
+				check("kcmp(2)", CheckOutcome::Passed, "Available"),
+				check(
+					"Sleep inhibit",
+					CheckOutcome::Warning,
+					"  logind returned no file descriptor.",
+				),
+			]),
+			true,
+		);
+		assert!(!dto.all_fatal_passed && dto.rechecked && dto.checked_at_ms.is_some());
+		let access = &dto.checks[0];
+		assert_eq!(access.id.as_deref(), Some("render_access"));
+		assert_eq!(access.message, "Cannot open /dev/dri/renderD128: Permission denied");
+		assert_eq!(
+			access.hint.as_deref(),
+			Some("The node is owned by group 'render'.\nAdd your user to this group: `sudo usermod -aG render $USER`")
+		);
+		assert!(access.fatal);
+		assert_eq!(dto.checks[1].id.as_deref(), Some("kcmp"));
+		assert_eq!((dto.checks[1].hint.as_ref(), dto.checks[1].fatal), (None, false));
+		assert_eq!(dto.checks[2].message, "logind returned no file descriptor.");
+		assert_eq!(dto.checks[2].hint, None);
+	}
+
+	/// A re-run while a session streams never probes the GPU or binds the
+	/// stream ports: it repeats the previous GPU results and reports the
+	/// ports as the server's own.
+	#[test]
+	fn a_recheck_during_a_session_reuses_gpu_results_and_skips_port_binding() {
+		let mut previous = report(vec![
+			check("Vulkan", CheckOutcome::Passed, "Test GPU, Vulkan 1.4"),
+			check("Codecs", CheckOutcome::Passed, "H.264 4:2:0 8-bit"),
+			check("uinput", CheckOutcome::Warning, "  stale"),
+		]);
+		previous.supported_codecs = crate::healthcheck::CODEC_H264;
+		let config = Config::default();
+		let recheck = healthcheck::recheck_in_server(&config, Some(&previous), true);
+		assert_eq!(recheck.supported_codecs, crate::healthcheck::CODEC_H264);
+		let names: Vec<_> = recheck.checks.iter().map(|check| check.name).collect();
+		assert_eq!(&names[..2], ["Vulkan", "Codecs"], "GPU results first, others re-run");
+		assert!(recheck.checks[0].message.contains("do not run while a session streams"));
+		let ports = recheck.checks.iter().find(|check| check.name == "Ports").unwrap();
+		assert_eq!(ports.outcome, CheckOutcome::Passed, "{}", ports.message);
+		assert!(ports.message.contains("in use by the session"), "{}", ports.message);
+		// Without a previous report the GPU is not probed either.
+		let recheck = healthcheck::recheck_in_server(&config, None, true);
+		assert_eq!(recheck.checks[0].name, "GPU");
+		assert_eq!(recheck.checks[0].outcome, CheckOutcome::Warning);
 	}
 }

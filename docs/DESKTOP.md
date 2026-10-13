@@ -66,12 +66,32 @@ NixOS's generated configuration is read-only: edit
 
 ## Stream status and tray
 
-The dashboard shows the active application/client, duration, video/audio formats
-and streaming performance. **Diagnostics** shows version, GPU, profiles, ports
-and the startup healthcheck. The application name follows the foreground game;
-**Moonlight application** retains the original launcher. Disconnected sessions
-retain status until stopped. Frame pacing distinguishes VRR from fixed refresh;
-audio details reflect the negotiated layout and quality.
+The dashboard shows the active application/client, duration, video/audio formats,
+the encoder backend and GPU, and streaming performance. The application name
+follows the foreground game; **Moonlight application** retains the original
+launcher. Disconnected sessions retain status until stopped. Frame pacing
+distinguishes VRR from fixed refresh; audio details reflect the negotiated
+layout and quality.
+
+While streaming, **Diagnosis** states what limits the stream on the host, for
+example an encoder that cannot keep up, a game rendering below the stream's
+frame rate, packets the network could not carry, or frames that need
+composition, each with what to change. **Capture path** shows whether frames go
+straight from the game to the encoder (**Direct export**) or are composited
+first, and why. The host cannot see problems on the client or the network
+beyond its own socket. To list only warnings, turn off **Settings →
+Diagnostics → Informational findings**; this app preference applies at once and
+**Copy diagnostics** still includes every finding.
+
+When a session ends unexpectedly, the dashboard names the cause, such as the
+game's exit status or signal and how long after launch it ended.
+
+**Diagnostics** lists **Recent problems** (rejected launches, refused codec or
+HDR requests, unexpected stops) with what to do, the **Host checks** with a fix
+for each failed check, and the version, GPU, verified codec profiles and ports.
+**Run checks** repeats the host checks without restarting Pyroshine; while a
+session streams it keeps the startup GPU results instead of probing the GPU
+again. **Copy diagnostics** copies one JSON report for a bug report.
 
 | Tray indicator | Meaning |
 | --- | --- |
@@ -103,6 +123,7 @@ Override only if needed with `WEBKIT_DISABLE_DMABUF_RENDERER=0`.
 | Symptom | Action |
 | --- | --- |
 | No notification | Open **Clients**, retry pairing, check desktop notification settings. |
+| A launch or stream fails | Open **Diagnostics → Recent problems** for the cause and fix; see [failure causes](TIPS.md#read-why-a-launch-or-stream-failed). |
 | No request | Check server/network; enable **Settings → Pairing & security → Allow new pairings**, save and restart. [More pairing help](TIPS.md#pairing-does-not-complete). |
 | "Pyroshine isn't running" | Follow [Start](../README.md#2-start); the app reconnects automatically. |
 | Cannot connect / persistent retrying | Check `journalctl -u "pyroshine@$USER" -e` for **Desktop management interface unavailable**. Use the server's user/session bus; update server and GUI together, then restart both. |

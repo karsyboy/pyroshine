@@ -130,6 +130,11 @@ MOONSHINE_APPLICATION_UNIT=moonshine-bench.service \
 `MOONSHINE_APPLICATION_UNIT` must be a plain `*.service` name; an invalid value
 is ignored with a warning.
 
+A server test instance beside a live service also cannot own the management
+name on the shared session bus. `MOONSHINE_MANAGEMENT_BUS` (a D-Bus address,
+for example of a private `dbus-daemon`) serves its management interface there
+instead; applications still start through the session bus's systemd.
+
 ### Output
 
 Every 5 seconds, a summary is printed with:

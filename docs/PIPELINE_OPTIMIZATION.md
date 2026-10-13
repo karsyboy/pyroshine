@@ -116,6 +116,9 @@ Direct export requires complete-scene eligibility from
 [COMPOSITOR.md](COMPOSITOR.md#scene-and-input-decisions). Visible cursors, overlays,
 scaling and other scene content can require GLES composition. Rejection diagnostics
 record the first blocking condition with fixed counters, avoiding per-frame strings.
+Each exported frame also carries that condition and its path in a copyable
+`CaptureOrigin` through `FrameStats`, which management telemetry summarizes as the
+dashboard's capture path.
 Direct export also needs a single-plane RGB buffer the encoders sample (8-bit,
 10-bit or FP16, either channel order) with a modifier their Vulkan device imports
 ([capture buffers](COMPOSITOR.md#ownership-and-frame-handoff)); anything else,
@@ -345,9 +348,11 @@ and the largest per-sample error per codec, chroma format and bit depth. The
 per-sample bound catches localized corruption and unencoded padding rows,
 which averages hide; the mean error applies to planes of at least one 8x8
 transform block (a 2x2 4:2:0 frame has a single chroma sample). On a host that
-only runs the packaged daemon, the converter self-check at stream start covers
-the same store and layout path: a failure is logged as `Failed to create the
-YCbCr converter` with the differing plane and block column.
+only runs the packaged daemon, the converter self-check covers the same store
+and layout path at startup (the **Color conversion** health check, which also
+withdraws the affected profiles) and at stream start: a failure is logged as
+`converter self-check failed on this GPU` with the differing plane and block
+column.
 
 The encode/decode matrix includes the NVIDIA 8-bit 4:4:4 width regressions at
 1360, 1440 and 2400. Run it on NVIDIA hardware when updating the Pixelforge

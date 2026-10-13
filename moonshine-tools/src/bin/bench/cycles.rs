@@ -493,8 +493,8 @@ pub(super) async fn run_full_cycles(args: &Args) -> Result<(), BoxError> {
 			manager
 				.initialize_session(context(args, settings, cycle))
 				.await
-				.map_err(|()| "initialize")?;
-			manager.launch_session().await.map_err(|()| "launch")?;
+				.map_err(|_| "initialize")?;
+			manager.launch_session().await.map_err(|_| "launch")?;
 			let grant = manager
 				.authorize_stream(Ipv4Addr::LOCALHOST.into())
 				.await
@@ -554,10 +554,10 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 	manager
 		.initialize_session(context(args, settings, 0))
 		.await
-		.map_err(|()| boxed_error("initialize"))?;
-	if manager.launch_session().await.is_err() {
+		.map_err(|failure| boxed_error(format!("initialize: {failure}")))?;
+	if let Err(failure) = manager.launch_session().await {
 		let _ = manager.stop_session().await;
-		return Err(boxed_error("launch"));
+		return Err(boxed_error(format!("launch: {failure}")));
 	}
 	let grant = manager
 		.authorize_stream(Ipv4Addr::LOCALHOST.into())

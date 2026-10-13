@@ -22,6 +22,7 @@ use self::application::ApplicationContext;
 use self::compositor::Compositor;
 use self::compositor::LaunchedCompositor;
 use self::compositor::frame::HdrModeState;
+use self::failure::{SessionFailure, StopCauseSlot};
 use self::inhibit::SleepInhibitor;
 use self::lifecycle::StartLatch;
 use self::manager::{ResumePlan, SessionBackend, StartRequest};
@@ -32,6 +33,7 @@ use self::stream::video::VideoStreamConfig;
 pub mod application;
 pub mod authorization;
 pub mod compositor;
+pub mod failure;
 pub mod inhibit;
 pub mod keys;
 pub(crate) mod lifecycle;
@@ -181,8 +183,9 @@ impl SessionBackend for SystemSession {
 		&self,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		cause: StopCauseSlot,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	) -> Result<InitializedSession, ()> {
+	) -> Result<InitializedSession, SessionFailure> {
 		InitializedSession::new(
 			self.compositor_config.clone(),
 			self.video_config.clone(),
@@ -191,13 +194,14 @@ impl SessionBackend for SystemSession {
 			self.address.clone(),
 			context,
 			stop,
+			cause,
 			self.stats_tx.clone(),
 			foreground_tx,
 		)
 		.await
 	}
 
-	async fn launch(&self, session: InitializedSession) -> Result<LaunchedSession, ()> {
+	async fn launch(&self, session: InitializedSession) -> Result<LaunchedSession, SessionFailure> {
 		session.launch().await
 	}
 
@@ -273,6 +277,20 @@ impl SessionBackend for SystemSession {
 	}
 }
 
+/// A stream socket could not be created. The common cause is another process
+/// (often another streaming host such as Sunshine) holding its port.
+fn stream_setup_failure(stream: &str, port: u16) -> SessionFailure {
+	SessionFailure::new(
+		"stream_setup_failed",
+		format!("Pyroshine could not open the {stream} stream on UDP port {port}."),
+	)
+	.with_hint(format!(
+		"Make sure no other program (for example another streaming server) uses UDP port {port}, \
+		 or change the port in the configuration. {}",
+		failure::SEE_SERVICE_LOG
+	))
+}
+
 /// Initialized session state — components created, compositor and app not yet started.
 pub(crate) struct InitializedSession {
 	context: SessionContext,
@@ -282,6 +300,7 @@ pub(crate) struct InitializedSession {
 	control_stream: ControlStream,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	stop: ShutdownManager<SessionShutdownReason>,
+	cause: StopCauseSlot,
 }
 
 impl InitializedSession {
@@ -294,9 +313,10 @@ impl InitializedSession {
 		address: String,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		cause: StopCauseSlot,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	) -> Result<Self, ()> {
+	) -> Result<Self, SessionFailure> {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
@@ -307,7 +327,10 @@ impl InitializedSession {
 			stop.clone(),
 			foreground_tx,
 		);
-		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
+		let (audio_port, video_port, control_port) = (audio_config.port, video_config.port, control_config.port);
+		let audio = AudioStream::new(audio_config, address.clone(), stop.clone())
+			.await
+			.map_err(|()| stream_setup_failure("audio", audio_port))?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
@@ -315,9 +338,12 @@ impl InitializedSession {
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
+			cause.clone(),
 		)
-		.await?;
-		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())?;
+		.await
+		.map_err(|()| stream_setup_failure("video", video_port))?;
+		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())
+			.map_err(|()| stream_setup_failure("control", control_port))?;
 
 		Ok(Self {
 			context,
@@ -327,6 +353,7 @@ impl InitializedSession {
 			control_stream,
 			hdr_metadata_rx,
 			stop,
+			cause,
 		})
 	}
 
@@ -334,7 +361,7 @@ impl InitializedSession {
 	///
 	/// The manager records the application unit before calling this, so a
 	/// cancellation after systemd accepted the unit is still cleaned up.
-	pub(crate) async fn launch(self) -> Result<LaunchedSession, ()> {
+	pub(crate) async fn launch(self) -> Result<LaunchedSession, SessionFailure> {
 		let Self {
 			context,
 			compositor,
@@ -343,6 +370,7 @@ impl InitializedSession {
 			control_stream,
 			hdr_metadata_rx,
 			stop,
+			cause,
 		} = self;
 
 		// Waiting for the compositor's readiness blocks; keep it off the runtime
@@ -350,7 +378,20 @@ impl InitializedSession {
 		// exits on the session stop that cancelled it.
 		let launched_compositor = tokio::task::spawn_blocking(move || compositor.launch())
 			.await
-			.map_err(|e| tracing::error!("Compositor launch task failed: {e}"))??;
+			.map_err(|e| {
+				tracing::error!("Compositor launch task failed: {e}");
+				SessionFailure::see_log("compositor_start_failed", "The streaming compositor failed to start.")
+			})?
+			.map_err(|error| {
+				SessionFailure::new(
+					"compositor_start_failed",
+					format!("The streaming compositor could not start: {error}."),
+				)
+				.with_hint(
+					"Check the GPU selection (gpu in the configuration) and the startup checks on the \
+					 Diagnostics page or with pyroshine healthcheck.",
+				)
+			})?;
 		let ready = launched_compositor.ready();
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
@@ -375,6 +416,7 @@ impl InitializedSession {
 				]),
 			},
 			stop,
+			cause,
 		)
 		.await?;
 

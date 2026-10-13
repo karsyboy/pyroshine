@@ -12,10 +12,10 @@ use moonshine_management::dto::{
 	SaveOutcome, ServerInfo, SessionPhase, SessionSnapshot,
 };
 use moonshine_management::{ManagementError, ManagementProxy, UI_BUS_NAME};
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::{Management, ServerFacts, config_store::ConfigStore, serve, server_info};
+use super::{Management, ServerFacts, serve};
 use crate::clients::{ClientManager, PendingClient, new_approval_token};
 use crate::config::Config;
 use crate::session::manager::SessionManager;
@@ -119,7 +119,9 @@ impl Harness {
 		let sessions = SessionManager::for_test(shutdown.clone());
 		let clients = ClientManager::isolated(directory.path().join("state.toml"));
 		clients.ensure_cleanup(shutdown);
-		let config = Config::default();
+		let mut config = Config::default();
+		config.webserver.enable_pairing = true;
+		config.stream.timeout = 60;
 		let facts = ServerFacts {
 			version: "test".into(),
 			config_path: config_path.clone(),
@@ -129,22 +131,7 @@ impl Harness {
 			gpu_name: "Test GPU".into(),
 			health: None,
 		};
-		let management = Arc::new(Management {
-			server: server_info(&facts, &config),
-			config: ConfigStore::open(config_path.clone()),
-			pairing_enabled: true,
-			client_patience: Duration::from_secs(60),
-			session: watch::channel(SessionSnapshot {
-				phase: SessionPhase::Idle,
-				session: None,
-				last_stop: None,
-			})
-			.0,
-			stats: watch::channel(None).0,
-			runtime: tokio::runtime::Handle::current(),
-			sessions: sessions.clone(),
-			clients: clients.clone(),
-		});
+		let management = Arc::new(Management::new(facts, &config, sessions.clone(), clients.clone()));
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
 		let server = tokio::spawn(serve(management, builder));
 		let connection = bus.connect().await;
@@ -565,4 +552,73 @@ async fn the_desktop_ui_name_suppresses_fallback_notifications() {
 		assert!(Instant::now() < deadline, "UI departure was not observed");
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
+}
+
+/// Rejected launches and negotiations reach the desktop app as events with
+/// their cause and hint, are kept for `GetEvents`, and appear in the
+/// diagnostic report.
+#[tokio::test]
+async fn reported_problems_are_signalled_kept_and_included_in_the_report() {
+	use crate::session::failure::Problem;
+	use moonshine_management::dto::{DiagnosticReport, ServerEvent};
+
+	let harness = Harness::start().await;
+	let mut events = harness
+		.proxy
+		.receive_server_event()
+		.await
+		.unwrap()
+		.map(|signal| signal.args().unwrap().event().clone());
+	let events_before: Vec<ServerEvent> = serde_json::from_str(&harness.proxy.get_events().await.unwrap()).unwrap();
+	assert!(events_before.is_empty());
+
+	harness.sessions.report_problem(Problem::new(
+		"codec_unsupported",
+		"The client requested AV1 4:2:0 8-bit, which this GPU did not pass at startup.",
+		Some("Choose a verified profile in the client: H.264, PyroWave.".into()),
+	));
+	let event: ServerEvent = next(&mut events).await;
+	assert_eq!(event.level, "error");
+	assert_eq!(event.code, "codec_unsupported");
+	assert_eq!(
+		event.hint.as_deref(),
+		Some("Choose a verified profile in the client: H.264, PyroWave.")
+	);
+
+	let kept: Vec<ServerEvent> = serde_json::from_str(&harness.proxy.get_events().await.unwrap()).unwrap();
+	assert_eq!(kept, std::slice::from_ref(&event));
+	let report: DiagnosticReport = serde_json::from_str(&harness.proxy.get_diagnostic_report().await.unwrap()).unwrap();
+	assert_eq!(report.events, [event]);
+	assert_eq!(report.server.capabilities.gpu, "Test GPU");
+	assert_eq!(report.session.phase, SessionPhase::Idle);
+	assert!(report.stats.is_none());
+}
+
+/// The event log keeps the most recent events only.
+#[tokio::test]
+async fn the_event_log_is_bounded() {
+	use crate::session::failure::Problem;
+	use moonshine_management::dto::ServerEvent;
+
+	let harness = Harness::start().await;
+	let mut events = harness
+		.proxy
+		.receive_server_event()
+		.await
+		.unwrap()
+		.map(|signal| signal.args().unwrap().event().clone());
+	for index in 0..super::EVENT_LOG + 5 {
+		harness
+			.sessions
+			.report_problem(Problem::new("test", format!("problem {index}"), None));
+		// Paced by the signal so the bounded problem channel never lags.
+		let _: ServerEvent = next(&mut events).await;
+	}
+	let kept: Vec<ServerEvent> = serde_json::from_str(&harness.proxy.get_events().await.unwrap()).unwrap();
+	assert_eq!(kept.len(), super::EVENT_LOG);
+	assert_eq!(kept[0].message, "problem 5");
+	assert_eq!(
+		kept.last().unwrap().message,
+		format!("problem {}", super::EVENT_LOG + 4)
+	);
 }

@@ -3,7 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
-mod convert;
+pub(crate) mod convert;
 pub(super) mod dmabuf;
 mod encode_caps;
 pub(super) mod failure;
@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::admission::OverlayCaps;
 use crate::session::compositor::frame::{
-	FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
+	CaptureOrigin, FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
 };
 use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
@@ -219,6 +219,73 @@ fn apply_failure(
 	}
 }
 
+/// Why an encoding loop ended the stream.
+#[derive(Debug)]
+enum EncoderError {
+	/// The encoder for the negotiated format could not be created.
+	Setup(String),
+	/// The color converter produced wrong output in its self-check: the
+	/// stream would show corrupted colors.
+	ColorConversion(convert::SelfCheckFailure),
+	/// Encoding failed permanently (device loss or a futile failure streak).
+	Runtime(String),
+}
+
+impl std::fmt::Display for EncoderError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Setup(error) => write!(f, "encoder setup failed: {error}"),
+			Self::ColorConversion(failure) => failure.fmt(f),
+			Self::Runtime(error) => f.write_str(error),
+		}
+	}
+}
+
+/// The operator-facing cause of an encoder that ended the stream.
+fn encoder_stop_cause(codec: VideoCodec, error: &EncoderError) -> crate::session::failure::StopCause {
+	use crate::session::failure::StopCause;
+	let (detail, hint) = match error {
+		EncoderError::ColorConversion(failure) => (
+			format!(
+				"Color conversion to {} produced wrong colors on this GPU ({}), so Pyroshine stopped the stream \
+				 instead of sending corrupted video.",
+				convert::format_label(failure.format),
+				failure.detail
+			),
+			format!(
+				"This is a Pyroshine or GPU driver bug, not a setting: retrying will not help. Use Copy diagnostics on \
+				 the Diagnostics page and report it at {}. Meanwhile choose another chroma format or bit \
+				 depth, or PyroWave, from the profiles the Color conversion check passes.",
+				crate::session::failure::ISSUES_URL
+			),
+		),
+		EncoderError::Setup(error) => (
+			format!("The {codec} encoder could not be created for this stream: {error}."),
+			"Choose another codec, a lower resolution or 4:2:0 in the client. The Diagnostics page lists \
+			 the codec profiles this GPU passed at startup."
+				.to_string(),
+		),
+		EncoderError::Runtime(error) if error.contains("ERROR_DEVICE_LOST") || error.contains("device lost") => (
+			format!("The GPU lost its device while encoding {codec}: {error}."),
+			"The GPU driver reset or hung. Check the kernel log (journalctl -k -e) for GPU errors; \
+			 a driver update or lower load (resolution, frame rate) can help."
+				.to_string(),
+		),
+		EncoderError::Runtime(error) => (
+			format!("The {codec} encoder failed repeatedly and stopped the stream: {error}."),
+			"Reconnect to retry. If it persists, try another codec in the client; the service log has \
+			 the per-frame errors."
+				.to_string(),
+		),
+	};
+	StopCause {
+		detail,
+		hint: Some(hint),
+		unexpected: false,
+		reported: false,
+	}
+}
+
 fn color_description_for(format: NegotiatedVideoFormat) -> Result<ColorDescription, String> {
 	let description = match (format.primaries, format.transfer) {
 		(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
@@ -345,6 +412,8 @@ struct FrameContext {
 	new_content: bool,
 	/// Captured with VRR (presentation-driven) pacing.
 	vrr_capture: bool,
+	/// How the source frame was produced; diagnostics only.
+	capture_origin: CaptureOrigin,
 	/// Pre-encode latency breakdown measured on the encoding thread.
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
@@ -530,6 +599,7 @@ async fn run_packet_consumer(
 			.created_at
 			.saturating_duration_since(frame_context.source_time);
 		let vrr_capture = frame_context.vrr_capture;
+		let capture_origin = frame_context.capture_origin;
 		frame_number += 1;
 
 		let t_start = std::time::Instant::now();
@@ -617,6 +687,7 @@ async fn run_packet_consumer(
 			source_interval,
 			content_age,
 			vrr_capture,
+			capture_origin,
 		};
 		let completion_stats_tx = stats_tx.clone();
 		let completion_idr_tx = idr_tx.clone();
@@ -709,6 +780,7 @@ async fn run_packet_consumer(
 			source_interval,
 			content_age,
 			vrr_capture,
+			capture_origin,
 		};
 		diagnostics.record(
 			&stats,
@@ -749,6 +821,7 @@ impl VideoPipeline {
 		fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		demand: crate::session::stream::MediaDemand,
+		stop_cause: crate::session::failure::StopCauseSlot,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -762,6 +835,7 @@ impl VideoPipeline {
 			keys_rx,
 			fec_feedback_rx,
 			demand: DemandTracker::new(demand),
+			stop_cause,
 		};
 
 		// Capture the main (multi-threaded) runtime handle so the OS-threaded
@@ -806,6 +880,8 @@ struct VideoPipelineInner {
 	keys_rx: SessionKeysReceiver,
 	fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 	demand: DemandTracker,
+	/// Receives the failure that ends the stream.
+	stop_cause: crate::session::failure::StopCauseSlot,
 }
 
 /// [`crate::session::stream::MediaDemand`] as the encoding loops see it: whether to produce,
@@ -941,25 +1017,34 @@ impl VideoPipelineInner {
 					pending_applied.take(),
 					&runtime,
 				)
+				.map_err(EncoderError::Runtime)
 			} else {
-				match self.create_encoder() {
-					Ok((context, encoder, input_extent)) => self.run_encoding_loop(
-						&runtime,
-						&frame_rx,
-						context,
-						encoder,
-						input_extent,
-						packet_tx.clone(),
-						idr_tx.clone(),
-						&mut idr_frame_request_rx,
-						&mut invalidate_request_rx,
-						&mut reset_request_rx,
-						&reconfigure_rx,
-						stop_session_manager.clone(),
-						hdr_metadata_tx.clone(),
-						stats_tx.clone(),
-						pending_applied.take(),
-					),
+				match self
+					.create_encoder()
+					.map_err(EncoderError::Setup)
+					.and_then(|(context, encoder, input_extent)| {
+						let converter = self.create_converter(&context, input_extent)?;
+						Ok((context, encoder, converter))
+					}) {
+					Ok((context, encoder, converter)) => self
+						.run_encoding_loop(
+							&runtime,
+							&frame_rx,
+							context,
+							encoder,
+							converter,
+							packet_tx.clone(),
+							idr_tx.clone(),
+							&mut idr_frame_request_rx,
+							&mut invalidate_request_rx,
+							&mut reset_request_rx,
+							&reconfigure_rx,
+							stop_session_manager.clone(),
+							hdr_metadata_tx.clone(),
+							stats_tx.clone(),
+							pending_applied.take(),
+						)
+						.map_err(EncoderError::Runtime),
 					Err(error) => Err(error),
 				}
 			};
@@ -978,12 +1063,74 @@ impl VideoPipelineInner {
 						let _ = activation.applied.send(Err(()));
 					}
 					tracing::error!(%error, "Video encoding loop failed");
+					// Recorded before this thread's worker guard stops the session.
+					if !stop_session_manager.is_shutdown_triggered() {
+						self.stop_cause
+							.record(encoder_stop_cause(self.context.format.codec, &error));
+					}
 					break;
 				},
 			}
 		}
 
 		tracing::debug!("Video pipeline stopped.");
+	}
+
+	/// Create the RGB-to-YCbCr converter for this epoch's encoder, whose input
+	/// images measure `input_extent`.
+	///
+	/// The only RGB-to-YCbCr path of the conventional codecs: preferably on the
+	/// dedicated compute family, compositing late layers (cursor and
+	/// notification) and padding to the encoder's block alignment. A converter
+	/// this GPU cannot run correctly fails the stream setup
+	/// ([`EncoderError::ColorConversion`]).
+	fn create_converter(
+		&self,
+		context: &VideoContext,
+		input_extent: (u32, u32),
+	) -> Result<InputConverter, EncoderError> {
+		let ctx = &self.context;
+		let output_format = match (ctx.format.chroma, ctx.format.bit_depth) {
+			(ChromaFormat::Yuv420, BitDepth::Eight) => OutputFormat::NV12,
+			(ChromaFormat::Yuv420, BitDepth::Ten) => OutputFormat::P010,
+			(ChromaFormat::Yuv444, BitDepth::Eight) => OutputFormat::YUV444,
+			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
+		};
+		let codec = pixelforge_codec(ctx.format.codec).map_err(EncoderError::Setup)?;
+		let (extent_width, extent_height) =
+			convert::conversion_extent(codec, ctx.width, ctx.height).map_err(EncoderError::Setup)?;
+		if extent_width > input_extent.0 || extent_height > input_extent.1 {
+			return Err(EncoderError::Setup(format!(
+				"conversion extent {extent_width}x{extent_height} exceeds the encoder input {}x{}",
+				input_extent.0, input_extent.1
+			)));
+		}
+		let converter = InputConverter::new(
+			context.clone(),
+			self.config.conversion_queue,
+			(ctx.width, ctx.height),
+			(extent_width, extent_height),
+			output_format,
+			if ctx.format.hdr {
+				ColorSpace::Bt2020
+			} else {
+				ColorSpace::Bt709
+			},
+			ctx.format.range == ColorRange::Full,
+		)
+		.map_err(|error| match error {
+			convert::ConverterError::Create(error) => {
+				EncoderError::Setup(format!("Failed to create the YCbCr converter: {error}"))
+			},
+			convert::ConverterError::SelfCheck(failure) => EncoderError::ColorConversion(failure),
+		})?;
+		tracing::info!(
+			async_compute = converter.async_compute,
+			conversion_width = extent_width,
+			conversion_height = extent_height,
+			"Using RGB to YCbCr converter with late cursor composition"
+		);
+		Ok(converter)
 	}
 
 	/// Create the encoder for this epoch; also returns the extent of its input
@@ -1148,6 +1295,7 @@ impl VideoPipelineInner {
 		let mut sequence_number = 0u32;
 		// Pacing of the last captured frame, reported for resends of it.
 		let mut last_vrr_capture = false;
+		let mut last_capture_origin = CaptureOrigin::default();
 		let mut rtp_clock = super::rtp_clock::RtpClock::new();
 		let mut last_encoded = None;
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -1215,6 +1363,7 @@ impl VideoPipelineInner {
 					let created_at = frame.created_at;
 					let source_time = frame.source_time;
 					last_vrr_capture = frame.vrr_capture;
+					last_capture_origin = frame.origin;
 					let pacing_origin = frame.pacing_origin();
 					let buffer_index = frame.buffer_index;
 					let reusable = last_encoded
@@ -1361,6 +1510,7 @@ impl VideoPipelineInner {
 				source_interval,
 				content_age: created_at.saturating_duration_since(source_time),
 				vrr_capture: last_vrr_capture,
+				capture_origin: last_capture_origin,
 			};
 			if stats.send > frame_interval {
 				consecutive_slow_sends = consecutive_slow_sends.saturating_add(1);
@@ -1414,7 +1564,7 @@ impl VideoPipelineInner {
 		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
 		context: VideoContext,
 		mut encoder: Encoder,
-		input_extent: (u32, u32),
+		mut input_converter: InputConverter,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
@@ -1485,46 +1635,6 @@ impl VideoPipelineInner {
 		// Rate-limits the drop-to-catch-up warning.
 		let mut last_drop_warn: Option<std::time::Instant> = None;
 
-		// Determine output YUV format based on chroma sampling and dynamic range.
-		let output_format = match (ctx.format.chroma, ctx.format.bit_depth) {
-			(ChromaFormat::Yuv420, BitDepth::Eight) => OutputFormat::NV12,
-			(ChromaFormat::Yuv420, BitDepth::Ten) => OutputFormat::P010,
-			(ChromaFormat::Yuv444, BitDepth::Eight) => OutputFormat::YUV444,
-			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
-		};
-
-		// The only RGB-to-YCbCr path of the conventional codecs: preferably on
-		// the dedicated compute family, compositing late layers (cursor and
-		// notification) and padding to the encoder's block alignment. A
-		// converter this GPU cannot run correctly fails the stream setup.
-		let (extent_width, extent_height) =
-			convert::conversion_extent(pixelforge_codec(ctx.format.codec)?, ctx.width, ctx.height)?;
-		if extent_width > input_extent.0 || extent_height > input_extent.1 {
-			return Err(format!(
-				"conversion extent {extent_width}x{extent_height} exceeds the encoder input {}x{}",
-				input_extent.0, input_extent.1
-			));
-		}
-		let mut input_converter = InputConverter::new(
-			context.clone(),
-			self.config.conversion_queue,
-			(ctx.width, ctx.height),
-			(extent_width, extent_height),
-			output_format,
-			if ctx.format.hdr {
-				ColorSpace::Bt2020
-			} else {
-				ColorSpace::Bt709
-			},
-			ctx.format.range == ColorRange::Full,
-		)
-		.map_err(|e| format!("Failed to create the YCbCr converter: {e}"))?;
-		tracing::info!(
-			async_compute = input_converter.async_compute,
-			conversion_width = extent_width,
-			conversion_height = extent_height,
-			"Using RGB to YCbCr converter with late cursor composition"
-		);
 		let _overlay_support = OverlaySupport::declare(frame_rx, OverlayCaps::PIXELS.union(OverlayCaps::DMABUF));
 		let mut convert_window = convert::ConvertWindow::default();
 
@@ -1560,6 +1670,7 @@ impl VideoPipelineInner {
 		// Track the last HDR mode state sent to the control stream.
 		// Pacing of the last captured frame, reported for replays of it.
 		let mut last_vrr_capture = false;
+		let mut last_capture_origin = CaptureOrigin::default();
 		let mut last_hdr_state = HdrModeState {
 			enabled: ctx.format.hdr,
 			metadata: None,
@@ -1687,6 +1798,7 @@ impl VideoPipelineInner {
 									source_time: now,
 									new_content: false,
 									vrr_capture: last_vrr_capture,
+									capture_origin: last_capture_origin,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
 									convert: std::time::Duration::ZERO,
@@ -2048,11 +2160,13 @@ impl VideoPipelineInner {
 						// needed, packetizes and sends it, and records stats.
 						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 						last_vrr_capture = frame.vrr_capture;
+						last_capture_origin = frame.origin;
 						let frame_context = FrameContext {
 							created_at: frame.created_at,
 							source_time: frame.source_time,
 							new_content: true,
 							vrr_capture: frame.vrr_capture,
+							capture_origin: frame.origin,
 							channel_wait: t1_received.duration_since(frame.created_at),
 							import: t2_imported.duration_since(t1_received),
 							convert: t3_converted.duration_since(t2_imported),
@@ -2152,7 +2266,10 @@ impl Drop for ConsumerTask<'_> {
 
 #[cfg(test)]
 mod tests {
-	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_vk, is_device_lost};
+	use super::{
+		BT2408_SDR_REFERENCE_NITS, EncoderError, OutputFormat, SCRGB_REFERENCE_WHITE_NITS, VideoCodec, convert,
+		drm_fourcc_to_vk, encoder_stop_cause, is_device_lost,
+	};
 	use ash::vk::{self, Handle};
 	use pixelforge::PixelForgeError;
 
@@ -2356,6 +2473,30 @@ mod tests {
 				vk::Result::ERROR_DEVICE_LOST
 			)));
 		}
+	}
+
+	/// Issue #11: a converter self-check failure is reported as a color
+	/// conversion defect to report, not as an encoder to retry.
+	#[test]
+	fn color_conversion_failures_are_reported_as_bugs_not_retries() {
+		let cause = encoder_stop_cause(
+			VideoCodec::Hevc,
+			&EncoderError::ColorConversion(convert::SelfCheckFailure {
+				format: OutputFormat::NV12,
+				detail: "Cb 0/4 by column within a 4x2 block".into(),
+			}),
+		);
+		assert_eq!(
+			cause.detail,
+			"Color conversion to 4:2:0 8-bit (NV12) produced wrong colors on this GPU (Cb 0/4 by column within a \
+			 4x2 block), so Pyroshine stopped the stream instead of sending corrupted video."
+		);
+		let hint = cause.hint.unwrap();
+		assert!(hint.contains("retrying will not help"), "{hint}");
+		assert!(hint.contains(crate::session::failure::ISSUES_URL), "{hint}");
+		// A setup failure keeps its own advice.
+		let setup = encoder_stop_cause(VideoCodec::Av1, &EncoderError::Setup("too small".into()));
+		assert!(setup.detail.starts_with("The AV1 encoder could not be created"));
 	}
 
 	#[test]

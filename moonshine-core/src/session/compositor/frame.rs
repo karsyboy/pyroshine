@@ -200,6 +200,28 @@ impl SourceLease {
 	}
 }
 
+/// How a captured frame was produced. Diagnostics only: the encoders handle
+/// every path the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CapturePath {
+	/// The application's own DMA-BUF, exported without composition.
+	Direct,
+	/// Direct export with the cursor or a Steam notification drawn by the
+	/// encoder's conversion (late composition).
+	DirectLate,
+	/// The scene composited with GLES into a capture buffer.
+	#[default]
+	Composited,
+}
+
+/// A frame's capture path and, when it was composited, the first condition
+/// that ruled out direct export.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CaptureOrigin {
+	pub path: CapturePath,
+	pub composition_reason: Option<super::DirectReject>,
+}
+
 /// A compositor frame exported for encoding.
 #[derive(Debug)]
 pub(crate) struct ExportedFrame {
@@ -242,6 +264,8 @@ pub(crate) struct ExportedFrame {
 	/// Layers to composite at encode time, bottom to top; all `None` when the
 	/// frame is complete.
 	pub overlays: FrameOverlays,
+	/// How the frame was produced; diagnostics only.
+	pub origin: CaptureOrigin,
 }
 
 /// Layout of a single DMA-BUF plane; its descriptor is owned by the frame.
@@ -299,6 +323,7 @@ impl ExportedFrame {
 			color_space,
 			hdr_metadata,
 			overlays: Default::default(),
+			origin: CaptureOrigin::default(),
 		}
 	}
 
@@ -358,6 +383,7 @@ impl ExportedFrame {
 			color_space: FrameColorSpace::Srgb,
 			hdr_metadata: None,
 			overlays: Default::default(),
+			origin: CaptureOrigin::default(),
 		}
 	}
 }

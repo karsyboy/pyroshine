@@ -157,6 +157,16 @@ impl Daemon {
 		}
 	}
 
+	/// Replace the server's health report and tell the window.
+	pub fn health_changed(&self, app: &AppHandle, report: Value) {
+		self.update(|overview| {
+			if let Some(server) = overview.server.as_mut().and_then(Value::as_object_mut) {
+				server.insert("health".into(), report.clone());
+			}
+		});
+		let _ = app.emit("daemon://health", &report);
+	}
+
 	fn current(&self, generation: u64) -> bool {
 		self.generation.load(Ordering::Acquire) == generation
 	}
@@ -225,16 +235,26 @@ impl Daemon {
 				proxy.receive_config_saved().await?,
 				proxy.receive_stats_updated().await?,
 				proxy.receive_server_event().await?,
+				proxy.receive_health_changed().await?,
 			))
 		};
-		let (mut session, mut pairing, mut requested, mut resolved, mut clients, mut saved, mut stats, mut events) =
-			match streams.await {
-				Ok(streams) => streams,
-				Err(error) => {
-					tracing::warn!("Cannot subscribe to Pyroshine: {error}");
-					return Attached::failed(error.into());
-				},
-			};
+		let (
+			mut session,
+			mut pairing,
+			mut requested,
+			mut resolved,
+			mut clients,
+			mut saved,
+			mut stats,
+			mut events,
+			mut health,
+		) = match streams.await {
+			Ok(streams) => streams,
+			Err(error) => {
+				tracing::warn!("Cannot subscribe to Pyroshine: {error}");
+				return Attached::failed(error.into());
+			},
+		};
 		let overview = match read_overview(&proxy).await {
 			Ok(overview) => overview,
 			Err(error) => {
@@ -328,6 +348,12 @@ impl Daemon {
 					if let Some(value) = signal.args().ok().and_then(|args| json(args.event())) {
 						sinks.notifier.server_event(&value).await;
 						let _ = sinks.app.emit("daemon://server-event", &value);
+					}
+				},
+				Some(signal) = health.next() => {
+					current!();
+					if let Some(value) = signal.args().ok().and_then(|args| json(args.report())) {
+						self.health_changed(&sinks.app, value);
 					}
 				},
 				else => return Attached::Ended,

@@ -100,6 +100,9 @@ fn main() {
 			commands::load_config,
 			commands::validate_config,
 			commands::save_config,
+			commands::events,
+			commands::run_health_check,
+			commands::diagnostic_report,
 			commands::quit,
 		])
 		.setup(move |app| {

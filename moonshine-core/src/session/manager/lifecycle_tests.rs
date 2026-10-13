@@ -91,6 +91,11 @@ struct FakeBackend {
 	stop_on_launch_return: AtomicBool,
 	/// The most recent session's stop, so tests can play a failing worker.
 	session_stop: std::sync::Mutex<Option<ShutdownManager<SessionShutdownReason>>>,
+	/// The most recent session's stop cause slot.
+	session_cause: std::sync::Mutex<Option<StopCauseSlot>>,
+	/// Stopping the application records its exit as a cause, as the exit
+	/// monitor does when teardown stops the unit.
+	exit_on_stop: AtomicBool,
 	foreground_tx: std::sync::Mutex<Option<watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>>>,
 	/// Every reconnect plan the backend ran.
 	plans: std::sync::Mutex<Vec<PlanRecord>>,
@@ -120,6 +125,8 @@ impl FakeBackend {
 			worker_exit: watch::channel(true).0,
 			stop_on_launch_return: AtomicBool::new(false),
 			session_stop: std::sync::Mutex::new(None),
+			session_cause: std::sync::Mutex::new(None),
+			exit_on_stop: AtomicBool::new(false),
 			foreground_tx: std::sync::Mutex::new(None),
 			plans: std::sync::Mutex::new(Vec::new()),
 			start_pacing: std::sync::Mutex::new(Vec::new()),
@@ -171,6 +178,10 @@ impl FakeBackend {
 	}
 }
 
+fn injected() -> SessionFailure {
+	SessionFailure::new("test_failure", "Injected test failure.")
+}
+
 impl SessionBackend for FakeBackend {
 	type Initialized = FakeSession;
 	type Launched = FakeSession;
@@ -180,24 +191,26 @@ impl SessionBackend for FakeBackend {
 		&self,
 		_context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		cause: StopCauseSlot,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	) -> Result<FakeSession, ()> {
+	) -> Result<FakeSession, SessionFailure> {
+		*self.session_cause.lock().unwrap() = Some(cause);
 		if self.counters.resources.load(Ordering::SeqCst) != 0 || self.counters.unit_created.load(Ordering::SeqCst) {
 			self.counters.overlapped.store(true, Ordering::SeqCst);
 		}
 		*self.session_stop.lock().unwrap() = Some(stop.clone());
 		*self.foreground_tx.lock().unwrap() = Some(foreground_tx);
 		// Like the gamepad thread: a worker that exists from initialization.
-		self.spawn_worker(&stop, None)?;
+		self.spawn_worker(&stop, None).map_err(|()| injected())?;
 		let session = self.session(&stop, 1);
-		self.gate(Op::Initialize).await?;
+		self.gate(Op::Initialize).await.map_err(|()| injected())?;
 		Ok(session)
 	}
 
-	async fn launch(&self, session: FakeSession) -> Result<FakeSession, ()> {
+	async fn launch(&self, session: FakeSession) -> Result<FakeSession, SessionFailure> {
 		// systemd accepted the transient unit; the start job is still running.
 		self.counters.unit_created.store(true, Ordering::SeqCst);
-		self.gate(Op::Launch).await?;
+		self.gate(Op::Launch).await.map_err(|()| injected())?;
 		if self.stop_on_launch_return.load(Ordering::SeqCst) {
 			let _ = session.stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
 		}
@@ -256,6 +269,17 @@ impl SessionBackend for FakeBackend {
 	}
 
 	async fn stop_application(&self, _unit_name: &str) -> Result<(), ()> {
+		if self.exit_on_stop.load(Ordering::SeqCst)
+			&& let Some(cause) = self.session_cause.lock().unwrap().as_ref()
+		{
+			// Like the exit monitor seeing the application exit after SIGTERM.
+			cause.record(crate::session::failure::StopCause {
+				detail: "Game exited with status 143, 3 s after launch.".into(),
+				hint: None,
+				unexpected: true,
+				reported: false,
+			});
+		}
 		self.gate(Op::StopApplication).await?;
 		self.counters.unit_created.store(false, Ordering::SeqCst);
 		self.counters.unit_stops.fetch_add(1, Ordering::SeqCst);
@@ -364,7 +388,7 @@ impl Harness {
 	}
 
 	async fn initialize(&self) -> Result<(), ()> {
-		self.core.initialize_session(context()).await
+		self.core.initialize_session(context()).await.map_err(drop)
 	}
 
 	async fn grant(&self) -> StreamAuthorization {
@@ -559,10 +583,10 @@ async fn hold_at(h: &Harness, op: Op) -> tokio::task::JoinHandle<Result<(), ()>>
 	h.hold(op);
 	let core = h.core.clone();
 	let task = match op {
-		Op::Initialize => tokio::spawn(async move { core.initialize_session(context()).await }),
+		Op::Initialize => tokio::spawn(async move { core.initialize_session(context()).await.map_err(drop) }),
 		Op::Launch => {
 			h.initialize().await.unwrap();
-			tokio::spawn(async move { core.launch_session().await })
+			tokio::spawn(async move { core.launch_session().await.map_err(drop) })
 		},
 		Op::Start => {
 			h.launched().await;
@@ -633,7 +657,7 @@ async fn failure_of_each_transition_tears_down_deterministically() {
 			Op::Initialize => h.initialize().await,
 			Op::Launch => {
 				h.initialize().await.unwrap();
-				h.core.launch_session().await
+				h.core.launch_session().await.map_err(drop)
 			},
 			Op::Start => {
 				h.launched().await;
@@ -1681,7 +1705,76 @@ mod status {
 		h.wait_idle().await;
 		let last = status.borrow().last_stop.clone().unwrap();
 		assert_eq!(last.reason, SessionShutdownReason::CompositorStopped);
+		assert_eq!(last.cause, None, "the worker did not say why");
 		assert_eq!(phase(&status, ClientPresence::default()), SessionPhase::Idle);
+	}
+
+	/// A cause recorded before the stop (the application's exit status, the
+	/// encoder's failure) is reported with the stop, and only the first one.
+	#[tokio::test]
+	async fn the_first_recorded_cause_is_reported_with_the_stop() {
+		use crate::session::failure::StopCause;
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.active().await;
+		let cause = h.backend().session_cause.lock().unwrap().clone().unwrap();
+		let exit = StopCause {
+			detail: "Game crashed (SIGSEGV, core dumped), 4 s after launch.".into(),
+			hint: Some("Read its output.".into()),
+			unexpected: true,
+			reported: false,
+		};
+		cause.record(exit.clone());
+		let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+		stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped)
+			.unwrap();
+		// A consequence of the stop does not replace the cause.
+		cause.record(StopCause {
+			detail: "later".into(),
+			hint: None,
+			unexpected: false,
+			reported: false,
+		});
+		h.wait_idle().await;
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::ApplicationStopped);
+		assert_eq!(last.cause, Some(exit));
+	}
+
+	/// Found end to end (2026-10-13): ending a session stops the application
+	/// before the workers, and the exit monitor saw that exit. It is a
+	/// consequence of the operator's stop, never its cause.
+	#[tokio::test]
+	async fn an_application_exit_caused_by_teardown_is_not_the_cause() {
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.active().await;
+		h.backend().exit_on_stop.store(true, Ordering::SeqCst);
+		h.core.stop_session().await.unwrap();
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::UserStopped);
+		assert_eq!(last.cause, None);
+	}
+
+	/// A failed launch is the cause of its session's stop, marked as already
+	/// reported (the launch response and its problem event carry it).
+	#[tokio::test]
+	async fn a_failed_launch_is_the_reported_cause_of_the_stop() {
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.fail(Op::Launch);
+		h.initialize().await.unwrap();
+		let failure = h.core.launch_session().await.unwrap_err();
+		assert_eq!(failure, injected());
+		h.wait_idle().await;
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::TransitionFailed);
+		let cause = last.cause.unwrap();
+		assert_eq!(cause.detail, "Injected test failure.");
+		assert!(cause.reported);
+		// A second launch attempt is refused with a cause, not a bare error.
+		let refused = h.core.launch_session().await.unwrap_err();
+		assert_eq!(refused.code, "session_cancelled");
 	}
 
 	/// A teardown past its deadline is never reported idle.

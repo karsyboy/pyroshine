@@ -46,6 +46,15 @@ pub trait Management {
 	/// Latest [`crate::dto::StreamStats`], or JSON `null`.
 	fn get_stats(&self) -> zbus::Result<String>;
 
+	/// Recent [`crate::dto::ServerEvent`]s, oldest first, as a JSON array.
+	fn get_events(&self) -> zbus::Result<String>;
+	/// Run the host checks again and return the [`crate::dto::HealthReport`].
+	/// While a session runs, checks that would disturb it (GPU encoder
+	/// probes, port binding) report their startup result instead.
+	fn run_health_check(&self) -> zbus::Result<String>;
+	/// [`crate::dto::DiagnosticReport`].
+	fn get_diagnostic_report(&self) -> zbus::Result<String>;
+
 	#[zbus(signal)]
 	fn session_changed(&self, snapshot: String) -> zbus::Result<()>;
 	#[zbus(signal)]
@@ -62,6 +71,9 @@ pub trait Management {
 	fn stats_updated(&self, stats: String) -> zbus::Result<()>;
 	#[zbus(signal)]
 	fn server_event(&self, event: String) -> zbus::Result<()>;
+	/// A new [`crate::dto::HealthReport`] (after `RunHealthCheck`).
+	#[zbus(signal)]
+	fn health_changed(&self, report: String) -> zbus::Result<()>;
 }
 
 /// Proxy for a running desktop UI instance.

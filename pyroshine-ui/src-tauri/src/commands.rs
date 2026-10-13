@@ -86,6 +86,34 @@ pub async fn save_config(daemon: State<'_, Arc<Daemon>>, values: Value, revision
 	)
 }
 
+/// Recent events (oldest first). Empty from a daemon that does not keep them.
+#[tauri::command]
+pub async fn events(daemon: State<'_, Arc<Daemon>>) -> Result<Value> {
+	match daemon.proxy().await?.get_events().await {
+		Ok(events) => parse(&events),
+		Err(error) if UiError::from(error.clone()).kind == "incompatible" => Ok(Value::Array(Vec::new())),
+		Err(error) => Err(error.into()),
+	}
+}
+
+/// Run the host checks again; the daemon also announces the new report.
+#[tauri::command]
+pub async fn run_health_check(app: AppHandle, daemon: State<'_, Arc<Daemon>>) -> Result<Value> {
+	let report = parse(&daemon.proxy().await?.run_health_check().await?)?;
+	daemon.health_changed(&app, report.clone());
+	Ok(report)
+}
+
+/// Everything needed to diagnose the host, as indented JSON for the clipboard.
+#[tauri::command]
+pub async fn diagnostic_report(daemon: State<'_, Arc<Daemon>>) -> Result<String> {
+	let report = parse(&daemon.proxy().await?.get_diagnostic_report().await?)?;
+	serde_json::to_string_pretty(&report).map_err(|error| UiError {
+		kind: "failed".into(),
+		message: error.to_string(),
+	})
+}
+
 /// Quit the desktop app. Pyroshine and any stream keep running.
 #[tauri::command]
 pub fn quit(app: AppHandle) {

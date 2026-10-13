@@ -72,6 +72,18 @@ pub struct SessionDetails {
 	pub audio: Option<AudioDetails>,
 }
 
+/// Which encoder backend produces the video stream and on which GPU.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncoderDetails {
+	/// `vulkan_video` (Pixelforge H.264/HEVC/AV1) or `pyrowave`.
+	pub backend: String,
+	/// Display name, for example `Vulkan Video`.
+	pub backend_label: String,
+	/// GPU that encodes; the capture GPU as well (Pyroshine captures and
+	/// encodes on one device).
+	pub gpu: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationSummary {
 	/// Application ID as reported to clients.
@@ -127,6 +139,9 @@ pub struct VideoDetails {
 	pub max_reference_frames: u32,
 	/// PyroWave transport dialect, for PyroWave streams.
 	pub pyrowave_dialect: Option<String>,
+	/// Encoder backend and GPU. Absent from older daemons.
+	#[serde(default)]
+	pub encoder: Option<EncoderDetails>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +183,14 @@ pub struct LastStop {
 	/// Whether teardown completed (false when it exceeded its deadline).
 	pub completed: bool,
 	pub at_ms: u64,
+	/// What ended the session, when the component that ended it said, for
+	/// example "Steam exited with status 1, 4 s after launch." Absent from
+	/// older daemons.
+	#[serde(default)]
+	pub detail: Option<String>,
+	/// What the operator can do about it.
+	#[serde(default)]
+	pub hint: Option<String>,
 }
 
 /// Static server information, sent by `GetServer`.
@@ -206,6 +229,12 @@ pub struct CodecCapability {
 pub struct HealthReport {
 	pub all_fatal_passed: bool,
 	pub checks: Vec<HealthCheck>,
+	/// When the checks ran. Absent from older daemons.
+	#[serde(default)]
+	pub checked_at_ms: Option<u64>,
+	/// The report comes from `RunHealthCheck` rather than startup.
+	#[serde(default)]
+	pub rechecked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +244,15 @@ pub struct HealthCheck {
 	pub outcome: String,
 	pub message: String,
 	pub duration_ms: u64,
+	/// Stable identifier, for example `render_node`. Absent from older daemons.
+	#[serde(default)]
+	pub id: Option<String>,
+	/// What to change when the check did not pass.
+	#[serde(default)]
+	pub hint: Option<String>,
+	/// A failure keeps Pyroshine from starting.
+	#[serde(default)]
+	pub fatal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +426,26 @@ pub struct StreamStats {
 	/// captured in the window (or from a daemon that does not report it).
 	#[serde(default)]
 	pub capture: Option<CaptureStats>,
+	/// The daemon's reading of this window: bottlenecks and causes worth
+	/// the operator's attention, most important first. Empty when nothing
+	/// stands out (and from older daemons).
+	#[serde(default)]
+	pub findings: Vec<Finding>,
+}
+
+/// One conclusion drawn from a statistics window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Finding {
+	/// Stable identifier, for example `encoder_bound`.
+	pub id: String,
+	/// `info` or `warning`.
+	pub severity: String,
+	/// One line, for example "The encoder limits the frame rate".
+	pub title: String,
+	/// The numbers behind it.
+	pub detail: String,
+	/// What the operator can change.
+	pub hint: Option<String>,
 }
 
 /// How the application's frames reached the encoder over the window: their
@@ -413,6 +471,40 @@ pub struct CaptureStats {
 	/// Time from content becoming current to its capture, in microseconds.
 	pub content_age_p50_us: f64,
 	pub content_age_p95_us: f64,
+	/// How the frames were produced (direct export or composition). Absent
+	/// from older daemons.
+	#[serde(default)]
+	pub path: Option<CapturePathStats>,
+}
+
+/// How the window's frames reached the encoder.
+///
+/// Direct export hands the application's own DMA-BUF to the encoder;
+/// composition renders the scene into a capture buffer first, which costs
+/// GPU time on the game's GPU and adds latency.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturePathStats {
+	/// `direct`, `direct_late`, `composited` or `mixed`: the path of every
+	/// frame in the window, or `mixed`.
+	pub current: String,
+	/// The application's buffer, exported unchanged.
+	pub direct_frames: u64,
+	/// Direct export with the cursor or a Steam notification drawn by the
+	/// encoder's color conversion.
+	pub direct_late_frames: u64,
+	/// Composited by the compositor.
+	pub composited_frames: u64,
+	/// Why frames were composited, most frequent first.
+	pub composition_reasons: Vec<CompositionReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositionReason {
+	/// Stable identifier, for example `scaling` or `steam_overlay`.
+	pub id: String,
+	pub label: String,
+	pub hint: Option<String>,
+	pub frames: u64,
 }
 
 /// Timing of one pipeline stage over the window, in microseconds.
@@ -426,7 +518,7 @@ pub struct StageStats {
 	pub max_us: f64,
 }
 
-/// Notable backend event, sent by `ServerEvent`.
+/// Notable backend event, sent by `ServerEvent` and listed by `GetEvents`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerEvent {
 	/// `info`, `warning` or `error`.
@@ -434,6 +526,22 @@ pub struct ServerEvent {
 	pub code: String,
 	pub message: String,
 	pub at_ms: u64,
+	/// What the operator can do about it. Absent from older daemons.
+	#[serde(default)]
+	pub hint: Option<String>,
+}
+
+/// Everything needed to diagnose the host in one document, sent by
+/// `GetDiagnosticReport` for the desktop app's "Copy diagnostics".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticReport {
+	pub generated_at_ms: u64,
+	/// Includes the most recent health report.
+	pub server: ServerInfo,
+	pub session: SessionSnapshot,
+	pub stats: Option<StreamStats>,
+	/// Recent events, oldest first.
+	pub events: Vec<ServerEvent>,
 }
 
 /// Editable configuration settings, sent by `GetConfigSchema`. The daemon

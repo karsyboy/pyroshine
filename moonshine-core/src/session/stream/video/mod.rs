@@ -21,6 +21,7 @@ mod pipeline;
 pub(crate) mod pyrowave;
 mod rtp_clock;
 pub use pipeline::ConversionQueueMode;
+pub(crate) use pipeline::convert;
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
 pub use fec::FecMode;
@@ -188,6 +189,8 @@ pub struct FrameStats {
 	pub content_age: std::time::Duration,
 	/// Captured with VRR (presentation-driven) pacing.
 	pub vrr_capture: bool,
+	/// How the source frame was produced (direct export or composition).
+	pub(crate) capture_origin: crate::session::compositor::frame::CaptureOrigin,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -512,6 +515,8 @@ pub(crate) struct VideoStream {
 	frame_rx: crate::session::compositor::admission::CaptureReceiver,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	/// Receives the encoder's failure if it ends the session.
+	stop_cause: crate::session::failure::StopCauseSlot,
 }
 
 impl VideoStream {
@@ -522,6 +527,7 @@ impl VideoStream {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stop_cause: crate::session::failure::StopCauseSlot,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
@@ -539,6 +545,7 @@ impl VideoStream {
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,
+			stop_cause,
 		})
 	}
 
@@ -557,6 +564,7 @@ impl VideoStream {
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,
+			stop_cause,
 		} = self;
 
 		// Apply QoS to UDP socket.
@@ -624,6 +632,7 @@ impl VideoStream {
 			fec_feedback_rx,
 			reconfigure_rx,
 			demand,
+			stop_cause,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
@@ -1247,6 +1256,7 @@ mod tests {
 				watch::channel(HdrModeState::new(false)).0,
 				ShutdownManager::new(),
 				broadcast::channel(1).0,
+				Default::default(),
 			)
 			.await
 			.is_err()
@@ -1290,6 +1300,7 @@ mod tests {
 					watch::channel(HdrModeState::new(false)).0,
 					stop.clone(),
 					broadcast::channel(1).0,
+					Default::default(),
 				)
 				.await
 			})

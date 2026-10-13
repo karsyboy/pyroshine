@@ -10,7 +10,9 @@ use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, Vide
 
 use crate::config::Config;
 use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
-use crate::session::stream::video::{BitDepth, ChromaFormat, NegotiatedVideoFormat, VideoCodec};
+use crate::session::stream::video::{
+	BitDepth, ChromaFormat, ConversionQueueMode, NegotiatedVideoFormat, VideoCodec, convert,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -27,7 +29,7 @@ pub struct CheckResult {
 	pub duration_ms: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HealthReport {
 	pub checks: Vec<CheckResult>,
 	pub all_fatal_passed: bool,
@@ -73,6 +75,32 @@ pub const CODEC_PYROWAVE_MASK: u32 = CODEC_PYROWAVE | CODEC_PYROWAVE_444 | CODEC
 
 /// Test a negotiated mode against the exact combinations successfully probed
 /// at startup.  This intentionally has no codec-name-only shortcut.
+/// Codec profiles in advertisement order: capability bit, stable id, label.
+pub const CODEC_PROFILES: &[(u32, &str, &str)] = &[
+	(CODEC_H264, "h264", "H.264"),
+	(CODEC_H264_HIGH_8444, "h264_444", "H.264 4:4:4"),
+	(CODEC_HEVC, "hevc", "HEVC"),
+	(CODEC_HEVC_MAIN10, "hevc_main10", "HEVC Main10"),
+	(CODEC_HEVC_REXT_8444, "hevc_444", "HEVC 4:4:4"),
+	(CODEC_HEVC_REXT_10444, "hevc_444_10", "HEVC 4:4:4 10-bit"),
+	(CODEC_AV1_MAIN8, "av1", "AV1"),
+	(CODEC_AV1_MAIN10, "av1_main10", "AV1 10-bit"),
+	(CODEC_AV1_HIGH_8444, "av1_444", "AV1 4:4:4"),
+	(CODEC_AV1_HIGH_10444, "av1_444_10", "AV1 4:4:4 10-bit"),
+	(CODEC_PYROWAVE, "pyrowave", "PyroWave"),
+	(CODEC_PYROWAVE_444, "pyrowave_444", "PyroWave 4:4:4"),
+	(CODEC_PYROWAVE_HDR, "pyrowave_hdr", "PyroWave HDR10"),
+];
+
+/// Labels of the profiles in `capabilities`, in advertisement order.
+pub fn codec_profile_labels(capabilities: u32) -> Vec<&'static str> {
+	CODEC_PROFILES
+		.iter()
+		.filter(|(bit, _, _)| capabilities & bit != 0)
+		.map(|(_, _, label)| *label)
+		.collect()
+}
+
 pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -> bool {
 	if format.codec == VideoCodec::PyroWave {
 		if format.range != crate::session::stream::video::ColorRange::Full {
@@ -247,6 +275,7 @@ pub fn print_health_report(report: &HealthReport) {
 /// is invoked unconditionally so the server always advertises real capabilities.
 pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 	let gpu_config = config.map(|c| c.compositor.gpu.clone()).unwrap_or(None);
+	let conversion_queue = conversion_queue(config);
 
 	let mut report = HealthReport {
 		checks: Vec::new(),
@@ -258,12 +287,14 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 		duration: Duration::ZERO,
 	};
 
-	run_gpu_checks(&mut report, &gpu_config);
+	run_gpu_checks(&mut report, &gpu_config, conversion_queue);
 	// --no-health-check discards the report, but identity/selection failures
-	// must still reach the administrator before the generic startup gate.
+	// and profiles withdrawn for wrong colors must still reach the
+	// administrator before the generic startup gate.
 	for check in report.checks.iter().filter(|check| {
-		check.outcome == CheckOutcome::Failed
-			&& matches!(check.name, "GPU config" | "Render access" | "EGL/GLES" | "Vulkan")
+		(check.outcome == CheckOutcome::Failed
+			&& matches!(check.name, "GPU config" | "Render access" | "EGL/GLES" | "Vulkan"))
+			|| (check.outcome != CheckOutcome::Passed && check.name == COLOR_CONVERSION)
 	}) {
 		tracing::error!(check = check.name, error = %check.message, "GPU capability probe failed");
 	}
@@ -276,8 +307,14 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 	}
 }
 
+fn conversion_queue(config: Option<&Config>) -> ConversionQueueMode {
+	config
+		.map(|config| config.stream.video.conversion_queue)
+		.unwrap_or_default()
+}
+
 /// Run the GPU/codec/HDR probes and record their results into `report`.
-fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
+fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>, conversion_queue: ConversionQueueMode) {
 	check_render_nodes(report, gpu_config);
 	let render_node_open = check_render_node_open(report, gpu_config);
 	// Prefer the configured/accessible node over the first discovered one, so
@@ -285,6 +322,7 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	let egl_result = check_egl(report, render_node_open.as_ref());
 	let vk_context = check_vulkan(report, render_node_open.as_ref().filter(|_| egl_result.is_some()));
 	check_codecs(report, vk_context.as_ref());
+	check_color_conversion(report, vk_context.as_ref(), conversion_queue);
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
 
 	if let Some(ref ctx) = vk_context {
@@ -300,6 +338,69 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	if let Some((_, hdr, _)) = &egl_result {
 		report.hdr_supported = *hdr && vk_context.is_some() && report.dma_buf_supported;
 	}
+}
+
+/// Checks whose probes create GPU encoders or contexts. A re-run inside the
+/// server repeats them only while no session runs.
+pub const GPU_CHECKS: &[&str] = &[
+	"Render nodes",
+	"GPU config",
+	"Render access",
+	"EGL/GLES",
+	"Vulkan",
+	"Codecs",
+	COLOR_CONVERSION,
+	"PyroWave",
+	"DMA-BUF",
+];
+
+/// Run the checks again inside the running server (the desktop app's
+/// "Run checks"). Unlike [`run_healthcheck`] it never binds the server's own
+/// listeners, and while a session runs it reports the GPU probes of
+/// `previous` instead of creating encoders next to the live stream.
+pub fn recheck_in_server(config: &Config, previous: Option<&HealthReport>, session_active: bool) -> HealthReport {
+	let started = Instant::now();
+	let mut report = HealthReport {
+		checks: Vec::new(),
+		all_fatal_passed: true,
+		supported_codecs: 0,
+		hdr_supported: false,
+		dma_buf_supported: false,
+		gpu_name: String::new(),
+		duration: Duration::ZERO,
+	};
+	match previous.filter(|_| session_active) {
+		None if session_active => report.add_warn(
+			"GPU",
+			"  GPU probes were not run: a session is streaming.\n  Run the checks again when no session runs.".into(),
+			0,
+		),
+		Some(previous) => {
+			for check in previous.checks.iter().filter(|check| GPU_CHECKS.contains(&check.name)) {
+				let message = format!(
+					"{}\n  Result of the previous check: GPU probes do not run while a session streams.",
+					check.message.trim_end()
+				);
+				report.add(check.name, check.outcome, message, check.duration_ms);
+			}
+			report.supported_codecs = previous.supported_codecs;
+			report.hdr_supported = previous.hdr_supported;
+			report.dma_buf_supported = previous.dma_buf_supported;
+			report.gpu_name = previous.gpu_name.clone();
+		},
+		None => run_gpu_checks(&mut report, &config.compositor.gpu, conversion_queue(Some(config))),
+	}
+	check_xwayland(&mut report);
+	check_xdg_runtime(&mut report);
+	check_inhibit(&mut report);
+	check_kcmp(&mut report);
+	check_ports_in_server(&mut report, config, session_active);
+	check_uinput(&mut report);
+	check_uhid(&mut report);
+	check_input_group(&mut report);
+	check_dirs(&mut report, config);
+	report.duration = started.elapsed();
+	report
 }
 
 pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
@@ -319,7 +420,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	// --- GPU checks ---
 
-	run_gpu_checks(&mut report, &gpu_config);
+	run_gpu_checks(&mut report, &gpu_config, conversion_queue(config));
 
 	// --- External dependencies ---
 
@@ -803,6 +904,96 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	}
 }
 
+const COLOR_CONVERSION: &str = "Color conversion";
+
+/// The converter output format each conventional profile encodes from.
+const CONVERSION_PROFILES: [(pixelforge::OutputFormat, u32); 4] = [
+	(
+		pixelforge::OutputFormat::NV12,
+		CODEC_H264 | CODEC_HEVC | CODEC_AV1_MAIN8,
+	),
+	(pixelforge::OutputFormat::P010, CODEC_HEVC_MAIN10 | CODEC_AV1_MAIN10),
+	(
+		pixelforge::OutputFormat::YUV444,
+		CODEC_H264_HIGH_8444 | CODEC_HEVC_REXT_8444 | CODEC_AV1_HIGH_8444,
+	),
+	(
+		pixelforge::OutputFormat::YUV444P10,
+		CODEC_HEVC_REXT_10444 | CODEC_AV1_HIGH_10444,
+	),
+];
+
+/// Run the stream converter's known-answer self-check for every output format
+/// a verified profile needs, on the configured conversion queue.
+///
+/// Encoder probes only show that a profile can be created; a GPU or driver
+/// that miscompiles the conversion shader still produces wrong colors in every
+/// frame (issue #11: green, striped video on an RTX 5070 Ti). Stream setup runs
+/// the same check and refuses such a converter; running it here reports the
+/// defect before any client connects, and withdraws the affected profiles so
+/// clients are offered only profiles that stream correctly.
+fn check_color_conversion(report: &mut HealthReport, context: Option<&VideoContext>, mode: ConversionQueueMode) {
+	// Without Vulkan, the Vulkan and Codecs checks already explain the failure.
+	let Some(context) = context else {
+		return;
+	};
+	record_color_conversion(report, |format| {
+		convert::self_check(context, mode, format).map_err(|failure| failure.detail)
+	});
+}
+
+/// [`check_color_conversion`] with the self-check supplied by the caller.
+fn record_color_conversion(
+	report: &mut HealthReport,
+	mut self_check: impl FnMut(pixelforge::OutputFormat) -> Result<(), String>,
+) {
+	let start = Instant::now();
+	let mut passed = Vec::new();
+	let mut failures = Vec::new();
+	let mut withdrawn = 0;
+	for (format, profiles) in CONVERSION_PROFILES {
+		if report.supported_codecs & profiles == 0 {
+			continue;
+		}
+		match self_check(format) {
+			Ok(()) => passed.push(convert::format_label(format)),
+			Err(detail) => {
+				failures.push(format!("{}: {detail}", convert::format_label(format)));
+				withdrawn |= report.supported_codecs & profiles;
+			},
+		}
+	}
+	let elapsed = start.elapsed().as_millis() as u64;
+	if failures.is_empty() {
+		if !passed.is_empty() {
+			report.add_passed(
+				COLOR_CONVERSION,
+				format!("Output matches the reference for {}", passed.join(", ")),
+				elapsed,
+			);
+		}
+		return;
+	}
+	report.supported_codecs &= !withdrawn;
+	let remaining = codec_profile_labels(report.supported_codecs);
+	let mut message = format!(
+		"  Wrong colors from this GPU's conversion to {}\n  \
+		 Not offered to clients: {}.\n  \
+		 This is a Pyroshine or GPU driver bug, not a setting. Report it with the Diagnostics page's \
+		 Copy diagnostics (or this output) at {}.\n",
+		failures.join("; "),
+		codec_profile_labels(withdrawn).join(", "),
+		crate::session::failure::ISSUES_URL,
+	);
+	if remaining.is_empty() {
+		message.push_str("  No codec profile remains: this host cannot stream until the conversion is fixed.");
+		report.add_failed(COLOR_CONVERSION, message, elapsed);
+	} else {
+		message.push_str(&format!("  Clients can still use: {}.", remaining.join(", ")));
+		report.add_warn(COLOR_CONVERSION, message, elapsed);
+	}
+}
+
 fn check_dmabuf(report: &mut HealthReport, context: Option<&VideoContext>) -> bool {
 	let start = Instant::now();
 	let ctx = match context {
@@ -974,7 +1165,12 @@ fn check_inhibit(report: &mut HealthReport) {
 		Err(e) => {
 			report.add_warn(
 				"Sleep inhibit",
-				format!("  Cannot acquire sleep inhibit: {e}\n  Add your user to the 'moonshine' group: `sudo usermod -aG moonshine $USER`\n  Then log out and back in."),
+				format!(
+					"  Cannot acquire sleep inhibit: {e}\n  \
+					 The packaged service joins the 'pyroshine' group, which polkit allows to block sleep\n  \
+					 (NixOS: 'moonshine'). A server started from a terminal needs your user in that group:\n  \
+					 `sudo usermod -aG pyroshine $USER`, then log out and back in."
+				),
 				start.elapsed().as_millis() as u64,
 			);
 			return;
@@ -1006,7 +1202,7 @@ fn check_inhibit(report: &mut HealthReport) {
 
 	report.add_passed(
 		"Sleep inhibit",
-		"Can acquire logind sleep inhibit (user in moonshine group, polkit rules ok)".into(),
+		"Can acquire logind sleep inhibit (polkit rule and group membership ok)".into(),
 		start.elapsed().as_millis() as u64,
 	);
 }
@@ -1099,16 +1295,48 @@ fn check_ports(report: &mut HealthReport, config: &Config) {
 		}
 	}
 
+	report_ports(report, start, &failed, &ok_list);
+}
+
+fn report_ports(report: &mut HealthReport, start: Instant, failed: &[String], ok_list: &[String]) {
 	if failed.is_empty() {
 		report.add_passed("Ports", ok_list.join(", "), start.elapsed().as_millis() as u64);
 	} else {
-		let mut msg = "  Port conflicts detected:\n".to_string();
-		for f in &failed {
-			msg.push_str(&format!("    {f}\n"));
-		}
+		let mut msg = format!("  Port conflicts detected: {}\n", failed.join("; "));
+		msg.push_str(
+			"  Another program (often another streaming server such as Sunshine) holds them.\n  \
+			 Stop it, or change the ports in the configuration.\n",
+		);
 		msg.push_str(&format!("  Available ports: {}", ok_list.join(", ")));
 		report.add_failed("Ports", msg, start.elapsed().as_millis() as u64);
 	}
+}
+
+/// [`check_ports`] from inside the running server: its TCP listeners are
+/// held by the server itself, and the UDP stream ports by a live session.
+fn check_ports_in_server(report: &mut HealthReport, config: &Config, session_active: bool) {
+	let start = Instant::now();
+	let mut failed = Vec::new();
+	let mut ok_list = vec![format!(
+		"HTTP({}), HTTPS({}), RTSP({}) served by Pyroshine",
+		config.webserver.port, config.webserver.port_https, config.stream.port
+	)];
+	let udp = [
+		(config.stream.video.port, "Video UDP"),
+		(config.stream.audio.port, "Audio UDP"),
+		(config.stream.control.port, "Control UDP"),
+	];
+	if session_active {
+		ok_list.push("UDP stream ports in use by the session".into());
+	} else {
+		for (port, name) in udp {
+			match std::net::UdpSocket::bind((config.address.as_str(), port)) {
+				Ok(_) => ok_list.push(format!("{name}({port})")),
+				Err(e) => failed.push(format!("{name} port {port}: {e}")),
+			}
+		}
+	}
+	report_ports(report, start, &failed, &ok_list);
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,5 +1685,80 @@ mod tests {
 				ColorRange::Full,
 			)
 		));
+	}
+
+	fn conversion_report(supported_codecs: u32) -> HealthReport {
+		HealthReport {
+			checks: Vec::new(),
+			all_fatal_passed: true,
+			supported_codecs,
+			hdr_supported: false,
+			dma_buf_supported: true,
+			gpu_name: String::new(),
+			duration: Duration::ZERO,
+		}
+	}
+
+	/// Issue #11: a GPU whose conversion loses chroma samples encodes every
+	/// frame "successfully" with wrong colors. The check withdraws exactly the
+	/// profiles that convert through the failing format and keeps the rest.
+	#[test]
+	fn wrong_colors_withdraw_the_affected_profiles() {
+		use pixelforge::OutputFormat;
+		let all = CODEC_H264 | CODEC_HEVC | CODEC_HEVC_MAIN10 | CODEC_HEVC_REXT_8444 | CODEC_AV1_MAIN8 | CODEC_PYROWAVE;
+		let mut report = conversion_report(all);
+		let mut checked = Vec::new();
+		record_color_conversion(&mut report, |format| {
+			checked.push(format);
+			match format {
+				OutputFormat::NV12 => Err("Cb 0/4 by column within a 4x2 block".into()),
+				_ => Ok(()),
+			}
+		});
+		// AV1/HEVC 4:4:4 10-bit are not supported: their format is not checked.
+		assert_eq!(checked, [OutputFormat::NV12, OutputFormat::P010, OutputFormat::YUV444]);
+		assert_eq!(
+			report.supported_codecs,
+			CODEC_HEVC_MAIN10 | CODEC_HEVC_REXT_8444 | CODEC_PYROWAVE
+		);
+		let check = &report.checks[0];
+		assert_eq!((check.name, check.outcome), (COLOR_CONVERSION, CheckOutcome::Warning));
+		assert!(report.all_fatal_passed, "other profiles still stream");
+		let mut lines = check.message.lines().map(str::trim);
+		assert_eq!(
+			lines.next(),
+			Some("Wrong colors from this GPU's conversion to 4:2:0 8-bit (NV12): Cb 0/4 by column within a 4x2 block")
+		);
+		assert_eq!(lines.next(), Some("Not offered to clients: H.264, HEVC, AV1."));
+		assert!(
+			check
+				.message
+				.contains("Clients can still use: HEVC Main10, HEVC 4:4:4, PyroWave.")
+		);
+		assert!(check.message.contains(crate::session::failure::ISSUES_URL));
+	}
+
+	#[test]
+	fn wrong_colors_for_every_remaining_profile_fail_the_check() {
+		let mut report = conversion_report(CODEC_H264 | CODEC_HEVC);
+		record_color_conversion(&mut report, |_| Err("Y 3/4".into()));
+		assert_eq!(report.supported_codecs, 0);
+		assert_eq!(report.checks[0].outcome, CheckOutcome::Failed);
+		assert!(!report.all_fatal_passed);
+		assert!(report.checks[0].message.contains("No codec profile remains"));
+
+		// A correct conversion passes and keeps every profile.
+		let mut report = conversion_report(CODEC_H264 | CODEC_AV1_HIGH_10444);
+		record_color_conversion(&mut report, |_| Ok(()));
+		assert_eq!(report.supported_codecs, CODEC_H264 | CODEC_AV1_HIGH_10444);
+		assert_eq!(report.checks[0].outcome, CheckOutcome::Passed);
+		assert_eq!(
+			report.checks[0].message,
+			"Output matches the reference for 4:2:0 8-bit (NV12), 4:4:4 10-bit"
+		);
+		// PyroWave alone needs no conversion check.
+		let mut report = conversion_report(CODEC_PYROWAVE);
+		record_color_conversion(&mut report, |_| unreachable!());
+		assert!(report.checks.is_empty());
 	}
 }

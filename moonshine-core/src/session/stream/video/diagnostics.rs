@@ -298,6 +298,7 @@ mod tests {
 			source_interval: Duration::ZERO,
 			content_age: Duration::ZERO,
 			vrr_capture: false,
+			capture_origin: Default::default(),
 		};
 		for _ in 0..10_000 {
 			window.record(&stats, 3, 128, Some(3));

@@ -8,8 +8,10 @@ import type {
   ClientsSnapshot,
   ConfigDocument,
   ConfigValues,
+  HealthReport,
   Overview,
   PairingSnapshot,
+  ServerEvent,
   SessionSnapshot,
   StreamStats,
   UiError,
@@ -26,8 +28,24 @@ const scenario = new URLSearchParams(window.location.search).get("mock") ?? "str
 const now = Date.now();
 
 const session: SessionSnapshot =
-  scenario === "idle" || scenario === "offline"
-    ? { phase: "idle", session: null, last_stop: null }
+  scenario === "idle" || scenario === "offline" || scenario === "crashed"
+    ? {
+        phase: "idle",
+        session: null,
+        last_stop:
+          scenario === "crashed"
+            ? {
+                epoch: 3,
+                reason: "application_stopped",
+                message: "The application exited.",
+                unexpected: true,
+                completed: true,
+                at_ms: now - 90_000,
+                detail: "Cyberpunk 2077 crashed (SIGSEGV, core dumped), 12 s after launch.",
+                hint: "Its output is discarded: set stdout = \"journal\" and stderr = \"journal\" for this application, launch it again, then read it with: journalctl --user -u moonshine-session.service -e",
+              }
+            : null,
+      }
     : {
         phase: scenario === "retained" ? "client_disconnected" : "streaming",
         session: {
@@ -55,6 +73,7 @@ const session: SessionSnapshot =
             minimum_fec_packets: 2,
             max_reference_frames: 1,
             pyrowave_dialect: "native_wire_v1",
+            encoder: { backend: "pyrowave", backend_label: "PyroWave (Vulkan compute)", gpu: "AMD Radeon RX 7900 XTX (RADV NAVI31)" },
           },
           audio: {
             channels: 2,
@@ -163,9 +182,85 @@ function stats(): StreamStats {
       uneven_percent: 0.4 * jitter(),
       content_age_p50_us: 6,
       content_age_p95_us: 15,
+      path:
+        scenario === "composited"
+          ? {
+              current: "mixed",
+              direct_frames: 21,
+              direct_late_frames: 0,
+              composited_frames: 99,
+              composition_reasons: [
+                {
+                  id: "scaling",
+                  label: "The game renders at a different resolution than the stream",
+                  hint: "Run the game fullscreen at the stream's resolution so its frames can be exported without scaling.",
+                  frames: 99,
+                },
+              ],
+            }
+          : { current: "direct", direct_frames: 120, direct_late_frames: 0, composited_frames: 0, composition_reasons: [] },
     },
+    findings:
+      scenario === "composited"
+        ? [
+            {
+              id: "send_backlog",
+              severity: "warning",
+              title: "The network could not keep up with the bitrate",
+              detail: "41 packets were discarded before sending at 1060 Mbit/s (requested 1200 Mbit/s).",
+              hint: "Lower the bitrate in the client, or use a wired connection.",
+            },
+            {
+              id: "composited",
+              severity: "info",
+              title: "Frames are composited: the game renders at a different resolution than the stream",
+              detail: "83 % of frames were composited rather than exported directly, which costs GPU time and latency.",
+              hint: "Run the game fullscreen at the stream's resolution so its frames can be exported without scaling.",
+            },
+          ]
+        : [],
   };
 }
+
+let health: HealthReport = {
+  all_fatal_passed: true,
+  checked_at_ms: now - 5 * 3_600_000,
+  rechecked: false,
+  checks: [
+    { name: "Vulkan", outcome: "passed", message: "AMD Radeon RX 7900 XTX (RADV NAVI31), driver 25.2.0, Vulkan 1.4.318", duration_ms: 41, id: "vulkan", hint: null, fatal: false },
+    { name: "DMA-BUF", outcome: "passed", message: "VK_KHR_external_memory_fd, VK_EXT_image_drm_format_modifier", duration_ms: 12, id: "dma_buf", hint: null, fatal: false },
+    { name: "uinput", outcome: "passed", message: "Writable", duration_ms: 1, id: "uinput", hint: null, fatal: false },
+    {
+      name: "Sleep inhibit",
+      outcome: "warning",
+      message: "Cannot acquire sleep inhibit: org.freedesktop.DBus.Error.AccessDenied",
+      duration_ms: 3,
+      id: "sleep_inhibit",
+      hint: "Add your user to the 'pyroshine' group: `sudo usermod -aG pyroshine $USER`\nThen log out and back in.",
+      fatal: false,
+    },
+  ],
+};
+
+const events: ServerEvent[] =
+  scenario === "offline"
+    ? []
+    : [
+        {
+          level: "error",
+          code: "codec_unsupported",
+          message: "The client requested AV1 4:4:4 8-bit, which this GPU did not pass at startup.",
+          hint: "Choose a verified profile in the client: H.264, HEVC, HEVC Main10, AV1, PyroWave, PyroWave 4:4:4, PyroWave HDR10. Pyroshine never falls back silently.",
+          at_ms: now - 26 * 60_000,
+        },
+        {
+          level: "error",
+          code: "application_not_found",
+          message: "Launching Heroic failed: The application command 'heroic' was not found.",
+          hint: "Install it, or use an absolute path in the application's command (commands are looked up in the PATH of the Pyroshine service).",
+          at_ms: now - 3 * 60_000,
+        },
+      ];
 
 const overview = (): Overview => ({
   connected: scenario !== "offline",
@@ -193,15 +288,7 @@ const overview = (): Overview => ({
             dma_buf: true,
             gpu: "AMD Radeon RX 7900 XTX (RADV NAVI31)",
           },
-          health: {
-            all_fatal_passed: true,
-            checks: [
-              { name: "Vulkan", outcome: "passed", message: "Vulkan 1.4 device available", duration_ms: 41 },
-              { name: "DMA-BUF import", outcome: "passed", message: "Supported", duration_ms: 12 },
-              { name: "uinput", outcome: "passed", message: "/dev/uinput is writable", duration_ms: 1 },
-              { name: "Sleep inhibition", outcome: "warning", message: "polkit rule not installed", duration_ms: 3 },
-            ],
-          },
+          health,
           listeners: { address: "0.0.0.0", http_port: 47989, https_port: 47984, rtsp_port: 48010, video_port: 47998, audio_port: 48000, control_port: 47999 },
           pairing_enabled: true,
         },
@@ -289,6 +376,15 @@ export async function mockInvoke<T>(command: string, args: Record<string, unknow
       config = { ...config, values: args.values as ConfigValues, revision: `r${Date.now()}`, restart_required: true };
       emit("daemon://config-saved", { revision: config.revision, restart_required: true });
       return { revision: config.revision, changed_paths: [], restart_required: true } as T;
+    case "events":
+      return events as T;
+    case "run_health_check":
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      health = { ...health, rechecked: true, checked_at_ms: Date.now() };
+      emit("daemon://health", health);
+      return health as T;
+    case "diagnostic_report":
+      return JSON.stringify({ generated_at_ms: Date.now(), ...overview(), events }, null, 2) as T;
     case "quit":
       return undefined as T;
     default:

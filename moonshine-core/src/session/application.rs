@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
 use futures_util::StreamExt;
@@ -79,6 +79,7 @@ impl ApplicationConfig {
 	}
 }
 
+use crate::session::failure::{SessionFailure, StopCause, StopCauseSlot};
 use crate::session::manager::SessionShutdownReason;
 
 const SYSTEMD_BUS: &str = "org.freedesktop.systemd1";
@@ -88,6 +89,7 @@ const SYSTEMD_MANAGER: &str = "org.freedesktop.systemd1.Manager";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const PROPERTIES_CHANGED: &str = "PropertiesChanged";
 const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
+const SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
 const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 
 /// systemd's `TimeoutStopUSec` for the application unit: how long the
@@ -122,6 +124,8 @@ async fn subscribe_to_systemd_signals(conn: &Connection) -> Result<(), ()> {
 
 #[derive(Clone)]
 pub(crate) struct LaunchOptions<'a> {
+	/// Application title, for operator-facing messages.
+	pub title: &'a str,
 	pub unit_name: &'a str,
 	pub program: &'a str,
 	pub args: &'a [String],
@@ -161,14 +165,21 @@ pub(crate) struct Application {
 }
 
 impl Application {
+	/// Launch the application unit. `cause` receives the application's exit
+	/// status if it ends the session.
 	pub async fn spawn(
 		config: ApplicationConfig,
 		context: ApplicationContext,
 		stop: ShutdownManager<SessionShutdownReason>,
-	) -> Result<Self, ()> {
+		cause: StopCauseSlot,
+	) -> Result<Self, SessionFailure> {
 		let Some(program) = config.command.first() else {
 			tracing::error!("Application command is empty.");
-			return Err(());
+			return Err(SessionFailure::new(
+				"application_command_empty",
+				format!("The application \"{}\" has no command.", config.title),
+			)
+			.with_hint("Set its command in the Pyroshine configuration."));
 		};
 		let args = &config.command[1..];
 		let envs = make_envs(&context)?;
@@ -176,10 +187,13 @@ impl Application {
 		tracing::info!(program, ?args, "Launching application.");
 
 		// Connect to the user session bus.
-		let conn = Connection::session()
+		let conn = Connection::session().await.map_err(|e| {
+			tracing::error!("Failed to connect to session bus: {e}");
+			session_bus_failure(&e.to_string())
+		})?;
+		subscribe_to_systemd_signals(&conn)
 			.await
-			.map_err(|e| tracing::error!("Failed to connect to session bus: {e}"))?;
-		subscribe_to_systemd_signals(&conn).await?;
+			.map_err(|()| session_bus_failure("subscribing to systemd signals failed"))?;
 
 		// Stop any leftover unit from a previous session. A unit whose processes
 		// cannot be shown gone, or that is still loaded, cannot be replaced
@@ -190,11 +204,17 @@ impl Application {
 				tracing::error!(
 					unit = context.unit_name,
 					"A previous application unit is still present; refusing to launch over it"
+				);
+				SessionFailure::new(
+					"previous_application_running",
+					"The previous session's application is still running.",
 				)
+				.with_hint(format!("Stop it with: systemctl --user stop {}", context.unit_name))
 			})?;
 
 		// Launch the application as a transient systemd service unit.
 		let options = LaunchOptions {
+			title: &config.title,
 			unit_name: &context.unit_name,
 			program,
 			args,
@@ -206,22 +226,64 @@ impl Application {
 			stderr_value: &config.stderr,
 		};
 
-		let unit_path = match start_transient_service(&conn, &options).await {
-			Ok(unit_path) => unit_path,
-			Err(_) => {
+		let (unit_path, watch) = match start_transient_service(&conn, &options).await {
+			Ok(started) => started,
+			Err(failure) => {
 				// Best effort cleanup on launch failure; the session's teardown
 				// stops (and verifies) the unit again.
 				stop_unit(&conn, &context.unit_name, Settled::Terminated).await.ok();
-				return Err(());
+				return Err(failure);
 			},
 		};
-		let exit_monitor = spawn_unit_exit_monitor(conn.clone(), context.unit_name.clone(), unit_path, stop);
+		let exit_monitor = spawn_unit_exit_monitor(
+			conn.clone(),
+			ExitReport {
+				title: config.title.clone(),
+				unit_name: context.unit_name.clone(),
+				output: output_hint(&context.unit_name, &config.stdout, &config.stderr),
+				launched_at: Instant::now(),
+			},
+			unit_path,
+			watch,
+			stop,
+			cause,
+		);
 
 		Ok(Self {
 			config,
 			exit_monitor: Some(exit_monitor),
 		})
 	}
+}
+
+fn session_bus_failure(error: &str) -> SessionFailure {
+	SessionFailure::new(
+		"session_bus_unavailable",
+		format!("Pyroshine cannot reach the user session bus to start the application ({error})."),
+	)
+	.with_hint(
+		"Pyroshine starts applications through the user's systemd instance. Run it as the logged-in desktop user \
+		 (the packaged pyroshine@USER service does this).",
+	)
+}
+
+/// Where the operator can read the application's output, as configured by
+/// its `stdout`/`stderr` settings.
+fn output_hint(unit_name: &str, stdout: &Option<String>, stderr: &Option<String>) -> String {
+	let journal = format!("journalctl --user -u {unit_name} -e");
+	for value in [stderr, stdout].into_iter().flatten() {
+		let (setting, path) = split_standard_io(&Some(value.clone()));
+		if let Some((_, path)) = path.filter(|(property, _)| *property != "FileDescriptorName") {
+			return format!("Its output is in {path}.");
+		}
+		if setting.starts_with("journal") || setting.starts_with("kmsg") {
+			return format!("Read its output with: {journal}");
+		}
+	}
+	format!(
+		"Its output is discarded: set stdout = \"journal\" and stderr = \"journal\" for this application, \
+		 launch it again, then read it with: {journal}"
+	)
 }
 
 impl Drop for Application {
@@ -248,7 +310,7 @@ pub(crate) async fn stop_application_unit(unit_name: &str) -> Result<(), ()> {
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
+fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, SessionFailure> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -257,7 +319,10 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 			context
 				.pulse_socket_path
 				.parent()
-				.ok_or_else(|| tracing::error!("Failed to get parent directory of PulseAudio socket."))?
+				.ok_or_else(|| {
+					tracing::error!("Failed to get parent directory of PulseAudio socket.");
+					SessionFailure::see_log("internal_error", "The audio socket path is invalid.")
+				})?
 				.to_string_lossy()
 		),
 		format!("DISPLAY=:{}", context.xdisplay),
@@ -288,7 +353,11 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 				key,
 				"Removed presentation-layer setting; remove it from the application environment"
 			);
-			return Err(());
+			return Err(SessionFailure::new(
+				"application_environment_obsolete",
+				format!("The application environment sets {key}, a removed presentation-layer setting."),
+			)
+			.with_hint("Remove it from the application's environment."));
 		}
 		envs.push(format!("{key}={value}"));
 	}
@@ -309,19 +378,21 @@ fn obsolete_presentation_environment(key: &str, value: &str) -> bool {
 		) || (key == "VK_INSTANCE_LAYERS" && value.split(':').any(|layer| layer == "VK_LAYER_MOONSHINE_wsi"))
 }
 
-/// Wait for a `JobRemoved` signal matching the given job path, accepting only `"done"` as success.
+/// Wait for a `JobRemoved` signal matching the given job path, accepting only
+/// `"done"` as success. The error is systemd's job result (for example
+/// `failed`), `timeout` or `unavailable`.
 async fn wait_for_job_signal(
 	job_stream: &mut SignalStream<'_>,
 	job_path: &OwnedObjectPath,
 	timeout: Duration,
 	label: &str,
-) -> Result<(), ()> {
+) -> Result<(), String> {
 	let result = tokio::time::timeout(timeout, async {
 		while let Some(message) = job_stream.next().await {
-			let body: (u32, OwnedObjectPath, String, String) = message
-				.body()
-				.deserialize()
-				.map_err(|e| tracing::error!("Failed to deserialize JobRemoved signal: {e}"))?;
+			let body: (u32, OwnedObjectPath, String, String) = message.body().deserialize().map_err(|e| {
+				tracing::error!("Failed to deserialize JobRemoved signal: {e}");
+				"unavailable".to_string()
+			})?;
 			let (_, ref path, ref unit, ref result) = body;
 
 			if path != job_path {
@@ -332,23 +403,23 @@ async fn wait_for_job_signal(
 				"done" => Ok(()),
 				other => {
 					tracing::warn!(result = other, unit = unit, "{label} job finished unsuccessfully.");
-					Err(())
+					Err(other.to_string())
 				},
 			};
 		}
-		Err(())
+		Err("unavailable".to_string())
 	})
 	.await;
 
 	match result {
 		Ok(Ok(())) => Ok(()),
-		Ok(Err(())) => {
+		Ok(Err(result)) => {
 			tracing::warn!(label, "Received failure result for {label} job.");
-			Err(())
+			Err(result)
 		},
 		Err(_) => {
 			tracing::warn!(timeout_secs = timeout.as_secs(), "Timed out waiting for {label} job.");
-			Err(())
+			Err("timeout".to_string())
 		},
 	}
 }
@@ -531,22 +602,324 @@ async fn stop_unit_owned(unit_name: String) -> Result<(), ()> {
 	stop_unit(&conn, &unit_name, Settled::Terminated).await
 }
 
+/// How the application's main process ended, as systemd reported it on the
+/// unit's `Service` interface.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ExitStatus {
+	/// systemd's service `Result`, for example `success`, `exit-code`,
+	/// `signal`, `core-dump` or `oom-kill`.
+	result: Option<String>,
+	/// `ExecMainCode`: `CLD_EXITED` (1), `CLD_KILLED` (2) or `CLD_DUMPED` (3).
+	code: Option<i32>,
+	/// `ExecMainStatus`: the exit status or the signal number.
+	status: Option<i32>,
+}
+
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+const CLD_DUMPED: i32 = 3;
+
+impl ExitStatus {
+	fn absorb(&mut self, changed: &HashMap<String, zvariant::Value<'_>>) {
+		if let Some(zvariant::Value::Str(result)) = changed.get("Result") {
+			self.result = Some(result.to_string());
+		}
+		if let Some(zvariant::Value::I32(code)) = changed.get("ExecMainCode") {
+			// Zero means no main process has exited yet.
+			self.code = (*code != 0).then_some(*code);
+		}
+		if let Some(zvariant::Value::I32(status)) = changed.get("ExecMainStatus") {
+			self.status = Some(*status);
+		}
+	}
+
+	/// What happened to the process, completing "<title> ...".
+	fn describe(&self) -> String {
+		if self.result.as_deref() == Some("oom-kill") {
+			return "was killed because the system ran out of memory".into();
+		}
+		match (self.code, self.status) {
+			(Some(CLD_EXITED), Some(0)) => "exited normally".into(),
+			(Some(CLD_EXITED), Some(status)) => format!("exited with status {status}"),
+			(Some(CLD_KILLED), Some(signal)) => format!("was killed by {}", signal_name(signal)),
+			(Some(CLD_DUMPED), Some(signal)) => format!("crashed ({}, core dumped)", signal_name(signal)),
+			// Without an exit code, `success` may be the value from before the
+			// process started; claim nothing.
+			_ => match self.result.as_deref() {
+				Some("timeout") => "timed out".into(),
+				_ => "exited".into(),
+			},
+		}
+	}
+
+	/// The process failed rather than quitting on its own: a non-zero
+	/// status, a fatal signal or a resource limit.
+	fn failed(&self) -> bool {
+		match (self.code, self.status) {
+			(Some(CLD_EXITED), Some(status)) => status != 0,
+			(Some(CLD_KILLED | CLD_DUMPED), _) => true,
+			_ => self
+				.result
+				.as_deref()
+				.is_some_and(|result| !matches!(result, "success" | "exit-code")),
+		}
+	}
+
+	/// A crash rather than an exit the application chose.
+	fn crashed(&self) -> bool {
+		self.code == Some(CLD_DUMPED)
+			|| self.result.as_deref() == Some("oom-kill")
+			|| (self.code == Some(CLD_KILLED)
+				&& self
+					.status
+					.is_some_and(|signal| ![libc::SIGTERM, libc::SIGINT, libc::SIGHUP].contains(&signal)))
+	}
+}
+
+fn signal_name(signal: i32) -> String {
+	let name = match signal {
+		libc::SIGHUP => "SIGHUP",
+		libc::SIGINT => "SIGINT",
+		libc::SIGQUIT => "SIGQUIT",
+		libc::SIGILL => "SIGILL",
+		libc::SIGABRT => "SIGABRT",
+		libc::SIGBUS => "SIGBUS",
+		libc::SIGFPE => "SIGFPE",
+		libc::SIGKILL => "SIGKILL",
+		libc::SIGSEGV => "SIGSEGV",
+		libc::SIGPIPE => "SIGPIPE",
+		libc::SIGTERM => "SIGTERM",
+		_ => return format!("signal {signal}"),
+	};
+	name.to_string()
+}
+
+/// How long an exit waits for systemd's exit-status signal, which follows
+/// the state change in the same batch.
+const EXIT_STATUS_WAIT: Duration = Duration::from_millis(250);
+
+/// An exit within this long after launch is reported as a startup failure.
+const EARLY_EXIT: Duration = Duration::from_secs(30);
+
+/// systemd's object path for `unit_name` (`sd_bus_path_encode`): every byte
+/// other than an ASCII letter or a non-leading digit becomes `_xx`.
+fn unit_object_path(unit_name: &str) -> String {
+	let mut path = String::from("/org/freedesktop/systemd1/unit/");
+	for (index, byte) in unit_name.bytes().enumerate() {
+		if byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit()) {
+			path.push(byte as char);
+		} else {
+			path.push_str(&format!("_{byte:02x}"));
+		}
+	}
+	path
+}
+
+/// Property changes of one unit, subscribed before the unit starts so its exit
+/// status is seen even when systemd unloads the unit right after it exits
+/// (`CollectMode=inactive-or-failed`).
+struct UnitWatch {
+	path: OwnedObjectPath,
+	stream: MessageStream,
+	exit: ExitStatus,
+}
+
+impl UnitWatch {
+	async fn new(conn: &Connection, path: OwnedObjectPath) -> Result<Self, String> {
+		let rule = MatchRule::builder()
+			.msg_type(zbus::message::Type::Signal)
+			.sender(SYSTEMD_BUS)
+			.and_then(|builder| builder.path(path.clone()))
+			.and_then(|builder| builder.interface(PROPERTIES_INTERFACE))
+			.and_then(|builder| builder.member(PROPERTIES_CHANGED))
+			.map_err(|e| format!("cannot build the match rule: {e}"))?
+			.build();
+		let stream = MessageStream::for_match_rule(rule, conn, None)
+			.await
+			.map_err(|e| format!("cannot follow the unit: {e}"))?;
+		Ok(Self {
+			path,
+			stream,
+			exit: ExitStatus::default(),
+		})
+	}
+
+	/// The next terminal `ActiveState` (`inactive` or `failed`), recording
+	/// exit-status changes on the way. `None` once the stream ends or a signal
+	/// cannot be read.
+	///
+	/// The subscription predates the unit, so it also delivers the state the
+	/// unit was loaded in (`inactive`, before it started). A terminal state is
+	/// therefore confirmed with systemd before it counts: a unit that is still
+	/// running, or gone (unloaded after it exited), answers authoritatively.
+	async fn next_terminal_state(&mut self, conn: &Connection) -> Option<&'static str> {
+		loop {
+			let state = self.next_active_state().await?;
+			if let Some(terminal) = terminal_state(&state)
+				&& self.confirm_terminal(conn).await
+			{
+				// A stale state can be confirmed when the process has exited
+				// since: its exit status is then still queued behind it.
+				self.drain_exit_status().await;
+				return Some(terminal);
+			}
+		}
+	}
+
+	/// Read queued signals until the exit status is known, briefly.
+	async fn drain_exit_status(&mut self) {
+		let deadline = tokio::time::Instant::now() + EXIT_STATUS_WAIT;
+		while self.exit.code.is_none() {
+			match tokio::time::timeout_at(deadline, self.next_active_state()).await {
+				Ok(Some(_)) => {},
+				Ok(None) | Err(_) => return,
+			}
+		}
+	}
+
+	/// Whether the unit has really stopped: its current state is terminal,
+	/// or it no longer exists.
+	async fn confirm_terminal(&self, conn: &Connection) -> bool {
+		let reply = conn
+			.call_method(
+				Some(SYSTEMD_BUS),
+				&self.path,
+				Some(PROPERTIES_INTERFACE),
+				"Get",
+				&(UNIT_INTERFACE, ACTIVE_STATE_PROPERTY),
+			)
+			.await;
+		match reply {
+			Ok(reply) => match reply.body().deserialize::<(zvariant::Value<'_>,)>() {
+				Ok((zvariant::Value::Str(state),)) => terminal_state(state.as_str()).is_some(),
+				_ => true,
+			},
+			// Unloaded: systemd removes the object once the unit is collected.
+			Err(_) => true,
+		}
+	}
+
+	async fn next_active_state(&mut self) -> Option<String> {
+		while let Some(Ok(signal)) = self.stream.next().await {
+			let body = signal.body();
+			let Ok((iface, changed, _)) =
+				body.deserialize::<(String, HashMap<String, zvariant::Value<'_>>, Vec<String>)>()
+			else {
+				tracing::error!("Failed to deserialize PropertiesChanged signal");
+				return None;
+			};
+			match iface.as_str() {
+				SERVICE_INTERFACE => self.exit.absorb(&changed),
+				UNIT_INTERFACE => {
+					if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY) {
+						return Some(state.to_string());
+					}
+				},
+				_ => {},
+			}
+		}
+		None
+	}
+
+	/// Read the exit status directly when no change signal carried it (the
+	/// process exited before the subscription, or signals were coalesced).
+	/// Best effort: the unit may already be unloaded.
+	async fn complete_exit_status(&mut self, conn: &Connection) {
+		self.drain_exit_status().await;
+		if self.exit.code.is_some() {
+			return;
+		}
+		let reply = tokio::time::timeout(
+			Duration::from_millis(500),
+			conn.call_method(
+				Some(SYSTEMD_BUS),
+				&self.path,
+				Some(PROPERTIES_INTERFACE),
+				"GetAll",
+				&(SERVICE_INTERFACE,),
+			),
+		)
+		.await;
+		if let Ok(Ok(reply)) = reply
+			&& let Ok(properties) = reply.body().deserialize::<HashMap<String, zvariant::Value<'_>>>()
+		{
+			self.exit.absorb(&properties);
+		}
+	}
+}
+
+/// What to do about an early or failed exit. A command that quits cleanly
+/// right away usually handed off to a process that was already running (a
+/// second `steam` launch does this), so it gets no stream of its own.
+fn exit_hint(exit: &ExitStatus, output: &str) -> String {
+	if exit.failed() {
+		output.to_string()
+	} else {
+		format!(
+			"A command that exits right away often hands off to an instance that is already running, or starts \
+			 another process and returns; Pyroshine ends the session when the launched command exits. Close the \
+			 running instance, or launch a command that stays running. {output}"
+		)
+	}
+}
+
+/// What the exit monitor needs to explain an exit.
+struct ExitReport {
+	title: String,
+	unit_name: String,
+	/// Where the application's output can be read.
+	output: String,
+	launched_at: Instant,
+}
+
+impl ExitReport {
+	fn cause(&self, exit: &ExitStatus) -> StopCause {
+		let elapsed = self.launched_at.elapsed();
+		let early = elapsed < EARLY_EXIT;
+		let detail = format!(
+			"{} {}, {} after launch.",
+			self.title,
+			exit.describe(),
+			crate::session::failure::human_duration(elapsed)
+		);
+		let hint = (exit.failed() || early).then(|| exit_hint(exit, &self.output));
+		StopCause {
+			detail,
+			hint,
+			unexpected: exit.crashed() || (early && exit.failed()),
+			reported: false,
+		}
+	}
+}
+
 fn spawn_unit_exit_monitor(
 	conn: Connection,
-	unit_name: String,
+	report: ExitReport,
 	unit_path: OwnedObjectPath,
+	mut watch: UnitWatch,
 	stop: ShutdownManager<SessionShutdownReason>,
+	cause: StopCauseSlot,
 ) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		tokio::select! {
-			state = wait_for_unit_terminal_state(&conn, &unit_name, &unit_path) => {
+			state = wait_for_unit_terminal_state(&conn, &report.unit_name, &unit_path, &mut watch) => {
 				match state {
 					Ok(state) => {
-						tracing::info!(unit = unit_name, state, "Application unit exited; stopping session.");
+						watch.complete_exit_status(&conn).await;
+						let exit_cause = report.cause(&watch.exit);
+						tracing::info!(
+							unit = report.unit_name,
+							state,
+							exit = ?watch.exit,
+							"{} Stopping session.",
+							exit_cause.detail
+						);
+						// Recorded before the stop so teardown reports it.
+						cause.record(exit_cause);
 						let _ = stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
 					},
 					Err(()) => {
-						tracing::warn!(unit = unit_name, "Application unit monitor stopped unexpectedly.");
+						tracing::warn!(unit = report.unit_name, "Application unit monitor stopped unexpectedly.");
 					},
 				}
 			},
@@ -559,6 +932,7 @@ async fn wait_for_unit_terminal_state(
 	conn: &Connection,
 	unit_name: &str,
 	unit_path: &OwnedObjectPath,
+	watch: &mut UnitWatch,
 ) -> Result<String, ()> {
 	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
 		.await
@@ -567,21 +941,6 @@ async fn wait_for_unit_terminal_state(
 		.receive_signal("UnitRemoved")
 		.await
 		.map_err(|e| tracing::error!("Failed to subscribe to UnitRemoved signals: {e}"))?;
-
-	let rule = MatchRule::builder()
-		.msg_type(zbus::message::Type::Signal)
-		.sender(SYSTEMD_BUS)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.path(unit_path)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.interface(PROPERTIES_INTERFACE)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.member(PROPERTIES_CHANGED)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.build();
-	let mut state_stream = MessageStream::for_match_rule(rule, conn, None)
-		.await
-		.map_err(|e| tracing::error!("Failed to create state stream: {e}"))?;
 
 	match current_unit_state(conn, unit_path).await {
 		Ok(state) => {
@@ -594,21 +953,8 @@ async fn wait_for_unit_terminal_state(
 
 	loop {
 		tokio::select! {
-			message = state_stream.next() => {
-				let Some(Ok(signal)) = message else {
-					return Err(());
-				};
-				let body = signal.body();
-				let (iface, changed, _): (String, HashMap<String, zvariant::Value<'_>>, Vec<String>) =
-					body.deserialize()
-						.map_err(|e| tracing::error!("Failed to deserialize PropertiesChanged signal: {e}"))?;
-				if iface != UNIT_INTERFACE {
-					continue;
-				}
-				if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY)
-					&& let Some(state) = terminal_state(state.as_str()) {
-						return Ok(state.to_string());
-					}
+			state = watch.next_terminal_state(conn) => {
+				return state.map(str::to_string).ok_or(());
 			},
 			message = unit_removed_stream.next() => {
 				let Some(message) = message else {
@@ -682,32 +1028,53 @@ fn split_standard_io(value: &Option<String>) -> (String, Option<(&'static str, S
 }
 
 /// Launch the application as a transient systemd service unit via D-Bus.
-async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<OwnedObjectPath, ()> {
+///
+/// Returns the unit's object path and a watch subscribed before the unit
+/// started, so the exit monitor sees how the application ends.
+async fn start_transient_service(
+	conn: &Connection,
+	options: &LaunchOptions<'_>,
+) -> Result<(OwnedObjectPath, UnitWatch), SessionFailure> {
+	let internal = |message: &str| SessionFailure::see_log("application_start_failed", message.to_string());
 	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
 	let (pre_entries, main_entry, post_entries) = tokio::task::spawn_blocking({
 		let pre_commands = options.pre_commands.clone();
 		let post_commands = options.post_commands.clone();
 		let main_program = options.program.to_string();
 		let args = options.args.to_vec();
-		move || -> Result<_, ()> {
+		move || -> Result<_, SessionFailure> {
 			let program_for_error = main_program.clone();
 			// Every configured hook is installed in order, or the launch fails;
 			// systemd can only enforce hooks it is given.
 			let hooks = |stage, commands| {
-				build_exec_entries(stage, commands)
-					.map_err(|error| tracing::error!(%error, "Application hook cannot be installed; not launching"))
+				build_exec_entries(stage, commands).map_err(|error| {
+					tracing::error!(%error, "Application hook cannot be installed; not launching");
+					SessionFailure::new("application_hook_invalid", format!("Application hook {error}."))
+						.with_hint("Fix the application's pre_command/post_command in the Pyroshine configuration.")
+				})
 			};
 			Ok((
 				hooks("pre_command", &pre_commands)?,
 				build_exec_entry(main_program, args.clone()).ok_or_else(move || {
 					tracing::error!("Main program '{}' not found in PATH.", program_for_error);
+					SessionFailure::new(
+						"application_not_found",
+						format!("The application command '{program_for_error}' was not found."),
+					)
+					.with_hint(
+						"Install it, or use an absolute path in the application's command \
+						 (commands are looked up in the PATH of the Pyroshine service).",
+					)
 				})?,
 				hooks("post_command", &post_commands)?,
 			))
 		}
 	})
 	.await
-	.map_err(|e| tracing::error!("spawn_blocking panicked: {e}"))??;
+	.map_err(|e| {
+		tracing::error!("spawn_blocking panicked: {e}");
+		internal("Resolving the application command failed unexpectedly.")
+	})??;
 
 	tracing::debug!(?pre_entries, ?main_entry, ?post_entries, "Building transient service");
 
@@ -717,6 +1084,10 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 	// (`StandardOutput=file` + `StandardOutputFile=/path`).
 	let (stdout_setting, stdout_path) = split_standard_io(options.stdout_value);
 	let (stderr_setting, stderr_path) = split_standard_io(options.stderr_value);
+
+	let exec_array = |entries: &[(String, Vec<String>, bool)]| {
+		build_exec_array(entries).map_err(|()| internal("The application command could not be encoded for systemd."))
+	};
 
 	// Properties: a(sv) — array of (property_name: s, value: v)
 	// zvariant::Value has D-Bus type 'v' (variant), so Vec<(String, Value)> serialises as a(sv).
@@ -740,7 +1111,7 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 			]),
 		),
 		// ExecStart: a(sasb)
-		("ExecStart".to_string(), build_exec_array(&[main_entry])?),
+		("ExecStart".to_string(), exec_array(&[main_entry])?),
 		(
 			"TimeoutStopUSec".to_string(),
 			zvariant::Value::U64(UNIT_STOP_TIMEOUT.as_micros() as u64),
@@ -768,23 +1139,44 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 	// Only include ExecStartPre/ExecStopPost when non-empty: an empty a(sasb) array still
 	// needs a valid element signature, and omitting absent properties is cleaner.
 	if !pre_entries.is_empty() {
-		properties.push(("ExecStartPre".to_string(), build_exec_array(&pre_entries)?));
+		properties.push(("ExecStartPre".to_string(), exec_array(&pre_entries)?));
 	}
 	if !post_entries.is_empty() {
-		properties.push(("ExecStopPost".to_string(), build_exec_array(&post_entries)?));
+		properties.push(("ExecStopPost".to_string(), exec_array(&post_entries)?));
 	}
 
 	// Aux units: empty a(sa(sv))
 	let aux: Vec<(&str, Vec<(&str, zvariant::Value)>)> = Vec::new();
 
+	let output = output_hint(options.unit_name, options.stdout_value, options.stderr_value);
+	let exited = |exit: &ExitStatus, stage: &str| {
+		SessionFailure::new(
+			"application_exited",
+			format!("{} {} {stage}.", options.title, exit.describe()),
+		)
+		.with_hint(exit_hint(exit, &output))
+	};
+
+	// Follow the unit before it exists: an application that exits at once
+	// is unloaded immediately, together with its exit status.
+	let expected_path = OwnedObjectPath::try_from(unit_object_path(options.unit_name))
+		.map_err(|e| internal(&format!("The unit name cannot be followed: {e}")))?;
+	let mut watch = UnitWatch::new(conn, expected_path).await.map_err(|e| {
+		tracing::error!("Failed to follow the application unit: {e}");
+		internal("Pyroshine could not follow the application unit.")
+	})?;
+
 	// Subscribe to JobRemoved before calling StartTransientUnit to avoid a race condition.
 	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
 		.await
-		.map_err(|e| tracing::error!("Failed to create systemd proxy: {e}"))?;
-	let mut job_stream = proxy
-		.receive_signal("JobRemoved")
-		.await
-		.map_err(|e| tracing::error!("Failed to subscribe to JobRemoved signals: {e}"))?;
+		.map_err(|e| {
+			tracing::error!("Failed to create systemd proxy: {e}");
+			internal("Pyroshine could not talk to systemd.")
+		})?;
+	let mut job_stream = proxy.receive_signal("JobRemoved").await.map_err(|e| {
+		tracing::error!("Failed to subscribe to JobRemoved signals: {e}");
+		internal("Pyroshine could not talk to systemd.")
+	})?;
 
 	// Call StartTransientUnit.
 	let reply = conn
@@ -796,15 +1188,47 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 			&(options.unit_name, "replace", &properties, &aux),
 		)
 		.await
-		.map_err(|e| tracing::warn!("Failed to start transient service: {e}"))?;
+		.map_err(|e| {
+			tracing::warn!("Failed to start transient service: {e}");
+			SessionFailure::new(
+				"application_start_rejected",
+				format!("systemd refused to start {}: {e}", options.title),
+			)
+			.with_hint("Check the application's stdout/stderr settings and command in the Pyroshine configuration.")
+		})?;
 
-	let (job_path,): (OwnedObjectPath,) = reply
-		.body()
-		.deserialize()
-		.map_err(|e| tracing::warn!("Failed to deserialize StartTransientUnit reply: {e}"))?;
+	let (job_path,): (OwnedObjectPath,) = reply.body().deserialize().map_err(|e| {
+		tracing::warn!("Failed to deserialize StartTransientUnit reply: {e}");
+		internal("systemd sent an unexpected reply.")
+	})?;
 
 	// Wait for the launch job to complete.
-	wait_for_job_signal(&mut job_stream, &job_path, START_JOB_TIMEOUT, "Application launch").await?;
+	if let Err(result) = wait_for_job_signal(&mut job_stream, &job_path, START_JOB_TIMEOUT, "Application launch").await
+	{
+		watch.complete_exit_status(conn).await;
+		let failure = if !options.pre_commands.is_empty() {
+			SessionFailure::new(
+				"application_start_failed",
+				format!(
+					"{} could not start (systemd start job result: {result}). One of its pre_command hooks may have failed.",
+					options.title
+				),
+			)
+			.with_hint(output.clone())
+		} else if watch.exit.code.is_some() {
+			exited(&watch.exit, "while starting")
+		} else {
+			SessionFailure::new(
+				"application_start_failed",
+				format!(
+					"{} could not start (systemd start job result: {result}).",
+					options.title
+				),
+			)
+			.with_hint(output.clone())
+		};
+		return Err(failure);
+	}
 
 	// Get the unit object path — now that the job is done, the unit should exist.
 	let unit_path = conn
@@ -815,73 +1239,66 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 			"GetUnit",
 			&options.unit_name,
 		)
-		.await
-		.map_err(|e| tracing::error!("Failed to get unit object path: {e}"))?;
-	let (path,): (OwnedObjectPath,) = unit_path
-		.body()
-		.deserialize()
-		.map_err(|e| tracing::error!("Failed to deserialize unit object path: {e}"))?;
-
-	// Check current state before subscribing — catches apps that exit immediately.
-	let state = current_unit_state(conn, &path).await?;
-	if terminal_state(&state).is_some() {
-		tracing::warn!(state = state, "Application exited immediately after launch.");
-		return Err(());
+		.await;
+	let path: OwnedObjectPath = match unit_path {
+		Ok(reply) => {
+			reply
+				.body()
+				.deserialize::<(OwnedObjectPath,)>()
+				.map_err(|e| {
+					tracing::error!("Failed to deserialize unit object path: {e}");
+					internal("systemd sent an unexpected reply.")
+				})?
+				.0
+		},
+		Err(error) if no_such_unit(&error) => {
+			// Already exited and unloaded.
+			watch.complete_exit_status(conn).await;
+			tracing::warn!(exit = ?watch.exit, "Application exited immediately after launch.");
+			return Err(exited(&watch.exit, "immediately after launch"));
+		},
+		Err(e) => {
+			tracing::error!("Failed to get unit object path: {e}");
+			return Err(internal("systemd did not report the application unit."));
+		},
+	};
+	if path != watch.path {
+		// systemd's path encoding is stable; follow the reported path anyway.
+		tracing::warn!(expected = %watch.path, reported = %path, "Unexpected application unit path");
+		watch = UnitWatch::new(conn, path.clone()).await.map_err(|e| {
+			tracing::error!("Failed to follow the application unit: {e}");
+			internal("Pyroshine could not follow the application unit.")
+		})?;
 	}
 
-	// Subscribe to PropertiesChanged on this unit object.
-	let rule = MatchRule::builder()
-		.msg_type(zbus::message::Type::Signal)
-		.sender(SYSTEMD_BUS)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.path(&path)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.interface(PROPERTIES_INTERFACE)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.member(PROPERTIES_CHANGED)
-		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
-		.build();
-	let mut state_stream = MessageStream::for_match_rule(rule, conn, None)
+	// Check current state — catches apps that exit immediately.
+	let state = current_unit_state(conn, &path)
 		.await
-		.map_err(|e| tracing::error!("Failed to create state stream: {e}"))?;
+		.map_err(|()| internal("Pyroshine could not read the application unit's state."))?;
+	if terminal_state(&state).is_some() {
+		watch.complete_exit_status(conn).await;
+		tracing::warn!(state = state, exit = ?watch.exit, "Application exited immediately after launch.");
+		return Err(exited(&watch.exit, "immediately after launch"));
+	}
 
 	// Wait for ActiveState to change to a terminal failure state.
-	let failure_result = tokio::time::timeout(options.timeout, async {
-		while let Some(Ok(signal)) = state_stream.next().await {
-			let body = signal.body();
-			let (iface, changed, _): (String, HashMap<String, zvariant::Value<'_>>, Vec<String>) =
-				body.deserialize()
-					.map_err(|e| tracing::error!("Failed to deserialize PropertiesChanged signal: {e}"))?;
-			if iface != UNIT_INTERFACE {
-				continue;
-			}
-			if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY) {
-				return match state.to_string().as_str() {
-					"failed" | "inactive" => {
-						tracing::warn!(state = state.to_string(), "Application exited shortly after launch.");
-						Err(())
-					},
-					_ => continue, // e.g. "activating" → "active" — keep waiting
-				};
-			}
-		}
-		Ok(())
-	})
-	.await;
+	let early_exit = tokio::time::timeout(options.timeout, watch.next_terminal_state(conn)).await;
 
-	match failure_result {
-		Ok(Ok(())) => {
-			// Timeout expired — unit is still alive, launch succeeded.
-			tracing::info!("Application launched in service {}", options.unit_name);
-			Ok(path)
-		},
-		Ok(Err(())) => Err(()),
-		Err(_) => {
-			// Timeout expired — unit is still alive, launch succeeded.
-			tracing::info!("Application launched in service {}", options.unit_name);
-			Ok(path)
-		},
+	if let Ok(Some(state)) = early_exit {
+		watch.complete_exit_status(conn).await;
+		tracing::warn!(state, exit = ?watch.exit, "Application exited shortly after launch.");
+		return Err(exited(
+			&watch.exit,
+			&format!(
+				"within {} of launch",
+				crate::session::failure::human_duration(options.timeout)
+			),
+		));
 	}
+	// The unit is still alive after the launch timeout (or its signals ended,
+	// which the exit monitor reports): the launch succeeded.
+	tracing::info!("Application launched in service {}", options.unit_name);
+	Ok((path, watch))
 }
 
 /// Resolve configured `stage` (`pre_command`/`post_command`) hooks into exec
@@ -1067,6 +1484,7 @@ mod tests {
 			let unit = format!("pyroshine-test-{}-{name}.service", std::process::id());
 			let args = vec!["-c".to_string(), script.to_string()];
 			let options = LaunchOptions {
+				title: name,
 				unit_name: &unit,
 				program: "sh",
 				args: &args,
@@ -1093,6 +1511,212 @@ mod tests {
 		}
 		// An absent unit is already stopped.
 		assert_eq!(stop_application_unit("pyroshine-test-absent.service").await, Ok(()));
+	}
+
+	/// Launch failures and exits name the exit status systemd reported, even
+	/// though the unit is unloaded as soon as it exits.
+	/// `MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core exit_status -- --ignored --nocapture`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs a user systemd session: MOONSHINE_TEST_SYSTEMD=1"]
+	async fn launch_failures_and_exits_report_the_exit_status() {
+		use super::*;
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_SYSTEMD").is_some(),
+			"set MOONSHINE_TEST_SYSTEMD=1"
+		);
+		let conn = Connection::session().await.unwrap();
+		subscribe_to_systemd_signals(&conn).await.unwrap();
+		let cases = [
+			("exit-3", "exit 3", "exited with status 3 "),
+			("immediate-success", "exit 0", "exited normally "),
+		];
+		for (name, script, expected) in cases {
+			let unit = format!("pyroshine-test-{}-{name}.service", std::process::id());
+			let args = vec!["-c".to_string(), script.to_string()];
+			let options = LaunchOptions {
+				title: "Test game",
+				unit_name: &unit,
+				program: "sh",
+				args: &args,
+				envs: &[],
+				timeout: Duration::from_millis(1500),
+				pre_commands: &Vec::new(),
+				post_commands: &Vec::new(),
+				stdout_value: &None,
+				stderr_value: &None,
+			};
+			let failure = start_transient_service(&conn, &options).await.err().expect(name);
+			eprintln!("{name}: {failure:?}");
+			assert_eq!(failure.code, "application_exited", "{name}");
+			assert!(failure.message.starts_with("Test game "), "{name}: {}", failure.message);
+			assert!(failure.message.contains(expected), "{name}: {}", failure.message);
+			let hint = failure.hint.as_deref().unwrap();
+			assert!(hint.contains("stdout = \"journal\""), "{name}");
+			assert_eq!(
+				hint.contains("hands off"),
+				name == "immediate-success",
+				"{name}: {hint}"
+			);
+			stop_unit(&conn, &unit, Settled::Unloaded).await.unwrap();
+		}
+
+		// A program that does not exist never reaches systemd.
+		let options = LaunchOptions {
+			title: "Missing",
+			unit_name: "pyroshine-test-missing.service",
+			program: "pyroshine-test-no-such-program",
+			args: &[],
+			envs: &[],
+			timeout: Duration::from_millis(500),
+			pre_commands: &Vec::new(),
+			post_commands: &Vec::new(),
+			stdout_value: &None,
+			stderr_value: &None,
+		};
+		let failure = start_transient_service(&conn, &options).await.err().unwrap();
+		assert_eq!(failure.code, "application_not_found");
+
+		// An exit after the launch window reaches the exit monitor, which
+		// records the cause before it stops the session.
+		let unit = format!("pyroshine-test-{}-late-exit.service", std::process::id());
+		let args = vec!["-c".to_string(), "sleep 1; exit 7".to_string()];
+		let journal = Some("journal".to_string());
+		let options = LaunchOptions {
+			title: "Late game",
+			unit_name: &unit,
+			program: "sh",
+			args: &args,
+			envs: &[],
+			timeout: Duration::from_millis(200),
+			pre_commands: &Vec::new(),
+			post_commands: &Vec::new(),
+			stdout_value: &journal,
+			stderr_value: &journal,
+		};
+		let (path, watch) = start_transient_service(&conn, &options).await.unwrap();
+		let stop = ShutdownManager::new();
+		let cause = StopCauseSlot::default();
+		let report = ExitReport {
+			title: "Late game".into(),
+			unit_name: unit.clone(),
+			output: output_hint(&unit, &journal, &journal),
+			launched_at: Instant::now(),
+		};
+		let monitor = spawn_unit_exit_monitor(conn.clone(), report, path, watch, stop.clone(), cause.clone());
+		let reason = tokio::time::timeout(Duration::from_secs(10), stop.wait_shutdown_triggered())
+			.await
+			.unwrap();
+		assert_eq!(reason, SessionShutdownReason::ApplicationStopped);
+		let cause = cause.get().expect("the exit monitor records a cause");
+		eprintln!("late exit: {cause:?}");
+		assert!(
+			cause.detail.starts_with("Late game exited with status 7, "),
+			"{}",
+			cause.detail
+		);
+		assert!(cause.unexpected, "an early failing exit is unexpected");
+		assert_eq!(
+			cause.hint.as_deref(),
+			Some(format!("Read its output with: journalctl --user -u {unit} -e").as_str())
+		);
+		monitor.await.unwrap();
+		stop_unit(&conn, &unit, Settled::Unloaded).await.unwrap();
+
+		// A crash after launch is unexpected and names the signal.
+		let unit = format!("pyroshine-test-{}-crash.service", std::process::id());
+		let args = vec!["60".to_string()];
+		let options = LaunchOptions {
+			title: "Crashing game",
+			unit_name: &unit,
+			program: "sleep",
+			args: &args,
+			envs: &[],
+			timeout: Duration::from_millis(200),
+			pre_commands: &Vec::new(),
+			post_commands: &Vec::new(),
+			stdout_value: &None,
+			stderr_value: &None,
+		};
+		let (path, watch) = start_transient_service(&conn, &options).await.unwrap();
+		let stop = ShutdownManager::new();
+		let cause = StopCauseSlot::default();
+		let report = ExitReport {
+			title: "Crashing game".into(),
+			unit_name: unit.clone(),
+			output: output_hint(&unit, &None, &None),
+			launched_at: Instant::now(),
+		};
+		let monitor = spawn_unit_exit_monitor(conn.clone(), report, path, watch, stop.clone(), cause.clone());
+		conn.call_method(
+			Some(SYSTEMD_BUS),
+			SYSTEMD_PATH,
+			Some(SYSTEMD_MANAGER),
+			"KillUnit",
+			&(unit.as_str(), "main", libc::SIGSEGV),
+		)
+		.await
+		.unwrap();
+		tokio::time::timeout(Duration::from_secs(30), stop.wait_shutdown_triggered())
+			.await
+			.unwrap();
+		let cause = cause.get().unwrap();
+		eprintln!("crash: {cause:?}");
+		assert!(cause.detail.contains("SIGSEGV"), "{}", cause.detail);
+		assert!(cause.unexpected);
+		monitor.await.unwrap();
+		stop_unit(&conn, &unit, Settled::Unloaded).await.unwrap();
+	}
+
+	#[test]
+	fn exit_status_descriptions() {
+		use super::{CLD_DUMPED, CLD_EXITED, CLD_KILLED, ExitStatus};
+		let status = |result: &str, code, status| ExitStatus {
+			result: Some(result.into()),
+			code: Some(code),
+			status: Some(status),
+		};
+		let clean = status("success", CLD_EXITED, 0);
+		assert_eq!(clean.describe(), "exited normally");
+		assert!(!clean.failed() && !clean.crashed());
+		let failed = status("exit-code", CLD_EXITED, 2);
+		assert_eq!(failed.describe(), "exited with status 2");
+		assert!(failed.failed() && !failed.crashed());
+		let segv = status("core-dump", CLD_DUMPED, libc::SIGSEGV);
+		assert_eq!(segv.describe(), "crashed (SIGSEGV, core dumped)");
+		assert!(segv.crashed());
+		let killed = status("signal", CLD_KILLED, libc::SIGKILL);
+		assert_eq!(killed.describe(), "was killed by SIGKILL");
+		assert!(killed.crashed(), "SIGKILL from outside Pyroshine's stop is a crash");
+		assert!(!status("signal", CLD_KILLED, libc::SIGTERM).crashed());
+		let oom = status("oom-kill", CLD_KILLED, libc::SIGKILL);
+		assert_eq!(oom.describe(), "was killed because the system ran out of memory");
+		assert_eq!(ExitStatus::default().describe(), "exited");
+	}
+
+	#[test]
+	fn unit_object_paths_follow_systemd_encoding() {
+		assert_eq!(
+			super::unit_object_path("moonshine-session.service"),
+			"/org/freedesktop/systemd1/unit/moonshine_2dsession_2eservice"
+		);
+		assert_eq!(
+			super::unit_object_path("1app@x.service"),
+			"/org/freedesktop/systemd1/unit/_31app_40x_2eservice"
+		);
+	}
+
+	#[test]
+	fn output_hints_follow_the_configured_destination() {
+		let unit = "moonshine-session.service";
+		assert!(super::output_hint(unit, &None, &None).starts_with("Its output is discarded"));
+		assert_eq!(
+			super::output_hint(unit, &None, &Some("journal".into())),
+			"Read its output with: journalctl --user -u moonshine-session.service -e"
+		);
+		assert_eq!(
+			super::output_hint(unit, &Some("append:/tmp/game.log".into()), &None),
+			"Its output is in /tmp/game.log."
+		);
 	}
 
 	#[test]

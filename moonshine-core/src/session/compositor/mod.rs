@@ -39,7 +39,7 @@ use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
 
 use self::admission::{CaptureReceiver, CaptureSender, capture_channel};
-pub(crate) use self::capture::CapturePacing;
+pub(crate) use self::capture::{CapturePacing, DirectReject};
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
 
@@ -296,7 +296,9 @@ impl Compositor {
 		)
 	}
 
-	pub fn launch(self) -> Result<LaunchedCompositor, ()> {
+	/// Start the compositor thread and wait for its readiness. The error
+	/// describes why it could not start, for the operator.
+	pub fn launch(self) -> Result<LaunchedCompositor, String> {
 		let Self {
 			config,
 			context,
@@ -320,27 +322,45 @@ impl Compositor {
 		};
 		// Registered before the thread exists: session completion then implies
 		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
-		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)?;
+		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)
+			.map_err(|()| "the session stopped before the compositor started".to_string())?;
 		let outputs = CompositorOutputs {
 			frame_tx,
 			ready_tx,
 			foreground_tx,
 		};
+		// Why the thread ended before readiness. The thread drops its ready
+		// sender before reporting, so a disconnected ready channel waits briefly
+		// for the reason.
+		let (failure_tx, failure_rx) = mpsc::sync_channel::<String>(1);
 		std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
 				let _worker = worker;
 				if let Err(e) = run_compositor(config, context, outputs, input_rx, reconfigure_rx, stop) {
 					tracing::error!("Compositor failed: {e}");
+					let _ = failure_tx.try_send(e);
 				}
 			})
 			.map_err(|e| {
 				tracing::error!("Failed to spawn compositor thread: {e}");
+				format!("the compositor thread could not be created: {e}")
 			})?;
 
-		let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|e| {
-			tracing::warn!("Timed out waiting for compositor ready: {e}");
-		})?;
+		let ready = match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+			Ok(ready) => ready,
+			Err(mpsc::RecvTimeoutError::Disconnected) => {
+				return Err(failure_rx
+					.recv_timeout(std::time::Duration::from_secs(1))
+					.unwrap_or_else(|_| "the compositor stopped before it was ready".to_string()));
+			},
+			Err(mpsc::RecvTimeoutError::Timeout) => {
+				tracing::warn!("Timed out waiting for compositor ready");
+				return Err(failure_rx
+					.try_recv()
+					.unwrap_or_else(|_| "the compositor did not become ready within 5 seconds".to_string()));
+			},
+		};
 
 		// Mirrors the launch-time format selection: HDR only when capable.
 		let mode = OutputMode {

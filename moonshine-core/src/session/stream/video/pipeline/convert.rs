@@ -801,7 +801,7 @@ impl InputConverter {
 		output_format: OutputFormat,
 		color_space: ColorSpace,
 		full_range: bool,
-	) -> Result<Self, String> {
+	) -> Result<Self, ConverterError> {
 		let converter = Self::create(
 			context.clone(),
 			mode,
@@ -811,9 +811,9 @@ impl InputConverter {
 			color_space,
 			full_range,
 			false,
-		)?;
-		self_check(&context, mode, output_format)
-			.map_err(|e| format!("{output_format:?} converter self-check failed on this GPU: {e}"))?;
+		)
+		.map_err(ConverterError::Create)?;
+		self_check(&context, mode, output_format)?;
 		Ok(converter)
 	}
 
@@ -1890,9 +1890,74 @@ fn self_check_pixel(x: u32, y: u32) -> [u8; 4] {
 	]
 }
 
+/// Why a converter could not be provided.
+#[derive(Debug)]
+pub(crate) enum ConverterError {
+	/// Creating the Vulkan objects failed.
+	Create(String),
+	/// The converter runs, but its output on this GPU differs from the CPU
+	/// reference: every frame would carry wrong colors.
+	SelfCheck(SelfCheckFailure),
+}
+
+impl std::fmt::Display for ConverterError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Create(error) => f.write_str(error),
+			Self::SelfCheck(failure) => failure.fmt(f),
+		}
+	}
+}
+
+impl From<SelfCheckFailure> for ConverterError {
+	fn from(failure: SelfCheckFailure) -> Self {
+		Self::SelfCheck(failure)
+	}
+}
+
+/// A self-check that ran and produced wrong output (or could not run).
+#[derive(Debug)]
+pub(crate) struct SelfCheckFailure {
+	pub format: OutputFormat,
+	/// Where the output differs (plane and block column), or why the check
+	/// could not run.
+	pub detail: String,
+}
+
+impl std::fmt::Display for SelfCheckFailure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"{:?} converter self-check failed on this GPU: {}",
+			self.format, self.detail
+		)
+	}
+}
+
+/// Operator name of a converter output format and its stream profile.
+pub(crate) fn format_label(format: OutputFormat) -> &'static str {
+	match format {
+		OutputFormat::NV12 => "4:2:0 8-bit (NV12)",
+		OutputFormat::P010 => "4:2:0 10-bit (P010)",
+		OutputFormat::YUV444 => "4:4:4 8-bit",
+		OutputFormat::YUV444P10 => "4:4:4 10-bit",
+		OutputFormat::I420 => "4:2:0 8-bit (I420)",
+	}
+}
+
 /// Convert the self-check pattern on `mode`'s queue and compare with
-/// [`reference`] (BT.709, limited range).
-fn self_check(context: &VideoContext, mode: ConversionQueueMode, format: OutputFormat) -> Result<(), String> {
+/// [`reference`] (BT.709, limited range). Stream setup runs it for every
+/// converter; the health check runs it for every format a verified profile
+/// needs.
+pub(crate) fn self_check(
+	context: &VideoContext,
+	mode: ConversionQueueMode,
+	format: OutputFormat,
+) -> Result<(), SelfCheckFailure> {
+	self_check_inner(context, mode, format).map_err(|detail| SelfCheckFailure { format, detail })
+}
+
+fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: OutputFormat) -> Result<(), String> {
 	let frame = SELF_CHECK_FRAME;
 	let subsampled = format_info(format).is_some_and(|info| info.subsampled);
 	let extent = if subsampled {
