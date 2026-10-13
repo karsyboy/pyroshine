@@ -254,6 +254,22 @@ windows otherwise take focus right after the overlay closes, and because
 Smithay's XWM publishes every focused window as `_NET_ACTIVE_WINDOW`, Wine would
 deactivate the game again.
 
+Such a subwindow is also remembered and restored (with `RevertToParent`)
+whenever the compositor focuses its toplevel again, like gamescope's
+`currentKeyboardFocusWindow`, instead of retargeting the toplevel. Big Picture is
+a Steam-owned toplevel with Chromium's browser window embedded as a child from
+another X client. Chromium counts as active, and draws `:focus` styles such as
+the green Play button and the selected settings and Steam Input icons, while X
+focus is inside its own window. With focus on the toplevel it is active only
+while the X pointer is over its window, so any window mapped under the pointer
+or a pointer grab takes the highlight away while controller navigation keeps
+working.
+
+For the same reason the input focus window is raised in the X stack as well as
+in the scene. Xwayland picks the window under the pointer by X stacking order:
+left below a game mapped after it, the Steam overlay would never have the X
+pointer.
+
 That Xlib connection installs a process-wide, non-fatal error handler when it
 opens. Its requests target client windows that can disappear at any moment, and
 X reports the resulting errors asynchronously; Xlib's default handler would exit
@@ -348,7 +364,12 @@ session or systemd units). The `game_restored_when_steam_*` tests replay the
 Steam overlay sequence observed with Grim Dawn (overlay takes keyboard focus,
 game requests iconic, overlay hidden by property or opacity) and require the game
 to return to `NormalState`; `keyboard_focus_taken_by_steam_is_reclaimed` moves X
-focus to a Steam window and to `None` and requires the game to get it back, and
+focus to a Steam window and to `None` and requires the game to get it back,
+`steam_browser_subwindow_keeps_focus_when_overlay_closes` requires a browser
+subwindow focused inside Steam's window to keep focus when a game is exited from
+the overlay, `input_focus_window_is_raised_in_the_x_stack` requires the X pointer
+to be over the overlay while it is the input focus and over the game again after
+it closes, and
 `x11_errors_on_destroyed_focus_windows_are_not_fatal` requires asynchronous X
 errors from vanished windows to leave the process running:
 
@@ -402,7 +423,10 @@ with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug,focus=debug`).
    fullscreen Proton game that minimizes on focus loss (for example Grim Dawn):
    open and close the overlay at least ten times, in `capture_mode = "auto"` and
    `"composited"`. The game must return immediately; the log shows
-   `WM_CHANGE_STATE iconic acknowledged` when it minimized.
+   `WM_CHANGE_STATE iconic acknowledged` when it minimized. In Big Picture,
+   open the overlay over a game and choose **Exit game**, then select a game's
+   Play button, settings and Steam Input icons with the controller: each must
+   be highlighted (Play green) every time.
 5. **Simultaneous games.** Launch a Vulkan game, then a second one without
    closing the first, and switch between them through Steam at least ten times,
    then close the second, continue the first and relaunch the second. The

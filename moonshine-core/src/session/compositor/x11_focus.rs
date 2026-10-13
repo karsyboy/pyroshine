@@ -771,6 +771,12 @@ impl X11Focus {
 		window == 0 || window as Window == POINTER_ROOT
 	}
 
+	/// Whether `window` is a live subwindow of `toplevel` (not `toplevel`
+	/// itself), such as Chromium's browser window inside Steam's Big Picture.
+	pub fn is_subwindow_of(&self, window: u32, toplevel: u32) -> bool {
+		window != toplevel && !Self::is_no_window(window) && self.get_ancestor_chain(window).contains(&toplevel)
+	}
+
 	/// Read a single CARDINAL (format-32) window property by pre-interned atom.
 	///
 	/// Centralizes the ~15-line pattern of: get property → validate format →

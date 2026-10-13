@@ -32,6 +32,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Keep Steam Big Picture's selection highlight after returning from a game. The selected Play button (green), game settings and Steam Input icons could show no highlight, often after exiting a game from the Steam overlay, while controller navigation still worked. The compositor moved keyboard focus from Steam's browser window back to its outer window, and left the overlay below the game for X pointer purposes, so the browser stopped counting as active. Focus inside Big Picture is now kept, and the window that takes input is raised for X as well, as in gamescope.
 - Export most applications' frames directly on NVIDIA instead of compositing every frame. Vulkan and X11 applications (including Proton and DXVK games) chose a compressed NVIDIA buffer layout that the encoder cannot read, so only native Wayland OpenGL was exported directly. The compositor now asks applications to prefer the layouts the encoder reads. On an RTX 3080 at 720p this removed about 1.4 ms of capture delay and 0.25 ms of GPU time per frame; AMD (RX 9070 XT) already exported these applications directly.
 
 ## [v0.17.4] - 2026-10-12

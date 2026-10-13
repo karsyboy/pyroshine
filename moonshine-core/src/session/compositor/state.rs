@@ -497,6 +497,12 @@ pub(crate) struct MoonshineCompositor {
 	/// `currentKeyboardFocusWindow`).
 	pub current_keyboard_focus_window: Option<u32>,
 
+	/// A subwindow the client focused inside `current_keyboard_focus_window`,
+	/// as `(toplevel, subwindow)`, such as Chromium's browser window inside
+	/// Steam's Big Picture toplevel. Restored when the compositor focuses that
+	/// toplevel again. Gamescope keeps this in `currentKeyboardFocusWindow`.
+	pub keyboard_subwindow: Option<(u32, u32)>,
+
 	/// X11 windows whose `WM_CHANGE_STATE` iconic request was acknowledged
 	/// and that are still iconic; see `XwmHandler::minimize_request`.
 	pub(super) iconic_windows: std::collections::HashSet<u32>,
@@ -1002,6 +1008,7 @@ impl MoonshineCompositor {
 				pointer_focus_window: None,
 				input_focus_window: None,
 				current_keyboard_focus_window: None,
+				keyboard_subwindow: None,
 				iconic_windows: Default::default(),
 				input_focus_mode: 0,
 				damage_sequence_counter: 0,
