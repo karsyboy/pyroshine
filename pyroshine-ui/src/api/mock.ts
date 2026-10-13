@@ -236,7 +236,7 @@ let health: HealthReport = {
       message: "Cannot acquire sleep inhibit: org.freedesktop.DBus.Error.AccessDenied",
       duration_ms: 3,
       id: "sleep_inhibit",
-      hint: "Add your user to the 'moonshine' group: `sudo usermod -aG moonshine $USER`\nThen log out and back in.",
+      hint: "Add your user to the 'pyroshine' group: `sudo usermod -aG pyroshine $USER`\nThen log out and back in.",
       fatal: false,
     },
   ],
