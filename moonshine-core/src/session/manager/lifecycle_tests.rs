@@ -93,6 +93,9 @@ struct FakeBackend {
 	session_stop: std::sync::Mutex<Option<ShutdownManager<SessionShutdownReason>>>,
 	/// The most recent session's stop cause slot.
 	session_cause: std::sync::Mutex<Option<StopCauseSlot>>,
+	/// Stopping the application records its exit as a cause, as the exit
+	/// monitor does when teardown stops the unit.
+	exit_on_stop: AtomicBool,
 	foreground_tx: std::sync::Mutex<Option<watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>>>,
 	/// Every reconnect plan the backend ran.
 	plans: std::sync::Mutex<Vec<PlanRecord>>,
@@ -123,6 +126,7 @@ impl FakeBackend {
 			stop_on_launch_return: AtomicBool::new(false),
 			session_stop: std::sync::Mutex::new(None),
 			session_cause: std::sync::Mutex::new(None),
+			exit_on_stop: AtomicBool::new(false),
 			foreground_tx: std::sync::Mutex::new(None),
 			plans: std::sync::Mutex::new(Vec::new()),
 			start_pacing: std::sync::Mutex::new(Vec::new()),
@@ -265,6 +269,17 @@ impl SessionBackend for FakeBackend {
 	}
 
 	async fn stop_application(&self, _unit_name: &str) -> Result<(), ()> {
+		if self.exit_on_stop.load(Ordering::SeqCst)
+			&& let Some(cause) = self.session_cause.lock().unwrap().as_ref()
+		{
+			// Like the exit monitor seeing the application exit after SIGTERM.
+			cause.record(crate::session::failure::StopCause {
+				detail: "Game exited with status 143, 3 s after launch.".into(),
+				hint: None,
+				unexpected: true,
+				reported: false,
+			});
+		}
 		self.gate(Op::StopApplication).await?;
 		self.counters.unit_created.store(false, Ordering::SeqCst);
 		self.counters.unit_stops.fetch_add(1, Ordering::SeqCst);
@@ -1724,6 +1739,21 @@ mod status {
 		let last = status.borrow().last_stop.clone().unwrap();
 		assert_eq!(last.reason, SessionShutdownReason::ApplicationStopped);
 		assert_eq!(last.cause, Some(exit));
+	}
+
+	/// Found end to end (2026-10-13): ending a session stops the application
+	/// before the workers, and the exit monitor saw that exit. It is a
+	/// consequence of the operator's stop, never its cause.
+	#[tokio::test]
+	async fn an_application_exit_caused_by_teardown_is_not_the_cause() {
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.active().await;
+		h.backend().exit_on_stop.store(true, Ordering::SeqCst);
+		h.core.stop_session().await.unwrap();
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::UserStopped);
+		assert_eq!(last.cause, None);
 	}
 
 	/// A failed launch is the cause of its session's stop, marked as already

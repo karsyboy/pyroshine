@@ -719,6 +719,9 @@ impl<B: SessionBackend> SessionCore<B> {
 		let Lifecycle::Live(live) = std::mem::replace(&mut guard.lifecycle, Lifecycle::Stopping(waiter.clone())) else {
 			unreachable!("checked above");
 		};
+		// The cause is decided now: an application exit observed while
+		// teardown stops it is a consequence, not the reason for this stop.
+		live.record.cause.seal();
 		// Retire every identifier immediately: nothing may negotiate, discover
 		// endpoints or commit into a session that is being torn down.
 		guard.keys_tx = None;

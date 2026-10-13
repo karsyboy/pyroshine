@@ -145,18 +145,25 @@ pub struct StopCause {
 ///
 /// A worker that ends the session records why *before* it triggers the stop,
 /// so teardown, which reads the slot after every worker finished, sees it.
-/// Later records are ignored: the first failure is the cause, the rest are
-/// consequences of the stop.
+/// Teardown seals the slot when it begins: whatever happens afterwards is a
+/// consequence of the stop, including the application exiting because
+/// teardown stopped it (before it triggers the workers' stop). Later records
+/// are ignored for the same reason.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct StopCauseSlot(Arc<OnceLock<StopCause>>);
+pub(crate) struct StopCauseSlot(Arc<OnceLock<Option<StopCause>>>);
 
 impl StopCauseSlot {
 	pub fn record(&self, cause: StopCause) {
-		let _ = self.0.set(cause);
+		let _ = self.0.set(Some(cause));
+	}
+
+	/// Keep the cause recorded so far, if any, and ignore later records.
+	pub fn seal(&self) {
+		let _ = self.0.set(None);
 	}
 
 	pub fn get(&self) -> Option<StopCause> {
-		self.0.get().cloned()
+		self.0.get().cloned().flatten()
 	}
 }
 
@@ -192,7 +199,20 @@ mod tests {
 			unexpected: true,
 			reported: false,
 		});
-		assert_eq!(slot.get(), Some(first));
+		assert_eq!(slot.get(), Some(first.clone()));
+		slot.seal();
+		assert_eq!(slot.get(), Some(first), "sealing keeps the recorded cause");
+
+		// A slot sealed before any record stays empty.
+		let sealed = StopCauseSlot::default();
+		sealed.seal();
+		sealed.record(StopCause {
+			detail: "the application exited because teardown stopped it".into(),
+			hint: None,
+			unexpected: true,
+			reported: false,
+		});
+		assert_eq!(sealed.get(), None);
 	}
 
 	#[test]

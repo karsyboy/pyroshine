@@ -121,11 +121,23 @@ impl ManagementService {
 	) -> Self {
 		let management = Arc::new(Management::new(facts, config, sessions, clients));
 		let task = tokio::spawn(async move {
-			let _ = shutdown
-				.wrap_cancel(serve(management, zbus::connection::Builder::session()))
-				.await;
+			let _ = shutdown.wrap_cancel(serve(management, management_bus())).await;
 		});
 		Self { tasks: vec![task] }
+	}
+}
+
+/// The bus the management interface is served on: the session bus, or
+/// `MOONSHINE_MANAGEMENT_BUS` (a D-Bus address) for a test instance that runs
+/// beside a live service on the same account and must not take over its name
+/// (applications still start through the session bus's systemd).
+fn management_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
+	match std::env::var("MOONSHINE_MANAGEMENT_BUS") {
+		Ok(address) => {
+			tracing::info!(address, "Serving the management interface on MOONSHINE_MANAGEMENT_BUS");
+			zbus::connection::Builder::address(address.as_str())
+		},
+		Err(_) => zbus::connection::Builder::session(),
 	}
 }
 
