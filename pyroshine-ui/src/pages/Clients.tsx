@@ -332,7 +332,9 @@ export function ClientsPage({ request }: { request: string | null }) {
         </Alert>
       )}
       <Typography variant="body2" color="text.secondary">
-        Without this app (for example on a headless host), approve pairing on the host-local page linked in the
+        Without this app (for example on a headless host), run <Box component="code">pyroshine pair</Box> on the host
+        or over SSH as the streaming user, without sudo, then start pairing in the client, confirm the requester and
+        enter its PIN in the terminal. Older releases can approve pairing on the host-local page linked in the
         Pyroshine log (<Box component="code">http://localhost:{port}/pin?uniqueid=…</Box>), forwarding the port over SSH
         if needed.
       </Typography>
