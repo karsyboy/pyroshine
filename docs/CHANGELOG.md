@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.5] - 2026-10-13
+
 ### Added
 
 - Explain why a launch fails. Moonlight and Pyrolight show the cause in their error dialog instead of "check Moonshine logs": a missing command, a failed hook, a UDP port held by another program, a compositor that cannot start, or an application that exits during launch with its exit status or signal, each with what to change. An application that exits cleanly right away is explained as a hand-off to an already-running instance.
