@@ -1284,6 +1284,143 @@ mod xwayland_tests {
 		shut_down(stop);
 	}
 
+	/// Steam's Big Picture window is a Steam-owned toplevel with Chromium's
+	/// browser window embedded as a child from another X client. Chromium
+	/// counts as active, and draws `:focus` styles such as the green Play
+	/// button, while X focus is inside its own window; with focus on the
+	/// toplevel it is active only while the X pointer is over it. Seen on
+	/// hardware: the browser focused itself while the overlay was up over a
+	/// game, then exiting the game from the overlay moved focus back to the
+	/// toplevel. Gamescope keeps a focused subwindow of the focus target.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn steam_browser_subwindow_keeps_focus_when_overlay_closes() {
+		const GAME_APP: u32 = 219990;
+		let (stop, _handles, launched) = launch();
+		let display = format!(":{}", launched.ready().xdisplay);
+		let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let input_focus =
+			|conn: &x11rb::rust_connection::RustConnection| conn.get_input_focus().unwrap().reply().unwrap().focus;
+
+		let steam = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 769)]);
+		// Chromium runs its own X connection, like steamwebhelper.
+		let (browser_conn, _) = x11rb::connect(Some(&display)).unwrap();
+		let browser = map_child(&browser_conn, steam);
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", GAME_APP)]);
+		assert!(
+			wait_until(|| input_focus(&conn) == game),
+			"the game never received focus"
+		);
+
+		// Guide: Big Picture becomes the interactive overlay over the game and
+		// Chromium focuses its browser window.
+		set_cardinal(&conn, steam, b"STEAM_OVERLAY", 1);
+		set_cardinal(&conn, steam, b"STEAM_INPUT_FOCUS", 1);
+		assert!(
+			wait_until(|| input_focus(&conn) == steam),
+			"the overlay never took focus"
+		);
+		browser_conn
+			.set_input_focus(
+				x11rb::protocol::xproto::InputFocus::PARENT,
+				browser,
+				x11rb::CURRENT_TIME,
+			)
+			.unwrap();
+		browser_conn.flush().unwrap();
+		assert!(wait_until(|| input_focus(&conn) == browser));
+
+		// "Exit game": the game goes and Steam returns to Big Picture.
+		conn.destroy_window(game).unwrap();
+		set_cardinal(&conn, steam, b"STEAM_INPUT_FOCUS", 0);
+		set_cardinal(&conn, steam, b"STEAM_OVERLAY", 0);
+		assert!(wait_until(
+			|| cardinal(&conn, root, b"_NET_ACTIVE_WINDOW") == Some(steam)
+		));
+		std::thread::sleep(std::time::Duration::from_millis(300));
+		assert_eq!(
+			input_focus(&conn),
+			browser,
+			"focus moved from the browser to {:#x} (toplevel {steam:#x})",
+			input_focus(&conn)
+		);
+
+		drop(browser_conn);
+		drop(conn);
+		shut_down(stop);
+	}
+
+	/// Xwayland picks the window under the pointer by X stacking order, not by
+	/// the compositor's scene. While the Steam overlay is the input focus over
+	/// a game mapped after it, the X pointer must be over the overlay, or
+	/// Chromium in it sees the pointer leave and stops drawing focus styles.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn input_focus_window_is_raised_in_the_x_stack() {
+		const GAME_APP: u32 = 219990;
+		let (stop, _handles, launched) = launch();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let input_focus =
+			|conn: &x11rb::rust_connection::RustConnection| conn.get_input_focus().unwrap().reply().unwrap().focus;
+		// The root child holding a client window: Smithay reparents into frames.
+		let frame = |window| conn.query_tree(window).unwrap().reply().unwrap().parent;
+		let under_pointer = || conn.query_pointer(root).unwrap().reply().unwrap().child;
+
+		let steam = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 769)]);
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", GAME_APP)]);
+		assert!(
+			wait_until(|| input_focus(&conn) == game),
+			"the game never received focus"
+		);
+		assert!(wait_until(|| under_pointer() == frame(game)));
+
+		set_cardinal(&conn, steam, b"STEAM_OVERLAY", 1);
+		set_cardinal(&conn, steam, b"STEAM_INPUT_FOCUS", 1);
+		assert!(
+			wait_until(|| input_focus(&conn) == steam),
+			"the overlay never took focus"
+		);
+		assert!(
+			wait_until(|| under_pointer() == frame(steam)),
+			"the pointer is over {:#x}, not the overlay's frame {:#x}",
+			under_pointer(),
+			frame(steam)
+		);
+
+		// Closing the overlay puts the game back on top.
+		set_cardinal(&conn, steam, b"STEAM_INPUT_FOCUS", 0);
+		set_cardinal(&conn, steam, b"STEAM_OVERLAY", 0);
+		assert!(wait_until(|| input_focus(&conn) == game));
+		assert!(wait_until(|| under_pointer() == frame(game)));
+
+		drop(conn);
+		shut_down(stop);
+	}
+
+	/// Map a full-size child of `parent`, like a browser embedded in its window.
+	fn map_child(conn: &impl Connection, parent: u32) -> u32 {
+		let window = conn.generate_id().unwrap();
+		conn.create_window(
+			x11rb::COPY_DEPTH_FROM_PARENT,
+			window,
+			parent,
+			0,
+			0,
+			WIDTH,
+			HEIGHT,
+			0,
+			WindowClass::INPUT_OUTPUT,
+			x11rb::COPY_FROM_PARENT,
+			&CreateWindowAux::new().background_pixel(0),
+		)
+		.unwrap();
+		conn.map_window(window).unwrap();
+		conn.flush().unwrap();
+		window
+	}
+
 	/// A resuming client with another resolution reconfigures the live output.
 	/// Windows held at the output size must follow it, or the application keeps
 	/// rendering at the previous client's resolution and is scaled into the

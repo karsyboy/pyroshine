@@ -781,6 +781,10 @@ impl MoonshineCompositor {
 				})
 		};
 		if !escaped {
+			// Remembered so that focusing this toplevel again restores it.
+			if x11_focus.is_subwindow_of(actual, desired) {
+				self.keyboard_subwindow = Some((desired, actual));
+			}
 			return;
 		}
 		tracing::debug!(target: "focus", desired, actual, "Keyboard focus taken by another window; reclaiming");
@@ -1631,6 +1635,18 @@ impl MoonshineCompositor {
 				"Raised input focus window"
 			);
 		}
+		// Raise it in the X stack too: Xwayland picks the window under the
+		// pointer by X stacking, not by the scene. Left below a game mapped
+		// after it, the Steam overlay never has the X pointer, and Chromium,
+		// which counts as active only with the pointer over it while focus is
+		// on Steam's toplevel, stops drawing `:focus` styles.
+		if let Some(x11) = input_focus.x11_surface()
+			&& !x11.is_override_redirect()
+			&& let Some(xwm) = self.xwm.as_mut()
+			&& let Err(err) = xwm.raise_window(x11)
+		{
+			tracing::debug!(target: "focus", window_id = x11.window_id(), %err, "Failed to raise input focus window in the X stack");
+		}
 
 		if let Some(old_target) = self.seat.get_keyboard().and_then(|k| k.current_focus())
 			&& keyboard_target.as_ref() != Some(old_target.window())
@@ -1647,8 +1663,11 @@ impl MoonshineCompositor {
 			self.last_keyboard_focus_window = Some(x11.window_id());
 		}
 
-		// Set keyboard focus via Smithay seat.
+		// Set keyboard focus via Smithay seat. Entering an X11 window makes
+		// Smithay focus its toplevel.
+		let mut keyboard_entered = false;
 		if let Some(keyboard) = self.seat.get_keyboard() {
+			keyboard_entered = keyboard.current_focus().as_ref().map(|f| f.window()) != keyboard_target.as_ref();
 			let serial = smithay::utils::SERIAL_COUNTER.next_serial();
 			if let Some(ref target) = keyboard_target {
 				tracing::debug!(
@@ -1678,11 +1697,30 @@ impl MoonshineCompositor {
 		if let Some(ref x11_focus) = self.x11_focus
 			&& let Some(kid) = keyboard_focus_id
 		{
-			if input_changed {
+			if input_changed || keyboard_entered {
 				// Watch before moving focus so this change is never mistaken
 				// for a client taking focus (see `reclaim_keyboard_focus`).
 				x11_focus.watch_keyboard_focus(kid);
-				x11_focus.set_input_focus_revert(kid, 0);
+				// A subwindow the client focused inside the target keeps focus.
+				// Chromium in Steam's Big Picture toplevel is active (and draws
+				// `:focus` styles such as the green Play button) only while
+				// focus is inside its own window; with focus on the toplevel it
+				// depends on the X pointer being over it. Gamescope restores
+				// such a window too (`currentKeyboardFocusWindow`).
+				let subwindow = self
+					.keyboard_subwindow
+					.filter(|&(toplevel, _)| toplevel == kid)
+					.map(|(_, subwindow)| subwindow)
+					.or_else(|| x11_focus.get_input_focus())
+					.filter(|&subwindow| x11_focus.is_subwindow_of(subwindow, kid));
+				if let Some(subwindow) = subwindow {
+					// RevertToParent: focus on a subwindow that goes returns to
+					// its toplevel rather than to None.
+					x11_focus.set_input_focus_revert(subwindow, 2);
+				} else {
+					x11_focus.set_input_focus_revert(kid, 0);
+				}
+				self.keyboard_subwindow = subwindow.map(|subwindow| (kid, subwindow));
 				x11_focus.set_net_active_window(kid);
 				self.current_keyboard_focus_window = Some(kid);
 				// A window that minimized itself when it lost keyboard focus
