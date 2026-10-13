@@ -14,6 +14,11 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Changed
+
+- Update the server's Rust dependencies to their current releases, including the new major versions of aes-gcm, sdp-types, libloading, mdns-sd, opus and dirs. Streaming, pairing and discovery behavior is unchanged.
+- Propose vendored dependency updates automatically. A daily workflow regenerates Inputtino or Pixelforge on a new upstream revision with the existing patch series and opens a pull request for review, or an issue when a patch no longer applies. Dependabot proposes Cargo, npm and GitHub Actions updates weekly.
+
 ## [v0.17.4] - 2026-10-12
 
 ### Changed

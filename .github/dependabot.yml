@@ -1,0 +1,69 @@
+# Dependency update pull requests. Minor and patch updates are grouped per
+# ecosystem; major updates arrive individually because they usually need code
+# changes. See
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# The vendored Inputtino and Pixelforge trees are generated from pinned
+# upstream revisions plus patch series (vendor/README.md); the Vendor upstream
+# workflow proposes their updates, so Dependabot leaves them alone. Smithay,
+# ash and ksni are deliberately pinned to Git revisions and are updated by hand.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    exclude-paths:
+      - "vendor/**"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps
+    ignore:
+      - dependency-name: inputtino
+      - dependency-name: inputtino-sys
+      - dependency-name: pixelforge
+      - dependency-name: smithay
+      - dependency-name: ash
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # The desktop app is a separate Cargo workspace.
+  - package-ecosystem: cargo
+    directory: /pyroshine-ui/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps(ui)
+    ignore:
+      - dependency-name: ksni
+    groups:
+      ui-cargo-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /pyroshine-ui
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps(ui)
+    groups:
+      ui-npm-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]

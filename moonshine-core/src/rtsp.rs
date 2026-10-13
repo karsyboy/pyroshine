@@ -978,7 +978,6 @@ fn negotiated_audio_quality(session: &sdp_types::Session) -> Result<Option<Audio
 fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Option<F> {
 	sdp_session
 		.get_first_attribute_value(attribute)
-		.ok()
 		.flatten()
 		.map(|s| s.trim())
 		.and_then(|s| s.parse().ok())
@@ -1032,8 +1031,8 @@ fn bitrate_bps_from_kbps(bitrate_kbps: u64) -> Option<usize> {
 fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Result<F, ()> {
 	sdp_session
 		.get_first_attribute_value(attribute)
-		.map_err(|e| tracing::warn!("Failed to attribute {attribute} from request: {e}"))?
 		.ok_or_else(|| tracing::warn!("No {attribute} attribute in request"))?
+		.ok_or_else(|| tracing::warn!("Attribute {attribute} has no value in request"))?
 		.trim()
 		.parse()
 		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))

@@ -40,6 +40,15 @@ Review upstream changes and obtain owner approval before applying an upstream
 update, following [the repository policy](../AGENTS.md#upstream-synchronization).
 An update is a reviewed change, never an automatic tracking-branch build.
 
+The daily [Vendor upstream workflow](../.github/workflows/vendor-upstream.yaml)
+proposes updates: when Inputtino's default branch or a newer Pixelforge release
+tag moves past the pin, it regenerates the tree with the existing patches,
+moves the Cargo pins, runs `--check` and opens a `vendor-update/<dependency>`
+pull request. If regeneration fails, usually because a patch no longer
+applies, it opens an issue instead. Merging that pull request is the approval;
+the checklist in its description covers the steps below that it cannot run.
+CI runs on these pull requests only when the `VENDOR_UPDATE_TOKEN` secret is set.
+
 ```sh
 # After editing a patch, regenerate at the existing pin.
 scripts/vendor-inputtino.sh

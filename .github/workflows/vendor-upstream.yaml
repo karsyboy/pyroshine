@@ -1,0 +1,233 @@
+name: Vendor upstream
+
+# Watches the upstreams of the vendored dependencies (vendor/README.md). When
+# an upstream moves past the pinned base, regenerate the vendor tree on that
+# revision with the existing patch series, update the Cargo pins and open a
+# pull request for review. If the patch series no longer applies, open an
+# issue instead: the patches must be rebased by hand. Nothing here merges;
+# the pull request is the reviewed change the upstream policy requires.
+#
+# Pull requests opened with the default GITHUB_TOKEN do not trigger CI. Set a
+# VENDOR_UPDATE_TOKEN secret (a fine-grained token with contents, pull
+# requests and issues write access) so CI runs on them. With the default
+# token, "Allow GitHub Actions to create and approve pull requests" must be
+# enabled in the repository's Actions settings.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: vendor-upstream
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Inputtino has no releases; the base follows the default branch.
+          - dependency: inputtino
+            name: Inputtino
+            upstream: https://github.com/games-on-whales/inputtino
+            track: branch
+          # Pixelforge is pinned to a release tag (check-vendor-pins.py).
+          - dependency: pixelforge
+            name: Pixelforge
+            upstream: https://github.com/hgaiser/pixelforge
+            track: release
+    env:
+      DEPENDENCY: ${{ matrix.dependency }}
+      NAME: ${{ matrix.name }}
+      UPSTREAM: ${{ matrix.upstream }}
+      TRACK: ${{ matrix.track }}
+      BRANCH: vendor-update/${{ matrix.dependency }}
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ secrets.VENDOR_UPDATE_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.VENDOR_UPDATE_TOKEN || github.token }}
+
+      - name: Compare the pin with upstream
+        id: upstream
+        run: |
+          set -euo pipefail
+          base="vendor/${DEPENDENCY}-patches/UPSTREAM"
+          pinned_commit="$(sed -n 's/^commit //p' "${base}")"
+          pinned_describe="$(sed -n 's/^describe //p' "${base}")"
+          if [[ "${TRACK}" == release ]]; then
+            ref="$(git ls-remote --tags --refs "${UPSTREAM}" 'v*' | sed 's|.*refs/tags/||' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+            newest="$(printf '%s\n%s\n' "${pinned_describe}" "${ref}" | sort -V | tail -n1)"
+            if [[ -z "${ref}" || "${ref}" == "${pinned_describe}" || "${newest}" != "${ref}" ]]; then
+              echo "${NAME} ${pinned_describe} is the latest release."
+              echo "update=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            label="${ref}"
+          else
+            ref="$(git ls-remote "${UPSTREAM}" HEAD | cut -f1)"
+            if [[ ! "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "error: could not resolve ${UPSTREAM} HEAD" >&2
+              exit 1
+            fi
+            if [[ "${ref}" == "${pinned_commit}" ]]; then
+              echo "${NAME} ${pinned_commit} is the upstream head."
+              echo "update=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            label="${ref:0:7}"
+          fi
+
+          # Skip when an open pull request already proposes this revision.
+          if git fetch --quiet --depth=1 origin "refs/heads/${BRANCH}" 2>/dev/null; then
+            proposed="$(git show "FETCH_HEAD:${base}" 2>/dev/null || true)"
+            if grep -qxF -e "commit ${ref}" -e "describe ${ref}" <<<"${proposed}" \
+              && [[ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[].number')" ]]; then
+              echo "${BRANCH} already proposes ${NAME} ${label}."
+              echo "update=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+
+          # Skip when an open issue already reports that this revision failed.
+          issue_title="Vendored ${NAME} ${label}: update needs manual work"
+          if [[ -n "$(gh issue list --state open --limit 200 --json title \
+            --jq ".[] | select(.title == \"${issue_title}\") | .title")" ]]; then
+            echo "An open issue already tracks ${NAME} ${label}."
+            echo "update=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "update=true"
+            echo "ref=${ref}"
+            echo "label=${label}"
+            echo "pinned_commit=${pinned_commit}"
+            echo "pinned_describe=${pinned_describe}"
+            echo "issue_title=${issue_title}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.upstream.outputs.update == 'true'
+
+      # A failure here is reported as an issue by the last step.
+      - name: Regenerate on the new upstream
+        id: regenerate
+        if: steps.upstream.outputs.update == 'true'
+        continue-on-error: true
+        env:
+          REF: ${{ steps.upstream.outputs.ref }}
+          PINNED_COMMIT: ${{ steps.upstream.outputs.pinned_commit }}
+          PINNED_DESCRIBE: ${{ steps.upstream.outputs.pinned_describe }}
+        run: |
+          set -euo pipefail
+          {
+            "scripts/vendor-${DEPENDENCY}.sh" "${REF}"
+            base="vendor/${DEPENDENCY}-patches/UPSTREAM"
+            commit="$(sed -n 's/^commit //p' "${base}")"
+            describe="$(sed -n 's/^describe //p' "${base}")"
+            # Move the Cargo pins and the recorded base to the new revision;
+            # check-vendor-pins.py (run by --check) verifies the result.
+            sed -i "s/${PINNED_COMMIT}/${commit}/g" "vendor/${DEPENDENCY}/LOCAL_CHANGES.md"
+            if [[ "${DEPENDENCY}" == inputtino ]]; then
+              sed -i "s/rev = \"${PINNED_COMMIT}\"/rev = \"${commit}\"/" moonshine-core/Cargo.toml
+            else
+              sed -i "s/tag = \"${PINNED_DESCRIBE}\"/tag = \"${describe}\"/" moonshine-core/Cargo.toml
+              sed -i "s/^# Pixelforge ${PINNED_DESCRIBE} /# Pixelforge ${describe} /" Cargo.toml
+              sed -i "s/(${PINNED_DESCRIBE}, /(${describe}, /" vendor/pixelforge/LOCAL_CHANGES.md
+            fi
+            # Re-resolve only what the manifests changed.
+            cargo metadata --format-version 1 >/dev/null
+            "scripts/vendor-${DEPENDENCY}.sh" --check
+            echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+            echo "describe=${describe}" >> "${GITHUB_OUTPUT}"
+          } 2>&1 | tee "${RUNNER_TEMP}/regenerate.log"
+
+      - name: Summarize upstream changes
+        if: steps.upstream.outputs.update == 'true'
+        env:
+          REF: ${{ steps.upstream.outputs.ref }}
+          PINNED_COMMIT: ${{ steps.upstream.outputs.pinned_commit }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --bare --filter=blob:none "${UPSTREAM}" "${RUNNER_TEMP}/upstream.git"
+          new="$(git -C "${RUNNER_TEMP}/upstream.git" rev-parse "${REF}^{commit}")"
+          {
+            echo "Compare: ${UPSTREAM}/compare/${PINNED_COMMIT}...${new}"
+            echo
+            echo '```'
+            git -C "${RUNNER_TEMP}/upstream.git" log --no-merges --format='%h %s' \
+              "${PINNED_COMMIT}..${new}" | head -n 100
+            echo '```'
+          } > "${RUNNER_TEMP}/changes.md"
+
+      - name: Open or update the pull request
+        if: steps.upstream.outputs.update == 'true' && steps.regenerate.outcome == 'success'
+        env:
+          LABEL: ${{ steps.upstream.outputs.label }}
+          PINNED_DESCRIBE: ${{ steps.upstream.outputs.pinned_describe }}
+          COMMIT: ${{ steps.regenerate.outputs.commit }}
+          DESCRIBE: ${{ steps.regenerate.outputs.describe }}
+        run: |
+          set -euo pipefail
+          title="vendor(${DEPENDENCY}): update upstream base to ${LABEL}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --create "${BRANCH}"
+          git add --all vendor Cargo.toml Cargo.lock moonshine-core/Cargo.toml
+          git commit --quiet --message "${title}" \
+            --message "Regenerated vendor/${DEPENDENCY} from ${UPSTREAM} ${DESCRIBE} (${COMMIT}) with the existing patch series."
+          git push --force origin "HEAD:refs/heads/${BRANCH}"
+          {
+            printf 'Upstream %s moved from `%s` to `%s` (`%s`). ' "${NAME}" "${PINNED_DESCRIBE}" "${DESCRIBE}" "${COMMIT}"
+            printf 'Every patch in `vendor/%s-patches/` still applies, and `scripts/vendor-%s.sh --check` passes.\n\n' "${DEPENDENCY}" "${DEPENDENCY}"
+            cat "${RUNNER_TEMP}/changes.md"
+            printf '\n## Before merging\n\n'
+            printf 'Review the upstream changes per the upstream synchronization policy in `AGENTS.md`, then:\n\n'
+            printf -- '- [ ] Drop any patch upstream now provides; update `vendor/%s/LOCAL_CHANGES.md`.\n' "${DEPENDENCY}"
+            printf -- '- [ ] `scripts/vendor-%s.sh --test` and the workspace CI pass.\n' "${DEPENDENCY}"
+            printf -- '- [ ] Hardware acceptance checks in `LOCAL_CHANGES.md` and the Nix build.\n'
+            printf '\n_Opened by the Vendor upstream workflow. A newer upstream revision updates this branch and pull request._\n'
+          } > "${RUNNER_TEMP}/body.md"
+          pr="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "${pr}" ]]; then
+            gh pr edit "${pr}" --title "${title}" --body-file "${RUNNER_TEMP}/body.md"
+          else
+            gh pr create --base "${BASE_BRANCH}" --head "${BRANCH}" \
+              --title "${title}" --body-file "${RUNNER_TEMP}/body.md"
+          fi
+
+      - name: Report an update that needs manual work
+        if: steps.upstream.outputs.update == 'true' && steps.regenerate.outcome == 'failure'
+        env:
+          ISSUE_TITLE: ${{ steps.upstream.outputs.issue_title }}
+          REF: ${{ steps.upstream.outputs.ref }}
+          PINNED_DESCRIBE: ${{ steps.upstream.outputs.pinned_describe }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'Upstream %s has moved past the pinned base `%s` to `%s`, ' "${NAME}" "${PINNED_DESCRIBE}" "${REF}"
+            printf 'but regenerating `vendor/%s` on it failed, so no pull request was opened.\n\n' "${DEPENDENCY}"
+            printf 'Usually a patch in `vendor/%s-patches/` no longer applies: rebase it onto the new upstream, ' "${DEPENDENCY}"
+            printf 'or drop it if upstream now covers it, following `vendor/README.md`. The log shows the failing step.\n\n'
+            echo '<details><summary>Regeneration log</summary>'
+            echo
+            echo '```'
+            tail -n 150 "${RUNNER_TEMP}/regenerate.log"
+            echo '```'
+            echo '</details>'
+            echo
+            cat "${RUNNER_TEMP}/changes.md"
+          } > "${RUNNER_TEMP}/issue.md"
+          gh issue create --title "${ISSUE_TITLE}" --body-file "${RUNNER_TEMP}/issue.md"

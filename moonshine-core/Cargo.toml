@@ -4,51 +4,51 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
-aes = "0.9.1"
-aes-gcm = "0.10.3"
+aes = "0.9.3"
+aes-gcm = "0.11.1"
 async-shutdown = "0.2.2"
 ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
-aws-lc-rs = "1.17.0"
-bitflags = "2.13.0"
+aws-lc-rs = "1.18.2"
+bitflags = "2.13.2"
 byteorder = "1.5.0"
-bytes = "1.11.1"
-calloop = "0.14.4"
+bytes = "1.12.1"
+calloop = "0.14.5"
 cbc = "0.2.1"
-crossbeam-channel = "0.5.15"
+crossbeam-channel = "0.5.17"
 dasp = { version = "0.11.0", features = ["signal", "interpolate", "interpolate-sinc", "ring_buffer"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
-http-body-util = "0.1.3"
-hyper = { version = "1.10.1", features = ["server", "http1"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 image = "0.25.10"
 inputtino = { version = "0.1.0", git = "https://github.com/games-on-whales/inputtino", rev = "d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8" }
 inout = "0.2.2"
-libc = "0.2.186"
-libloading = "0.8.9"
-mdns-sd = "0.20.0"
-mio = { version = "1.2.1", features = ["net", "os-ext", "os-poll"] }
+libc = "0.2.190"
+libloading = "0.9.0"
+mdns-sd = "0.21.5"
+mio = { version = "1.2.4", features = ["net", "os-ext", "os-poll"] }
 mio-timerfd = "0.2.0"
 moonshine-management = { path = "../moonshine-management" }
 network-interface = "2.0.5"
-notify-rust = "4.17.0"
-opus = "0.3.1"
+notify-rust = "4.18.2"
+opus = "0.4.0"
 pkcs8 = "0.11.0"
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.9.1", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
-rcgen = "0.14.8"
+rcgen = "0.14.10"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
-rustls = "0.23.40"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls = "0.23.45"
 rustls-pemfile = "2.2.0"
-sdp-types = "0.1.8"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-sha2 = "0.11.0"
+sdp-types = "0.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 shellexpand = "3.1.2"
 shlex = "2.0.1"
 smithay = { git = "https://github.com/Smithay/smithay", rev = "0ff00983b6007257a7a161a4fe8b14a778e2ac8f", default-features = false, features = [
@@ -61,25 +61,25 @@ smithay = { git = "https://github.com/Smithay/smithay", rev = "0ff00983b6007257a
     "xwayland",
     "x11rb_event_source",
 ] }
-quinn-udp = "0.6.1"
-socket2 = "0.6.4"
-steamlocate = "2.1.0"
+quinn-udp = "0.6.3"
+socket2 = "0.6.5"
+steamlocate = "2.1.1"
 strum_macros = "0.28.0"
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "tracing"] }
-tokio-enet = "0.1.0"
-tokio-rustls = "0.26.4"
-toml = "1.1.2"
-toml_edit = "0.25.13"
+tokio = { version = "1.53.2", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "tracing"] }
+tokio-enet = "0.1.1"
+tokio-rustls = "0.26.6"
+toml = "1.1.8"
+toml_edit = "0.25.17"
 tracing = "0.1.44"
 url = "2.5.8"
-uuid = { version = "1.23.3", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 walkdir = "2.5.0"
-which = "8.0.3"
+which = "8.0.6"
 x509-parser = "0.18.1"
-xcursor = "0.3.10"
-zbus = { version = "5.16.0", features = ["blocking"] }
-zvariant = "5.12.0"
+xcursor = "0.3.11"
+zbus = { version = "5.19.0", features = ["blocking"] }
+zvariant = "5.15.0"
 
 [dev-dependencies]
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
@@ -88,4 +88,4 @@ tempfile = "3.27.0"
 # X11 client for the ignored compositor/XWayland tests (same version as Smithay's).
 x11rb = "0.13.2"
 # Paused virtual time for deterministic teardown-deadline tests.
-tokio = { version = "1.52.3", features = ["test-util"] }
+tokio = { version = "1.53.2", features = ["test-util"] }

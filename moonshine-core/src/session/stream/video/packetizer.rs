@@ -1,7 +1,7 @@
 use super::pyrowave_protocol::{PyroWaveDialect, record_boundaries};
 use aes_gcm::{
-	Aes128Gcm, Key, Nonce,
-	aead::{AeadInPlace, KeyInit},
+	Aes128Gcm, Key,
+	aead::{AeadInOut, KeyInit, Nonce},
 };
 use fec_rs::ReedSolomon;
 use std::collections::{HashMap, hash_map::Entry};
@@ -188,7 +188,7 @@ impl Packetizer {
 		// Key bytes were validated at the HTTP boundary; the type guarantees a
 		// 16-byte AES-128 key, so cipher construction cannot fail here.
 		VideoEncryption::Enabled {
-			cipher: Box::new(Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(material.key().as_bytes()))),
+			cipher: Box::new(Aes128Gcm::new(&Key::<Aes128Gcm>::from(*material.key().as_bytes()))),
 			generation: material.generation(),
 			nonces: material.nonces().clone(),
 		}
@@ -513,12 +513,12 @@ impl Packetizer {
 					iv[..8].copy_from_slice(&(first_counter + shard_index as u64).to_le_bytes());
 					iv[11] = b'V';
 
-					let nonce = Nonce::from_slice(&iv);
+					let nonce = Nonce::<Aes128Gcm>::from(iv);
 
 					// Encrypt the shard data in-place, returning a detached 16-byte tag.
 					let shard_data = shard_buf.shard_mut(shard_index);
 					let tag = cipher
-						.encrypt_in_place_detached(nonce, b"", shard_data)
+						.encrypt_inout_detached(&nonce, b"", shard_data.into())
 						.map_err(|e| tracing::warn!("Failed to encrypt video shard: {e}"))?;
 
 					// Fill the encryption prefix: iv(12) + frameNumber(4) + tag(16).
@@ -703,7 +703,7 @@ mod tests {
 			p.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
 			let batch = p.packetize(&frame, true, 80, 0, 20, 1, &mut 0, 0, 0).unwrap();
 			let prefix = if encrypt { ENC_PREFIX_SIZE } else { 0 };
-			let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&[0; 16]));
+			let cipher = Aes128Gcm::new(&Key::<Aes128Gcm>::from([0; 16]));
 			let mut plain: Vec<Vec<u8>> = batch
 				.as_bytes()
 				.chunks_exact(batch.shard_size())
@@ -711,11 +711,11 @@ mod tests {
 					let mut data = shard[prefix..].to_vec();
 					if encrypt {
 						cipher
-							.decrypt_in_place_detached(
-								Nonce::from_slice(&shard[..12]),
+							.decrypt_inout_detached(
+								shard[..12].try_into().unwrap(),
 								b"",
-								&mut data,
-								aes_gcm::Tag::from_slice(&shard[16..32]),
+								data.as_mut_slice().into(),
+								shard[16..32].try_into().unwrap(),
 							)
 							.unwrap();
 					}
@@ -868,7 +868,7 @@ mod tests {
 
 	/// Decrypt every shard of `batch` with `key`.
 	fn decrypt_shards(batch: &ShardBatch, key: &[u8; 16]) -> Result<Vec<DecryptedShard>, ()> {
-		let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(key));
+		let cipher = Aes128Gcm::new(&Key::<Aes128Gcm>::from(*key));
 		batch
 			.as_bytes()
 			.chunks_exact(batch.shard_size())
@@ -876,11 +876,11 @@ mod tests {
 				let iv: [u8; 12] = shard[..12].try_into().unwrap();
 				let mut data = shard[ENC_PREFIX_SIZE..].to_vec();
 				cipher
-					.decrypt_in_place_detached(
-						Nonce::from_slice(&iv),
+					.decrypt_inout_detached(
+						&Nonce::<Aes128Gcm>::from(iv),
 						b"",
-						&mut data,
-						aes_gcm::Tag::from_slice(&shard[16..32]),
+						data.as_mut_slice().into(),
+						<&aes_gcm::Tag>::try_from(&shard[16..32]).unwrap(),
 					)
 					.map_err(|_| ())?;
 				Ok((iv, data))
