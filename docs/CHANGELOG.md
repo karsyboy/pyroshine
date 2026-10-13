@@ -30,6 +30,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Name the `pyroshine` group (NixOS: `moonshine`) in the healthcheck's sleep-inhibit hint instead of the upstream `moonshine` group.
 - Propose vendored dependency updates automatically. A daily workflow regenerates Inputtino or Pixelforge on a new upstream revision with the existing patch series and opens a pull request for review, or an issue when a patch no longer applies. Dependabot proposes Cargo, npm and GitHub Actions updates weekly.
 
+### Fixed
+
+- Export most applications' frames directly on NVIDIA instead of compositing every frame. Vulkan and X11 applications (including Proton and DXVK games) chose a compressed NVIDIA buffer layout that the encoder cannot read, so only native Wayland OpenGL was exported directly. The compositor now asks applications to prefer the layouts the encoder reads. On an RTX 3080 at 720p this removed about 1.4 ms of capture delay and 0.25 ms of GPU time per frame; AMD (RX 9070 XT) already exported these applications directly.
+
 ## [v0.17.4] - 2026-10-12
 
 ### Changed
