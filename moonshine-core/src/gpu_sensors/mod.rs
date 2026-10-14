@@ -141,7 +141,7 @@ impl GpuSampler {
 			Some("nvidia") => match device.pci_address.as_deref().map(nvml::Device::open) {
 				Some(Ok(device)) => Backend::Nvml(device),
 				Some(Err(error)) => {
-					tracing::debug!("NVML is unavailable, reading sysfs only: {error}");
+					tracing::info!("NVML is unavailable ({error}); NVIDIA GPU readings are limited to sysfs");
 					Backend::Sysfs(sysfs::Sensors::new(&device))
 				},
 				None => Backend::Sysfs(sysfs::Sensors::new(&device)),
@@ -154,6 +154,14 @@ impl GpuSampler {
 			backend,
 			last: None,
 		})
+	}
+
+	/// Where readings come from: `nvml` or `sysfs`.
+	pub(crate) fn source(&self) -> &'static str {
+		match self.backend {
+			Backend::Sysfs(_) => "sysfs",
+			Backend::Nvml(_) => "nvml",
+		}
 	}
 
 	/// Read the sensors and the GPU time of `groups` since the previous sample.

@@ -86,7 +86,8 @@ Diagnostics → Informational findings**; this app preference applies at once an
 **GPU** shows the capture GPU while streaming: how busy it and its video
 encoder are, clocks, temperature, power and video memory, and how much GPU time
 the game and Pyroshine each used. Values a driver does not report are left out;
-NVIDIA readings come from the driver's NVML library.
+NVIDIA readings come from the driver's NVML library, which samples a process
+only while it is busy, so light work can show **No recent sample**.
 
 When a session ends unexpectedly, the dashboard names the cause, such as the
 game's exit status or signal and how long after launch it ended.

@@ -482,7 +482,7 @@ function GpuSection({ gpu, history }: { gpu: GpuStats; history: StreamStats[] })
               {rows.map(({ group, engine }, index) => (
                 <TableRow key={`${group.role}-${engine?.engine ?? "none"}`}>
                   <TableCell>{index === 0 || rows[index - 1].group !== group ? group.label || group.role : ""}</TableCell>
-                  <TableCell>{engine ? `${engineLabels[engine.class] ?? engine.class} (${engine.engine})` : "Idle"}</TableCell>
+                  <TableCell>{engine ? `${engineLabels[engine.class] ?? engine.class} (${engine.engine})` : "No recent sample"}</TableCell>
                   <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
                     {engine ? percent(engine.busy_percent) : "—"}
                   </TableCell>
@@ -510,6 +510,7 @@ function GpuSection({ gpu, history }: { gpu: GpuStats; history: StreamStats[] })
         {gpu.source === "nvml" ? "Read through the NVIDIA driver (NVML)" : "Read from the kernel's GPU sensors and per-process DRM usage"} once
         per second. The application row covers every process the launched application started; Pyroshine's covers
         capture, composition, color conversion and encoding.
+        {gpu.source === "nvml" && " The NVIDIA driver samples a process only while it is busy, so light work may show no sample."}
       </Typography>
     </Box>
   );

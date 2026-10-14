@@ -550,12 +550,29 @@ async fn follow_stats(
 				)
 			};
 			let capture = management.capture_node();
-			// Opening may load NVML; keep it off the async workers.
-			let gpu = tokio::task::spawn_blocking(move || capture.as_deref().and_then(GpuSampler::open))
-				.await
-				.ok()
-				.flatten()
-				.map(|sampler| telemetry::GpuProbe::new(sampler, application));
+			// Opening may load NVML; keep it off the async workers, and never
+			// let it hold up the statistics.
+			let opening = tokio::task::spawn_blocking(move || capture.as_deref().and_then(GpuSampler::open));
+			let sampler = match tokio::time::timeout(telemetry::GPU_DEADLINE, opening).await {
+				Ok(Ok(sampler)) => sampler,
+				Ok(Err(error)) => {
+					tracing::warn!("Opening the GPU for readings failed ({error}); statistics continue without them");
+					None
+				},
+				Err(_) => {
+					tracing::warn!(
+						"Opening the GPU for readings did not finish within {} s; statistics continue without them",
+						telemetry::GPU_DEADLINE.as_secs()
+					);
+					None
+				},
+			};
+			tracing::info!(
+				epoch,
+				gpu = sampler.as_ref().map_or("none", GpuSampler::source),
+				"Collecting stream statistics"
+			);
+			let gpu = sampler.map(|sampler| telemetry::GpuProbe::new(sampler, application));
 			let aggregation = telemetry::aggregate(
 				receiver,
 				epoch,

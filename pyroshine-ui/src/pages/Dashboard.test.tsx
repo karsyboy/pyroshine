@@ -171,7 +171,7 @@ describe("GPU", () => {
     expect(html).toContain("Graphics (gfx)");
     expect(html).toContain("85 %");
     expect(html).toContain("Grim Dawn");
-    expect(html).toContain("Idle");
+    expect(html).toContain("No recent sample");
   });
 
   it("shows only the sensors a driver reports, and nothing for an older daemon", () => {

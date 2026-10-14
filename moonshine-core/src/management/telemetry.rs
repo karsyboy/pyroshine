@@ -374,6 +374,8 @@ pub(crate) struct GpuProbe {
 	application_label: String,
 	/// The application unit's cgroup, looked up until found.
 	application_cgroup: Option<String>,
+	/// The lookup missed its deadline; it is not retried for this stream.
+	cgroup_abandoned: bool,
 }
 
 impl GpuProbe {
@@ -382,6 +384,7 @@ impl GpuProbe {
 			sampler,
 			application_label,
 			application_cgroup: None,
+			cgroup_abandoned: false,
 		}
 	}
 
@@ -404,25 +407,54 @@ impl GpuProbe {
 	}
 }
 
-/// One GPU reading on a blocking thread; the probe is lost only if that
-/// thread panics.
+/// Longest wait for opening the GPU, looking up the application's cgroup or
+/// one GPU reading. Statistics never wait longer: a step that misses it is
+/// abandoned for the rest of the stream, with a warning naming it.
+pub(crate) const GPU_DEADLINE: Duration = Duration::from_secs(3);
+
+/// One GPU reading on a blocking thread. The probe is dropped (GPU readings
+/// stop for this stream) if the reading panics or misses [`GPU_DEADLINE`];
+/// a reading still running then finishes in the background.
 async fn sample_gpu(probe: &mut Option<GpuProbe>) -> Option<GpuStats> {
 	let mut taken = probe.take()?;
-	if taken.application_cgroup.is_none() {
-		taken.application_cgroup = crate::session::application::application_cgroup().await;
-		match &taken.application_cgroup {
-			Some(cgroup) => tracing::debug!(cgroup, "Attributing GPU time to the application unit"),
-			None => tracing::debug!("The application unit's cgroup is unknown; its GPU time is not attributed yet"),
+	if taken.application_cgroup.is_none() && !taken.cgroup_abandoned {
+		match tokio::time::timeout(GPU_DEADLINE, crate::session::application::application_cgroup()).await {
+			Ok(Some(cgroup)) => {
+				tracing::debug!(cgroup, "Attributing GPU time to the application unit");
+				taken.application_cgroup = Some(cgroup);
+			},
+			Ok(None) => tracing::debug!("The application unit's cgroup is unknown; its GPU time is not attributed yet"),
+			Err(_) => {
+				tracing::warn!(
+					"Looking up the application unit's cgroup did not finish within {} s; its GPU time is not \
+					 attributed for this stream",
+					GPU_DEADLINE.as_secs()
+				);
+				taken.cgroup_abandoned = true;
+			},
 		}
 	}
-	let (returned, stats) = tokio::task::spawn_blocking(move || {
+	let reading = tokio::task::spawn_blocking(move || {
 		let stats = taken.sample();
 		(taken, stats)
-	})
-	.await
-	.ok()?;
-	*probe = Some(returned);
-	Some(stats)
+	});
+	match tokio::time::timeout(GPU_DEADLINE, reading).await {
+		Ok(Ok((returned, stats))) => {
+			*probe = Some(returned);
+			Some(stats)
+		},
+		Ok(Err(error)) => {
+			tracing::warn!("Reading the GPU failed ({error}); GPU readings stop for this stream");
+			None
+		},
+		Err(_) => {
+			tracing::warn!(
+				"Reading the GPU did not finish within {} s; GPU readings stop for this stream",
+				GPU_DEADLINE.as_secs()
+			);
+			None
+		},
+	}
 }
 
 /// Aggregate `receiver` until `active` turns false, publishing summaries to
@@ -459,9 +491,14 @@ pub(crate) async fn aggregate(
 				},
 			}
 		}
-		if window.elapsed(Instant::now()) >= WINDOW {
+		// The window ends at this tick; frames drained while the GPU is read
+		// belong to the next one. Ticks land a little early or late, so a
+		// window ends at the tick nearest one second, not the first after it
+		// (which would make most windows 1.25 s).
+		let now = Instant::now();
+		if window.elapsed(now) + DRAIN_PERIOD / 2 >= WINDOW {
 			let gpu = sample_gpu(&mut gpu).await;
-			let stats = window.finish(Instant::now(), epoch, &target, gpu);
+			let stats = window.finish(now, epoch, &target, gpu);
 			publish(&stats);
 			latest.send_replace(Some(stats));
 		}
@@ -604,6 +641,24 @@ mod tests {
 		assert_eq!(stats.frames, 100);
 		assert_eq!(stats.samples_dropped, 50);
 		assert!((stats.encoded_bitrate_bps - 8_000_000.0).abs() < 1e-3);
+	}
+
+	/// Windows last one second, not one drain period more. Real time: the
+	/// windows measure `std::time::Instant`, which paused Tokio time does not move.
+	#[tokio::test]
+	async fn windows_end_at_the_tick_nearest_one_second() {
+		let (sender, receiver) = broadcast::channel(256);
+		let (_active_tx, active) = watch::channel(true);
+		let (latest, mut latest_rx) = watch::channel(None);
+		tokio::spawn(async move {
+			aggregate(receiver, 1, TARGET, None, active, &latest, |_| {}).await;
+		});
+		for _ in 0..3 {
+			let _ = sender.send(frame(1_000, 1_100, 500, false));
+			latest_rx.changed().await.unwrap();
+			let window = latest_rx.borrow().as_ref().unwrap().window_ms;
+			assert!((950..=1100).contains(&window), "{window} ms");
+		}
 	}
 
 	/// A consumer that never reads cannot slow the producer: `send` never

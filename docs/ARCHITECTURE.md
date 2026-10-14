@@ -678,8 +678,15 @@ NVIDIA driver) for NVIDIA. GPU time is attributed from DRM fdinfo
 (`drm-engine-*`, or xe's `drm-cycles-*`, per client ID, deduplicated across
 descriptors) to two process groups: the application unit's cgroup (looked up
 through systemd's `ControlGroup`) and Pyroshine's own service cgroup, which
-includes XWayland. NVIDIA attributes through NVML's per-process utilization
-instead. Missing sensors are omitted, never reported as zero.
+includes XWayland. The proprietary NVIDIA driver publishes no fdinfo counters:
+there, a group is present when NVML's running-process lists name one of its
+processes (with its memory), and its busy shares average NVML's per-process
+utilization samples in the window, which exist only for processes busy in a
+recent sampling period. NVML is loaded and initialized once per process and
+never shut down. Missing sensors are omitted, never reported as zero. Opening
+the GPU, the cgroup lookup and each reading have a 3 s deadline; a step that
+misses it is abandoned for the stream with a warning, and statistics continue
+without it. Each stream logs `Collecting stream statistics` with the backend.
 
 **Findings.** Each published window is read by `management/findings.rs`
 (`StreamStats.findings`): an encoder slower than the frame budget while frames
