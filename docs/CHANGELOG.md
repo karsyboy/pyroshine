@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.6] - 2026-10-14
+
 ### Changed
 
 - Build PyroWave from fork revision `b09e136`, which includes the fragment-path decoder fix merged from upstream and establishes GPU completion on encode failures (see Fixed). The bitstream and C API 1.1.0 are unchanged.
