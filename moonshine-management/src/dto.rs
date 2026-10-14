@@ -180,7 +180,8 @@ pub struct LastStop {
 	pub message: String,
 	/// Whether something other than a user or service stop ended the session.
 	pub unexpected: bool,
-	/// Whether teardown completed (false when it exceeded its deadline).
+	/// Whether teardown completed: false when it exceeded its deadline or the
+	/// application could not be confirmed stopped.
 	pub completed: bool,
 	pub at_ms: u64,
 	/// What ended the session, when the component that ended it said, for

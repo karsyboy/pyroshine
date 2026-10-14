@@ -1119,9 +1119,15 @@ async fn hung_application_stop_is_bounded() {
 #[tokio::test]
 async fn failed_application_stop_is_not_reported_idle() {
 	let h = Harness::new();
+	let status = h.core.subscribe_status();
 	h.active().await;
 	h.fail(Op::StopApplication);
 	let stopped = h.core.stop_session().await;
+	// Recorded as the failure it is, not as a completed stop.
+	assert_eq!(
+		status.borrow().last_stop.clone().unwrap().failure,
+		Some(crate::session::status::TeardownFailure::ApplicationNotStopped)
+	);
 	assert!(
 		h.counters().unit_created.load(Ordering::SeqCst),
 		"fixture: a failed stop leaves the fake unit live"
@@ -1144,9 +1150,14 @@ async fn failed_application_stop_is_not_reported_idle() {
 #[tokio::test(start_paused = true)]
 async fn hung_application_stop_is_not_reported_idle() {
 	let h = Harness::new();
+	let status = h.core.subscribe_status();
 	h.active().await;
 	h.hold(Op::StopApplication);
 	let stopped = h.core.stop_session().await;
+	assert_eq!(
+		status.borrow().last_stop.clone().unwrap().failure,
+		Some(crate::session::status::TeardownFailure::ApplicationNotStopped)
+	);
 	let phase = h.phase().await;
 	assert!(
 		stopped.is_err() && phase != "idle",
@@ -1690,7 +1701,7 @@ mod status {
 		assert_eq!(phase(&status, presence(second, false, true)), SessionPhase::Idle);
 		let last = status.borrow().last_stop.clone().unwrap();
 		assert_eq!(last.reason, SessionShutdownReason::UserStopped);
-		assert!(last.completed);
+		assert!(last.completed());
 	}
 
 	/// A worker failure ends the session through the same teardown and is
@@ -1786,7 +1797,10 @@ mod status {
 		h.backend().worker_exit.send_replace(false);
 		assert!(h.core.stop_session().await.is_err());
 		assert_eq!(phase(&status, ClientPresence::default()), SessionPhase::Error);
-		assert!(!status.borrow().last_stop.clone().unwrap().completed);
+		assert_eq!(
+			status.borrow().last_stop.clone().unwrap().failure,
+			Some(crate::session::status::TeardownFailure::DeadlineExceeded)
+		);
 		h.backend().worker_exit.send_replace(true);
 	}
 }

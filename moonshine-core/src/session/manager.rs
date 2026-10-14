@@ -43,7 +43,7 @@ use crate::session::failure::{Problem, SessionFailure, StopCauseSlot};
 use crate::session::keys::KeyLedger;
 use crate::session::lifecycle::StartLatch;
 use crate::session::status::{
-	ClientPresence, LifecycleStatus, LiveStatus, ManagerStatus, StopRecord, TransitionStatus,
+	ClientPresence, LifecycleStatus, LiveStatus, ManagerStatus, StopRecord, TeardownFailure, TransitionStatus,
 };
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
@@ -788,18 +788,25 @@ impl<B: SessionBackend> SessionCore<B> {
 		})
 		.await;
 
+		let failure = match result {
+			Ok(true) => None,
+			Ok(false) => Some(TeardownFailure::ApplicationNotStopped),
+			Err(_) => Some(TeardownFailure::DeadlineExceeded),
+		};
 		let mut guard = self.lock().await;
 		guard.last_stop = Some(StopRecord {
 			epoch,
 			reason,
 			cause: cause.get(),
-			completed: result.is_ok(),
+			failure,
 			at: SystemTime::now(),
 		});
-		let result = match result {
-			Ok(true) => Ok(()),
-			Ok(false) => Err("the application unit's termination could not be established"),
-			Err(_) => Err("teardown exceeded its deadline"),
+		let result = match failure {
+			None => Ok(()),
+			Some(TeardownFailure::ApplicationNotStopped) => {
+				Err("the application unit's termination could not be established")
+			},
+			Some(TeardownFailure::DeadlineExceeded) => Err("teardown exceeded its deadline"),
 		};
 		match result {
 			Ok(()) => {

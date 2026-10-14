@@ -82,9 +82,37 @@ pub(crate) struct StopRecord {
 	pub reason: SessionShutdownReason,
 	/// What ended the session, when the component that ended it said.
 	pub cause: Option<StopCause>,
-	/// Teardown released everything within its deadline.
-	pub completed: bool,
+	/// Why teardown did not complete; `None` when it released everything
+	/// and established the application's termination within its deadline.
+	pub failure: Option<TeardownFailure>,
 	pub at: SystemTime,
+}
+
+impl StopRecord {
+	pub fn completed(&self) -> bool {
+		self.failure.is_none()
+	}
+}
+
+/// Why a session's teardown failed. Either way the service refuses new
+/// sessions and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeardownFailure {
+	/// Stopping the application unit failed or did not answer in time, so its
+	/// termination is not established.
+	ApplicationNotStopped,
+	/// Workers did not release their resources within the teardown deadline.
+	DeadlineExceeded,
+}
+
+impl TeardownFailure {
+	/// Operator-facing explanation.
+	pub(crate) fn message(self) -> &'static str {
+		match self {
+			Self::ApplicationNotStopped => "The application could not be confirmed stopped; Pyroshine is restarting.",
+			Self::DeadlineExceeded => "The session did not stop within its deadline; Pyroshine is restarting.",
+		}
+	}
 }
 
 /// Control-stream ownership of the current generation.

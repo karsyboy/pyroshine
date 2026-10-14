@@ -340,6 +340,7 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 				.as_ref()
 				.and_then(|stop| stop.cause.as_ref())
 				.is_some_and(|cause| cause.reported);
+			let failure = manager.last_stop.as_ref().and_then(|stop| stop.failure);
 			if let Some(stop) = snapshot
 				.last_stop
 				.as_ref()
@@ -348,10 +349,9 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 				let event = ServerEvent {
 					level: if stop.completed { "warning" } else { "error" }.into(),
 					code: stop.reason.clone(),
-					message: if stop.completed {
-						stop.detail.clone().unwrap_or_else(|| stop.message.clone())
-					} else {
-						"The session did not stop within its deadline; Pyroshine is restarting.".into()
+					message: match failure {
+						None => stop.detail.clone().unwrap_or_else(|| stop.message.clone()),
+						Some(failure) => failure.message().into(),
 					},
 					at_ms: stop.at_ms,
 					hint: stop.hint.clone().filter(|_| stop.completed),
@@ -537,7 +537,7 @@ impl Management {
 					reason: reason.into(),
 					message: message.into(),
 					unexpected: unexpected || stop.cause.as_ref().is_some_and(|cause| cause.unexpected),
-					completed: stop.completed,
+					completed: stop.completed(),
 					at_ms: unix_millis(stop.at),
 					detail: stop.cause.as_ref().map(|cause| cause.detail.clone()),
 					hint: stop.cause.as_ref().and_then(|cause| cause.hint.clone()),
