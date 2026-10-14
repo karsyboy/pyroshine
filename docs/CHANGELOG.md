@@ -14,28 +14,19 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-### Added
-
-- Add `pyroshine diag`, which writes a redacted support bundle (`.tar.gz`) for bug reports on hosts without the desktop app: the diagnostic report, the last two minutes of stream statistics, host and GPU details, the configuration, the service status and log, and `vulkaninfo --summary`. Without a reachable server it collects what it can itself and runs the health check when no server is running. The desktop app saves the same bundle with **Diagnostics → Save support bundle**.
-- Show the capture GPU while streaming. The dashboard's **GPU** section reports how busy the GPU and its video encoder are, clocks, temperature, power, video memory, and the GPU time the game and Pyroshine each used, from the kernel's sensors and per-process DRM usage. On NVIDIA it reads the driver's NVML library, which names each side's processes and video memory but samples a process's busy time only while it is busy. **Diagnosis** uses them: a slow encoder names a saturated encode engine or a GPU kept busy by the game, and a fully busy GPU that costs frames is reported with each side's share.
-
-### Changed
-
-- Redact **Copy diagnostics**. The home directory, user and host names, the server name, client names and IDs, certificate fingerprints, UUIDs and IP addresses are replaced with placeholders, as in support bundles.
-- Collect stream statistics while a client streams even when the desktop app is closed, so a support bundle collected afterwards includes them. Summarizing costs one wakeup every 250 ms and one GPU reading per second on a blocking thread; the media path is unchanged.
-
-### Fixed
-
-- Make stream statistics windows one second long. About half of them lasted 1.25 s because a window ended only at the first 250 ms tick after one second; rates were correct, but the dashboard updated unevenly.
-### Changed
-
-- Lower H.264, HEVC and AV1 latency when the encoder or the network is the bottleneck. The conventional pipeline now keeps at most two frames between encode submission and socket send instead of three, and starts the next capture as soon as a frame completes instead of up to one frame interval later. On an RTX 3080 streaming incompressible 4K content at 240 FPS, median frame age fell from 12.4 to 8.0 ms (99th percentile 14.6 to 9.8 ms) at 2.6% fewer frames; behind a link slower than the stream bitrate, median frame age fell by 40–43% on an RTX 3080 and an RX 9070 XT at an unchanged frame rate. Unsaturated streams and game frame rates are unchanged.
-
 ## [v0.17.6] - 2026-10-14
 
 ### Changed
 
 - Build PyroWave from fork revision `b09e136`, which includes the fragment-path decoder fix merged from upstream and establishes GPU completion on encode failures (see Fixed). The bitstream and C API 1.1.0 are unchanged.
+- Lower H.264, HEVC and AV1 latency when the encoder or the network is the bottleneck. The conventional pipeline now keeps at most two frames between encode submission and socket send instead of three, and starts the next capture as soon as a frame completes instead of up to one frame interval later. On an RTX 3080 streaming incompressible 4K content at 240 FPS, median frame age fell from 12.4 to 8.0 ms (99th percentile 14.6 to 9.8 ms) at 2.6% fewer frames; behind a link slower than the stream bitrate, median frame age fell by 40–43% on an RTX 3080 and an RX 9070 XT at an unchanged frame rate. Unsaturated streams and game frame rates are unchanged.
+- Redact **Copy diagnostics**. The home directory, user and host names, the server name, client names and IDs, certificate fingerprints, UUIDs and IP addresses are replaced with placeholders, as in support bundles.
+- Collect stream statistics while a client streams even when the desktop app is closed, so a support bundle collected afterwards includes them. Summarizing costs one wakeup every 250 ms and one GPU reading per second on a blocking thread; the media path is unchanged.
+
+### Added
+
+- Add `pyroshine diag`, which writes a redacted support bundle (`.tar.gz`) for bug reports on hosts without the desktop app: the diagnostic report, the last two minutes of stream statistics, host and GPU details, the configuration, the service status and log, and `vulkaninfo --summary`. Without a reachable server it collects what it can itself and runs the health check when no server is running. The desktop app saves the same bundle with **Diagnostics → Save support bundle**.
+- Show the capture GPU while streaming. The dashboard's **GPU** section reports how busy the GPU and its video encoder are, clocks, temperature, power, video memory, and the GPU time the game and Pyroshine each used, from the kernel's sensors and per-process DRM usage. On NVIDIA it reads the driver's NVML library, which names each side's processes and video memory but samples a process's busy time only while it is busy. **Diagnosis** uses them: a slow encoder names a saturated encode engine or a GPU kept busy by the game, and a fully busy GPU that costs frames is reported with each side's share.
 
 ### Fixed
 
@@ -44,6 +35,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Finish audio drains. An application that drained a stream holding less than one 5 ms tick of audio, or nothing, waited forever (players that drain before closing hung on exit), and a completed drain deleted the stream, so further writes failed. Drains now play the remaining audio, are answered once, and keep the stream; deleting a stream with a drain pending answers the drain with an error, as PulseAudio does. An underrun is reported to the client once instead of every tick.
 - Keep a session running when systemd cannot be asked about its application. A failed or timed-out query of the application's state was taken as the application having exited, which ended the session (or rejected the launch) while the game was still running. Queries are retried briefly, and the session follows the application's signals until systemd answers.
 - Report a failed application stop as a failure. When the application's termination could not be established during teardown, the last stop was recorded as completed and no problem event was published; it is now an error saying the application could not be confirmed stopped, distinct from a teardown that exceeded its deadline.
+- Make stream statistics windows one second long. About half of them lasted 1.25 s because a window ended only at the first 250 ms tick after one second; rates were correct, but the dashboard updated unevenly.
 
 ## [v0.17.5] - 2026-10-13
 
