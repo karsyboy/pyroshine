@@ -14,6 +14,18 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Changed
+
+- Build PyroWave from fork revision `b09e136`, which includes the fragment-path decoder fix merged from upstream and establishes GPU completion on encode failures (see Fixed). The bitstream and C API 1.1.0 are unchanged.
+
+### Fixed
+
+- Never release a captured buffer that PyroWave may still read. A PyroWave frame that failed after its scaling pass was queued (for example when a buffer could not be allocated) left that pass to run with the next frame, after the compositor had reused the buffer; on an RX 9070 XT a test reproduction lost the GPU. A failed wait for the GPU was also reported as success. Such failures now wait for the queued work, and a wait that fails ends the stream without releasing the buffer.
+- Route game and application audio to the right speakers. Surround streams whose channel order differs from the sink's (ALSA's 5.1 order puts the rear speakers before center and LFE) and streams with fewer channels (quadraphonic rears played on center and LFE) were mapped by channel index; they now follow the stream's speaker positions, folding missing speakers into their neighbours. Stereo output keeps its ITU-R BS.775 downmix.
+- Finish audio drains. An application that drained a stream holding less than one 5 ms tick of audio, or nothing, waited forever (players that drain before closing hung on exit), and a completed drain deleted the stream, so further writes failed. Drains now play the remaining audio, are answered once, and keep the stream; deleting a stream with a drain pending answers the drain with an error, as PulseAudio does. An underrun is reported to the client once instead of every tick.
+- Keep a session running when systemd cannot be asked about its application. A failed or timed-out query of the application's state was taken as the application having exited, which ended the session (or rejected the launch) while the game was still running. Queries are retried briefly, and the session follows the application's signals until systemd answers.
+- Report a failed application stop as a failure. When the application's termination could not be established during teardown, the last stop was recorded as completed and no problem event was published; it is now an error saying the application could not be confirmed stopped, distinct from a teardown that exceeded its deadline.
+
 ## [v0.17.5] - 2026-10-13
 
 ### Added
