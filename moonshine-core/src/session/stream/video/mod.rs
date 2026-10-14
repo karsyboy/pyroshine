@@ -152,6 +152,12 @@ pub struct FrameStats {
 	pub import: std::time::Duration,
 	/// Time spent on GPU color conversion.
 	pub convert: std::time::Duration,
+	/// Part of `convert` spent waiting for the encoder's input slot, i.e. for
+	/// the readback of the frame submitted two encodes earlier.
+	pub slot_wait: std::time::Duration,
+	/// Frames submitted but not yet transport-complete when this frame was
+	/// submitted, including itself (always 1 for PyroWave).
+	pub outstanding: u8,
 	/// Time spent submitting the frame to the asynchronous encoder.
 	pub submit: std::time::Duration,
 	/// Time between submit completion and the packet consumer awaiting the encode future.
@@ -940,7 +946,7 @@ mod tests {
 			let mut completions = Vec::new();
 			for _ in 0..3 {
 				let mut batch = shard_batch::ShardBuf::new(3, 64, 0).into_batch();
-				batch.hold_until_release(shard_batch::NetworkCredit(credits.clone()));
+				batch.hold_until_release(shard_batch::NetworkCredit::new(credits.clone()));
 				let (sent, completed) = std::sync::mpsc::sync_channel(1);
 				batch.set_send_completion(sent);
 				completions.push(completed);
@@ -1580,7 +1586,7 @@ mod tests {
 		let mut completions = Vec::new();
 		for _ in 0..3 {
 			let mut batch = shard_batch::ShardBuf::new(3, 64, 0).into_batch();
-			batch.hold_until_release(shard_batch::NetworkCredit(credits.clone()));
+			batch.hold_until_release(shard_batch::NetworkCredit::new(credits.clone()));
 			let (sent, completed) = std::sync::mpsc::sync_channel(1);
 			batch.set_send_completion(sent);
 			completions.push(completed);

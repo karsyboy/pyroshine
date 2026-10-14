@@ -13,7 +13,7 @@ or GLES rendering. Without demand it retains dirty state and skips capture work.
 | Consumer | When demand is useful | When admission ends |
 | --- | --- | --- |
 | PyroWave | Prior frame's encode, packetization and socket send have completed | Actual socket-send completion, or an error/drop |
-| Conventional codec | Fewer than three useful frames outstanding, including network work | Final socket submission, transport failure, epoch discard or cancellation |
+| Conventional codec | Fewer than two useful frames outstanding, including network work | Final socket submission, transport failure, epoch discard or cancellation |
 
 The source buffer's `consumed` flag is independent. It releases the DMA-BUF only
 after GPU reads finish; PyroWave can release the client's buffer before paced
@@ -205,13 +205,30 @@ comparison. Pixelforge shares the input image concurrently with that family.
 The conversion ends with a CPU fence wait before `Encoder::encode`, whose API
 takes no wait semaphore, and releases the source only after that wait.
 
-Conventional encoding uses Pixelforge's asynchronous pipeline with three owned
+Conventional encoding uses Pixelforge's asynchronous pipeline with two owned
 completion credits spanning submission, readback, packetization, queue residence
 and socket submission. The capture thread issues demand only below that bound;
 IDR replays use the same gate. The consumer moves each credit into its batch
 rather than freeing it at enqueue. RAII also covers queued encoder messages,
 packetization errors, sender failure, cancellation and discarded epochs.
-The three credits retain the existing encode/send overlap on healthy links.
+
+Two credits let one frame encode while the previous one is read back,
+packetized and sent. A third credit cannot add throughput once the encoder or
+the link is the bottleneck: its capture waits for one of Pixelforge's two input
+slots (inside the encoder's `input_image`), behind the previous encode, or
+behind the previous frame's socket send, and ages there. Releasing a credit
+wakes the capture thread (`shard_batch::CreditWake`), so demand is raised as
+soon as the oldest frame completes rather than at the end of a frame-interval
+wait; the capture then lands on the next refresh tick (or, under VRR pacing,
+at once). Without that wakeup two credits lose about a quarter of the
+saturated frame rate, and with it three credits keep three frames queued in
+front of a saturated link. Do not raise the bound to recover throughput without
+re-measuring frame age under encoder and link saturation.
+
+`MOONSHINE_CONVENTIONAL_FRAMES_IN_FLIGHT` (1–3) overrides the bound for A/B
+measurement on other hardware; it is a diagnostic, not a setting. Benchmark
+summaries report frame age, the encoder-slot wait and how many frames were
+outstanding at each submission (see [benchmarking](BENCHMARKING.md#output)).
 
 A requested IDR on a static scene (no new capture within a frame interval) is
 replayed from the converter, not from the encoder's input image: Pixelforge
@@ -222,9 +239,10 @@ encoded.
 The IDR stays pending across loop iterations until a recovery or a new frame is
 actually submitted, including while network credits are exhausted.
 
-Network output storage is bounded by three frames. For a negotiated wire shard
+Network output storage is bounded by the credits: two frames, or at most three
+with the diagnostic override. For a negotiated wire shard
 size `S`, the protocol's maximum four unprotected blocks of 1023 data shards
-bound it by `3 * 4092 * S` bytes; protected blocks have at most 255 total shards.
+bound it by `N * 4092 * S` bytes for `N` credits; protected blocks have at most 255 total shards.
 This is a representability bound, not a desired queue size. TRACE completion
 records expose current/high-water output frames and bytes. An indefinitely
 blocked socket can make those frames indefinitely old; stop and pause interrupt
