@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Changed
+
+- Lower H.264, HEVC and AV1 latency when the encoder or the network is the bottleneck. The conventional pipeline now keeps at most two frames between encode submission and socket send instead of three, and starts the next capture as soon as a frame completes instead of up to one frame interval later. On an RTX 3080 streaming incompressible 4K content at 240 FPS, median frame age fell from 12.4 to 8.0 ms (99th percentile 14.6 to 9.8 ms) at 2.6% fewer frames; behind a link slower than the stream bitrate, median frame age fell by 40–43% on an RTX 3080 and an RX 9070 XT at an unchanged frame rate. Unsaturated streams and game frame rates are unchanged.
+
 ## [v0.17.6] - 2026-10-14
 
 ### Changed
