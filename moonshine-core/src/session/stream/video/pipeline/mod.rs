@@ -49,19 +49,58 @@ use pixelforge::{
 	PixelForgeError, PixelFormat, RateControlMode, VideoContext,
 };
 
-/// Maximum number of frames in flight (submitted to the encoder but not yet
-/// packetized and sent) before we start dropping new captures.
+/// Useful-work credits of the conventional pipeline: frames submitted to the
+/// encoder and not yet transport-complete.
 ///
 /// This is the pipeline's backpressure policy, chosen for low latency: rather
 /// than block the encoding thread and let already-captured frames queue up
-/// (growing end-to-end latency), when the consumer (packetize/network-send)
-/// falls this far behind we *drop the new capture before encoding it* so the
-/// stream stays realtime. Dropping pre-encode keeps the encoded P-frame chain
-/// valid — a dropped frame never enters the encoder's reference state, unlike
-/// discarding an already-encoded packet, which would break decoding until the
-/// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
-/// GPU fed plus one slot of slack, bounding useful work to three frames even under network stalls.
+/// (growing end-to-end latency), capture demand is withheld while every credit
+/// is held, so a frame is never captured just to wait. Withholding *before*
+/// encoding keeps the encoded P-frame chain valid — a skipped frame never
+/// enters the encoder's reference state, unlike discarding an already-encoded
+/// packet, which would break decoding until the next IDR.
+///
+/// Two credits let one frame encode while the previous one is read back,
+/// packetized and sent. A third adds no throughput when the encoder or the
+/// link is the bottleneck: its capture only waits for a Pixelforge input slot,
+/// behind the previous encode, or behind the previous frame's socket send,
+/// and ages there (about one service time per frame). Measured on RTX 3080 and
+/// RX 9070 hosts, two credits cut p50 frame age by 35–43% under encoder or link
+/// saturation, cost at most 3% of the saturated frame rate, and matched three
+/// everywhere else. This depends on the prompt wakeup in
+/// [`super::shard_batch::CreditWake`]: without it, re-admission lags a release
+/// by up to an interval and two credits lose a quarter of saturated throughput.
+const DEFAULT_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Upper bound for the diagnostic override: it also bounds network output
+/// storage (see `PIPELINE_OPTIMIZATION.md`).
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
+/// Diagnostic override of [`DEFAULT_FRAMES_IN_FLIGHT`] (1..=3) for A/B
+/// measurement on other hardware; not a user setting.
+const FRAMES_IN_FLIGHT_ENV: &str = "MOONSHINE_CONVENTIONAL_FRAMES_IN_FLIGHT";
+
+fn conventional_credit_limit() -> usize {
+	match std::env::var(FRAMES_IN_FLIGHT_ENV) {
+		Err(_) => DEFAULT_FRAMES_IN_FLIGHT,
+		Ok(value) => match value.trim().parse::<usize>() {
+			Ok(limit @ 1..=MAX_FRAMES_IN_FLIGHT) => {
+				tracing::info!(
+					limit,
+					"Conventional frame credit bound overridden by {FRAMES_IN_FLIGHT_ENV}"
+				);
+				limit
+			},
+			_ => {
+				tracing::warn!(
+					value,
+					"Ignoring {FRAMES_IN_FLIGHT_ENV}: expected 1..={MAX_FRAMES_IN_FLIGHT}"
+				);
+				DEFAULT_FRAMES_IN_FLIGHT
+			},
+		},
+	}
+}
 
 /// Declares whether this consumer composites frame overlays (late cursor
 /// composition) and withdraws the declaration on every exit; the next
@@ -107,8 +146,8 @@ fn import_overlay(
 		.map_err(|e| e.to_string())
 }
 
-fn conventional_can_admit(in_flight: &AtomicUsize) -> bool {
-	in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT
+fn conventional_can_admit(in_flight: &AtomicUsize, limit: usize) -> bool {
+	in_flight.load(Ordering::Relaxed) < limit
 }
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
@@ -418,6 +457,10 @@ struct FrameContext {
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
 	convert: std::time::Duration,
+	/// Part of `convert` spent waiting for the encoder's input slot.
+	slot_wait: std::time::Duration,
+	/// Frames outstanding at submission, including this one.
+	outstanding: u8,
 	/// Time spent in the `encode` submit call.
 	submit: std::time::Duration,
 	/// When the submit call returned and the frame was ready for packet consumption.
@@ -669,6 +712,8 @@ async fn run_packet_consumer(
 			channel_wait: frame_context.channel_wait,
 			import: frame_context.import,
 			convert: frame_context.convert,
+			slot_wait: frame_context.slot_wait,
+			outstanding: frame_context.outstanding,
 			submit: frame_context.submit,
 			consumer_queue: consumer_queue_dur,
 			encode_wait: encode_wait_dur,
@@ -762,6 +807,8 @@ async fn run_packet_consumer(
 			channel_wait: frame_context.channel_wait,
 			import: frame_context.import,
 			convert: frame_context.convert,
+			slot_wait: frame_context.slot_wait,
+			outstanding: frame_context.outstanding,
 			submit: frame_context.submit,
 			consumer_queue: consumer_queue_dur,
 			encode_wait: encode_wait_dur,
@@ -1486,6 +1533,8 @@ impl VideoPipelineInner {
 				channel_wait,
 				import: encoded.import,
 				convert: std::time::Duration::ZERO,
+				slot_wait: std::time::Duration::ZERO,
+				outstanding: 1,
 				submit: encoded.submit,
 				consumer_queue: std::time::Duration::ZERO,
 				encode_wait: encoded.encode_wait,
@@ -1599,11 +1648,14 @@ impl VideoPipelineInner {
 		// independent of this loop's cadence.
 		//
 		// `in_flight` counts frames through network completion/discard.
-		// The encoding thread reads it to decide when to drop new captures (see
-		// `MAX_FRAMES_IN_FLIGHT`); the consumer decrements it per frame. The channel
-		// is sized just above that gate so it never actually blocks the producer —
-		// admission is governed by the drop gate, not by the channel filling.
+		// The encoding thread reads it to decide when to request captures (see
+		// `DEFAULT_FRAMES_IN_FLIGHT`); releasing a credit decrements it and wakes
+		// this thread through `credit_wake`. The channel is sized above the
+		// largest bound so it never actually blocks the producer — admission is
+		// governed by the credit gate, not by the channel filling.
 		let in_flight = Arc::new(AtomicUsize::new(0));
+		let credit_limit = conventional_credit_limit();
+		let credit_wake = Arc::new(super::shard_batch::CreditWake::default());
 		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
 		let consumer = ConsumerTask::new(runtime, {
 			let ctx = self.context.clone();
@@ -1760,9 +1812,20 @@ impl VideoPipelineInner {
 
 			// Try to receive a frame from compositor (with timeout).
 			// No captures while no client can receive them (PERF-001).
+			//
+			// While every credit is held, sleep until one is released rather than
+			// for a whole interval: demand is then raised as soon as the oldest
+			// frame completes, and the capture lands on the next refresh tick.
+			let mut recv_timeout = frame_interval;
+			if self.demand.wanted() && !conventional_can_admit(&in_flight, credit_limit) {
+				let waited = std::time::Instant::now();
+				if !credit_wake.wait_below(&in_flight, credit_limit, frame_interval) {
+					recv_timeout = frame_interval.saturating_sub(waited.elapsed());
+				}
+			}
 			let received_frame = match frame_rx.recv_timeout_if(
-				frame_interval,
-				conventional_can_admit(&in_flight) && self.demand.wanted(),
+				recv_timeout,
+				conventional_can_admit(&in_flight, credit_limit) && self.demand.wanted(),
 			) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1772,7 +1835,7 @@ impl VideoPipelineInner {
 					// (see `encode_static_recovery`).
 					if pending_idr
 						&& has_encoded && last_output
-						&& conventional_can_admit(&in_flight)
+						&& conventional_can_admit(&in_flight, credit_limit)
 						&& self.demand.may_replay(2 * frame_interval)
 					{
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
@@ -1802,6 +1865,8 @@ impl VideoPipelineInner {
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
 									convert: std::time::Duration::ZERO,
+									slot_wait: std::time::Duration::ZERO,
+									outstanding: 0,
 									submit: submitted_at.duration_since(now),
 									submitted_at,
 									inject_hdr,
@@ -1809,12 +1874,15 @@ impl VideoPipelineInner {
 									buffer_index: usize::MAX,
 								};
 								// Count this frame in flight; the consumer decrements when done.
-								in_flight.fetch_add(1, Ordering::Relaxed);
+								let outstanding = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
 								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(
-									frame_context,
+									FrameContext {
+										outstanding: outstanding.min(u8::MAX as usize) as u8,
+										..frame_context
+									},
 									future,
-									InFlightGuard(in_flight.clone()),
+									InFlightGuard::with_wake(in_flight.clone(), credit_wake.clone()),
 								));
 							},
 							Err(e) => {
@@ -1845,7 +1913,7 @@ impl VideoPipelineInner {
 				// keeps the encoded P-frame chain valid (a skipped frame never enters
 				// the encoder's reference state). IDR replay also waits for a
 				// credit so recovery cannot create an unbounded hidden queue.
-				if !conventional_can_admit(&in_flight) {
+				if !conventional_can_admit(&in_flight, credit_limit) {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
 							encoder_in_flight = in_flight.load(Ordering::Relaxed),
@@ -2056,13 +2124,18 @@ impl VideoPipelineInner {
 						opacity: layer.opacity,
 					})
 				});
+				// Blocks until the readback of the frame submitted two encodes
+				// earlier has freed this slot (Pixelforge's pipeline depth).
+				let t_slot = std::time::Instant::now();
+				let target_image = encoder.input_image();
+				let slot_wait = t_slot.elapsed();
 				let converted = input_converter
 					.convert(
 						&source_import,
 						import_vk_format,
 						needs_transition,
 						&layers,
-						convert::Target::encoder_input(encoder.input_image()),
+						convert::Target::encoder_input(target_image),
 					)
 					.map(|outcome| {
 						convert_window.record(outcome.gpu_ns, frame.has_overlays());
@@ -2170,6 +2243,8 @@ impl VideoPipelineInner {
 							channel_wait: t1_received.duration_since(frame.created_at),
 							import: t2_imported.duration_since(t1_received),
 							convert: t3_converted.duration_since(t2_imported),
+							slot_wait,
+							outstanding: 0,
 							submit: t4_encoded.duration_since(t3_converted),
 							submitted_at: t4_encoded,
 							inject_hdr,
@@ -2177,13 +2252,16 @@ impl VideoPipelineInner {
 							buffer_index: frame.buffer_index,
 						};
 						// Count this frame in flight; the consumer decrements when done.
-						in_flight.fetch_add(1, Ordering::Relaxed);
+						let outstanding = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
 						submitted_count += 1;
 						if frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(
-								frame_context,
+								FrameContext {
+									outstanding: outstanding.min(u8::MAX as usize) as u8,
+									..frame_context
+								},
 								future,
-								InFlightGuard(in_flight.clone()),
+								InFlightGuard::with_wake(in_flight.clone(), credit_wake.clone()),
 							))
 							.is_err()
 						{
@@ -2349,23 +2427,23 @@ mod tests {
 		use super::*;
 		let in_flight = Arc::new(AtomicUsize::new(0));
 		let (tx, mut rx) = mpsc::channel(128);
-		for _ in 0..MAX_FRAMES_IN_FLIGHT {
-			assert!(conventional_can_admit(&in_flight));
+		for _ in 0..DEFAULT_FRAMES_IN_FLIGHT {
+			assert!(conventional_can_admit(&in_flight, DEFAULT_FRAMES_IN_FLIGHT));
 			in_flight.fetch_add(1, Ordering::Relaxed);
 			let mut batch = super::super::shard_batch::ShardBuf::new(1, 64, 0).into_batch();
-			batch.hold_until_release(InFlightGuard(in_flight.clone()));
+			batch.hold_until_release(InFlightGuard::new(in_flight.clone()));
 			tx.send(batch).await.unwrap();
 		}
-		assert!(!conventional_can_admit(&in_flight));
+		assert!(!conventional_can_admit(&in_flight, DEFAULT_FRAMES_IN_FLIGHT));
 		let mut sending = rx.recv().await.unwrap();
 		for _ in 0..10 {
 			tokio::task::yield_now().await;
-			assert!(!conventional_can_admit(&in_flight));
+			assert!(!conventional_can_admit(&in_flight, DEFAULT_FRAMES_IN_FLIGHT));
 		}
 		// Handoff/dequeue did not free a credit. Success and all discard/failure
 		// paths do, so another capture can be admitted without dropping references.
 		sending.notify_sent();
-		assert!(conventional_can_admit(&in_flight));
+		assert!(conventional_can_admit(&in_flight, DEFAULT_FRAMES_IN_FLIGHT));
 		drop(rx);
 		assert_eq!(in_flight.load(Ordering::Relaxed), 0);
 	}

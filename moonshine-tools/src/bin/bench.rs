@@ -314,6 +314,12 @@ struct StatsSummary {
 	avg_packets_per_frame: f64,
 	stale_frames_dropped: u64,
 	total: LatencyDistribution,
+	/// Content time (capture deadline or latch) to transport completion.
+	age: LatencyDistribution,
+	slot_wait: LatencyDistribution,
+	/// Frames by outstanding count at submission (index 0 = 1 outstanding;
+	/// the last bucket collects 4 or more).
+	outstanding: [u64; 4],
 	submit: LatencyDistribution,
 	encode_wait: LatencyDistribution,
 	avg_channel_wait_us: f64,
@@ -410,6 +416,11 @@ struct StatsAccumulator {
 	send_us: u128,
 	enqueue_us: u128,
 	total_samples_us: Vec<u64>,
+	age_us: u128,
+	age_samples_us: Vec<u64>,
+	slot_wait_us: u128,
+	slot_wait_samples_us: Vec<u64>,
+	outstanding: [u64; 4],
 	submit_samples_us: Vec<u64>,
 	encode_wait_samples_us: Vec<u64>,
 	key_frames: u64,
@@ -438,6 +449,11 @@ impl StatsAccumulator {
 			send_us: 0,
 			enqueue_us: 0,
 			total_samples_us: Vec::new(),
+			age_us: 0,
+			age_samples_us: Vec::new(),
+			slot_wait_us: 0,
+			slot_wait_samples_us: Vec::new(),
+			outstanding: [0; 4],
 			submit_samples_us: Vec::new(),
 			encode_wait_samples_us: Vec::new(),
 			key_frames: 0,
@@ -472,6 +488,13 @@ impl StatsAccumulator {
 		self.send_us += stats.send.as_micros();
 		self.enqueue_us += stats.enqueue.as_micros();
 		self.total_samples_us.push(total);
+		let age = (stats.total + stats.content_age).as_micros() as u64;
+		self.age_us += age as u128;
+		self.age_samples_us.push(age);
+		let slot_wait = stats.slot_wait.as_micros() as u64;
+		self.slot_wait_us += slot_wait as u128;
+		self.slot_wait_samples_us.push(slot_wait);
+		self.outstanding[(stats.outstanding as usize).clamp(1, 4) - 1] += 1;
 		self.submit_samples_us.push(submit);
 		self.encode_wait_samples_us.push(encode_wait);
 		if stats.is_key_frame {
@@ -514,6 +537,9 @@ impl StatsAccumulator {
 			avg_packets_per_frame: self.packet_count as f64 / self.count as f64,
 			stale_frames_dropped: self.stale_frames_dropped,
 			total: LatencyDistribution::new(self.total_us, &self.total_samples_us),
+			age: LatencyDistribution::new(self.age_us, &self.age_samples_us),
+			slot_wait: LatencyDistribution::new(self.slot_wait_us, &self.slot_wait_samples_us),
+			outstanding: self.outstanding,
 			submit: LatencyDistribution::new(self.submit_us, &self.submit_samples_us),
 			encode_wait: LatencyDistribution::new(self.encode_wait_us, &self.encode_wait_samples_us),
 			avg_channel_wait_us: self.channel_wait_us as f64 / self.count as f64,
@@ -599,6 +625,21 @@ impl StatsAccumulator {
 			avg_accounted = summary.avg_accounted_us(),
 			avg_delta = summary.avg_delta_us(),
 			avg_consumer_queue = summary.avg_consumer_queue_us
+		);
+		tracing::info!(
+			"  frame age: avg={:.0}us p50={}us p95={}us p99={}us max={}us  slot_wait: avg={:.0}us p95={}us p99={}us  outstanding@submit 1/2/3/4+: {}/{}/{}/{}",
+			summary.age.avg_us,
+			summary.age.p50_us,
+			summary.age.p95_us,
+			summary.age.p99_us,
+			summary.age.max_us,
+			summary.slot_wait.avg_us,
+			summary.slot_wait.p95_us,
+			summary.slot_wait.p99_us,
+			summary.outstanding[0],
+			summary.outstanding[1],
+			summary.outstanding[2],
+			summary.outstanding[3],
 		);
 		tracing::info!("  key_frames: {}", summary.key_frames);
 		tracing::info!("  stale compositor frames dropped: {}", summary.stale_frames_dropped);

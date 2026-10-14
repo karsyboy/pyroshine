@@ -520,6 +520,8 @@ mod tests {
 			channel_wait: Duration::from_micros(10),
 			import: Duration::from_micros(100),
 			convert: Duration::ZERO,
+			slot_wait: Duration::ZERO,
+			outstanding: 1,
 			submit: Duration::from_micros(20),
 			consumer_queue: Duration::ZERO,
 			encode_wait: Duration::from_micros(encode_us),

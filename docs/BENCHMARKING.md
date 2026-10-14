@@ -146,10 +146,24 @@ Every 5 seconds, a summary is printed with:
 - **Encode wait latency** — avg/min/max and p50/p95/p99 time waiting for the asynchronous encode/readback future
 - **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, enqueue/residence and actual socket send; consumer queue is reported as a diagnostic included inside encode wait
 - **Key frames** — number of keyframes emitted
+- **Frame age** — p50/p95/p99/max from the content's capture deadline (or VRR latch) to transport completion, which includes capture deferral that `total` omits; the conventional encoder-slot wait (time a converted frame waited for Pixelforge's input slot, part of `convert`); and how many frames were outstanding when each frame was submitted (`1/2/3/4+`), which shows encode/send overlap
 
 At the end of the run, a final summary covers the entire session (excluding the warmup period).
 
 With `--matrix`, each combination prints the same per-run summaries and the command finishes with a consolidated latency distribution table plus an average pipeline breakdown table. Matrix mode uses fixed target FPS values of 60, 120, and 360. If `--duration` is left at `0`, matrix mode defaults to 8 seconds per combination so the matrix completes.
+
+### Conventional credit bound
+
+`MOONSHINE_CONVENTIONAL_FRAMES_IN_FLIGHT=1|2|3` overrides the conventional
+pipeline's useful-work credits (default 2; see
+[capture admission](PIPELINE_OPTIMIZATION.md#encoding-caches-and-queue-selection)).
+Compare bounds with workloads that saturate each stage, interleaving runs:
+an uncapped incompressible source at a stream rate above what the encoder
+sustains (encoder), the same source behind a token-bucket shaper below the
+encoded bitrate on loopback inside the benchmark's network namespace (link),
+and the [game interference harness](#game-interference-harness) (GPU). Judge
+frame-age percentiles together with delivered FPS and the game's FPS; a bound
+that only lowers `total` may be deferring captures instead.
 
 ### How It Works
 

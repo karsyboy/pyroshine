@@ -4,10 +4,65 @@ use std::sync::{
 };
 
 /// One encoder submission, held until transport release (or any earlier error).
-pub(crate) struct NetworkCredit(pub Arc<AtomicUsize>);
+pub(crate) struct NetworkCredit {
+	count: Arc<AtomicUsize>,
+	wake: Option<Arc<CreditWake>>,
+}
+impl NetworkCredit {
+	#[cfg(test)]
+	pub fn new(count: Arc<AtomicUsize>) -> Self {
+		Self { count, wake: None }
+	}
+
+	/// A credit whose release wakes a producer blocked in [`CreditWake::wait_below`].
+	pub fn with_wake(count: Arc<AtomicUsize>, wake: Arc<CreditWake>) -> Self {
+		Self {
+			count,
+			wake: Some(wake),
+		}
+	}
+}
 impl Drop for NetworkCredit {
 	fn drop(&mut self) {
-		self.0.fetch_sub(1, Ordering::Relaxed);
+		self.count.fetch_sub(1, Ordering::Release);
+		if let Some(wake) = &self.wake {
+			wake.notify();
+		}
+	}
+}
+
+/// Lets the capture/encode thread sleep until a credit is released instead of
+/// for a whole frame interval, so capture demand is raised as soon as work
+/// completes rather than up to one interval later.
+#[derive(Default)]
+pub(crate) struct CreditWake {
+	lock: std::sync::Mutex<()>,
+	released: std::sync::Condvar,
+}
+impl CreditWake {
+	/// Wait until `count < limit` or `timeout` elapses; returns whether a
+	/// credit is available. The count is checked under the lock that
+	/// [`Self::notify`] takes, so a release between check and wait is not lost.
+	pub fn wait_below(&self, count: &AtomicUsize, limit: usize, timeout: std::time::Duration) -> bool {
+		let deadline = Instant::now() + timeout;
+		let mut guard = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		while count.load(Ordering::Acquire) >= limit {
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				return false;
+			}
+			guard = self
+				.released
+				.wait_timeout(guard, remaining)
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.0;
+		}
+		true
+	}
+
+	fn notify(&self) {
+		drop(self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+		self.released.notify_all();
 	}
 }
 
@@ -407,7 +462,7 @@ mod tests {
 			let counter = Arc::new(AtomicUsize::new(1));
 			let queue = Arc::new(QueueDepth::default());
 			let mut batch = ShardBuf::new(2, 64, 0).into_batch();
-			batch.hold_until_release(NetworkCredit(counter.clone()));
+			batch.hold_until_release(NetworkCredit::new(counter.clone()));
 			batch.track_queue(queue.clone());
 			let (tx, rx) = std::sync::mpsc::sync_channel(0);
 			batch.set_send_completion(tx);
@@ -444,5 +499,27 @@ mod tests {
 		batch.notify_sent();
 		assert!(rx.try_recv().is_ok());
 		batch.notify_sent();
+	}
+
+	#[test]
+	fn credit_release_wakes_a_waiting_producer() {
+		use std::time::Duration;
+		let counter = Arc::new(AtomicUsize::new(2));
+		let wake = Arc::new(CreditWake::default());
+		// Exhausted and nothing released: the wait reports no credit.
+		assert!(!wake.wait_below(&counter, 2, Duration::from_millis(5)));
+
+		let mut batch = ShardBuf::new(1, 64, 0).into_batch();
+		batch.hold_until_release(NetworkCredit::with_wake(counter.clone(), wake.clone()));
+		let sender = std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(20));
+			batch.finish(CompletionDisposition::Submitted);
+		});
+		let started = Instant::now();
+		// Far longer than the release delay: returning early proves the wakeup.
+		assert!(wake.wait_below(&counter, 2, Duration::from_secs(10)));
+		assert!(started.elapsed() < Duration::from_secs(5));
+		assert_eq!(counter.load(Ordering::Relaxed), 1);
+		sender.join().unwrap();
 	}
 }

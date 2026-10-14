@@ -280,6 +280,8 @@ mod tests {
 			channel_wait: Duration::from_micros(1),
 			import: Duration::from_micros(2),
 			convert: Duration::from_micros(3),
+			slot_wait: Duration::ZERO,
+			outstanding: 1,
 			submit: Duration::from_micros(4),
 			consumer_queue: Duration::from_micros(5),
 			encode_wait: Duration::from_micros(6),
