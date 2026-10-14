@@ -54,6 +54,47 @@ pub(crate) struct PairedCredential {
 	pub paired_at: Option<u64>,
 }
 
+/// Path of the durable state file.
+pub(crate) fn state_path() -> Option<PathBuf> {
+	Some(dirs::data_dir()?.join("moonshine").join("state.toml"))
+}
+
+/// Values in the state file that identify this host or its clients, with
+/// the placeholder a support report shows instead: the server ID, client IDs
+/// and operator-assigned client names. Reads the file without locking or
+/// rewriting it, so it is safe while the server runs.
+pub(crate) fn identifying_values(path: &std::path::Path) -> Vec<(String, String)> {
+	let Some(data) = std::fs::read_to_string(path)
+		.ok()
+		.and_then(|text| toml::from_str::<StateData>(&text).ok())
+	else {
+		return Vec::new();
+	};
+	let mut values = vec![(data.unique_id, "<server-id>".to_string())];
+	let mut ids: Vec<_> = data.clients.into_iter().chain(data.client_certs.into_keys()).collect();
+	ids.sort();
+	ids.dedup();
+	values.extend(
+		ids.into_iter()
+			.enumerate()
+			.map(|(index, id)| (id, format!("<client-id-{}>", index + 1))),
+	);
+	let mut labels: Vec<_> = data
+		.client_metadata
+		.into_values()
+		.filter_map(|metadata| metadata.label)
+		.collect();
+	labels.sort();
+	labels.dedup();
+	values.extend(
+		labels
+			.into_iter()
+			.enumerate()
+			.map(|(index, label)| (label, format!("<client-name-{}>", index + 1))),
+	);
+	values
+}
+
 #[derive(Clone)]
 pub struct PersistentState {
 	data: Arc<RwLock<StateData>>,
@@ -74,10 +115,7 @@ impl PersistentState {
 	}
 
 	pub(crate) fn new() -> Result<Self, ()> {
-		let path = dirs::data_dir()
-			.ok_or_else(|| tracing::error!("Failed to get data directory."))?
-			.join("moonshine")
-			.join("state.toml");
+		let path = state_path().ok_or_else(|| tracing::error!("Failed to get data directory."))?;
 
 		crate::durable::create_directories(crate::durable::directory(&path))
 			.map_err(|e| tracing::error!("Failed to create state directory: {e}"))?;
@@ -128,6 +166,11 @@ impl PersistentState {
 		state.save()?;
 
 		Ok(state)
+	}
+
+	/// Location of the state file.
+	pub(crate) fn path(&self) -> &std::path::Path {
+		&self.path
 	}
 
 	pub fn get_uuid(&self) -> Result<String, ()> {

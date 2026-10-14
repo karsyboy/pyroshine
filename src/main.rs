@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod diag;
 mod pair;
 
 pub use moonshine_core::ShutdownReason;
@@ -45,6 +46,22 @@ enum Command {
 		#[arg(long)]
 		name: Option<String>,
 	},
+	/// Write a redacted support bundle (.tar.gz) for a bug report.
+	///
+	/// Asks the running server for it; without a reachable server, collects
+	/// the configuration, host and GPU details, the service log and a health
+	/// check itself.
+	Diag {
+		/// File or directory to write to (default: the current directory).
+		#[arg(long, short)]
+		output: Option<PathBuf>,
+		/// Do not ask the running server; collect locally.
+		#[arg(long)]
+		offline: bool,
+		/// Skip the health check when collecting locally.
+		#[arg(long)]
+		no_health_check: bool,
+	},
 }
 
 fn default_config_path() -> PathBuf {
@@ -69,6 +86,20 @@ async fn main() -> Result<(), ()> {
 		return pair::run(name.as_deref().unwrap_or("")).await.map_err(|error| {
 			eprintln!("Pairing failed: {error}");
 		});
+	}
+
+	// Like pairing, collection must not create a config or touch server state.
+	if let Some(Command::Diag {
+		output,
+		offline,
+		no_health_check,
+	}) = args.command
+	{
+		let config_path = args.config.unwrap_or_else(default_config_path);
+		let bus = std::env::var("MOONSHINE_MANAGEMENT_BUS").ok();
+		return diag::run(config_path, output, offline, !no_health_check, bus)
+			.await
+			.map_err(|error| eprintln!("{error}"));
 	}
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
@@ -307,6 +338,34 @@ mod cli_tests {
 		assert!(matches!(args.command, Some(Command::Pair { name: None })));
 		let args = Args::try_parse_from(["pyroshine", "pair", "--name", "Living room"]).unwrap();
 		assert!(matches!(args.command, Some(Command::Pair { name: Some(name) }) if name == "Living room"));
+	}
+
+	#[test]
+	fn diag_takes_an_output_and_the_positional_config_path() {
+		let args = Args::try_parse_from(["pyroshine", "diag"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Diag {
+				output: None,
+				offline: false,
+				no_health_check: false
+			})
+		));
+		let args = Args::try_parse_from([
+			"pyroshine",
+			"/tmp/config.toml",
+			"diag",
+			"-o",
+			"/tmp",
+			"--offline",
+			"--no-health-check",
+		])
+		.unwrap();
+		assert_eq!(args.config, Some(PathBuf::from("/tmp/config.toml")));
+		assert!(matches!(
+			args.command,
+			Some(Command::Diag { output: Some(output), offline: true, no_health_check: true }) if output == std::path::Path::new("/tmp")
+		));
 	}
 
 	#[test]

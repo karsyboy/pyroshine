@@ -103,6 +103,7 @@ fn main() {
 			commands::events,
 			commands::run_health_check,
 			commands::diagnostic_report,
+			commands::save_support_bundle,
 			commands::quit,
 		])
 		.setup(move |app| {

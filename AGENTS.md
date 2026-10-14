@@ -44,7 +44,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 
 | Area | Responsibility |
 | --- | --- |
-| Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown |
+| Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown; `pair.rs` and `diag.rs` subcommands |
 | `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
 | `app_scanner/` | Steam, Lutris, Heroic and desktop-entry discovery |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
@@ -61,6 +61,8 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `session/stream/video/pyrowave.rs`, `pyrowave_protocol.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership; dialect/profile negotiation |
 | `session/status.rs` | Public session phase from manager status and control-stream peer ownership |
 | `management/` | Session-bus management interface for the desktop app: status, pairing, clients, config store (`config_store.rs`), editor schema (`schema.rs`), telemetry aggregation |
+| `gpu_sensors/` | Capture GPU readings for telemetry: sysfs/hwmon sensors, per-process DRM fdinfo engine time, runtime-loaded NVML |
+| `support/` | Redacted support bundles (`pyroshine diag`, `GetSupportBundle`): collection, redaction, tar writer |
 
 Other workspace and integration areas:
 

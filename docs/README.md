@@ -11,6 +11,7 @@
 ## Advanced configuration and troubleshooting
 
 - [Troubleshooting and recipes](TIPS.md): host discovery, healthcheck failures, pairing, Steam, input access, Flatpak and application logs.
+- [Collect a support bundle](TIPS.md#collect-a-support-bundle): `pyroshine diag` writes a redacted `.tar.gz` for bug reports.
 - [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults and examples.
 - [Security administration](SECURITY_ADMINISTRATION.md): pairing security, certificate identity, revocation and state recovery.
 - [Changelog](CHANGELOG.md): Pyroshine releases and upcoming changes.

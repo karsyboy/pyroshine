@@ -594,6 +594,48 @@ async fn reported_problems_are_signalled_kept_and_included_in_the_report() {
 	assert!(report.stats.is_none());
 }
 
+/// The support bundle is a redacted archive built from the daemon's own
+/// report, and "Copy diagnostics" is redacted the same way.
+#[tokio::test]
+async fn support_bundles_and_diagnostic_reports_are_redacted() {
+	use moonshine_management::dto::DiagnosticReport;
+
+	let harness = Harness::start().await;
+	let bundle = harness.proxy.get_support_bundle().await.unwrap();
+	let entries = crate::support::archive_entries(&bundle);
+	let file = |name: &str| {
+		entries
+			.iter()
+			.find(|(path, ..)| path.ends_with(&format!("/{name}")))
+			.map(|(.., data)| String::from_utf8(data.clone()).unwrap())
+			.unwrap_or_else(|| panic!("{name} is in the bundle"))
+	};
+	let report: DiagnosticReport = serde_json::from_str(&file("report.json")).unwrap();
+	assert_eq!(report.server.capabilities.gpu, "Test GPU");
+	assert!(report.host.is_some());
+	assert!(
+		report.server.config_path.ends_with("config.toml") && !report.server.config_path.contains(&whoami()),
+		"{}",
+		report.server.config_path
+	);
+	let config = file("config.toml");
+	assert!(config.contains("name = \"<server-name>\""), "{config}");
+	assert!(!config.contains("Test host"));
+	assert!(file("README.txt").contains("report.json"));
+	assert!(file("host.json").contains("\"kernel\""));
+
+	let report: DiagnosticReport = serde_json::from_str(&harness.proxy.get_diagnostic_report().await.unwrap()).unwrap();
+	assert!(report.host.is_some_and(|host| !host.kernel.is_empty()));
+}
+
+fn whoami() -> String {
+	// Short or generic account names are not redacted; nothing to check then.
+	std::env::var("USER")
+		.ok()
+		.filter(|user| user.len() >= 3)
+		.unwrap_or_else(|| "\0".into())
+}
+
 /// The event log keeps the most recent events only.
 #[tokio::test]
 async fn the_event_log_is_bounded() {

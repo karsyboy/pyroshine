@@ -459,6 +459,41 @@ fn no_such_unit(error: &zbus::Error) -> bool {
 	matches!(error, zbus::Error::MethodError(name, ..) if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit")
 }
 
+/// The cgroup of the running application unit (relative to the cgroup2
+/// root), for attributing GPU time to the application. `None` when the unit
+/// is not loaded or the user's systemd cannot be reached.
+pub(crate) async fn application_cgroup() -> Option<String> {
+	let unit_name = super::application_unit_name();
+	let conn = Connection::session().await.ok()?;
+	let path: OwnedObjectPath = conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			SYSTEMD_PATH,
+			Some(SYSTEMD_MANAGER),
+			"GetUnit",
+			&(unit_name,),
+		)
+		.await
+		.ok()?
+		.body()
+		.deserialize()
+		.ok()?;
+	let cgroup: zvariant::OwnedValue = conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			&path,
+			Some(PROPERTIES_INTERFACE),
+			"Get",
+			&(SERVICE_INTERFACE, "ControlGroup"),
+		)
+		.await
+		.ok()?
+		.body()
+		.deserialize()
+		.ok()?;
+	String::try_from(cgroup).ok().filter(|cgroup| !cgroup.is_empty())
+}
+
 /// Query whether `unit_name` is loaded, its `ActiveState` and the processes
 /// left in its cgroup.
 async fn unit_state(conn: &Connection, unit_name: &str) -> Result<UnitState, ()> {

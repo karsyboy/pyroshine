@@ -207,6 +207,40 @@ export interface StreamStats {
   capture?: CaptureStats | null;
   /** The daemon's reading of the window, warnings first; absent from older daemons. */
   findings?: Finding[];
+  /** Capture GPU activity; absent when the driver exposes no sensors (and from older daemons). */
+  gpu?: GpuStats | null;
+}
+
+/** Capture GPU readings over one window. Each value is null when the driver does not report it. */
+export interface GpuStats {
+  driver: string;
+  /** `sysfs` (kernel interfaces) or `nvml` (NVIDIA). */
+  source: string;
+  busy_percent: number | null;
+  encoder_busy_percent: number | null;
+  core_clock_mhz: number | null;
+  memory_clock_mhz: number | null;
+  temperature_c: number | null;
+  hotspot_c: number | null;
+  power_w: number | null;
+  power_limit_w: number | null;
+  vram_used_bytes: number | null;
+  vram_total_bytes: number | null;
+  processes: GpuProcessStats[];
+}
+
+export interface GpuProcessStats {
+  role: "application" | "pyroshine";
+  label: string;
+  /** Busiest first; a shared engine can exceed 100 %. */
+  engines: GpuEngineStats[];
+  vram_bytes: number | null;
+}
+
+export interface GpuEngineStats {
+  engine: string;
+  class: "graphics" | "compute" | "video_encode" | "video_decode" | "video" | "copy" | "other";
+  busy_percent: number;
 }
 
 export interface Finding {

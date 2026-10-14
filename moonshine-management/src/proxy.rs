@@ -54,6 +54,10 @@ pub trait Management {
 	fn run_health_check(&self) -> zbus::Result<String>;
 	/// [`crate::dto::DiagnosticReport`].
 	fn get_diagnostic_report(&self) -> zbus::Result<String>;
+	/// A redacted support bundle: a gzip-compressed tar archive with the
+	/// diagnostic report, recent statistics, host and GPU details, the
+	/// configuration and the service log. See `pyroshine diag`.
+	fn get_support_bundle(&self) -> zbus::Result<Vec<u8>>;
 
 	#[zbus(signal)]
 	fn session_changed(&self, snapshot: String) -> zbus::Result<()>;

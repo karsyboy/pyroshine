@@ -34,6 +34,29 @@ pub const UI_OBJECT_PATH: &str = "/io/github/karsyboy/PyroshineUi";
 /// UI activation interface (single instance, deep links from notifications).
 pub const UI_INTERFACE: &str = "io.github.karsyboy.PyroshineUi1";
 
+/// Name of a support bundle collected at `unix_seconds`:
+/// `pyroshine-diag-YYYYMMDD-HHMMSS` in UTC. It is the archive's top-level
+/// directory and the stem of the file the daemon's callers save it as.
+pub fn support_bundle_name(unix_seconds: u64) -> String {
+	let (days, time) = ((unix_seconds / 86_400) as i64, unix_seconds % 86_400);
+	// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+	let z = days + 719_468;
+	let era = z.div_euclid(146_097);
+	let doe = z.rem_euclid(146_097);
+	let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let day = doy - (153 * mp + 2) / 5 + 1;
+	let month = if mp < 10 { mp + 3 } else { mp - 9 };
+	let year = yoe + era * 400 + i64::from(month <= 2);
+	format!(
+		"pyroshine-diag-{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+		time / 3600,
+		time / 60 % 60,
+		time % 60
+	)
+}
+
 /// D-Bus error names returned by the management interface.
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "io.github.karsyboy.Pyroshine.Error")]
@@ -86,6 +109,13 @@ impl ManagementError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn support_bundles_are_named_by_utc_time() {
+		assert_eq!(support_bundle_name(1_791_993_542), "pyroshine-diag-20261014-155902");
+		assert_eq!(support_bundle_name(0), "pyroshine-diag-19700101-000000");
+		assert_eq!(support_bundle_name(951_782_400), "pyroshine-diag-20000229-000000");
+	}
 
 	#[test]
 	fn error_names_round_trip_through_dbus_errors() {
