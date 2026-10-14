@@ -182,6 +182,8 @@ pub(super) fn handle_command(
 				played_bytes: 0,
 				write_offset: 0,
 				read_offset: 0,
+				drains: Vec::new(),
+				underrun: false,
 			};
 
 			if buffer_attr.pre_buffering == 0 || flags.start_corked {
@@ -223,8 +225,18 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::DrainPlaybackStream(channel) => {
+			// Mirrors PulseAudio: acknowledged at once when nothing is left to
+			// play, otherwise by the clock once the buffer has played out (a
+			// corked stream waits for its uncork). See `PlaybackStream::drains`.
 			if let Some(stream) = client.playback_streams.get_mut(&channel) {
-				stream.state = StreamState::Draining(seq);
+				if stream.buffer.available_frames() == 0 && stream.drains.is_empty() {
+					pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+				} else {
+					stream.drains.push(seq);
+					if matches!(stream.state, StreamState::Prebuffering(_)) {
+						stream.state = StreamState::Playing;
+					}
+				}
 			} else {
 				pulse::write_error(
 					&mut ClientWriter(&mut client.outgoing),
@@ -284,7 +296,12 @@ pub(super) fn handle_command(
 						// Accounting is unchanged: the client keeps any credit it
 						// holds. pop_missing with in_prebuf=true bypasses the min_req
 						// gate, ensuring an immediate REQUEST even when missing < min_req.
-						let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, true);
+						// A draining stream is emptying, not refilling.
+						let req = if stream.drains.is_empty() {
+							pop_missing(&mut stream.missing, &mut stream.requested, min_req, true)
+						} else {
+							0
+						};
 						if req > 0 {
 							pulse::write_command_message(
 								&mut ClientWriter(&mut client.outgoing),
@@ -357,7 +374,17 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::DeletePlaybackStream(channel) => {
-			client.playback_streams.remove(&channel);
+			// Like PulseAudio's playback_stream_unlink: a pending drain is
+			// answered with an error, never left without a reply.
+			if let Some(stream) = client.playback_streams.remove(&channel) {
+				for tag in stream.drains {
+					pulse::write_error(
+						&mut ClientWriter(&mut client.outgoing),
+						tag,
+						&pulse::PulseError::NoEntity,
+					)?;
+				}
+			}
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
 			Ok(())
 		},

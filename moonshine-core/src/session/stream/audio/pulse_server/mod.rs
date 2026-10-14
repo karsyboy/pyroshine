@@ -64,6 +64,21 @@ fn clock_rate_hz(packet_duration_ms: u32) -> Result<u32, Error> {
 
 const SINK_NAME: &str = "moonshine";
 
+/// The sink's channel map for a negotiated channel count; playback streams are
+/// routed to these positions (see [`super::buffer::output_positions`]).
+fn sink_channel_map(channels: u8) -> pulse::ChannelMap {
+	pulse::ChannelMap::new(super::buffer::output_positions(channels as usize).iter().copied())
+}
+
+/// [`sink_channel_map`] in PulseAudio's `pa_channel_map_snprint` notation.
+fn sink_channel_map_names(channels: u8) -> &'static str {
+	match channels {
+		6 => "front-left,front-right,front-center,lfe,rear-left,rear-right",
+		8 => "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
+		_ => "front-left,front-right",
+	}
+}
+
 /// Pre-allocated zero-volume slice for muted streams (up to 8 channels).
 const ZERO_VOL: [f32; 8] = [0.0; 8];
 
@@ -82,7 +97,6 @@ enum StreamState {
 	Prebuffering(u64),
 	Corked,
 	Playing,
-	Draining(u32),
 }
 
 struct PlaybackStream {
@@ -111,6 +125,15 @@ struct PlaybackStream {
 	played_bytes: u64,
 	write_offset: u64,
 	read_offset: u64,
+	/// Tags of DRAIN requests not answered yet, acknowledged together once the
+	/// buffered audio has played out (`pa_memblockq` not readable). While any
+	/// is pending, prebuffering is disabled (`pa_memblockq_prebuf_disable`) so
+	/// a tail shorter than the prebuffer still plays. Draining keeps the
+	/// stream and its credit: clients write again after a drain.
+	drains: Vec<u32>,
+	/// An underflow was reported and no audio has played since; PulseAudio
+	/// reports each underrun once.
+	underrun: bool,
 }
 
 struct Client {
@@ -226,6 +249,9 @@ impl PlaybackStream {
 	/// Mirrors `pa_memblockq_prebuf_force`: hold playback until the buffer
 	/// holds `pre_buffering` bytes. Request accounting is unchanged.
 	fn prebuf_force(&mut self) {
+		if !self.drains.is_empty() {
+			return;
+		}
 		let pre_buffering = u64::from(self.buffer_attr.pre_buffering);
 		if pre_buffering == 0 {
 			return;
@@ -269,27 +295,7 @@ impl PulseServer {
 			sample_rate: CAPTURE_SAMPLE_RATE,
 		};
 
-		let channel_map = match channels {
-			6 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-			]),
-			8 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-				pulse::ChannelPosition::SideLeft,
-				pulse::ChannelPosition::SideRight,
-			]),
-			_ => pulse::ChannelMap::stereo(),
-		};
+		let channel_map = sink_channel_map(channels);
 
 		let port_name = match channels {
 			6 => "Surround 5.1 Output",
@@ -319,11 +325,7 @@ impl PulseServer {
 		dummy_sink.ports[0].port_type = pulse::port_info::PortType::Network;
 		dummy_sink.ports[0].description = Some(std::ffi::CString::new("virtual output").unwrap());
 
-		let channel_map_str = match channels {
-			6 => "front-left,front-right,front-center,lfe,rear-left,rear-right",
-			8 => "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
-			_ => "front-left,front-right",
-		};
+		let channel_map_str = sink_channel_map_names(channels);
 
 		let mut format_props = pulse::Props::new();
 		format_props.set(
@@ -555,27 +557,7 @@ impl PulseServer {
 			return Ok(());
 		}
 
-		let channel_map = match channels {
-			6 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-			]),
-			8 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-				pulse::ChannelPosition::SideLeft,
-				pulse::ChannelPosition::SideRight,
-			]),
-			_ => pulse::ChannelMap::stereo(),
-		};
+		let channel_map = sink_channel_map(channels);
 		let capture_spec = pulse::SampleSpec {
 			format: pulse::SampleFormat::Float32Le,
 			channels,
@@ -596,11 +578,7 @@ impl PulseServer {
 		self.server_state.server_info.sample_spec = capture_spec;
 		self.server_state.server_info.channel_map = channel_map;
 		self.server_state.sink_volume = vec![1.0; channels as usize];
-		let channel_map_str = match channels {
-			6 => "front-left,front-right,front-center,lfe,rear-left,rear-right",
-			8 => "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
-			_ => "front-left,front-right",
-		};
+		let channel_map_str = sink_channel_map_names(channels);
 		let mut format_props = pulse::Props::new();
 		format_props.set(
 			pulse::Prop::FormatChannels,
@@ -807,8 +785,6 @@ impl PulseServer {
 	}
 
 	fn clock_tick(&mut self) -> Result<(), Error> {
-		let mut done_draining = Vec::new();
-
 		let capture_ts = self.epoch.elapsed().as_millis() as u64;
 		let channels = self.server_state.capture_channels as u32;
 		let num_frames = CAPTURE_SAMPLE_RATE / self.clock_rate_hz;
@@ -839,46 +815,44 @@ impl PulseServer {
 		};
 
 		for client in self.clients.values_mut() {
-			done_draining.clear();
 			for (id, stream) in client.playback_streams.iter_mut() {
 				// ── Drain phase ─────────────────────────────────────────────────────
-				// Only Playing and Draining streams consume audio data each tick.
-				// Prebuffering and Corked streams do not drain.
-				if matches!(stream.state, StreamState::Playing | StreamState::Draining(_)) {
+				// Only playing streams consume audio data each tick; Prebuffering
+				// and Corked streams do not drain.
+				if stream.state == StreamState::Playing {
 					let buffer_len = stream.buffer.len_bytes();
-
-					let drained = if stream.muted {
-						stream.buffer.drain_and_mix(
-							num_frames as usize,
-							&mut frame.buf,
-							&ZERO_VOL[..stream.volume.len()],
-						)
+					let volume = if stream.muted {
+						&ZERO_VOL[..stream.volume.len()]
 					} else {
-						stream
-							.buffer
-							.drain_and_mix(num_frames as usize, &mut frame.buf, &stream.volume)
+						&stream.volume[..]
 					};
+					// A draining stream plays whatever is left, padded with silence.
+					let draining = !stream.drains.is_empty();
+					let drained = stream
+						.buffer
+						.drain_and_mix(num_frames as usize, &mut frame.buf, volume, draining);
 
 					if !drained {
 						// Buffer underrun: notify client and (re-)enter prebuffering.
-						tracing::warn!("Buffer underrun for stream {}", id);
-						pulse::write_command_message(
-							&mut ClientWriter(&mut client.outgoing),
-							u32::MAX,
-							&pulse::Command::Underflow(pulse::Underflow {
-								channel: *id,
-								offset: 0,
-							}),
-							client.protocol_version,
-						)?;
-
-						if matches!(stream.state, StreamState::Playing) {
-							// Accounting is unchanged: any demand not yet covered by
-							// the client's credit is requested below, this tick.
-							stream.prebuf_force();
+						if !stream.underrun {
+							tracing::warn!("Buffer underrun for stream {}", id);
+							pulse::write_command_message(
+								&mut ClientWriter(&mut client.outgoing),
+								u32::MAX,
+								&pulse::Command::Underflow(pulse::Underflow {
+									channel: *id,
+									offset: 0,
+								}),
+								client.protocol_version,
+							)?;
+							stream.underrun = true;
 						}
+						// Accounting is unchanged: any demand not yet covered by
+						// the client's credit is requested below, this tick.
+						stream.prebuf_force();
 						// Fall through to REQUEST phase — do NOT continue.
 					} else {
+						stream.underrun = false;
 						// Successful drain: accumulate demand.
 						// Mirrors pa_memblockq::read_index_changed → missing += delta.
 						let read_len = buffer_len - stream.buffer.len_bytes();
@@ -886,8 +860,17 @@ impl PulseServer {
 						stream.played_bytes += read_len as u64;
 						stream.missing += read_len as i64;
 
-						if matches!(stream.state, StreamState::Draining(_)) && stream.buffer.is_empty() {
-							done_draining.push(*id);
+						if draining && stream.buffer.available_frames() == 0 {
+							// Less than one output frame is left: discard it.
+							let rest = stream.buffer.len_bytes();
+							stream.buffer.clear();
+							stream.read_offset += rest as u64;
+							stream.missing += rest as i64;
+							for tag in std::mem::take(&mut stream.drains) {
+								pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), tag)?;
+							}
+							// Further writes prebuffer again, as after an underrun.
+							stream.prebuf_force();
 						}
 					}
 				}
@@ -895,10 +878,7 @@ impl PulseServer {
 				// ── Request phase ────────────────────────────────────────────────────
 				// Issue a REQUEST if enough demand has accumulated.
 				// Draining streams are excluded — they are emptying, not refilling.
-				if matches!(
-					stream.state,
-					StreamState::Playing | StreamState::Corked | StreamState::Prebuffering(_)
-				) {
+				if stream.drains.is_empty() {
 					let min_req = stream.buffer_attr.minimum_request_length as usize;
 					let in_prebuf = matches!(stream.state, StreamState::Prebuffering(_));
 					let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, in_prebuf);
@@ -913,13 +893,6 @@ impl PulseServer {
 							client.protocol_version,
 						)?;
 					}
-				}
-			}
-
-			for id in done_draining.iter() {
-				let stream = client.playback_streams.remove(id).unwrap();
-				if let StreamState::Draining(drain_seq) = stream.state {
-					pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), drain_seq)?;
 				}
 			}
 		}
@@ -1484,8 +1457,179 @@ mod receive_tests {
 		assert!(server.stop().await);
 	}
 
-	/// Real libpulse clients (`pacat`) play stereo, 5.1 and 7.1 into the
-	/// server; every channel reaches the capture frames. A second client is
+	/// A drain is answered exactly once: at once when nothing is buffered, and
+	/// after a tail shorter than one capture tick (and than the prebuffer) has
+	/// played. The stream and its write credit survive the drain, and deleting
+	/// a stream with a drain pending answers that drain with an error.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn drains_finish_short_tails_and_keep_the_stream() {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+		let server = Server::spawn();
+		let stop = Arc::new(AtomicBool::new(false));
+		// Count capture frames that carry the test signal.
+		let audible = Arc::new(AtomicU32::new(0));
+		let listener = std::thread::spawn({
+			let (frames, stop, audible) = (server.frames.clone(), stop.clone(), audible.clone());
+			move || {
+				while !stop.load(Ordering::Relaxed) {
+					if let Ok(frame) = frames.recv_timeout(time::Duration::from_millis(20))
+						&& frame.buf.iter().any(|v| *v > 0.4)
+					{
+						audible.fetch_add(1, Ordering::Relaxed);
+					}
+				}
+			}
+		});
+		let path = server.path.clone();
+		tokio::task::spawn_blocking({
+			let audible = audible.clone();
+			move || {
+				let mut client = UnixStream::connect(&path).unwrap();
+				client.set_read_timeout(Some(time::Duration::from_secs(2))).unwrap();
+				let requests = std::cell::Cell::new(0u32);
+				// The next command answering `seq`, skipping stream notifications.
+				let answer = |client: &mut UnixStream| -> (u32, pulse::Command, Vec<u8>) {
+					let deadline = time::Instant::now() + time::Duration::from_secs(2);
+					loop {
+						assert!(time::Instant::now() < deadline, "no answer within 2 s");
+						let mut message = vec![0u8; pulse::DESCRIPTOR_SIZE];
+						client.read_exact(&mut message).expect("an answer within 2 s");
+						let desc = pulse::read_descriptor(&mut std::io::Cursor::new(&message)).unwrap();
+						let start = message.len();
+						message.resize(start + desc.length as usize, 0);
+						client.read_exact(&mut message[start..]).unwrap();
+						let (seq, command) =
+							pulse::read_command_message(&mut std::io::Cursor::new(&message), pulse::MAX_VERSION)
+								.unwrap();
+						match command {
+							pulse::Command::Request(_) => requests.set(requests.get() + 1),
+							pulse::Command::Started(_) | pulse::Command::Underflow(_) => {},
+							command => return (seq, command, message),
+						}
+					}
+				};
+				let tail = |frames: usize| {
+					[
+						descriptor(frames as u32 * 8, 0),
+						0.5f32.to_le_bytes().repeat(frames * 2),
+					]
+					.concat()
+				};
+
+				let auth = pulse::Command::Auth(pulse::AuthParams {
+					version: pulse::MAX_VERSION,
+					..Default::default()
+				});
+				let mut name = pulse::Props::new();
+				name.set(pulse::Prop::ApplicationName, c"drain");
+				let create = pulse::Command::CreatePlaybackStream(pulse::PlaybackStreamParams {
+					sample_spec: pulse::SampleSpec {
+						format: pulse::SampleFormat::Float32Le,
+						sample_rate: 48_000,
+						channels: 2,
+					},
+					channel_map: pulse::ChannelMap::stereo(),
+					buffer_attr: pulse::stream::BufferAttr {
+						max_length: u32::MAX,
+						target_length: 48_000 * 8,
+						// One second: the tails below never start playback by themselves.
+						pre_buffering: 48_000 * 8,
+						minimum_request_length: u32::MAX,
+						fragment_size: u32::MAX,
+					},
+					..Default::default()
+				});
+				client
+					.write_all(
+						&[
+							command(0, &auth),
+							command(1, &pulse::Command::SetClientName(name)),
+							command(2, &create),
+						]
+						.concat(),
+					)
+					.unwrap();
+				let (seq, _, message) = loop {
+					let answer = answer(&mut client);
+					if answer.0 == 2 {
+						break answer;
+					}
+				};
+				assert_eq!(seq, 2);
+				let (_, reply) = pulse::read_reply_message::<pulse::CreatePlaybackStreamReply>(
+					&mut std::io::Cursor::new(&message),
+					pulse::MAX_VERSION,
+				)
+				.unwrap();
+				let channel = reply.channel;
+				assert_eq!(channel, 0, "the tail descriptor addresses channel 0");
+
+				// Nothing buffered: answered at once.
+				client
+					.write_all(&command(3, &pulse::Command::DrainPlaybackStream(channel)))
+					.unwrap();
+				assert!(matches!(answer(&mut client), (3, pulse::Command::Reply, _)));
+
+				// 100 frames: less than one 5 ms tick and than the prebuffer.
+				client
+					.write_all(&[tail(100), command(4, &pulse::Command::DrainPlaybackStream(channel))].concat())
+					.unwrap();
+				assert!(matches!(answer(&mut client), (4, pulse::Command::Reply, _)));
+				std::thread::sleep(time::Duration::from_millis(50));
+				assert!(audible.load(Ordering::Relaxed) > 0, "the tail was played");
+
+				// The stream still exists and asks for audio again.
+				let requested = requests.get();
+				let latency = pulse::Command::GetPlaybackLatency(pulse::LatencyParams {
+					channel,
+					now: time::SystemTime::now(),
+				});
+				client.write_all(&command(5, &latency)).unwrap();
+				assert!(matches!(answer(&mut client), (5, pulse::Command::Reply, _)));
+				client
+					.write_all(&command(6, &pulse::Command::TriggerPlaybackStream(channel)))
+					.unwrap();
+				assert!(matches!(answer(&mut client), (6, pulse::Command::Reply, _)));
+				assert!(requests.get() > requested, "the drained stream requests audio");
+				let before = audible.load(Ordering::Relaxed);
+				client.write_all(&tail(4800)).unwrap();
+				std::thread::sleep(time::Duration::from_millis(100));
+				assert!(audible.load(Ordering::Relaxed) > before, "writes after a drain play");
+
+				// A corked stream keeps its drain pending; deleting it answers the
+				// drain with an error before the delete's acknowledgement.
+				let cork = pulse::Command::CorkPlaybackStream(pulse::CorkStreamParams { channel, cork: true });
+				client.write_all(&command(7, &cork)).unwrap();
+				assert!(matches!(answer(&mut client), (7, pulse::Command::Reply, _)));
+				client
+					.write_all(
+						&[
+							tail(100),
+							command(8, &pulse::Command::DrainPlaybackStream(channel)),
+							command(9, &pulse::Command::DeletePlaybackStream(channel)),
+						]
+						.concat(),
+					)
+					.unwrap();
+				assert!(matches!(
+					answer(&mut client),
+					(8, pulse::Command::Error(pulse::PulseError::NoEntity), _)
+				));
+				assert!(matches!(answer(&mut client), (9, pulse::Command::Reply, _)));
+			}
+		})
+		.await
+		.unwrap();
+		stop.store(true, Ordering::Relaxed);
+		listener.join().unwrap();
+		assert!(server.stop().await);
+	}
+
+	/// Real libpulse clients (`pacat`) play stereo, 5.1 and 7.1 in the sink's
+	/// channel map into the server; every channel reaches the capture frames.
+	/// (libpulse's default 5.1 map is AIFF's, which has no LFE.) A second client is
 	/// killed mid-stream (its socket ends without any shutdown handshake) while
 	/// the first keeps playing, and the server stays responsive.
 	/// `MOONSHINE_TEST_PULSE_CLIENT=1 cargo test -p moonshine-core real_pulse_clients -- --ignored`
@@ -1517,7 +1661,7 @@ mod receive_tests {
 				1,
 			)
 			.unwrap();
-			let pacat = |seconds: usize| {
+			let pacat = |frames: usize| {
 				let mut child = Command::new("pacat")
 					.args([
 						&format!("--server=unix:{}", path.display()),
@@ -1526,6 +1670,7 @@ mod receive_tests {
 						"--format=float32le",
 						"--rate=48000",
 						&format!("--channels={channels}"),
+						&format!("--channel-map={}", sink_channel_map_names(channels)),
 						"--latency-msec=20",
 					])
 					.stdin(Stdio::piped())
@@ -1539,16 +1684,17 @@ mod receive_tests {
 						.flat_map(|channel| (0.1 + 0.1 * f32::from(channel)).to_le_bytes())
 						.collect();
 					let block = frame.repeat(480);
-					for _ in 0..seconds * 100 {
-						if std::io::Write::write_all(&mut stdin, &block).is_err() {
+					for start in (0..frames).step_by(480) {
+						let len = (frames - start).min(480) * frame.len();
+						if std::io::Write::write_all(&mut stdin, &block[..len]).is_err() {
 							break;
 						}
 					}
 				});
 				(child, writer)
 			};
-			let (mut player, player_writer) = pacat(3);
-			let (mut victim, _victim_writer) = pacat(30);
+			let (mut player, player_writer) = pacat(3 * 48_000);
+			let (mut victim, _victim_writer) = pacat(30 * 48_000);
 			// Mixed output carries every channel of the playing client.
 			let levels = tokio::task::spawn_blocking({
 				let frames = frames.clone();
@@ -1591,6 +1737,18 @@ mod receive_tests {
 			);
 			player_writer.join().unwrap();
 			let _ = player.wait();
+			// pacat drains its stream at the end of its input and exits once the
+			// drain is acknowledged, here for a tail shorter than one tick.
+			let (mut short, short_writer) = pacat(100);
+			short_writer.join().unwrap();
+			let deadline = time::Instant::now() + time::Duration::from_secs(3);
+			while short.try_wait().unwrap().is_none() {
+				if time::Instant::now() > deadline {
+					short.kill().unwrap();
+					panic!("{channels} channels: pacat's drain was not acknowledged");
+				}
+				tokio::time::sleep(time::Duration::from_millis(20)).await;
+			}
 			stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 			tokio::time::timeout(time::Duration::from_secs(2), stop.wait_shutdown_complete())
 				.await

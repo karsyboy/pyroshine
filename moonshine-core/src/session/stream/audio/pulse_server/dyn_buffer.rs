@@ -35,6 +35,7 @@ impl DynPlaybackBuffer {
 		}
 	}
 
+	#[cfg(test)]
 	pub fn is_empty(&self) -> bool {
 		match self {
 			Self::Stereo(b) => b.is_empty(),
@@ -68,12 +69,23 @@ impl DynPlaybackBuffer {
 	}
 
 	/// Drain `num_frames` from the buffer, mix into `output` with per-channel volume.
-	/// Returns `true` if frames were available, `false` on underrun.
-	pub fn drain_and_mix(&mut self, num_frames: usize, output: &mut [f32], vol: &[f32]) -> bool {
+	/// Returns `true` if frames were available, `false` on underrun. With
+	/// `tail`, fewer frames (or none) are mixed if that is all there is; the
+	/// rest of `output` is left silent.
+	pub fn drain_and_mix(&mut self, num_frames: usize, output: &mut [f32], vol: &[f32], tail: bool) -> bool {
 		match self {
-			Self::Stereo(b) => drain_mix_impl(b, num_frames, output, vol),
-			Self::Surround51(b) => drain_mix_impl(b, num_frames, output, vol),
-			Self::Surround71(b) => drain_mix_impl(b, num_frames, output, vol),
+			Self::Stereo(b) => drain_mix_impl(b, num_frames, output, vol, tail),
+			Self::Surround51(b) => drain_mix_impl(b, num_frames, output, vol, tail),
+			Self::Surround71(b) => drain_mix_impl(b, num_frames, output, vol, tail),
+		}
+	}
+
+	/// Whole frames at the output rate the buffer can still produce.
+	pub fn available_frames(&self) -> usize {
+		match self {
+			Self::Stereo(b) => b.available_frames(),
+			Self::Surround51(b) => b.available_frames(),
+			Self::Surround71(b) => b.available_frames(),
 		}
 	}
 }
@@ -83,13 +95,23 @@ fn drain_mix_impl<F: dasp::Frame<Sample = f32>>(
 	num_frames: usize,
 	output: &mut [f32],
 	vol: &[f32],
+	tail: bool,
 ) -> bool {
+	let num_frames = if tail {
+		num_frames.min(buffer.available_frames())
+	} else {
+		num_frames
+	};
 	let Some(frames) = buffer.drain(num_frames) else {
 		return false;
 	};
-	let mut resampled = dasp::Signal::into_interleaved_samples(frames).into_iter();
-	for (i, sample) in output.iter_mut().enumerate() {
-		let s = resampled.next().unwrap_or_default();
+	let resampled = dasp::Signal::into_interleaved_samples(frames).into_iter();
+	for (i, (sample, s)) in output
+		.iter_mut()
+		.zip(resampled)
+		.take(num_frames * F::CHANNELS)
+		.enumerate()
+	{
 		*sample += s * vol[i % vol.len()];
 	}
 	true
@@ -118,7 +140,7 @@ mod epoch_tests {
 			}
 			buffer.write(&bytes);
 			let mut out = vec![0.0; 10 * channels as usize];
-			assert!(buffer.drain_and_mix(10, &mut out, &vec![1.0; channels as usize]));
+			assert!(buffer.drain_and_mix(10, &mut out, &vec![1.0; channels as usize], false));
 			for frame in out.chunks_exact(channels as usize) {
 				assert_eq!(&frame[..2], &[0.2, 0.4]);
 				assert!(frame[2..].iter().all(|sample| *sample == 0.0));
