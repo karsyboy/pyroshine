@@ -226,7 +226,7 @@ impl Application {
 			stderr_value: &config.stderr,
 		};
 
-		let (unit_path, watch) = match start_transient_service(&conn, &options).await {
+		let watch = match start_transient_service(&conn, &options).await {
 			Ok(started) => started,
 			Err(failure) => {
 				// Best effort cleanup on launch failure; the session's teardown
@@ -243,7 +243,6 @@ impl Application {
 				output: output_hint(&context.unit_name, &config.stdout, &config.stderr),
 				launched_at: Instant::now(),
 			},
-			unit_path,
 			watch,
 			stop,
 			cause,
@@ -719,13 +718,14 @@ fn unit_object_path(unit_name: &str) -> String {
 /// status is seen even when systemd unloads the unit right after it exits
 /// (`CollectMode=inactive-or-failed`).
 struct UnitWatch {
+	unit_name: String,
 	path: OwnedObjectPath,
 	stream: MessageStream,
 	exit: ExitStatus,
 }
 
 impl UnitWatch {
-	async fn new(conn: &Connection, path: OwnedObjectPath) -> Result<Self, String> {
+	async fn new(conn: &Connection, unit_name: &str, path: OwnedObjectPath) -> Result<Self, String> {
 		let rule = MatchRule::builder()
 			.msg_type(zbus::message::Type::Signal)
 			.sender(SYSTEMD_BUS)
@@ -738,6 +738,7 @@ impl UnitWatch {
 			.await
 			.map_err(|e| format!("cannot follow the unit: {e}"))?;
 		Ok(Self {
+			unit_name: unit_name.to_string(),
 			path,
 			stream,
 			exit: ExitStatus::default(),
@@ -751,17 +752,28 @@ impl UnitWatch {
 	/// The subscription predates the unit, so it also delivers the state the
 	/// unit was loaded in (`inactive`, before it started). A terminal state is
 	/// therefore confirmed with systemd before it counts: a unit that is still
-	/// running, or gone (unloaded after it exited), answers authoritatively.
+	/// running, or gone (unloaded after it exited), answers authoritatively. A
+	/// confirmation that fails even after retrying is no answer: the signal is
+	/// not trusted and watching continues. A later state change is confirmed
+	/// again, and the exit monitor also ends on `UnitRemoved`.
 	async fn next_terminal_state(&mut self, conn: &Connection) -> Option<&'static str> {
 		loop {
 			let state = self.next_active_state().await?;
-			if let Some(terminal) = terminal_state(&state)
-				&& self.confirm_terminal(conn).await
-			{
-				// A stale state can be confirmed when the process has exited
-				// since: its exit status is then still queued behind it.
-				self.drain_exit_status().await;
-				return Some(terminal);
+			let Some(terminal) = terminal_state(&state) else {
+				continue;
+			};
+			match exit_confirmed(&query_activity(conn, &self.unit_name).await) {
+				Some(true) => {
+					// A stale state can be confirmed when the process has exited
+					// since: its exit status is then still queued behind it.
+					self.drain_exit_status().await;
+					return Some(terminal);
+				},
+				Some(false) => {},
+				None => tracing::warn!(
+					unit = self.unit_name,
+					"Could not confirm a reported application exit with systemd; still watching"
+				),
 			}
 		}
 	}
@@ -774,28 +786,6 @@ impl UnitWatch {
 				Ok(Some(_)) => {},
 				Ok(None) | Err(_) => return,
 			}
-		}
-	}
-
-	/// Whether the unit has really stopped: its current state is terminal,
-	/// or it no longer exists.
-	async fn confirm_terminal(&self, conn: &Connection) -> bool {
-		let reply = conn
-			.call_method(
-				Some(SYSTEMD_BUS),
-				&self.path,
-				Some(PROPERTIES_INTERFACE),
-				"Get",
-				&(UNIT_INTERFACE, ACTIVE_STATE_PROPERTY),
-			)
-			.await;
-		match reply {
-			Ok(reply) => match reply.body().deserialize::<(zvariant::Value<'_>,)>() {
-				Ok((zvariant::Value::Str(state),)) => terminal_state(state.as_str()).is_some(),
-				_ => true,
-			},
-			// Unloaded: systemd removes the object once the unit is collected.
-			Err(_) => true,
 		}
 	}
 
@@ -895,14 +885,13 @@ impl ExitReport {
 fn spawn_unit_exit_monitor(
 	conn: Connection,
 	report: ExitReport,
-	unit_path: OwnedObjectPath,
 	mut watch: UnitWatch,
 	stop: ShutdownManager<SessionShutdownReason>,
 	cause: StopCauseSlot,
 ) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		tokio::select! {
-			state = wait_for_unit_terminal_state(&conn, &report.unit_name, &unit_path, &mut watch) => {
+			state = wait_for_unit_terminal_state(&conn, &report.unit_name, &mut watch) => {
 				match state {
 					Ok(state) => {
 						watch.complete_exit_status(&conn).await;
@@ -928,12 +917,7 @@ fn spawn_unit_exit_monitor(
 	})
 }
 
-async fn wait_for_unit_terminal_state(
-	conn: &Connection,
-	unit_name: &str,
-	unit_path: &OwnedObjectPath,
-	watch: &mut UnitWatch,
-) -> Result<String, ()> {
+async fn wait_for_unit_terminal_state(conn: &Connection, unit_name: &str, watch: &mut UnitWatch) -> Result<String, ()> {
 	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
 		.await
 		.map_err(|e| tracing::error!("Failed to create systemd proxy: {e}"))?;
@@ -942,13 +926,20 @@ async fn wait_for_unit_terminal_state(
 		.await
 		.map_err(|e| tracing::error!("Failed to subscribe to UnitRemoved signals: {e}"))?;
 
-	match current_unit_state(conn, unit_path).await {
-		Ok(state) => {
-			if let Some(state) = terminal_state(state.as_str()) {
+	// Only an answer from systemd ends the session here. If the state cannot
+	// be read, the unit is followed by its signals instead.
+	match query_activity(conn, unit_name).await {
+		Ok(Activity::Absent) => return Ok("removed".to_string()),
+		Ok(Activity::State(state)) => {
+			if let Some(state) = terminal_state(&state) {
 				return Ok(state.to_string());
 			}
 		},
-		Err(()) => return Ok("removed".to_string()),
+		Err(error) => tracing::warn!(
+			unit = unit_name,
+			error,
+			"Could not read the application unit's state; following its signals"
+		),
 	}
 
 	loop {
@@ -972,25 +963,87 @@ async fn wait_for_unit_terminal_state(
 	}
 }
 
-async fn current_unit_state(conn: &Connection, unit_path: &OwnedObjectPath) -> Result<String, ()> {
+/// What systemd answered about a unit's activity.
+#[derive(Debug, PartialEq, Eq)]
+enum Activity {
+	/// Loaded, with this `ActiveState`.
+	State(String),
+	/// Not loaded: systemd collected it after it stopped.
+	Absent,
+}
+
+/// Query a unit's `ActiveState` by name. An error means systemd gave no
+/// answer (bus failure, timeout, unexpected reply), never that the unit
+/// stopped.
+async fn unit_activity(conn: &Connection, unit_name: &str) -> Result<Activity, String> {
 	let reply = conn
 		.call_method(
 			Some(SYSTEMD_BUS),
-			unit_path,
+			SYSTEMD_PATH,
+			Some(SYSTEMD_MANAGER),
+			"GetUnit",
+			&(unit_name,),
+		)
+		.await;
+	let path: OwnedObjectPath = match reply {
+		Ok(reply) => {
+			reply
+				.body()
+				.deserialize::<(OwnedObjectPath,)>()
+				.map_err(|e| format!("unexpected GetUnit reply: {e}"))?
+				.0
+		},
+		Err(error) if no_such_unit(&error) => return Ok(Activity::Absent),
+		Err(error) => return Err(format!("GetUnit failed: {error}")),
+	};
+	let reply = conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			&path,
 			Some(PROPERTIES_INTERFACE),
 			"Get",
 			&(UNIT_INTERFACE, ACTIVE_STATE_PROPERTY),
 		)
 		.await
-		.map_err(|e| tracing::error!("Failed to get unit state: {e}"))?;
+		.map_err(|e| format!("reading ActiveState failed: {e}"))?;
+	let (state,): (zvariant::OwnedValue,) = reply
+		.body()
+		.deserialize()
+		.map_err(|e| format!("unexpected ActiveState reply: {e}"))?;
+	String::try_from(state)
+		.map(Activity::State)
+		.map_err(|e| format!("unexpected ActiveState type: {e}"))
+}
 
-	let body = reply.body();
-	let (variant,): (zvariant::Value<'_>,) = body.deserialize().map_err(|e| {
-		tracing::error!("Failed to deserialize unit state: {e}");
-	})?;
-	match variant {
-		zvariant::Value::Str(state) => Ok(state.to_string()),
-		_ => Ok("unknown".to_string()),
+/// Delays before each attempt of [`query_activity`].
+const ACTIVITY_RETRY_DELAYS: [Duration; 3] = [Duration::ZERO, Duration::from_millis(200), Duration::from_secs(1)];
+/// Bound of one [`unit_activity`] attempt.
+const ACTIVITY_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// [`unit_activity`], retried briefly so a transient bus failure is not
+/// mistaken for an answer. Every attempt is bounded; dropping the future
+/// cancels it.
+async fn query_activity(conn: &Connection, unit_name: &str) -> Result<Activity, String> {
+	let mut error = String::new();
+	for delay in ACTIVITY_RETRY_DELAYS {
+		tokio::time::sleep(delay).await;
+		match tokio::time::timeout(ACTIVITY_QUERY_TIMEOUT, unit_activity(conn, unit_name)).await {
+			Ok(Ok(activity)) => return Ok(activity),
+			Ok(Err(e)) => error = e,
+			Err(_) => error = format!("no answer within {ACTIVITY_QUERY_TIMEOUT:?}"),
+		}
+	}
+	Err(error)
+}
+
+/// Whether an answer establishes that the unit has stopped: `Some(true)` for
+/// a terminal or unloaded unit, `Some(false)` while it runs, `None` when
+/// systemd gave no answer.
+fn exit_confirmed(activity: &Result<Activity, String>) -> Option<bool> {
+	match activity {
+		Ok(Activity::Absent) => Some(true),
+		Ok(Activity::State(state)) => Some(terminal_state(state).is_some()),
+		Err(_) => None,
 	}
 }
 
@@ -1031,10 +1084,7 @@ fn split_standard_io(value: &Option<String>) -> (String, Option<(&'static str, S
 ///
 /// Returns the unit's object path and a watch subscribed before the unit
 /// started, so the exit monitor sees how the application ends.
-async fn start_transient_service(
-	conn: &Connection,
-	options: &LaunchOptions<'_>,
-) -> Result<(OwnedObjectPath, UnitWatch), SessionFailure> {
+async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<UnitWatch, SessionFailure> {
 	let internal = |message: &str| SessionFailure::see_log("application_start_failed", message.to_string());
 	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
 	let (pre_entries, main_entry, post_entries) = tokio::task::spawn_blocking({
@@ -1161,10 +1211,12 @@ async fn start_transient_service(
 	// is unloaded immediately, together with its exit status.
 	let expected_path = OwnedObjectPath::try_from(unit_object_path(options.unit_name))
 		.map_err(|e| internal(&format!("The unit name cannot be followed: {e}")))?;
-	let mut watch = UnitWatch::new(conn, expected_path).await.map_err(|e| {
-		tracing::error!("Failed to follow the application unit: {e}");
-		internal("Pyroshine could not follow the application unit.")
-	})?;
+	let mut watch = UnitWatch::new(conn, options.unit_name, expected_path)
+		.await
+		.map_err(|e| {
+			tracing::error!("Failed to follow the application unit: {e}");
+			internal("Pyroshine could not follow the application unit.")
+		})?;
 
 	// Subscribe to JobRemoved before calling StartTransientUnit to avoid a race condition.
 	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
@@ -1265,20 +1317,27 @@ async fn start_transient_service(
 	if path != watch.path {
 		// systemd's path encoding is stable; follow the reported path anyway.
 		tracing::warn!(expected = %watch.path, reported = %path, "Unexpected application unit path");
-		watch = UnitWatch::new(conn, path.clone()).await.map_err(|e| {
-			tracing::error!("Failed to follow the application unit: {e}");
-			internal("Pyroshine could not follow the application unit.")
-		})?;
+		watch = UnitWatch::new(conn, options.unit_name, path.clone())
+			.await
+			.map_err(|e| {
+				tracing::error!("Failed to follow the application unit: {e}");
+				internal("Pyroshine could not follow the application unit.")
+			})?;
 	}
 
 	// Check current state — catches apps that exit immediately.
-	let state = current_unit_state(conn, &path)
-		.await
-		.map_err(|()| internal("Pyroshine could not read the application unit's state."))?;
-	if terminal_state(&state).is_some() {
-		watch.complete_exit_status(conn).await;
-		tracing::warn!(state = state, exit = ?watch.exit, "Application exited immediately after launch.");
-		return Err(exited(&watch.exit, "immediately after launch"));
+	let activity = query_activity(conn, options.unit_name).await;
+	match exit_confirmed(&activity) {
+		Some(true) => {
+			watch.complete_exit_status(conn).await;
+			tracing::warn!(?activity, exit = ?watch.exit, "Application exited immediately after launch.");
+			return Err(exited(&watch.exit, "immediately after launch"));
+		},
+		Some(false) => {},
+		None => {
+			tracing::error!(?activity, "Failed to read the application unit's state");
+			return Err(internal("Pyroshine could not read the application unit's state."));
+		},
 	}
 
 	// Wait for ActiveState to change to a terminal failure state.
@@ -1298,7 +1357,7 @@ async fn start_transient_service(
 	// The unit is still alive after the launch timeout (or its signals ended,
 	// which the exit monitor reports): the launch succeeded.
 	tracing::info!("Application launched in service {}", options.unit_name);
-	Ok((path, watch))
+	Ok(watch)
 }
 
 /// Resolve configured `stage` (`pre_command`/`post_command`) hooks into exec
@@ -1593,7 +1652,7 @@ mod tests {
 			stdout_value: &journal,
 			stderr_value: &journal,
 		};
-		let (path, watch) = start_transient_service(&conn, &options).await.unwrap();
+		let watch = start_transient_service(&conn, &options).await.unwrap();
 		let stop = ShutdownManager::new();
 		let cause = StopCauseSlot::default();
 		let report = ExitReport {
@@ -1602,7 +1661,7 @@ mod tests {
 			output: output_hint(&unit, &journal, &journal),
 			launched_at: Instant::now(),
 		};
-		let monitor = spawn_unit_exit_monitor(conn.clone(), report, path, watch, stop.clone(), cause.clone());
+		let monitor = spawn_unit_exit_monitor(conn.clone(), report, watch, stop.clone(), cause.clone());
 		let reason = tokio::time::timeout(Duration::from_secs(10), stop.wait_shutdown_triggered())
 			.await
 			.unwrap();
@@ -1637,7 +1696,7 @@ mod tests {
 			stdout_value: &None,
 			stderr_value: &None,
 		};
-		let (path, watch) = start_transient_service(&conn, &options).await.unwrap();
+		let watch = start_transient_service(&conn, &options).await.unwrap();
 		let stop = ShutdownManager::new();
 		let cause = StopCauseSlot::default();
 		let report = ExitReport {
@@ -1646,7 +1705,7 @@ mod tests {
 			output: output_hint(&unit, &None, &None),
 			launched_at: Instant::now(),
 		};
-		let monitor = spawn_unit_exit_monitor(conn.clone(), report, path, watch, stop.clone(), cause.clone());
+		let monitor = spawn_unit_exit_monitor(conn.clone(), report, watch, stop.clone(), cause.clone());
 		conn.call_method(
 			Some(SYSTEMD_BUS),
 			SYSTEMD_PATH,
@@ -1738,6 +1797,31 @@ mod tests {
 		}
 		for state in ["active", "deactivating", "activating", "reloading"] {
 			assert!(!loaded(state, 0).reached(Settled::Terminated), "{state}");
+		}
+	}
+
+	/// Only an answer from systemd confirms an application exit; a failed or
+	/// undecodable query is no answer and must not end the session.
+	#[test]
+	fn only_systemd_answers_confirm_an_exit() {
+		use super::{Activity, exit_confirmed};
+		assert_eq!(exit_confirmed(&Ok(Activity::Absent)), Some(true));
+		for state in ["inactive", "failed"] {
+			assert_eq!(
+				exit_confirmed(&Ok(Activity::State(state.into()))),
+				Some(true),
+				"{state}"
+			);
+		}
+		for state in ["active", "activating", "deactivating", "reloading"] {
+			assert_eq!(
+				exit_confirmed(&Ok(Activity::State(state.into()))),
+				Some(false),
+				"{state}"
+			);
+		}
+		for error in ["GetUnit failed: timeout", "unexpected ActiveState reply: signature"] {
+			assert_eq!(exit_confirmed(&Err(error.into())), None, "{error}");
 		}
 	}
 
