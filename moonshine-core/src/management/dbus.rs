@@ -325,7 +325,28 @@ impl ManagementInterface {
 		#[zbus(header)] header: Header<'_>,
 	) -> Result<String, ManagementError> {
 		authorize(connection, &header).await?;
-		Ok(json(&self.management.diagnostic_report()))
+		let management = self.management.clone();
+		on_runtime(&self.management, async move {
+			Ok(management.redacted_diagnostic_report().await)
+		})
+		.await
+	}
+
+	/// A redacted support bundle (gzip-compressed tar).
+	async fn get_support_bundle(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<Vec<u8>, ManagementError> {
+		authorize(connection, &header).await?;
+		let management = self.management.clone();
+		let bundle = on_runtime(&self.management, async move { Ok(management.support_bundle().await) }).await?;
+		if bundle.is_empty() {
+			return Err(ManagementError::Failed(
+				"The support bundle could not be collected; see the Pyroshine log.".into(),
+			));
+		}
+		Ok(bundle)
 	}
 
 	#[zbus(signal)]

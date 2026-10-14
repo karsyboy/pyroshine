@@ -816,7 +816,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use std::collections::BTreeSet;
 
 	use serde_json::{Value, json};

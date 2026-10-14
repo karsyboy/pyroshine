@@ -10,7 +10,7 @@
 //! Rules are deliberately conservative: a finding names a cause only when the
 //! window's numbers show it, and a window that looks healthy has none.
 
-use moonshine_management::dto::{Finding, StageStats, StreamStats};
+use moonshine_management::dto::{Finding, GpuStats, StageStats, StreamStats};
 
 /// What the stream was negotiated to deliver.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,6 +29,13 @@ const SKIPPED_SHARE: f64 = 0.05;
 const COMPOSITED_SHARE: f64 = 0.5;
 /// Share of uneven frame times worth reporting under fixed pacing.
 const UNEVEN_PERCENT: f64 = 25.0;
+/// GPU busy share at which the game and Pyroshine compete for it.
+const GPU_SATURATED: f64 = 95.0;
+/// Video encode engine busy share at which the encoder hardware is the limit.
+const ENCODER_SATURATED: f64 = 90.0;
+
+const GPU_CONTENTION_HINT: &str = "Cap the game's frame rate below the stream's, or lower its graphics settings: \
+	 Pyroshine's color conversion and encoding share the GPU with the game.";
 
 /// Findings for one window, warnings first.
 pub(crate) fn analyze(stats: &StreamStats, target: &StreamTarget) -> Vec<Finding> {
@@ -48,30 +55,63 @@ pub(crate) fn analyze(stats: &StreamStats, target: &StreamTarget) -> Vec<Finding
 		target_fps
 	};
 	let short = stats.fps < available_fps * SHORTFALL;
+	let skipped = stats.stale_frames_dropped as f64;
+	let skipping = skipped > 0.0 && skipped >= stats.frames as f64 * SKIPPED_SHARE;
+	let gpu = stats.gpu.as_ref();
+	let gpu_busy = gpu.and_then(|gpu| gpu.busy_percent);
+	let encoder_engine = gpu.and_then(encoder_busy);
+	let gpu_saturated = gpu_busy.is_some_and(|busy| busy >= GPU_SATURATED);
 
 	if let Some(encode) = stage("encode").filter(|encode| short && encode.p50_us > budget_us * BOTTLENECK_SHARE) {
+		let hint = if encoder_engine.is_some_and(|busy| busy >= ENCODER_SATURATED) {
+			"The GPU's video encoder is at its limit: lower the resolution, frame rate or bitrate in the client, or \
+			 choose a codec this GPU encodes faster."
+		} else if gpu_saturated {
+			GPU_CONTENTION_HINT
+		} else {
+			"Lower the resolution, frame rate or bitrate in the client, or choose a codec this GPU encodes faster. \
+			 A GPU busy rendering the game also slows encoding."
+		};
 		findings.push(Finding {
 			id: "encoder_bound".into(),
 			severity: "warning".into(),
 			title: format!("The encoder cannot keep up with {} fps", target.fps),
 			detail: format!(
-				"Encoding takes {} per frame (p95 {}), against a budget of {} at {} fps; {:.0} fps were delivered.",
+				"Encoding takes {} per frame (p95 {}), against a budget of {} at {} fps; {:.0} fps were delivered.{}",
 				millis(encode.p50_us),
 				millis(encode.p95_us),
 				millis(budget_us),
 				target.fps,
-				stats.fps
+				stats.fps,
+				gpu_context(gpu_busy, encoder_engine)
 			),
-			hint: Some(
-				"Lower the resolution, frame rate or bitrate in the client, or choose a codec this GPU encodes \
-				 faster. A GPU busy rendering the game also slows encoding."
-					.into(),
-			),
+			hint: Some(hint.into()),
 		});
 	}
 
-	let skipped = stats.stale_frames_dropped as f64;
-	if skipped > 0.0 && skipped >= stats.frames as f64 * SKIPPED_SHARE {
+	if gpu_saturated
+		&& (short || skipping)
+		&& !findings.iter().any(|finding| finding.id == "encoder_bound")
+		&& let (Some(gpu), Some(busy)) = (gpu, gpu_busy)
+	{
+		findings.push(Finding {
+			id: "gpu_saturated".into(),
+			severity: "warning".into(),
+			title: "The GPU is fully busy".into(),
+			detail: format!(
+				"The GPU was {busy:.0} % busy{}, and the host {}.",
+				attribution(gpu),
+				if short {
+					format!("delivered {:.0} of {available_fps:.0} fps", stats.fps)
+				} else {
+					"skipped captured frames".into()
+				}
+			),
+			hint: Some(GPU_CONTENTION_HINT.into()),
+		});
+	}
+
+	if skipping {
 		findings.push(Finding {
 			id: "frames_skipped".into(),
 			severity: "warning".into(),
@@ -194,6 +234,53 @@ pub(crate) fn analyze(stats: &StreamStats, target: &StreamTarget) -> Vec<Finding
 	findings
 }
 
+/// The video encode engine's busy share: the device's own counter, or else
+/// the encode engines Pyroshine used.
+fn encoder_busy(gpu: &GpuStats) -> Option<f64> {
+	gpu.encoder_busy_percent.or_else(|| {
+		let pyroshine = gpu.processes.iter().find(|group| group.role == "pyroshine")?;
+		pyroshine
+			.engines
+			.iter()
+			.filter(|engine| engine.class == "video_encode")
+			.map(|engine| engine.busy_percent)
+			.reduce(f64::max)
+	})
+}
+
+/// Graphics and compute share of a process group, in percent.
+fn render_share(gpu: &GpuStats, role: &str) -> Option<f64> {
+	let group = gpu.processes.iter().find(|group| group.role == role)?;
+	group
+		.engines
+		.iter()
+		.filter(|engine| engine.class == "graphics" || engine.class == "compute")
+		.map(|engine| engine.busy_percent)
+		.reduce(|a, b| a + b)
+}
+
+/// "; the application used 81 % in graphics and compute and Pyroshine 9 %".
+fn attribution(gpu: &GpuStats) -> String {
+	match (render_share(gpu, "application"), render_share(gpu, "pyroshine")) {
+		(Some(application), Some(pyroshine)) => {
+			format!("; the application used {application:.0} % in graphics and compute, Pyroshine {pyroshine:.0} %")
+		},
+		(Some(application), None) => format!("; the application used {application:.0} % in graphics and compute"),
+		(None, Some(pyroshine)) => format!("; Pyroshine used {pyroshine:.0} % in graphics and compute"),
+		(None, None) => String::new(),
+	}
+}
+
+/// " The GPU was 98 % busy and its video encoder 40 %." when known.
+fn gpu_context(busy: Option<f64>, encoder: Option<f64>) -> String {
+	match (busy, encoder) {
+		(Some(busy), Some(encoder)) => format!(" The GPU was {busy:.0} % busy and its video encoder {encoder:.0} %."),
+		(Some(busy), None) => format!(" The GPU was {busy:.0} % busy."),
+		(None, Some(encoder)) => format!(" The video encoder was {encoder:.0} % busy."),
+		(None, None) => String::new(),
+	}
+}
+
 /// Name the stage that takes longest, excluding the end-to-end total.
 fn slowest_stage_hint(stages: &[StageStats]) -> String {
 	match stages
@@ -305,6 +392,39 @@ mod tests {
 			],
 			capture: Some(capture(60.0)),
 			findings: Vec::new(),
+			gpu: None,
+		}
+	}
+
+	fn gpu(busy: f64, encoder: Option<f64>, application_gfx: f64, pyroshine_compute: f64) -> GpuStats {
+		use moonshine_management::dto::{GpuEngineStats, GpuProcessStats};
+		let group = |role: &str, engine: &str, class: &str, busy_percent: f64| GpuProcessStats {
+			role: role.into(),
+			label: role.into(),
+			engines: vec![GpuEngineStats {
+				engine: engine.into(),
+				class: class.into(),
+				busy_percent,
+			}],
+			vram_bytes: None,
+		};
+		GpuStats {
+			driver: "amdgpu".into(),
+			source: "sysfs".into(),
+			busy_percent: Some(busy),
+			encoder_busy_percent: encoder,
+			core_clock_mhz: None,
+			memory_clock_mhz: None,
+			temperature_c: None,
+			hotspot_c: None,
+			power_w: None,
+			power_limit_w: None,
+			vram_used_bytes: None,
+			vram_total_bytes: None,
+			processes: vec![
+				group("application", "gfx", "graphics", application_gfx),
+				group("pyroshine", "compute", "compute", pyroshine_compute),
+			],
 		}
 	}
 
@@ -330,6 +450,68 @@ mod tests {
 		// The same encode time without a shortfall (pipelined) is no finding.
 		stats.fps = 60.0;
 		assert!(!ids(&stats).contains(&"encoder_bound".to_string()));
+	}
+
+	#[test]
+	fn a_saturated_encoder_or_gpu_explains_a_slow_encoder() {
+		let mut stats = healthy();
+		stats.fps = 41.0;
+		stats.stages = vec![stage("encode", 22.0, 26.0), stage("total", 25.0, 30.0)];
+		stats.gpu = Some(gpu(60.0, Some(97.0), 40.0, 10.0));
+		let findings = analyze(&stats, &TARGET);
+		assert_eq!(findings.len(), 1);
+		assert!(
+			findings[0]
+				.detail
+				.ends_with("The GPU was 60 % busy and its video encoder 97 %.")
+		);
+		assert!(
+			findings[0]
+				.hint
+				.as_deref()
+				.unwrap()
+				.starts_with("The GPU's video encoder is at its limit")
+		);
+
+		stats.gpu = Some(gpu(99.0, Some(30.0), 85.0, 8.0));
+		let findings = analyze(&stats, &TARGET);
+		assert_eq!(ids(&stats), ["encoder_bound"], "one finding, not two");
+		assert_eq!(findings[0].hint.as_deref(), Some(GPU_CONTENTION_HINT));
+	}
+
+	#[test]
+	fn a_full_gpu_that_costs_frames_is_attributed() {
+		let mut stats = healthy();
+		stats.fps = 45.0;
+		stats.gpu = Some(gpu(99.0, None, 84.6, 7.2));
+		let findings = analyze(&stats, &TARGET);
+		assert_eq!(findings[0].id, "gpu_saturated");
+		assert_eq!(
+			findings[0].detail,
+			"The GPU was 99 % busy; the application used 85 % in graphics and compute, Pyroshine 7 %, and the host \
+			 delivered 45 of 60 fps."
+		);
+		// A busy GPU that costs nothing is no finding.
+		stats.fps = 60.0;
+		assert!(ids(&stats).is_empty());
+		// Without a busy counter (Intel), nothing is concluded.
+		stats.fps = 45.0;
+		stats.gpu.as_mut().unwrap().busy_percent = None;
+		assert!(!ids(&stats).contains(&"gpu_saturated".to_string()));
+	}
+
+	#[test]
+	fn the_encoder_engine_falls_back_to_pyroshines_encode_time() {
+		let mut gpu = gpu(50.0, None, 10.0, 10.0);
+		assert_eq!(encoder_busy(&gpu), None);
+		gpu.processes[1]
+			.engines
+			.push(moonshine_management::dto::GpuEngineStats {
+				engine: "enc".into(),
+				class: "video_encode".into(),
+				busy_percent: 93.0,
+			});
+		assert_eq!(encoder_busy(&gpu), Some(93.0));
 	}
 
 	#[test]

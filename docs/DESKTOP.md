@@ -83,6 +83,12 @@ beyond its own socket. To list only warnings, turn off **Settings →
 Diagnostics → Informational findings**; this app preference applies at once and
 **Copy diagnostics** still includes every finding.
 
+**GPU** shows the capture GPU while streaming: how busy it and its video
+encoder are, clocks, temperature, power and video memory, and how much GPU time
+the game and Pyroshine each used. Values a driver does not report are left out;
+NVIDIA readings come from the driver's NVML library, which samples a process
+only while it is busy, so light work can show **No recent sample**.
+
 When a session ends unexpectedly, the dashboard names the cause, such as the
 game's exit status or signal and how long after launch it ended.
 
@@ -91,7 +97,12 @@ HDR requests, unexpected stops) with what to do, the **Host checks** with a fix
 for each failed check, and the version, GPU, verified codec profiles and ports.
 **Run checks** repeats the host checks without restarting Pyroshine; while a
 session streams it keeps the startup GPU results instead of probing the GPU
-again. **Copy diagnostics** copies one JSON report for a bug report.
+again. **Copy diagnostics** copies one JSON report for a bug report. **Save
+support bundle** saves a `.tar.gz` with that report, the last two minutes of
+stream statistics, host and GPU details, the configuration and the service log
+to your download folder. Both are redacted: home directory, user and host
+names, the server name, client names and IDs, certificate fingerprints and IP
+addresses are replaced with placeholders.
 
 | Tray indicator | Meaning |
 | --- | --- |

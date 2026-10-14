@@ -2,23 +2,25 @@
 //!
 //! Both encoder backends already publish one [`FrameStats`] per completed
 //! frame on a `broadcast` channel (the benchmark's source). The aggregator
-//! subscribes to it only while the desktop UI runs and a client is streaming,
-//! so a headless server, or one without a streaming client, has no receiver
-//! and `send` stays the no-op it always was.
+//! subscribes to it while a client is streaming, so a server without a
+//! streaming client has no receiver and `send` stays the no-op it always was.
 //!
 //! While subscribed, the aggregator never waits on the pipeline and the
 //! pipeline never waits on it: a timer drains the channel four times a second
 //! (no per-frame wakeups), and a receiver that falls behind loses the oldest
 //! samples, which are counted. Once per second the window is summarized into a
-//! [`StreamStats`] for the UI.
+//! [`StreamStats`] for the desktop UI and the support bundle's history,
+//! together with one reading of the capture GPU ([`GpuProbe`]) taken on a
+//! blocking thread.
 
 use std::time::{Duration, Instant, SystemTime};
 
-use moonshine_management::dto::{CapturePathStats, CaptureStats, CompositionReason, StageStats, StreamStats};
+use moonshine_management::dto::{CapturePathStats, CaptureStats, CompositionReason, GpuStats, StageStats, StreamStats};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 use tokio::sync::watch;
 
 use super::findings::{self, StreamTarget};
+use crate::gpu_sensors::{self, GpuSampler, ProcessGroup};
 use crate::session::compositor::DirectReject;
 use crate::session::compositor::frame::CapturePath;
 use crate::session::stream::video::FrameStats;
@@ -282,7 +284,13 @@ impl StatsWindow {
 	}
 
 	/// Summarize the window and start the next one.
-	pub(crate) fn finish(&mut self, now: Instant, epoch: u64, target: &StreamTarget) -> StreamStats {
+	pub(crate) fn finish(
+		&mut self,
+		now: Instant,
+		epoch: u64,
+		target: &StreamTarget,
+		gpu: Option<GpuStats>,
+	) -> StreamStats {
 		let window = self.elapsed(now).max(Duration::from_millis(1));
 		let seconds = window.as_secs_f64();
 		let sampled = self.frames - self.samples_dropped;
@@ -335,6 +343,7 @@ impl StatsWindow {
 			stages,
 			capture,
 			findings: Vec::new(),
+			gpu,
 		};
 		stats.findings = findings::analyze(&stats, target);
 		let buffers = std::mem::take(&mut self.stage_micros);
@@ -358,6 +367,96 @@ pub(crate) fn unix_millis(time: SystemTime) -> u64 {
 		.unwrap_or(0)
 }
 
+/// Reads the capture GPU once per window, attributing its time to the
+/// application's unit and to Pyroshine.
+pub(crate) struct GpuProbe {
+	sampler: GpuSampler,
+	application_label: String,
+	/// The application unit's cgroup, looked up until found.
+	application_cgroup: Option<String>,
+	/// The lookup missed its deadline; it is not retried for this stream.
+	cgroup_abandoned: bool,
+}
+
+impl GpuProbe {
+	pub(crate) fn new(sampler: GpuSampler, application_label: String) -> Self {
+		Self {
+			sampler,
+			application_label,
+			application_cgroup: None,
+			cgroup_abandoned: false,
+		}
+	}
+
+	/// Blocking: reads sysfs, procfs or NVML.
+	fn sample(&mut self) -> GpuStats {
+		let mut groups = Vec::with_capacity(2);
+		if let Some(cgroup) = &self.application_cgroup {
+			groups.push(ProcessGroup {
+				role: "application",
+				label: self.application_label.clone(),
+				pids: gpu_sensors::cgroup_pids(cgroup),
+			});
+		}
+		groups.push(ProcessGroup {
+			role: "pyroshine",
+			label: "Pyroshine".into(),
+			pids: gpu_sensors::own_processes(),
+		});
+		self.sampler.sample(&groups)
+	}
+}
+
+/// Longest wait for opening the GPU, looking up the application's cgroup or
+/// one GPU reading. Statistics never wait longer: a step that misses it is
+/// abandoned for the rest of the stream, with a warning naming it.
+pub(crate) const GPU_DEADLINE: Duration = Duration::from_secs(3);
+
+/// One GPU reading on a blocking thread. The probe is dropped (GPU readings
+/// stop for this stream) if the reading panics or misses [`GPU_DEADLINE`];
+/// a reading still running then finishes in the background.
+async fn sample_gpu(probe: &mut Option<GpuProbe>) -> Option<GpuStats> {
+	let mut taken = probe.take()?;
+	if taken.application_cgroup.is_none() && !taken.cgroup_abandoned {
+		match tokio::time::timeout(GPU_DEADLINE, crate::session::application::application_cgroup()).await {
+			Ok(Some(cgroup)) => {
+				tracing::debug!(cgroup, "Attributing GPU time to the application unit");
+				taken.application_cgroup = Some(cgroup);
+			},
+			Ok(None) => tracing::debug!("The application unit's cgroup is unknown; its GPU time is not attributed yet"),
+			Err(_) => {
+				tracing::warn!(
+					"Looking up the application unit's cgroup did not finish within {} s; its GPU time is not \
+					 attributed for this stream",
+					GPU_DEADLINE.as_secs()
+				);
+				taken.cgroup_abandoned = true;
+			},
+		}
+	}
+	let reading = tokio::task::spawn_blocking(move || {
+		let stats = taken.sample();
+		(taken, stats)
+	});
+	match tokio::time::timeout(GPU_DEADLINE, reading).await {
+		Ok(Ok((returned, stats))) => {
+			*probe = Some(returned);
+			Some(stats)
+		},
+		Ok(Err(error)) => {
+			tracing::warn!("Reading the GPU failed ({error}); GPU readings stop for this stream");
+			None
+		},
+		Err(_) => {
+			tracing::warn!(
+				"Reading the GPU did not finish within {} s; GPU readings stop for this stream",
+				GPU_DEADLINE.as_secs()
+			);
+			None
+		},
+	}
+}
+
 /// Aggregate `receiver` until `active` turns false, publishing summaries to
 /// `latest` and `publish`. Returns when aggregation is no longer wanted or
 /// the channel closed.
@@ -365,6 +464,7 @@ pub(crate) async fn aggregate(
 	mut receiver: broadcast::Receiver<FrameStats>,
 	epoch: u64,
 	target: StreamTarget,
+	mut gpu: Option<GpuProbe>,
 	mut active: watch::Receiver<bool>,
 	latest: &watch::Sender<Option<StreamStats>>,
 	mut publish: impl FnMut(&StreamStats),
@@ -391,9 +491,14 @@ pub(crate) async fn aggregate(
 				},
 			}
 		}
+		// The window ends at this tick; frames drained while the GPU is read
+		// belong to the next one. Ticks land a little early or late, so a
+		// window ends at the tick nearest one second, not the first after it
+		// (which would make most windows 1.25 s).
 		let now = Instant::now();
-		if window.elapsed(now) >= WINDOW {
-			let stats = window.finish(now, epoch, &target);
+		if window.elapsed(now) + DRAIN_PERIOD / 2 >= WINDOW {
+			let gpu = sample_gpu(&mut gpu).await;
+			let stats = window.finish(now, epoch, &target, gpu);
 			publish(&stats);
 			latest.send_replace(Some(stats));
 		}
@@ -458,7 +563,7 @@ mod tests {
 		replay.content_age = Duration::ZERO;
 		window.record(&replay);
 		let capture = window
-			.finish(start + Duration::from_secs(1), 1, &TARGET)
+			.finish(start + Duration::from_secs(1), 1, &TARGET, None)
 			.capture
 			.unwrap();
 		assert_eq!(capture.pacing, "vrr");
@@ -476,7 +581,7 @@ mod tests {
 			window.record(&stats);
 		}
 		let capture = window
-			.finish(start + Duration::from_secs(2), 1, &TARGET)
+			.finish(start + Duration::from_secs(2), 1, &TARGET, None)
 			.capture
 			.unwrap();
 		assert_eq!(capture.pacing, "mixed");
@@ -486,7 +591,7 @@ mod tests {
 
 		assert!(
 			window
-				.finish(start + Duration::from_secs(3), 1, &TARGET)
+				.finish(start + Duration::from_secs(3), 1, &TARGET, None)
 				.capture
 				.is_none()
 		);
@@ -499,7 +604,7 @@ mod tests {
 		for index in 0..100u64 {
 			window.record(&frame(10_000, 12_000, 1_000 + index * 10, index == 0));
 		}
-		let stats = window.finish(start + Duration::from_secs(1), 7, &TARGET);
+		let stats = window.finish(start + Duration::from_secs(1), 7, &TARGET, None);
 		assert_eq!(stats.epoch, 7);
 		assert_eq!(stats.frames, 100);
 		assert!((stats.fps - 100.0).abs() < 1e-9);
@@ -520,7 +625,7 @@ mod tests {
 		assert!((encode.max_us - 1_990.0).abs() < 1e-6);
 
 		// The next window starts empty and reuses its buffers.
-		let next = window.finish(start + Duration::from_secs(2), 7, &TARGET);
+		let next = window.finish(start + Duration::from_secs(2), 7, &TARGET, None);
 		assert_eq!(next.frames, 0);
 		assert!(next.stages.is_empty());
 		assert!(next.transport_overhead_percent.is_none());
@@ -534,10 +639,28 @@ mod tests {
 			window.record(&frame(10_000, 10_000, 1_000, false));
 		}
 		window.lagged(50);
-		let stats = window.finish(start + Duration::from_secs(1), 1, &TARGET);
+		let stats = window.finish(start + Duration::from_secs(1), 1, &TARGET, None);
 		assert_eq!(stats.frames, 100);
 		assert_eq!(stats.samples_dropped, 50);
 		assert!((stats.encoded_bitrate_bps - 8_000_000.0).abs() < 1e-3);
+	}
+
+	/// Windows last one second, not one drain period more. Real time: the
+	/// windows measure `std::time::Instant`, which paused Tokio time does not move.
+	#[tokio::test]
+	async fn windows_end_at_the_tick_nearest_one_second() {
+		let (sender, receiver) = broadcast::channel(256);
+		let (_active_tx, active) = watch::channel(true);
+		let (latest, mut latest_rx) = watch::channel(None);
+		tokio::spawn(async move {
+			aggregate(receiver, 1, TARGET, None, active, &latest, |_| {}).await;
+		});
+		for _ in 0..3 {
+			let _ = sender.send(frame(1_000, 1_100, 500, false));
+			latest_rx.changed().await.unwrap();
+			let window = latest_rx.borrow().as_ref().unwrap().window_ms;
+			assert!((950..=1100).contains(&window), "{window} ms");
+		}
 	}
 
 	/// A consumer that never reads cannot slow the producer: `send` never
@@ -558,7 +681,7 @@ mod tests {
 		let (active_tx, active) = watch::channel(true);
 		let (latest, mut latest_rx) = watch::channel(None);
 		let task = tokio::spawn(async move {
-			aggregate(receiver, 3, TARGET, active, &latest, |_| {}).await;
+			aggregate(receiver, 3, TARGET, None, active, &latest, |_| {}).await;
 		});
 		tokio::time::timeout(Duration::from_secs(5), latest_rx.wait_for(Option::is_some))
 			.await
@@ -599,7 +722,7 @@ mod tests {
 			window.record(&stats);
 		}
 		let path = window
-			.finish(start + Duration::from_secs(1), 1, &TARGET)
+			.finish(start + Duration::from_secs(1), 1, &TARGET, None)
 			.capture
 			.unwrap()
 			.path
@@ -622,7 +745,7 @@ mod tests {
 		stats.capture_origin = origin(CapturePath::Direct, None);
 		window.record(&stats);
 		let path = window
-			.finish(start + Duration::from_secs(2), 1, &TARGET)
+			.finish(start + Duration::from_secs(2), 1, &TARGET, None)
 			.capture
 			.unwrap()
 			.path

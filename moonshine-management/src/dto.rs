@@ -432,6 +432,62 @@ pub struct StreamStats {
 	/// stands out (and from older daemons).
 	#[serde(default)]
 	pub findings: Vec<Finding>,
+	/// Activity of the capture GPU over the window; absent when its driver
+	/// exposes no sensors (and from older daemons).
+	#[serde(default)]
+	pub gpu: Option<GpuStats>,
+}
+
+/// Activity of the capture GPU over one statistics window. Every reading is
+/// optional: drivers expose different sensors, and an unreadable sensor is
+/// omitted rather than reported as zero.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuStats {
+	/// Kernel driver, for example `amdgpu`, `i915`, `xe` or `nvidia`.
+	pub driver: String,
+	/// Where the readings come from: `sysfs` (kernel interfaces) or `nvml`.
+	pub source: String,
+	/// Share of the window the GPU's graphics/compute engines were busy, in percent.
+	pub busy_percent: Option<f64>,
+	/// Share of the window the video encode engine was busy, in percent.
+	pub encoder_busy_percent: Option<f64>,
+	pub core_clock_mhz: Option<f64>,
+	pub memory_clock_mhz: Option<f64>,
+	/// Edge (or the only reported) temperature.
+	pub temperature_c: Option<f64>,
+	/// Hottest point (junction or hotspot) where the driver reports it.
+	pub hotspot_c: Option<f64>,
+	pub power_w: Option<f64>,
+	pub power_limit_w: Option<f64>,
+	pub vram_used_bytes: Option<u64>,
+	pub vram_total_bytes: Option<u64>,
+	/// GPU time of the streamed application and of Pyroshine itself, where the
+	/// driver attributes it to processes.
+	pub processes: Vec<GpuProcessStats>,
+}
+
+/// GPU use of one group of processes over the window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuProcessStats {
+	/// `application` (the launched application's unit) or `pyroshine`
+	/// (capture, composition, color conversion and encoding).
+	pub role: String,
+	pub label: String,
+	/// Busy share per engine, busiest first. An engine shared by several
+	/// queues can exceed 100 %.
+	pub engines: Vec<GpuEngineStats>,
+	/// Video memory resident for the group, where reported.
+	pub vram_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuEngineStats {
+	/// The driver's engine name, for example `gfx`, `enc` or `render`.
+	pub engine: String,
+	/// `graphics`, `compute`, `video_encode`, `video_decode`, `video`
+	/// (shared encode/decode engine), `copy` or `other`.
+	pub class: String,
+	pub busy_percent: f64,
 }
 
 /// One conclusion drawn from a statistics window.
@@ -543,6 +599,43 @@ pub struct DiagnosticReport {
 	pub stats: Option<StreamStats>,
 	/// Recent events, oldest first.
 	pub events: Vec<ServerEvent>,
+	/// Operating system, kernel, CPU and GPUs. Absent from older daemons.
+	#[serde(default)]
+	pub host: Option<HostInfo>,
+}
+
+/// The host's hardware and software, for support reports.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostInfo {
+	/// Kernel release, for example `6.17.2-arch1-1`.
+	pub kernel: String,
+	/// `PRETTY_NAME` from os-release.
+	pub os: Option<String>,
+	pub cpu: Option<String>,
+	pub cpu_threads: u32,
+	pub memory_total_bytes: Option<u64>,
+	/// The systemd unit Pyroshine runs in, for example `pyroshine@user.service`.
+	pub service_unit: Option<String>,
+	/// `system` or `user`: which systemd instance runs the unit.
+	pub service_scope: Option<String>,
+	pub gpus: Vec<GpuDevice>,
+}
+
+/// A DRM render node and the device behind it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuDevice {
+	pub render_node: String,
+	pub pci_address: Option<String>,
+	/// PCI vendor and device IDs, for example `0x1002` and `0x7550`.
+	pub vendor_id: Option<String>,
+	pub device_id: Option<String>,
+	pub driver: Option<String>,
+	/// Version of an out-of-tree kernel driver (NVIDIA); in-tree drivers
+	/// follow the kernel.
+	pub driver_version: Option<String>,
+	pub vbios: Option<String>,
+	/// The device Pyroshine captures and encodes on.
+	pub capture: bool,
 }
 
 /// Editable configuration settings, sent by `GetConfigSchema`. The daemon

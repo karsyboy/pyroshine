@@ -17,6 +17,7 @@ import TableRow from "@mui/material/TableRow";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import CheckCircle from "@mui/icons-material/CheckCircle";
+import Archive from "@mui/icons-material/Archive";
 import ContentCopy from "@mui/icons-material/ContentCopy";
 import ErrorIcon from "@mui/icons-material/Error";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
@@ -194,6 +195,22 @@ export function DiagnosticsPage() {
     }
   };
 
+  const [saving, setSaving] = useState(false);
+  const saveBundle = async () => {
+    setSaving(true);
+    try {
+      const path = await call<string>("save_support_bundle");
+      notify("success", `Support bundle saved to ${path}. Identifying values are redacted; review it before sharing.`);
+    } catch (error) {
+      notify(
+        "error",
+        errorKind(error) === "incompatible" ? "This Pyroshine version cannot build support bundles; update it." : errorMessage(error),
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const copyReport = async () => {
     let text: string;
     try {
@@ -219,6 +236,9 @@ export function DiagnosticsPage() {
           <>
             <Button variant="outlined" startIcon={<ContentCopy />} onClick={() => void copyReport()}>
               Copy diagnostics
+            </Button>
+            <Button variant="outlined" startIcon={<Archive />} disabled={saving} onClick={() => void saveBundle()}>
+              {saving ? "Collecting…" : "Save support bundle"}
             </Button>
             <Button variant="contained" startIcon={<Refresh />} disabled={running} onClick={() => void runChecks()}>
               {running ? "Checking…" : "Run checks"}

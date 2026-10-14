@@ -83,6 +83,8 @@ flowchart LR
 | `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
 | `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
 | `management/` | Session-bus management interface: status, pairing, clients, configuration store, telemetry aggregation | Session, pairing or trust decisions (it calls the owners) |
+| `gpu_sensors/` | Capture GPU sensors and per-process GPU time for telemetry and support bundles | Anything on a media path (it runs on blocking threads, once per second) |
+| `support/` | Redacted support bundles: collection, redaction, archive | Changing server state (it only reads) |
 | `session/status.rs` | Public session phase from manager status and control-stream ownership | Lifecycle transitions |
 
 Boundaries to preserve:
@@ -655,24 +657,46 @@ to cover exactly the settings `Config` serializes, and its choice values are
 serialized from the Rust enums.
 
 **Telemetry.** Both encoders already publish one `FrameStats` per frame on the
-benchmark's `broadcast` channel. The management service subscribes only while
-the desktop UI owns its bus name and a client is streaming, drains the channel
-on a 250 ms timer (no per-frame wakeups) and publishes one-second summaries
-(`StatsUpdated`). `broadcast::send` never blocks: a receiver that falls behind
-loses the oldest samples, which are counted, and with no receiver it remains
-the no-op it is on a headless server. Each sample also carries the frame's
+benchmark's `broadcast` channel. The management service subscribes while a
+client is streaming, drains the channel on a 250 ms timer (no per-frame
+wakeups) and summarizes one-second windows. It keeps the last 120 windows for
+support bundles and signals each one (`StatsUpdated`) while the desktop UI owns
+its bus name. `broadcast::send` never blocks: a receiver that falls behind
+loses the oldest samples, which are counted, and with no receiver (no
+streaming client) it remains a no-op. Each sample also carries the frame's
 capture pacing, content age and content-time interval since the previous new
 frame (the frame time the client sees in RTP), summarized as the window's
 frame pacing, and its `CaptureOrigin`: direct export, direct export with late
 layers, or composition and the first `DirectReject` that required it (a fixed
 enum, never a per-frame string), summarized as the window's capture path.
 
+**GPU readings.** Once per window, `gpu_sensors::GpuSampler` reads the capture
+GPU on a blocking thread (`StreamStats.gpu`): `hwmon` temperature, power and
+clocks for every driver, amdgpu's `gpu_busy_percent`, `vcn_busy_percent` and
+VRAM counters, Intel's actual frequency, and NVML (loaded at runtime from the
+NVIDIA driver) for NVIDIA. GPU time is attributed from DRM fdinfo
+(`drm-engine-*`, or xe's `drm-cycles-*`, per client ID, deduplicated across
+descriptors) to two process groups: the application unit's cgroup (looked up
+through systemd's `ControlGroup`) and Pyroshine's own service cgroup, which
+includes XWayland. The proprietary NVIDIA driver publishes no fdinfo counters:
+there, a group is present when NVML's running-process lists name one of its
+processes (with its memory), and its busy shares average NVML's per-process
+utilization samples in the window, which exist only for processes busy in a
+recent sampling period. NVML is loaded and initialized once per process and
+never shut down. Missing sensors are omitted, never reported as zero. Opening
+the GPU, the cgroup lookup and each reading have a 3 s deadline; a step that
+misses it is abandoned for the stream with a warning, and statistics continue
+without it. Each stream logs `Collecting stream statistics` with the backend.
+
 **Findings.** Each published window is read by `management/findings.rs`
 (`StreamStats.findings`): an encoder slower than the frame budget while frames
 are missed, a game rendering below the stream rate while every frame is
 delivered, skipped captures, socket failures or discarded packets, high
 pipeline latency, mostly composited frames, or uneven frame times under fixed
-pacing. Each finding has a stable ID, the window's numbers and a hint. Rules
+pacing. GPU readings refine them: an encoder that misses frames names a
+saturated encode engine or a GPU kept busy by the game, and a fully busy GPU
+that costs frames (`gpu_saturated`) states the application's and Pyroshine's
+graphics and compute shares. Each finding has a stable ID, the window's numbers and a hint. Rules
 name a cause only when the numbers show it, and they see only the host: client
 decoding and display pacing are outside them. Analysis runs on the management
 task once per window, never on a media path.
@@ -693,7 +717,22 @@ negotiation rejections, which stock clients show only as a status code, and
 launch failures are reported through `SessionManager::report_problem`.
 Management keeps the last 50 problems and unexpected stops as `ServerEvent`s
 (`GetEvents`), emits each as `ServerEvent`, and includes them in
-`GetDiagnosticReport` with the server, health, session and latest statistics.
+`GetDiagnosticReport` with the server, health, session, latest statistics and
+host facts (kernel, OS, CPU, memory, GPUs, service unit).
+
+**Support bundles.** `GetSupportBundle` returns a gzip-compressed tar archive
+built by `crate::support` on a blocking thread: the diagnostic report, the
+statistics history, host facts, one GPU sensor reading, the configuration,
+`systemctl status` and the last 3000 journal lines of the service unit (found
+from the daemon's own cgroup), and `vulkaninfo --summary`; external commands
+have a deadline. `pyroshine diag` saves it, and collects a bundle itself when
+no daemon is reachable, running the health check only when no Pyroshine server
+runs. Everything passes through one `Redactor`: the home directory, user and
+host names, the configured server name, the server ID, client IDs and names
+from `state.toml`, fingerprints, UUIDs and IP addresses become placeholders,
+and the configuration is redacted by setting (unknown keys are blanked; the
+schema test guarantees every real setting is known). `GetDiagnosticReport` is
+redacted the same way.
 
 **Health checks.** `GetServer` carries the startup report; each check has a
 stable ID, the first line of its message, and the remaining lines (the remedy

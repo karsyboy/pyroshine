@@ -52,3 +52,14 @@ export function channels(count: number): string {
       return `${count} channels`;
   }
 }
+
+export function bytes(count: number | null | undefined): string {
+  if (count == null || !Number.isFinite(count)) return "—";
+  if (count >= 2 ** 30) return `${(count / 2 ** 30).toFixed(1)} GiB`;
+  if (count >= 2 ** 20) return `${(count / 2 ** 20).toFixed(0)} MiB`;
+  return `${(count / 2 ** 10).toFixed(0)} KiB`;
+}
+
+export function percent(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "—" : `${value.toFixed(0)} %`;
+}

@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../api/session.fixture.json";
-import type { AudioDetails, CaptureStats, SessionSnapshot, StreamStats } from "../api/types";
+import type { AudioDetails, CaptureStats, GpuStats, SessionSnapshot, StreamStats } from "../api/types";
 import { setPreference } from "../state/preferences";
 import { DashboardPage } from "./Dashboard";
 
@@ -110,6 +110,88 @@ describe("frame pacing", () => {
     const html = renderStats(base);
     expect(html).toContain("Performance");
     expect(html).not.toContain("Frame pacing");
+  });
+});
+
+describe("GPU", () => {
+  const snapshot: SessionSnapshot = { ...fixture, phase: "streaming" };
+  const base: StreamStats = {
+    epoch: snapshot.session!.epoch,
+    at_ms: 0,
+    window_ms: 1000,
+    frames: 60,
+    fps: 60,
+    key_frames: 0,
+    encoded_bitrate_bps: 1,
+    wire_bitrate_bps: 1,
+    transport_overhead_percent: null,
+    packets: 1,
+    failed_packets: 0,
+    discarded_packets: 0,
+    stale_frames_dropped: 0,
+    samples_dropped: 0,
+    stages: [],
+  };
+  const gpu: GpuStats = {
+    driver: "amdgpu",
+    source: "sysfs",
+    busy_percent: 97,
+    encoder_busy_percent: 41,
+    core_clock_mhz: 2950,
+    memory_clock_mhz: 1258,
+    temperature_c: 53,
+    hotspot_c: 71,
+    power_w: 245,
+    power_limit_w: 340,
+    vram_used_bytes: 3 * 2 ** 30,
+    vram_total_bytes: 16 * 2 ** 30,
+    processes: [
+      { role: "application", label: "Grim Dawn", engines: [{ engine: "gfx", class: "graphics", busy_percent: 84.6 }], vram_bytes: 2 * 2 ** 30 },
+      { role: "pyroshine", label: "Pyroshine", engines: [], vram_bytes: 300 * 2 ** 20 },
+    ],
+  };
+
+  function renderGpu(value: GpuStats | undefined) {
+    daemon.stats = { ...base, gpu: value } as never;
+    try {
+      return render(snapshot);
+    } finally {
+      daemon.stats = null;
+    }
+  }
+
+  it("shows the sensors and GPU time per process", () => {
+    const html = renderGpu(gpu);
+    expect(html).toContain("GPU busy");
+    expect(html).toContain("97 %");
+    expect(html).toContain("core 2950 MHz");
+    expect(html).toContain("hotspot 71 °C");
+    expect(html).toContain("limit 340 W");
+    expect(html).toContain("of 16.0 GiB");
+    expect(html).toContain("Graphics (gfx)");
+    expect(html).toContain("85 %");
+    expect(html).toContain("Grim Dawn");
+    expect(html).toContain("No recent sample");
+  });
+
+  it("shows only the sensors a driver reports, and nothing for an older daemon", () => {
+    const sparse: GpuStats = {
+      ...gpu,
+      driver: "i915",
+      busy_percent: null,
+      encoder_busy_percent: null,
+      temperature_c: null,
+      hotspot_c: null,
+      power_w: null,
+      vram_used_bytes: null,
+      core_clock_mhz: 1650,
+      processes: [],
+    };
+    const html = renderGpu(sparse);
+    expect(html).toContain("1650 MHz");
+    expect(html).not.toContain("GPU busy");
+    expect(html).not.toContain("Temperature");
+    expect(renderGpu(undefined)).not.toContain("Video encoder");
   });
 });
 

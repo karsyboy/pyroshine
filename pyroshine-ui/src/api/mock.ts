@@ -219,6 +219,37 @@ function stats(): StreamStats {
             },
           ]
         : [],
+    gpu: {
+      driver: "amdgpu",
+      source: "sysfs",
+      busy_percent: 88 + Math.random() * 8,
+      encoder_busy_percent: 38 + Math.random() * 6,
+      core_clock_mhz: 2480 + Math.random() * 60,
+      memory_clock_mhz: 1250,
+      temperature_c: 66,
+      hotspot_c: 81,
+      power_w: 286 + Math.random() * 20,
+      power_limit_w: 339,
+      vram_used_bytes: 14.2 * 2 ** 30,
+      vram_total_bytes: 24 * 2 ** 30,
+      processes: [
+        {
+          role: "application",
+          label: "Cyberpunk 2077",
+          engines: [{ engine: "gfx", class: "graphics", busy_percent: 78 + Math.random() * 6 }],
+          vram_bytes: 11.8 * 2 ** 30,
+        },
+        {
+          role: "pyroshine",
+          label: "Pyroshine",
+          engines: [
+            { engine: "compute", class: "compute", busy_percent: 9.4 },
+            { engine: "gfx", class: "graphics", busy_percent: 1.2 },
+          ],
+          vram_bytes: 412 * 2 ** 20,
+        },
+      ],
+    },
   };
 }
 
@@ -385,6 +416,9 @@ export async function mockInvoke<T>(command: string, args: Record<string, unknow
       return health as T;
     case "diagnostic_report":
       return JSON.stringify({ generated_at_ms: Date.now(), ...overview(), events }, null, 2) as T;
+    case "save_support_bundle":
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      return "/home/user/Downloads/pyroshine-diag-20261014-155902.tar.gz" as T;
     case "quit":
       return undefined as T;
     default:

@@ -55,6 +55,7 @@ describe("host checks", () => {
     expect(html.indexOf("Render access")).toBeLessThan(html.indexOf("Vulkan"));
     expect(html).toContain("Run checks");
     expect(html).toContain("Copy diagnostics");
+    expect(html).toContain("Save support bundle");
   });
 
   it("explains a skipped startup check", () => {

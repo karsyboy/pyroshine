@@ -14,6 +14,19 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Add `pyroshine diag`, which writes a redacted support bundle (`.tar.gz`) for bug reports on hosts without the desktop app: the diagnostic report, the last two minutes of stream statistics, host and GPU details, the configuration, the service status and log, and `vulkaninfo --summary`. Without a reachable server it collects what it can itself and runs the health check when no server is running. The desktop app saves the same bundle with **Diagnostics → Save support bundle**.
+- Show the capture GPU while streaming. The dashboard's **GPU** section reports how busy the GPU and its video encoder are, clocks, temperature, power, video memory, and the GPU time the game and Pyroshine each used, from the kernel's sensors and per-process DRM usage. On NVIDIA it reads the driver's NVML library, which names each side's processes and video memory but samples a process's busy time only while it is busy. **Diagnosis** uses them: a slow encoder names a saturated encode engine or a GPU kept busy by the game, and a fully busy GPU that costs frames is reported with each side's share.
+
+### Changed
+
+- Redact **Copy diagnostics**. The home directory, user and host names, the server name, client names and IDs, certificate fingerprints, UUIDs and IP addresses are replaced with placeholders, as in support bundles.
+- Collect stream statistics while a client streams even when the desktop app is closed, so a support bundle collected afterwards includes them. Summarizing costs one wakeup every 250 ms and one GPU reading per second on a blocking thread; the media path is unchanged.
+
+### Fixed
+
+- Make stream statistics windows one second long. About half of them lasted 1.25 s because a window ended only at the first 250 ms tick after one second; rates were correct, but the dashboard updated unevenly.
 ### Changed
 
 - Lower H.264, HEVC and AV1 latency when the encoder or the network is the bottleneck. The conventional pipeline now keeps at most two frames between encode submission and socket send instead of three, and starts the next capture as soon as a frame completes instead of up to one frame interval later. On an RTX 3080 streaming incompressible 4K content at 240 FPS, median frame age fell from 12.4 to 8.0 ms (99th percentile 14.6 to 9.8 ms) at 2.6% fewer frames; behind a link slower than the stream bitrate, median frame age fell by 40–43% on an RTX 3080 and an RX 9070 XT at an unchanged frame rate. Unsaturated streams and game frame rates are unchanged.

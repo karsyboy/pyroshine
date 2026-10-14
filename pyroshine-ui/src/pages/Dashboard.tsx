@@ -19,12 +19,12 @@ import CheckCircleOutlined from "@mui/icons-material/CheckCircleOutlined";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import WarningAmber from "@mui/icons-material/WarningAmber";
 import { call, errorMessage } from "../api/bridge";
-import type { AudioDetails, CapturePathStats, CaptureStats, Finding, SessionDetails, SessionPhase, StreamStats } from "../api/types";
+import type { AudioDetails, CapturePathStats, CaptureStats, Finding, GpuEngineStats, GpuStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
 import { ConfirmDialog, Facts, Hint, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
 import { usePreferences } from "../state/preferences";
-import { bitrate, channels, duration, micros } from "../util/format";
+import { bitrate, bytes, channels, duration, micros, percent } from "../util/format";
 
 const headlines: Record<SessionPhase, string> = {
   idle: "Pyroshine is ready for connections.",
@@ -390,6 +390,132 @@ function FramePacing({ capture, history, streamFps }: { capture: CaptureStats; h
   );
 }
 
+const engineLabels: Record<GpuEngineStats["class"], string> = {
+  graphics: "Graphics",
+  compute: "Compute",
+  video_encode: "Video encode",
+  video_decode: "Video decode",
+  video: "Video",
+  copy: "Copy",
+  other: "Other",
+};
+
+function megahertz(value: number | null): string | undefined {
+  return value == null ? undefined : `${Math.round(value)} MHz`;
+}
+
+/// Capture GPU readings: device sensors, then GPU time per process group.
+function GpuSection({ gpu, history }: { gpu: GpuStats; history: StreamStats[] }) {
+  const tiles: { label: string; value: string; detail?: string; trend?: number[]; color?: string }[] = [];
+  if (gpu.busy_percent != null) {
+    tiles.push({
+      label: "GPU busy",
+      value: percent(gpu.busy_percent),
+      detail: megahertz(gpu.core_clock_mhz) ? `core ${megahertz(gpu.core_clock_mhz)}` : "graphics and compute",
+      trend: history.map((s) => s.gpu?.busy_percent ?? 0),
+      color: "warning.main",
+    });
+  } else if (gpu.core_clock_mhz != null) {
+    tiles.push({ label: "Core clock", value: megahertz(gpu.core_clock_mhz)!, detail: "this GPU reports no busy counter" });
+  }
+  if (gpu.encoder_busy_percent != null) {
+    tiles.push({
+      label: "Video encoder",
+      value: percent(gpu.encoder_busy_percent),
+      detail: "encode engine busy",
+      trend: history.map((s) => s.gpu?.encoder_busy_percent ?? 0),
+      color: "info.main",
+    });
+  }
+  if (gpu.temperature_c != null) {
+    tiles.push({
+      label: "Temperature",
+      value: `${gpu.temperature_c.toFixed(0)} °C`,
+      detail: gpu.hotspot_c != null ? `hotspot ${gpu.hotspot_c.toFixed(0)} °C` : undefined,
+    });
+  }
+  if (gpu.power_w != null) {
+    tiles.push({
+      label: "Power",
+      value: `${gpu.power_w.toFixed(0)} W`,
+      detail: gpu.power_limit_w != null ? `limit ${gpu.power_limit_w.toFixed(0)} W` : undefined,
+    });
+  }
+  if (gpu.vram_used_bytes != null) {
+    tiles.push({
+      label: "Video memory",
+      value: bytes(gpu.vram_used_bytes),
+      detail: gpu.vram_total_bytes != null ? `of ${bytes(gpu.vram_total_bytes)}` : undefined,
+    });
+  }
+  const rows = gpu.processes.flatMap((group) =>
+    group.engines.length === 0
+      ? [{ group, engine: null as GpuEngineStats | null }]
+      : group.engines.map((engine) => ({ group, engine: engine as GpuEngineStats | null })),
+  );
+  return (
+    <Box sx={{ mb: 3 }} aria-label="GPU">
+      <Stack direction="row" sx={{ alignItems: "center", gap: 1.5, mb: 1.5 }}>
+        <Typography variant="h6">GPU</Typography>
+        <Chip label={gpu.driver} size="small" variant="outlined" />
+      </Stack>
+      {tiles.length > 0 && (
+        <Stack direction="row" sx={{ gap: 2, flexWrap: "wrap", mb: 2 }}>
+          {tiles.map((tile) => (
+            <Tile key={tile.label} {...tile} />
+          ))}
+        </Stack>
+      )}
+      {rows.length > 0 && (
+        <Card>
+          <Table size="small" aria-label="GPU time by process">
+            <TableHead>
+              <TableRow>
+                <TableCell>Process</TableCell>
+                <TableCell>Engine</TableCell>
+                <TableCell align="right">Busy</TableCell>
+                <TableCell align="right">Video memory</TableCell>
+                <TableCell sx={{ width: "30%" }} />
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map(({ group, engine }, index) => (
+                <TableRow key={`${group.role}-${engine?.engine ?? "none"}`}>
+                  <TableCell>{index === 0 || rows[index - 1].group !== group ? group.label || group.role : ""}</TableCell>
+                  <TableCell>{engine ? `${engineLabels[engine.class] ?? engine.class} (${engine.engine})` : "No recent sample"}</TableCell>
+                  <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                    {engine ? percent(engine.busy_percent) : "—"}
+                  </TableCell>
+                  <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                    {index === 0 || rows[index - 1].group !== group ? bytes(group.vram_bytes) : ""}
+                  </TableCell>
+                  <TableCell>
+                    {engine && (
+                      <LinearProgress
+                        variant="determinate"
+                        value={Math.min(100, engine.busy_percent)}
+                        color={group.role === "application" ? "warning" : "primary"}
+                        sx={{ height: 6, borderRadius: 3 }}
+                        aria-label={`${group.label} ${engine.engine} busy`}
+                      />
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+        {gpu.source === "nvml" ? "Read through the NVIDIA driver (NVML)" : "Read from the kernel's GPU sensors and per-process DRM usage"} once
+        per second. The application row covers every process the launched application started; Pyroshine's covers
+        capture, composition, color conversion and encoding.
+        {gpu.source === "nvml" && " The NVIDIA driver samples a process only while it is busy, so light work may show no sample."}
+      </Typography>
+    </Box>
+  );
+}
+
 const QUALITY_LABELS: Record<string, string> = { standard: "Standard", high: "High", maximum: "Maximum" };
 
 function audioQuality(audio: AudioDetails): string {
@@ -529,6 +655,9 @@ export function DashboardPage({ navigate }: { navigate: (to: string) => void }) 
       )}
       {daemon.session?.phase === "streaming" && daemon.stats?.capture && daemon.stats.epoch === session?.epoch && (
         <FramePacing capture={daemon.stats.capture} history={daemon.history} streamFps={session?.video?.fps} />
+      )}
+      {daemon.session?.phase === "streaming" && daemon.stats?.gpu && daemon.stats.epoch === session?.epoch && (
+        <GpuSection gpu={daemon.stats.gpu} history={daemon.history} />
       )}
       {daemon.session?.phase === "streaming" && !daemon.stats && (
         <Typography color="text.secondary" sx={{ mb: 3 }}>

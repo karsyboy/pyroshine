@@ -9,8 +9,10 @@
 //!
 //! Nothing here is on a media path. Session state arrives through `watch`
 //! channels published on lifecycle and peer-ownership changes; pairing events
-//! through a bounded `broadcast` channel; frame statistics only while the
-//! desktop UI is present and a client is streaming (see `telemetry`).
+//! through a bounded `broadcast` channel; frame statistics and GPU readings
+//! while a client is streaming (see `telemetry`). Statistics are signalled
+//! only while the desktop UI is present, and the last two minutes are kept
+//! for support bundles (`crate::support`).
 //! Signals are emitted from management tasks; a slow or crashed UI cannot
 //! block any of them, and the daemon runs unchanged when the session bus name
 //! cannot be acquired.
@@ -47,11 +49,13 @@ use self::telemetry::unix_millis;
 use crate::ShutdownReason;
 use crate::clients::{ClientManager, PairingEvent};
 use crate::config::Config;
+use crate::gpu_sensors::{self, GpuSampler};
 use crate::healthcheck::{self, CheckOutcome};
 use crate::session::manager::{SessionManager, SessionView};
 use crate::session::status::{self, ClientPresence, ManagerStatus};
 use crate::session::stream::audio::{AudioQuality, AudioStreamContext};
 use crate::session::stream::video::{ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoCodec};
+use crate::support;
 
 /// Facts established at startup, reported by `GetServer`.
 pub struct ServerFacts {
@@ -67,6 +71,8 @@ pub struct ServerFacts {
 
 /// Events kept for `GetEvents` and the diagnostic report.
 const EVENT_LOG: usize = 50;
+/// Statistics windows kept for support bundles: two minutes.
+const STATS_HISTORY: usize = 120;
 
 /// Shared state behind the D-Bus interface and the event tasks.
 pub(crate) struct Management {
@@ -89,6 +95,9 @@ pub(crate) struct Management {
 	client_patience: Duration,
 	session: watch::Sender<SessionSnapshot>,
 	stats: watch::Sender<Option<StreamStats>>,
+	/// Recent statistics windows, oldest first. Kept after the stream ends,
+	/// so a bundle collected afterwards still shows it.
+	stats_history: Mutex<VecDeque<StreamStats>>,
 	/// The server's Tokio runtime. zbus serves methods on its own executor,
 	/// so work that needs Tokio (session teardown, blocking file I/O) is
 	/// handed to this runtime.
@@ -159,6 +168,7 @@ impl Management {
 			})
 			.0,
 			stats: watch::channel(None).0,
+			stats_history: Mutex::new(VecDeque::with_capacity(STATS_HISTORY)),
 			runtime: tokio::runtime::Handle::current(),
 			sessions,
 			clients,
@@ -217,14 +227,71 @@ impl Management {
 		dto
 	}
 
-	fn diagnostic_report(&self) -> DiagnosticReport {
+	/// The capture GPU's render node, as the compositor selects it.
+	fn capture_node(&self) -> Option<PathBuf> {
+		healthcheck::find_render_node(&self.running_config.compositor.gpu).ok()
+	}
+
+	/// The diagnostic report, including host details (read on a blocking thread).
+	async fn diagnostic_report(&self) -> DiagnosticReport {
+		let capture = self.capture_node();
+		let host = tokio::task::spawn_blocking(move || {
+			let service =
+				gpu_sensors::process_cgroup("self").and_then(|cgroup| support::ServiceUnit::from_cgroup(&cgroup));
+			support::host_info(capture.as_deref(), service.as_ref())
+		})
+		.await
+		.ok();
 		DiagnosticReport {
 			generated_at_ms: unix_millis(SystemTime::now()),
 			server: self.server(),
 			session: self.session.borrow().clone(),
 			stats: self.stats.borrow().clone(),
 			events: self.events(),
+			host,
 		}
+	}
+
+	/// The diagnostic report as redacted JSON, for "Copy diagnostics".
+	async fn redacted_diagnostic_report(&self) -> String {
+		let report = self.diagnostic_report().await;
+		let mut redactor = support::Redactor::for_host();
+		for (value, placeholder) in crate::state::identifying_values(self.clients.persistent_state().path()) {
+			redactor.word(&value, &placeholder);
+		}
+		redactor.word(&self.running_config.name, "<server-name>");
+		let mut value = serde_json::to_value(&report).expect("management documents serialize");
+		redactor.json(&mut value);
+		value.to_string()
+	}
+
+	/// A redacted support bundle (see [`support`]).
+	async fn support_bundle(&self) -> Vec<u8> {
+		let sources = support::BundleSources {
+			report: Some(self.diagnostic_report().await),
+			stats_history: self.stats_history.lock().unwrap().iter().cloned().collect(),
+			health: None,
+			config_path: PathBuf::from(self.server().config_path),
+			state_path: Some(self.clients.persistent_state().path().to_path_buf()),
+			capture_node: self.capture_node(),
+			service: gpu_sensors::process_cgroup("self").and_then(|cgroup| support::ServiceUnit::from_cgroup(&cgroup)),
+			notes: Vec::new(),
+		};
+		match tokio::task::spawn_blocking(move || support::build(sources, SystemTime::now())).await {
+			Ok(bundle) => bundle.archive,
+			Err(error) => {
+				tracing::warn!("Support bundle collection failed: {error}");
+				Vec::new()
+			},
+		}
+	}
+
+	fn record_stats(&self, stats: &StreamStats) {
+		let mut history = self.stats_history.lock().unwrap();
+		if history.len() == STATS_HISTORY {
+			history.pop_front();
+		}
+		history.push_back(stats.clone());
 	}
 }
 
@@ -450,14 +517,15 @@ async fn follow_pairing(management: &Management, emitter: &zbus::object_server::
 	}
 }
 
-/// Aggregate frame statistics while the UI is present and a client streams.
+/// Aggregate frame statistics and GPU readings while a client streams.
+/// Every window is kept for support bundles; it is signalled while the
+/// desktop UI is present.
 async fn follow_stats(
 	management: &Management,
 	emitter: &zbus::object_server::SignalEmitter<'static>,
 	ui: watch::Receiver<bool>,
 ) {
 	let mut session = management.session.subscribe();
-	let mut ui_changes = ui.clone();
 	let (active_tx, active) = watch::channel(false);
 	loop {
 		let streaming = {
@@ -466,38 +534,74 @@ async fn follow_stats(
 				.then(|| snapshot.session.as_ref().map(|session| session.epoch))
 				.flatten()
 		};
-		let wanted = streaming.filter(|_| *ui_changes.borrow_and_update());
-		active_tx.send_replace(wanted.is_some());
-		if let Some(epoch) = wanted {
+		active_tx.send_replace(streaming.is_some());
+		if let Some(epoch) = streaming {
 			let receiver = management.sessions.frame_stats_receiver();
-			let target = {
+			let (target, application) = {
 				let snapshot = session.borrow();
-				let video = snapshot.session.as_ref().and_then(|session| session.video.as_ref());
-				findings::StreamTarget {
-					fps: video.map_or(0, |video| video.fps),
-					bitrate_bps: video.map_or(0, |video| video.bitrate_bps),
-				}
+				let details = snapshot.session.as_ref();
+				let video = details.and_then(|session| session.video.as_ref());
+				(
+					findings::StreamTarget {
+						fps: video.map_or(0, |video| video.fps),
+						bitrate_bps: video.map_or(0, |video| video.bitrate_bps),
+					},
+					details.map_or_else(String::new, |session| session.application.title.clone()),
+				)
 			};
-			let aggregation =
-				telemetry::aggregate(receiver, epoch, target, active.clone(), &management.stats, |stats| {
+			let capture = management.capture_node();
+			// Opening may load NVML; keep it off the async workers, and never
+			// let it hold up the statistics.
+			let opening = tokio::task::spawn_blocking(move || capture.as_deref().and_then(GpuSampler::open));
+			let sampler = match tokio::time::timeout(telemetry::GPU_DEADLINE, opening).await {
+				Ok(Ok(sampler)) => sampler,
+				Ok(Err(error)) => {
+					tracing::warn!("Opening the GPU for readings failed ({error}); statistics continue without them");
+					None
+				},
+				Err(_) => {
+					tracing::warn!(
+						"Opening the GPU for readings did not finish within {} s; statistics continue without them",
+						telemetry::GPU_DEADLINE.as_secs()
+					);
+					None
+				},
+			};
+			tracing::info!(
+				epoch,
+				gpu = sampler.as_ref().map_or("none", GpuSampler::source),
+				"Collecting stream statistics"
+			);
+			let gpu = sampler.map(|sampler| telemetry::GpuProbe::new(sampler, application));
+			let aggregation = telemetry::aggregate(
+				receiver,
+				epoch,
+				target,
+				gpu,
+				active.clone(),
+				&management.stats,
+				|stats| {
+					management.record_stats(stats);
+					if !*ui.borrow() {
+						return;
+					}
 					let message = json(stats);
 					let emitter = emitter.clone();
 					tokio::spawn(async move {
 						let _ = ManagementInterface::stats_updated(&emitter, &message).await;
 					});
-				});
+				},
+			);
 			tokio::pin!(aggregation);
-			// Aggregate until the phase, epoch or UI presence changes.
+			// Aggregate until the phase or epoch changes.
 			loop {
 				tokio::select! {
 					() = &mut aggregation => break,
 					changed = session.changed() => if changed.is_err() { return },
-					changed = ui_changes.changed() => if changed.is_err() { return },
 				}
 				let snapshot = session.borrow().clone();
 				let still = snapshot.phase == SessionPhase::Streaming
-					&& snapshot.session.as_ref().map(|session| session.epoch) == Some(epoch)
-					&& *ui_changes.borrow();
+					&& snapshot.session.as_ref().map(|session| session.epoch) == Some(epoch);
 				if !still {
 					active_tx.send_replace(false);
 					(&mut aggregation).await;
@@ -507,9 +611,8 @@ async fn follow_stats(
 			continue;
 		}
 		management.stats.send_replace(None);
-		tokio::select! {
-			changed = session.changed() => if changed.is_err() { return },
-			changed = ui_changes.changed() => if changed.is_err() { return },
+		if session.changed().await.is_err() {
+			return;
 		}
 	}
 }
@@ -733,7 +836,7 @@ fn codec_capabilities(supported: u32) -> Vec<CodecCapability> {
 /// The health report for the desktop app. Each check's message is split into
 /// what it found (the first line) and what to do (the remaining lines, which
 /// the command-line report prints indented below it).
-fn health_report(report: &healthcheck::HealthReport, rechecked: bool) -> HealthReport {
+pub(crate) fn health_report(report: &healthcheck::HealthReport, rechecked: bool) -> HealthReport {
 	HealthReport {
 		all_fatal_passed: report.all_fatal_passed,
 		checks: report

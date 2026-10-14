@@ -312,6 +312,33 @@ The desktop app also notifies about these when its window is closed.
 latest stream statistics and recent problems as one JSON report for a bug report;
 it contains no keys, PINs or certificates.
 
+## Collect a support bundle
+
+For a bug report, attach a support bundle. On a host without the desktop app,
+or over SSH, run as the streaming user (without sudo):
+
+```sh
+pyroshine diag
+```
+
+It writes `pyroshine-diag-<date>-<time>.tar.gz` to the current directory
+(`-o <file or directory>` chooses another place). The bundle holds the
+diagnostic report, the last two minutes of stream statistics with GPU
+readings, host and GPU details, the configuration, the service status and its
+recent log, and `vulkaninfo --summary`. The desktop app's **Diagnostics → Save
+support bundle** saves the same file.
+
+Identifying values are replaced: the home directory, user and host names, the
+server name, client names and IDs, certificate fingerprints, UUIDs and IP
+addresses (`<lan-ip-1>`, `<ip-1>`, numbered consistently). Review the files
+before sharing.
+
+When the running server cannot be reached (it is stopped, older than the
+command, or runs as another user), `pyroshine diag` collects what it can
+itself and lists what it could not. It also runs the health check, unless a
+Pyroshine server is running or `--no-health-check` is given. `--offline` skips
+asking the server.
+
 ## Debug a failing application
 
 Applications discard output by default. Capture it by editing the existing entry:
