@@ -26,7 +26,7 @@ use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, MAX_OVER
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "689854dd9727fc2239699c386e69355189fbf332";
+pub(crate) const SOURCE_REVISION: &str = "b09e1365155e91710497be22eac6500f04bf74ea";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -396,18 +396,23 @@ const ERROR_NOT_IMPLEMENTED: ResultCode = -6;
 
 /// Classify a failed PyroWave call made while encoding one frame.
 ///
-/// `source` must reflect the pinned C implementation (revision
-/// [`SOURCE_REVISION`]): `encode_scaled` discards its command buffer without
-/// submitting on every error, and `compute_num_packets`/`packetize` wait on the
-/// queued fence before any other failure, so no exit leaves a source read
-/// outstanding. A missing device or API is terminal, as is a broken encoder
-/// after submission; per-frame argument, handle and memory failures drop the
-/// frame and are escalated by the pipeline's policy if they persist.
+/// `source` is the caller's view of the source buffer when the call fails
+/// with anything but `ERROR_GENERIC`. It relies on the completion contract of
+/// the pinned fork (revision [`SOURCE_REVISION`], documented in `pyrowave.h`):
+/// a failed scaled encode has flushed and waited for any scaler pass it
+/// queued, so no source read is outstanding, and the readback calls check
+/// their fence wait. `ERROR_GENERIC` from the encode or the first wait means
+/// that completion of queued GPU work could not be established (device loss):
+/// the source may still be read, so it is never released for reuse, and the
+/// stream stops. A missing device or API is terminal too; per-frame argument,
+/// handle and memory failures drop the frame and are escalated by the
+/// pipeline's policy if they persist.
 fn frame_failure(stage: EncodeStage, code: ResultCode, source: SourceAccess, operation: &str) -> EncodeFailure {
-	let recovery = match (stage, code) {
-		(_, ERROR_NO_VULKAN | ERROR_NOT_IMPLEMENTED) => Recovery::Terminal,
-		(EncodeStage::Wait | EncodeStage::Readback, ERROR_GENERIC) => Recovery::Terminal,
-		_ => Recovery::DropFrame,
+	let (recovery, source) = match (stage, code) {
+		(EncodeStage::Submit | EncodeStage::Wait, ERROR_GENERIC) => (Recovery::Terminal, SourceAccess::Unknown),
+		(_, ERROR_NO_VULKAN | ERROR_NOT_IMPLEMENTED) => (Recovery::Terminal, source),
+		(EncodeStage::Readback, ERROR_GENERIC) => (Recovery::Terminal, source),
+		_ => (Recovery::DropFrame, source),
 	};
 	EncodeFailure::new(
 		stage,
@@ -1096,7 +1101,7 @@ impl PyroWaveEncoder {
 			SourceAccess::Completed,
 			"computing PyroWave packet count",
 		)?;
-		// The fence wait above completed every GPU read of the source.
+		// The checked fence wait above completed every GPU read of the source.
 		if packet_count != 1 {
 			return Err(EncodeFailure::new(
 				EncodeStage::Readback,
@@ -1265,13 +1270,15 @@ mod tests {
 		assert_eq!(live.get(), 0);
 	}
 
-	/// ARCH-001: classification of the pinned C API's result codes. No exit
-	/// leaves a source read outstanding; device/API loss and a broken encoder
-	/// after submission are terminal, per-frame failures drop the frame.
+	/// ARCH-001: classification of the pinned C API's result codes. A source
+	/// is released only when no read of it can be outstanding; device/API loss
+	/// and unestablished completion are terminal, per-frame failures drop the
+	/// frame.
 	#[test]
 	fn frame_failures_follow_the_pinned_completion_contract() {
 		use super::super::pipeline::failure::{EncodeStage, Recovery, SourceAccess};
 		const INVALID_ARGUMENT: ResultCode = -2;
+		const OUT_OF_HOST_MEMORY: ResultCode = -3;
 		const OUT_OF_DEVICE_MEMORY: ResultCode = -4;
 		const UNSUPPORTED_EXTERNAL_HANDLE: ResultCode = -7;
 		const FAILED_EXTERNAL_HANDLE: ResultCode = -8;
@@ -1294,11 +1301,33 @@ mod tests {
 				);
 			}
 		}
-		for stage in [EncodeStage::Wait, EncodeStage::Readback] {
-			let failure = frame_failure(stage, ERROR_GENERIC, SourceAccess::Completed, "wait");
-			assert_eq!(failure.recovery, Recovery::Terminal);
-			assert!(failure.releases_source(), "the fence was waited before the failure");
+		// A scaled encode that fails after queuing its scaler pass waits for it
+		// before returning a per-frame error, so the source is released.
+		for code in [INVALID_ARGUMENT, OUT_OF_HOST_MEMORY, OUT_OF_DEVICE_MEMORY] {
+			let failure = frame_failure(EncodeStage::Submit, code, SourceAccess::NotSubmitted, "encode");
+			assert_eq!(failure.recovery, Recovery::DropFrame, "encode result {code}");
+			assert!(failure.releases_source(), "encode result {code}");
 		}
+		// ERROR_GENERIC from the encode or the first wait: queued reads of the
+		// source may still run.
+		for (stage, source) in [
+			(EncodeStage::Submit, SourceAccess::NotSubmitted),
+			(EncodeStage::Wait, SourceAccess::Completed),
+		] {
+			let failure = frame_failure(stage, ERROR_GENERIC, source, "wait");
+			assert_eq!(failure.recovery, Recovery::Terminal, "{stage:?}");
+			assert_eq!(failure.source, SourceAccess::Unknown, "{stage:?}");
+			assert!(!failure.releases_source(), "{stage:?}");
+		}
+		// Packetize runs after the wait above succeeded.
+		let failure = frame_failure(
+			EncodeStage::Readback,
+			ERROR_GENERIC,
+			SourceAccess::Completed,
+			"packetize",
+		);
+		assert_eq!(failure.recovery, Recovery::Terminal);
+		assert!(failure.releases_source());
 		assert_eq!(
 			frame_failure(
 				EncodeStage::Readback,

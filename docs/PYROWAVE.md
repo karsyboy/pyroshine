@@ -18,7 +18,7 @@ The only supported PyroWave source is:
 
 - repository: `https://github.com/karsyboy/pyrowave`
 - branch: `master` (the build uses the detached revision below, not the moving branch)
-- revision: `689854dd9727fc2239699c386e69355189fbf332`
+- revision: `b09e1365155e91710497be22eac6500f04bf74ea`
 - C API: 1.1.0
 - Granite: `fb178c8080d163419e8d20f10715c61c53c1ec9b`
 - Volk: `47cddf7ed97b94118a08aacb548a411188e016cc`
@@ -217,13 +217,17 @@ takes ownership. The compositor buffer is released only after PyroWave's
 packetization call has waited for the GPU encode.
 
 Failures keep the same rule ([encoder failure contract](ARCHITECTURE.md#video-path)).
-With the pinned C source, `encode_scaled` discards its command buffer without
-submitting on error, and `compute_num_packets`/`packetize` wait on the queued
-fence before any other failure, so every failed frame can release its source.
-Missing device/API support (`NO_VULKAN`, `NOT_IMPLEMENTED`) and a generic error
-after submission are terminal and end the session; per-frame argument, external
-handle and memory failures drop the frame. PyroWave frames are independent, so a
-dropped frame needs no IDR. Re-check this classification when the pin changes.
+The pinned fork documents a completion contract in `pyrowave.h`: a failed
+scaled encode flushes and waits for any scaler pass it already queued, and the
+readback calls (`compute_num_packets`, `packetize`) check their fence wait
+instead of trusting Granite's unchecked `wait()`. Every failed frame can
+therefore release its source, except `ERROR_GENERIC` from the encode or the
+packet-count wait, which means completion of queued reads could not be
+established: the source stays unreleased and the session ends. Missing
+device/API support (`NO_VULKAN`, `NOT_IMPLEMENTED`) and a generic readback
+error are terminal too; per-frame argument, external handle and memory
+failures drop the frame. PyroWave frames are independent, so a dropped frame
+needs no IDR. Re-check this classification when the pin changes.
 
 Capture is receiver-driven: one credit covers encode through socket-send
 completion, while GPU consumption releases the source independently. Epoch
