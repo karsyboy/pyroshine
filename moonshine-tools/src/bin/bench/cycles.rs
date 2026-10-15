@@ -6,8 +6,9 @@
 //! epochs. Both rotate one negotiated property per cycle (or none, for the
 //! unchanged-resume step), require encoded frames and received UDP bytes in
 //! every cycle, and record process resources. After every completed full stop
-//! the video port must be bindable and no application unit or child process
-//! may remain.
+//! the video port must be bindable, no application unit or child process may
+//! remain, and the process holds no more DMA-BUF descriptors than before the
+//! first session.
 //!
 //! The benchmark has no Moonlight client: there is no ENet control stream,
 //! client decode or audio endpoint. These cycles establish backend ownership
@@ -52,9 +53,6 @@ const STEPS: [&str; 11] = [
 	"audio-quality",
 	"packet-duration",
 ];
-
-/// Application unit created by the session backend for every launch.
-const APPLICATION_UNIT: &str = "moonshine-session.service";
 
 /// Requested settings; [`Self::video`] normalizes combinations the backend
 /// cannot encode (recorded per cycle as the effective format).
@@ -160,6 +158,8 @@ impl Settings {
 #[derive(Clone, Copy, Debug, Default)]
 struct Resources {
 	fds: usize,
+	/// Open descriptors that are DMA-BUFs (capture buffers, imports, exports).
+	dmabuf_fds: usize,
 	threads: usize,
 	rss_kib: u64,
 	children: usize,
@@ -179,6 +179,7 @@ impl Resources {
 			.unwrap_or(0);
 		Self {
 			fds: count("/proc/self/fd"),
+			dmabuf_fds: super::report::dmabuf_fds(),
 			threads: count("/proc/self/task"),
 			rss_kib,
 			children: child_processes(),
@@ -203,9 +204,16 @@ fn child_processes() -> usize {
 		.count()
 }
 
+/// Whether the application unit the session backend creates (including a
+/// `MOONSHINE_APPLICATION_UNIT` override) is still active.
 fn application_unit_active() -> bool {
 	std::process::Command::new("systemctl")
-		.args(["--user", "is-active", "--quiet", APPLICATION_UNIT])
+		.args([
+			"--user",
+			"is-active",
+			"--quiet",
+			moonshine_core::session::application_unit_name(),
+		])
 		.status()
 		.is_ok_and(|status| status.success())
 }
@@ -363,6 +371,7 @@ impl CycleLog {
 			frames,
 			received_bytes = received,
 			fds = resources.fds,
+			dmabuf_fds = resources.dmabuf_fds,
 			threads = resources.threads,
 			rss_kib = resources.rss_kib,
 			children = resources.children,
@@ -377,9 +386,10 @@ impl CycleLog {
 				line,
 				"{{\"kind\":\"{kind}\",\"cycle\":{cycle},\"step\":\"{step}\",\"settings\":\"{settings}\",\
 				 \"frames\":{frames},\"key_frames\":{key_frames},\"encoded_bytes\":{encoded},\
-				 \"received_bytes\":{received},\"fds\":{},\"threads\":{},\"rss_kib\":{},\"children\":{},\
-				 \"elapsed_ms\":{},\"pass\":{passed},\"failed\":{:?}}}",
+				 \"received_bytes\":{received},\"fds\":{},\"dmabuf_fds\":{},\"threads\":{},\"rss_kib\":{},\
+				 \"children\":{},\"elapsed_ms\":{},\"pass\":{passed},\"failed\":{:?}}}",
 				resources.fds,
+				resources.dmabuf_fds,
 				resources.threads,
 				resources.rss_kib,
 				resources.children,
@@ -522,6 +532,7 @@ pub(super) async fn run_full_cycles(args: &Args) -> Result<(), BoxError> {
 		checks.push(("unit-stopped", !application_unit_active()));
 		let resources = Resources::sample();
 		checks.push(("no-children", resources.children == 0));
+		checks.push(("dmabufs-released", resources.dmabuf_fds <= baseline.dmabuf_fds));
 		log.record(
 			"full",
 			cycle,
@@ -685,7 +696,7 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 	let released = port_is_free(video_port) && !application_unit_active();
 	let resources = Resources::sample();
 	tracing::info!(stopped, released, ?resources, "Final teardown");
-	if !stopped || !released || resources.children != 0 {
+	if !stopped || !released || resources.children != 0 || resources.dmabuf_fds > baseline.dmabuf_fds {
 		log.failures += 1;
 	}
 	finish(log, args.reconnect_cycles, baseline)

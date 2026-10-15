@@ -35,6 +35,8 @@ the guide for the area being changed:
 | Native Wayland/XWayland presentation, HDR and Wine/Proton | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity/report mapping | [Native controllers](NATIVE_CONTROLLERS.md), [DualSense Edge](DUALSENSE_EDGE.md) |
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
+| Test tiers, CI gates, hardware tests and baselines | [Testing](TESTING.md) |
+| What each codec, format, GPU and lifecycle feature does and how it is tested | [Capability inventory](CAPABILITIES.md) |
 | Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |
 | Mode changes, epochs and teardown | [Reconnect validation](reconnect-validation.md) |
 | Coding-agent rules and upstream policy | [AGENTS.md](../AGENTS.md) |

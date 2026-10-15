@@ -199,6 +199,25 @@ pub struct FrameStats {
 	pub(crate) capture_origin: crate::session::compositor::frame::CaptureOrigin,
 }
 
+impl FrameStats {
+	/// How the source frame was captured: `direct`, `direct_late` (direct
+	/// export with late-composited layers) or `composited`.
+	pub fn capture_path(&self) -> &'static str {
+		use crate::session::compositor::frame::CapturePath;
+		match self.capture_origin.path {
+			CapturePath::Direct => "direct",
+			CapturePath::DirectLate => "direct_late",
+			CapturePath::Composited => "composited",
+		}
+	}
+
+	/// Stable id of the first condition that ruled out direct export, for a
+	/// composited frame whose compositor recorded one.
+	pub fn composition_reason(&self) -> Option<&'static str> {
+		self.capture_origin.composition_reason.map(|reason| reason.id())
+	}
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VideoStreamContext {
 	/// Explicit setup-time PyroWave dialect; conventional codecs use None.

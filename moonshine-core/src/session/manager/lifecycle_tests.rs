@@ -61,6 +61,8 @@ struct Counters {
 	resources: AtomicUsize,
 	workers_started: AtomicUsize,
 	unit_created: AtomicBool,
+	/// Transient units systemd accepted, across all sessions.
+	unit_creates: AtomicUsize,
 	unit_stops: AtomicUsize,
 	/// Set if a new session was initialized while an old one still owned resources.
 	overlapped: AtomicBool,
@@ -210,6 +212,7 @@ impl SessionBackend for FakeBackend {
 	async fn launch(&self, session: FakeSession) -> Result<FakeSession, SessionFailure> {
 		// systemd accepted the transient unit; the start job is still running.
 		self.counters.unit_created.store(true, Ordering::SeqCst);
+		self.counters.unit_creates.fetch_add(1, Ordering::SeqCst);
 		self.gate(Op::Launch).await.map_err(|()| injected())?;
 		if self.stop_on_launch_return.load(Ordering::SeqCst) {
 			let _ = session.stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
@@ -321,6 +324,14 @@ impl Harness {
 
 	fn release(&self, op: Op) {
 		self.backend().gates[&op].released.send_replace(true);
+	}
+
+	fn clear_failure(&self, op: Op) {
+		self.backend().gates[&op].fail.store(false, Ordering::SeqCst);
+	}
+
+	fn session_stop(&self) -> ShutdownManager<SessionShutdownReason> {
+		self.backend().session_stop.lock().unwrap().clone().unwrap()
 	}
 
 	fn calls(&self, op: Op) -> usize {
@@ -1626,6 +1637,132 @@ async fn service_shutdown_during_every_transition_completes() {
 		h.assert_released().await;
 		assert!(h.initialize().await.is_err(), "{op:?}");
 	}
+}
+
+/// A completed session's identifiers and signals cannot reach its successor:
+/// its grant can neither ANNOUNCE nor PLAY, authorization generations are
+/// never reused, a late teardown request from its watchdog is a no-op, and a
+/// cause recorded through its slot is never reported as the successor's.
+#[tokio::test]
+async fn completed_session_cannot_affect_its_successor() {
+	use crate::session::failure::StopCause;
+	let h = Harness::new();
+	let status = h.core.subscribe_status();
+	let old_grant = h.active().await;
+	let old_epoch = h.core.session_view().await.unwrap().epoch;
+	let old_stop = h.session_stop();
+	let old_cause = h.backend().session_cause.lock().unwrap().clone().unwrap();
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+
+	let grant = h.active().await;
+	assert!(h.core.session_view().await.unwrap().epoch > old_epoch);
+	assert!(
+		grant.generation() > old_grant.generation(),
+		"generations are never reused"
+	);
+	assert!(h.announce(&old_grant).await.is_err(), "stale ANNOUNCE");
+	assert!(h.core.start_session(&old_grant).await.is_err(), "stale PLAY");
+	{
+		// The old watchdog handing a late worker failure to teardown.
+		let mut guard = h.core.lock().await;
+		assert!(
+			h.core
+				.begin_teardown(&mut guard, Some(old_epoch), SessionShutdownReason::VideoEncoderStopped)
+				.is_none()
+		);
+	}
+	let _ = old_stop.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped);
+	old_cause.record(StopCause {
+		detail: "stale".into(),
+		hint: None,
+		unexpected: true,
+		reported: false,
+	});
+	for _ in 0..10 {
+		tokio::task::yield_now().await;
+	}
+	assert_eq!(h.phase().await, "active");
+	assert_eq!(h.core.authorize_stream(h.client).await, Some(grant));
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 1);
+
+	h.core.stop_session().await.unwrap();
+	let last = status.borrow().last_stop.clone().unwrap();
+	assert_eq!(last.reason, SessionShutdownReason::UserStopped);
+	assert_eq!(last.cause, None, "a stale cause was reported for its successor");
+	h.assert_released().await;
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 2);
+}
+
+/// Sessions that end every way — a user stop, several stop sources at once,
+/// and a failure at each transition after the unit exists — stop every
+/// application unit the backend created exactly once and release every
+/// resource before the next session starts.
+#[tokio::test]
+async fn every_application_unit_is_stopped_exactly_once() {
+	let h = Harness::new();
+	for cycle in 0..36 {
+		match cycle % 6 {
+			0 => {
+				h.active().await;
+				h.core.stop_session().await.unwrap();
+			},
+			1 => {
+				// The user stops while the application exits and an encoder fails.
+				h.active().await;
+				h.backend().exit_on_stop.store(true, Ordering::SeqCst);
+				let stop = h.session_stop();
+				let user = {
+					let core = h.core.clone();
+					tokio::spawn(async move { core.stop_session().await })
+				};
+				let _ = stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+				let _ = stop.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped);
+				user.await.unwrap().unwrap();
+				h.wait_idle().await;
+				h.backend().exit_on_stop.store(false, Ordering::SeqCst);
+			},
+			2 => {
+				h.fail(Op::Launch);
+				h.initialize().await.unwrap();
+				assert!(h.core.launch_session().await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Launch);
+			},
+			3 => {
+				h.fail(Op::Start);
+				h.launched().await;
+				let grant = h.grant().await;
+				h.announce(&grant).await.unwrap();
+				assert!(h.core.start_session(&grant).await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Start);
+			},
+			4 => {
+				// A reconnect whose reconfiguration (encoder) fails.
+				let grant = h.resumed().await;
+				h.fail(Op::Resume);
+				assert!(h.core.start_session(&grant).await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Resume);
+			},
+			_ => {
+				let grant = h.active().await;
+				h.fail(Op::Pause);
+				assert!(h.announce(&grant).await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Pause);
+			},
+		}
+		h.assert_released().await;
+		assert_eq!(
+			h.counters().unit_stops.load(Ordering::SeqCst),
+			h.counters().unit_creates.load(Ordering::SeqCst),
+			"cycle {cycle}: every created unit is stopped exactly once"
+		);
+	}
+	assert_eq!(h.counters().unit_creates.load(Ordering::SeqCst), 36);
+	assert!(!h.counters().overlapped.load(Ordering::SeqCst));
 }
 
 mod status {

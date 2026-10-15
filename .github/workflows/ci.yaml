@@ -36,6 +36,16 @@ jobs:
       - name: Check workspace release notes
         run: python3 scripts/changelog.py check
 
+  bench-tooling:
+    name: Benchmark and hardware-test tooling
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Result validation/comparison, the baseline workload sets and the
+      # hardware-test registry logic; no GPU is needed or used.
+      - name: Test benchmark and hardware-test tooling
+        run: python3 -m unittest discover -s scripts -p 'test_bench_results.py'
+
   ci:
     name: ${{ matrix.name }}
     # Pin to ubuntu-24.04 (glibc 2.39) so CI validates the same baseline the
@@ -93,6 +103,32 @@ jobs:
 
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}
+
+      # Named gates for the session state machine (lifecycle, teardown
+      # ownership, authorization generations) and wire/protocol contracts.
+      # They also run above; a failure here names the regressed contract.
+      - name: Session lifecycle and protocol regression gates
+        if: matrix.name == 'Test Suite'
+        run: |
+          cargo test -p moonshine-core --lib --all-features -- \
+            session::manager:: session::lifecycle:: session::authorization:: session::status:: \
+            rtsp:: session::stream::control:: session::stream::video::packetizer:: \
+            session::stream::video::pyrowave_protocol:: session::stream::video::tests::
+
+      # Every ignored (hardware) test must be registered with its requirements.
+      # The availability report lists them as skipped here: hosted runners have
+      # no GPU, so these tests are never reported as passed or failed.
+      - name: Hardware test registry and availability
+        if: matrix.name == 'Test Suite'
+        run: |
+          python3 scripts/hardware_tests.py check-registry
+          python3 scripts/hardware_tests.py report --json "$RUNNER_TEMP/hardware-tests.json" | tee "$RUNNER_TEMP/hardware-tests.txt"
+          {
+            echo '### Hardware tests (not run on hosted runners)'
+            echo '```'
+            cat "$RUNNER_TEMP/hardware-tests.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Characterizations of open review findings must keep failing for their
       # recorded reason (scripts/known_defects.toml), and the hardware-independent

@@ -11,6 +11,7 @@ path = "src/bin/bench.rs"
 clap = { version = "4", features = ["derive"] }
 moonshine-core = { path = "../moonshine-core" }
 async-shutdown = "0.2.2"
+serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

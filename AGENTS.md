@@ -73,7 +73,10 @@ Other workspace and integration areas:
   separate Cargo workspace and npm project, packaged by `nfpm-ui.yaml`. It is a client of
   the management interface only; server crates must never depend on it.
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
-  (`build-shaders.sh`), changelog tooling/tests, measurement harnesses.
+  (`build-shaders.sh`), changelog tooling/tests, measurement harnesses, the
+  baseline recorder and result comparison (`record_baseline.py`,
+  `bench_results.py`) and the hardware-test registry/runner
+  (`hardware_tests.toml`, `hardware_tests.py`).
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
   installers, systemd, device permissions and system policy. The Arch
   `pyroshine-bin`/`pyroshine-ui-bin` PKGBUILDs live in `karsyboy/pyrowave-packages`.
@@ -93,6 +96,7 @@ Other workspace and integration areas:
 | Native presentation, HDR/color management and Wine/Proton setup | `docs/NATIVE_PRESENTATION.md` |
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
 | Performance measurements | `docs/BENCHMARKING.md`; lifetime/soak diagnostics in `docs/LONG_SESSION_PERFORMANCE.md` |
+| Test tiers, hardware tests, baselines and regression gates | `docs/TESTING.md`; feature status and coverage in `docs/CAPABILITIES.md` |
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |
@@ -168,7 +172,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 
 CI also runs `cargo machete` (install with `cargo install cargo-machete`),
 `python3 scripts/changelog.py check`,
-`python3 -m unittest discover -s scripts -p 'test_changelog.py'`, and
+`python3 -m unittest discover -s scripts -p 'test_changelog.py'`,
+`python3 -m unittest discover -s scripts -p 'test_bench_results.py'`,
+`python3 scripts/hardware_tests.py check-registry` (every `#[ignore]`d test
+must be listed in `scripts/hardware_tests.toml` with its requirements; add the
+entry with the test), and
 `python3 scripts/known_defects.py` (known-defect characterizations must still
 fail for their recorded reason; native controller tests under ASan/UBSan).
 When fixing a listed finding, un-ignore its tests and remove their entries in
@@ -179,6 +187,9 @@ Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs the
 `MOONSHINE_PYROWAVE_LIBRARY` pointing to the built library; use the full
 invocation in `CONTRIBUTING.md` or CI. Hardware-dependent tests are ignored by
 default so a run without hardware reports them as not executed, never as passed.
+On GPU hosts run them with `python3 scripts/hardware_tests.py run --json <file>`
+and record baselines with `scripts/record_baseline.py`; `docs/TESTING.md` has
+the full command set, including hosts without a toolchain.
 
 - Desktop app changes run the `pyroshine-ui` checks listed in `CONTRIBUTING.md`
   (npm typecheck/test/build, and fmt/clippy/test with `--manifest-path

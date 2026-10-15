@@ -54,11 +54,11 @@ pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
 /// session's teardown has stopped this unit.
 const APPLICATION_UNIT_NAME: &str = "moonshine-session.service";
 
-/// The application unit name: [`APPLICATION_UNIT_NAME`], or
+/// The application unit name: `moonshine-session.service`, or
 /// `MOONSHINE_APPLICATION_UNIT` for a benchmark or test instance that must not
 /// replace a live service's session on the same account. An invalid override
 /// is ignored with a warning.
-pub(crate) fn application_unit_name() -> &'static str {
+pub fn application_unit_name() -> &'static str {
 	static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 	NAME.get_or_init(|| match std::env::var("MOONSHINE_APPLICATION_UNIT") {
 		Ok(name) if valid_application_unit_name(&name) => Box::leak(name.into_boxed_str()),
