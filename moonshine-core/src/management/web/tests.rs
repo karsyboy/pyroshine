@@ -640,3 +640,52 @@ async fn the_support_bundle_downloads_as_an_attachment() {
 		"{disposition}"
 	);
 }
+
+#[tokio::test]
+async fn history_and_updates_are_served_to_the_signed_in_operator() {
+	let server = start().await;
+	let mut browser = Browser::new(&server);
+	assert_eq!(browser.get("/api/v1/history").await.status, 401);
+	assert_eq!(browser.get("/api/v1/updates").await.status, 401);
+	browser.sign_in(&server).await;
+
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+	let history = loop {
+		let history = browser.get("/api/v1/history?limit=5").await.json();
+		if history["available"] == true || tokio::time::Instant::now() > deadline {
+			break history;
+		}
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	};
+	assert_eq!(history["available"], true, "{history}");
+	assert_eq!(history["total"], 0);
+	assert_eq!(history["retention_days"], 90);
+	assert_eq!(browser.get("/api/v1/history/12345").await.status, 404);
+	assert_eq!(browser.get("/api/v1/history/not-a-number").await.status, 404);
+	let cleared = browser
+		.send("DELETE", "/api/v1/history", &browser.same_origin(), None)
+		.await;
+	assert_eq!(cleared.status, 204, "{}", cleared.body);
+
+	let updates = browser.get("/api/v1/updates").await.json();
+	assert_eq!(updates["automatic"], false, "checks are off until enabled");
+	assert_eq!(updates["current_version"], env!("CARGO_PKG_VERSION"));
+	let invalid = browser
+		.put(
+			"/api/v1/updates/settings",
+			json!({ "automatic": true, "channel": "nightly" }),
+		)
+		.await;
+	assert_eq!(invalid.status, 422);
+	let set = browser
+		.put(
+			"/api/v1/updates/settings",
+			json!({ "automatic": false, "channel": "prerelease" }),
+		)
+		.await;
+	assert_eq!(set.json()["channel"], "prerelease");
+	let dismiss = browser
+		.post("/api/v1/updates/dismiss", json!({ "version": "../etc" }))
+		.await;
+	assert_eq!(dismiss.status, 422);
+}

@@ -5,6 +5,7 @@ pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::app_scanner::LibraryConfig;
 pub use crate::app_scanner::lutris::LutrisApplicationScannerConfig;
 pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
+pub use crate::management::history::HistoryConfig;
 pub use crate::management::web::ManagementConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
@@ -28,6 +29,9 @@ pub struct Config {
 
 	/// The web management interface (separate from the GameStream webserver).
 	pub management: ManagementConfig,
+
+	/// The persistent session history.
+	pub history: HistoryConfig,
 
 	/// Configuration for the streams.
 	pub stream: StreamConfig,
@@ -114,6 +118,7 @@ impl Config {
 			.parse::<std::net::IpAddr>()
 			.map_err(|error| format!("address '{}' is not an IP address: {error}", self.address))?;
 		self.management.validate()?;
+		self.history.validate()?;
 		let tcp = [
 			("webserver.port", self.webserver.port),
 			("webserver.port_https", self.webserver.port_https),
@@ -194,6 +199,7 @@ impl Default for Config {
 			address: "0.0.0.0".to_string(),
 			webserver: Default::default(),
 			management: Default::default(),
+			history: Default::default(),
 			stream: Default::default(),
 			applications: vec![ApplicationConfig {
 				title: "Steam".to_string(),

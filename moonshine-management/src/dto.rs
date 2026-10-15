@@ -824,6 +824,200 @@ pub struct ScannerVariant {
 	pub fields: Vec<FieldSpec>,
 }
 
+/// One session in the persistent history. Every value was measured or
+/// negotiated on the host; nothing here is reported by the client.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+	/// Row identifier, stable while the entry is kept.
+	pub id: i64,
+	pub epoch: u64,
+	/// The application the client launched.
+	pub application: String,
+	/// The last foreground application, when it differed (for example a
+	/// game started from Steam).
+	#[serde(default)]
+	pub foreground_application: Option<String>,
+	/// Absent when `[history] record_client_address` is off.
+	#[serde(default)]
+	pub client_address: Option<String>,
+	/// The operator's name for the client that streamed from that address,
+	/// when it is known.
+	#[serde(default)]
+	pub client_label: Option<String>,
+	pub started_at_ms: u64,
+	/// Absent while the session runs.
+	#[serde(default)]
+	pub ended_at_ms: Option<u64>,
+	/// What the client asked for.
+	#[serde(default)]
+	pub requested: Option<HistoryMode>,
+	/// What was negotiated for the first stream of the session.
+	#[serde(default)]
+	pub video: Option<HistoryVideo>,
+	#[serde(default)]
+	pub audio_channels: Option<u8>,
+	/// Times the client disconnected while the application kept running.
+	pub disconnects: u32,
+	/// Times a client resumed the session.
+	pub reconnects: u32,
+	/// Disconnects, resumes and the stop, oldest first (bounded).
+	#[serde(default)]
+	pub events: Vec<HistoryEvent>,
+	#[serde(default)]
+	pub stop: Option<HistoryStop>,
+	/// Absent when the session never streamed a full statistics window.
+	#[serde(default)]
+	pub performance: Option<PerformanceSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryMode {
+	pub width: u32,
+	pub height: u32,
+	pub refresh_rate: u32,
+	pub hdr: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryVideo {
+	pub codec: String,
+	pub codec_label: String,
+	pub chroma: String,
+	pub bit_depth: u8,
+	pub hdr: bool,
+	pub width: u32,
+	pub height: u32,
+	pub fps: u32,
+	pub bitrate_bps: u64,
+	#[serde(default)]
+	pub encoder: Option<String>,
+	#[serde(default)]
+	pub gpu: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEvent {
+	pub at_ms: u64,
+	/// `disconnected`, `reconnected` or `stopped`.
+	pub kind: String,
+	#[serde(default)]
+	pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryStop {
+	/// Machine-readable reason (see [`LastStop::reason`]); `interrupted`
+	/// when Pyroshine stopped before the session ended.
+	pub reason: String,
+	pub message: String,
+	#[serde(default)]
+	pub detail: Option<String>,
+	#[serde(default)]
+	pub hint: Option<String>,
+	pub unexpected: bool,
+}
+
+/// Host-side performance over every statistics window of a session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PerformanceSummary {
+	/// Statistics windows aggregated (about one per second of streaming).
+	pub windows: u32,
+	pub streaming_ms: u64,
+	pub frames: u64,
+	pub fps_avg: f64,
+	/// The slowest window.
+	pub fps_min: f64,
+	pub encoded_bitrate_avg_bps: f64,
+	pub wire_bitrate_avg_bps: f64,
+	pub stale_frames_dropped: u64,
+	pub failed_packets: u64,
+	pub discarded_packets: u64,
+	/// Pipeline stages: mean of the windows' averages (weighted by frames)
+	/// and the worst window's 95th percentile.
+	pub stages: Vec<StageSummary>,
+	#[serde(default)]
+	pub gpu_busy_avg_percent: Option<f64>,
+	#[serde(default)]
+	pub encoder_busy_avg_percent: Option<f64>,
+	#[serde(default)]
+	pub gpu_temperature_max_c: Option<f64>,
+	/// Findings by how many windows reported them, most frequent first.
+	pub findings: Vec<FindingCount>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StageSummary {
+	pub id: String,
+	pub label: String,
+	pub avg_us: f64,
+	pub p95_max_us: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingCount {
+	pub id: String,
+	pub severity: String,
+	pub title: String,
+	pub windows: u32,
+}
+
+/// A page of the session history, newest first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoryPage {
+	/// Whether history is recorded (`[history] enabled` and storage works).
+	pub available: bool,
+	/// Why history is unavailable or the last write failed.
+	#[serde(default)]
+	pub error: Option<String>,
+	pub retention_days: u32,
+	pub max_sessions: u32,
+	pub total: u64,
+	pub entries: Vec<HistoryEntry>,
+}
+
+/// Release notifications (see the web interface's Updates page).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStatus {
+	pub current_version: String,
+	/// Check automatically once a day.
+	pub automatic: bool,
+	/// `stable` or `prerelease`.
+	pub channel: String,
+	pub checking: bool,
+	#[serde(default)]
+	pub last_checked_ms: Option<u64>,
+	#[serde(default)]
+	pub last_error: Option<String>,
+	/// The newest release on the channel, when a check succeeded.
+	#[serde(default)]
+	pub latest: Option<ReleaseInfo>,
+	/// `latest` is newer than the running server.
+	pub update_available: bool,
+	/// The operator dismissed the notice for `latest`.
+	pub dismissed: bool,
+	pub install: InstallGuidance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseInfo {
+	pub version: String,
+	pub prerelease: bool,
+	#[serde(default)]
+	pub published_at: Option<String>,
+	/// The release page on the project's repository.
+	pub url: String,
+}
+
+/// How this installation is updated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallGuidance {
+	/// `arch`, `debian`, `rpm`, `nix`, `portable` or `unknown`.
+	pub kind: String,
+	pub label: String,
+	/// Commands or steps, in order.
+	pub steps: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

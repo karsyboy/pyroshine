@@ -38,6 +38,12 @@
       "virtual_connector_strategy": "single_application",
       "vrr_capture": "auto"
     },
+    "history": {
+      "enabled": true,
+      "max_sessions": 1000,
+      "record_client_address": true,
+      "retention_days": 90
+    },
     "inhibit_sleep": true,
     "library": {
       "auto_refresh": true,
@@ -340,6 +346,62 @@
         "path": "management.web_root",
         "required": false,
         "section": "web"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Keep a record of each session: application, client, negotiated mode, reconnects, how it ended and a performance summary measured on this host.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Record session history",
+        "path": "history.enabled",
+        "required": false,
+        "section": "history"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Sessions older than this are removed.",
+        "kind": {
+          "max": 3650.0,
+          "min": 1.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "days"
+        },
+        "label": "Keep sessions for",
+        "path": "history.retention_days",
+        "required": false,
+        "section": "history"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "The oldest sessions are removed beyond this count.",
+        "kind": {
+          "max": 100000.0,
+          "min": 10.0,
+          "optional": false,
+          "type": "integer",
+          "unit": null
+        },
+        "label": "Most sessions kept",
+        "path": "history.max_sessions",
+        "required": false,
+        "section": "history"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Store each session's client IP address and the name you gave that client.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Record client addresses",
+        "path": "history.record_client_address",
+        "required": false,
+        "section": "history"
       },
       {
         "advanced": false,
@@ -1665,6 +1727,11 @@
         "description": "This management interface: its address, HTTPS and the host names browsers may use.",
         "id": "web",
         "title": "Web management"
+      },
+      {
+        "description": "How long finished sessions are kept and what is recorded about them.",
+        "id": "history",
+        "title": "Session history"
       },
       {
         "description": "Logging for performance investigation.",

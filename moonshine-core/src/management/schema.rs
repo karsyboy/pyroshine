@@ -471,6 +471,11 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"Web management",
 			"This management interface: its address, HTTPS and the host names browsers may use.",
 		),
+		section(
+			"history",
+			"Session history",
+			"How long finished sessions are kept and what is recorded about them.",
+		),
 		section("diagnostics", "Diagnostics", "Logging for performance investigation."),
 	];
 
@@ -590,6 +595,44 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			path(true, true, true),
 		)
 		.advanced(),
+		Field::new(
+			"history.enabled",
+			"history",
+			"Record session history",
+			"Keep a record of each session: application, client, negotiated mode, reconnects, how it \
+			 ended and a performance summary measured on this host.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"history.retention_days",
+			"history",
+			"Keep sessions for",
+			"Sessions older than this are removed.",
+			integer(
+				f64::from(*crate::management::history::RETENTION_DAYS.start()),
+				f64::from(*crate::management::history::RETENTION_DAYS.end()),
+				Some("days"),
+			),
+		),
+		Field::new(
+			"history.max_sessions",
+			"history",
+			"Most sessions kept",
+			"The oldest sessions are removed beyond this count.",
+			integer(
+				f64::from(*crate::management::history::MAX_SESSIONS.start()),
+				f64::from(*crate::management::history::MAX_SESSIONS.end()),
+				None,
+			),
+		)
+		.advanced(),
+		Field::new(
+			"history.record_client_address",
+			"history",
+			"Record client addresses",
+			"Store each session's client IP address and the name you gave that client.",
+			FieldKind::Bool,
+		),
 		Field::new(
 			"webserver.enable_pairing",
 			"security",

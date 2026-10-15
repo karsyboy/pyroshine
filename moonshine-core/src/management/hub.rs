@@ -1,7 +1,7 @@
 //! Transport-neutral publication of management events.
 //!
 //! The management tasks (`follow_sessions`, `follow_pairing`, statistics,
-//! library) publish each change once to the [`Hub`]. Every transport
+//! library, history, updates) publish each change once to the [`Hub`]. Every transport
 //! is a subscriber: the D-Bus service turns events into signals for the tray
 //! and `pyroshine pair`, the web server turns them into Server-Sent Events for
 //! browsers. A transport that falls behind loses events (the channel is
@@ -44,6 +44,10 @@ pub(crate) enum EventKind {
 	Health,
 	/// [`moonshine_management::dto::LibrarySnapshot`] (only while observed).
 	Library,
+	/// [`moonshine_management::dto::HistoryEntry`] of a session that ended.
+	History,
+	/// [`moonshine_management::dto::UpdateStatus`] after an automatic check.
+	Update,
 }
 
 impl EventKind {
@@ -60,6 +64,8 @@ impl EventKind {
 			Self::ServerEvent => "server-event",
 			Self::Health => "health",
 			Self::Library => "library",
+			Self::History => "history",
+			Self::Update => "update",
 		}
 	}
 }

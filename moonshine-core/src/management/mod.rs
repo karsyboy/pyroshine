@@ -19,7 +19,9 @@
 //! while a client is streaming (see `telemetry`). Changes are published once
 //! to the `hub`, which every transport follows; statistics are published
 //! only while someone watches, and the last two minutes are kept for support
-//! bundles (`crate::support`). A slow or crashed
+//! bundles (`crate::support`). Sessions are recorded in the persistent
+//! history (`history`) by its own writer thread, and release notifications
+//! (`updates`) are checked only when the operator asks. A slow or crashed
 //! consumer cannot block any of this, and the daemon runs unchanged when the
 //! session bus name or the web listener is unavailable.
 
@@ -29,11 +31,13 @@ mod dbus;
 #[cfg(test)]
 mod dbus_tests;
 mod findings;
+pub(crate) mod history;
 mod hub;
 mod library;
 mod ops;
 pub(crate) mod schema;
 pub(crate) mod telemetry;
+mod updates;
 pub mod web;
 
 use std::collections::VecDeque;
@@ -92,6 +96,10 @@ pub(crate) struct Management {
 	auth: Arc<auth::Auth>,
 	/// The web interface's address, when it is enabled.
 	web_url: Option<String>,
+	/// Finished sessions, for the web interface's history.
+	history: history::History,
+	/// Release notifications.
+	updates: Arc<updates::Updates>,
 	sessions: SessionManager,
 	library: Library,
 	clients: ClientManager,
@@ -180,6 +188,17 @@ impl ManagementService {
 				let _ = shutdown.wrap_cancel(dbus::serve(management, management_bus())).await;
 			}
 		}));
+		tasks.push(tokio::spawn({
+			let management = management.clone();
+			let shutdown = shutdown.clone();
+			async move {
+				let hub = management.hub.clone();
+				let checks = management
+					.updates
+					.run(move |status| hub.publish(EventKind::Update, json(status)));
+				let _ = shutdown.wrap_cancel(checks).await;
+			}
+		}));
 		if let Some(web) = web {
 			tasks.push(tokio::spawn(async move {
 				let _ = shutdown.clone().wrap_cancel(web.serve(management, shutdown)).await;
@@ -213,10 +232,18 @@ impl Management {
 		auth: Arc<auth::Auth>,
 		web_url: Option<String>,
 	) -> Self {
+		let hub = Arc::new(Hub::default());
+		let state_path = clients.persistent_state().path().to_path_buf();
+		let history = history::History::start(history::history_path(&state_path), &config.history, {
+			let hub = hub.clone();
+			move |entry| hub.publish(EventKind::History, json(entry))
+		});
 		Self {
-			hub: Arc::default(),
+			hub,
 			auth,
 			web_url,
+			history,
+			updates: Arc::new(updates::Updates::open(updates::updates_path(&state_path))),
 			server: Mutex::new(server_info(&facts, config)),
 			running_config: config.clone(),
 			health: Mutex::new(facts.health),
@@ -402,6 +429,9 @@ async fn follow_sessions(management: &Management) {
 		});
 		if changed {
 			management.hub.publish(EventKind::Session, json(&snapshot));
+			management
+				.history
+				.observe(&snapshot, |address| management.client_label(address));
 		}
 		if manager.last_stop != reported_stop {
 			reported_stop = manager.last_stop.clone();
@@ -582,6 +612,7 @@ async fn follow_stats(management: &Management) {
 				&management.stats,
 				|stats| {
 					management.record_stats(stats);
+					management.history.observe_stats(stats);
 					if management.hub.is_observed() {
 						management.hub.publish(EventKind::Stats, json(stats));
 					}
@@ -661,6 +692,17 @@ impl Management {
 				.map(pending_pairing)
 				.collect(),
 		}
+	}
+
+	/// The operator's name for the paired client last seen at `address`.
+	fn client_label(&self, address: &str) -> Option<String> {
+		self.clients_snapshot()
+			.ok()?
+			.clients
+			.into_iter()
+			.filter(|client| client.last_address.as_deref() == Some(address))
+			.max_by_key(|client| client.last_seen_ms)
+			.and_then(|client| client.label)
 	}
 
 	fn clients_snapshot(&self) -> Result<ClientsSnapshot, ()> {

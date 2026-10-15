@@ -384,7 +384,8 @@ pub(super) async fn serve(management: Arc<Management>, bus: zbus::Result<zbus::c
 	tokio::join!(follow_desktop(&connection, &management), forward(events, &emitter),);
 }
 
-/// Emit every hub event as its signal.
+/// Emit every hub event as its signal. History and update events have no
+/// signal: only the web interface shows them.
 async fn forward(mut events: broadcast::Receiver<super::hub::Event>, emitter: &SignalEmitter<'static>) {
 	loop {
 		let event = match events.recv().await {
@@ -407,6 +408,7 @@ async fn forward(mut events: broadcast::Receiver<super::hub::Event>, emitter: &S
 			EventKind::ServerEvent => ManagementInterface::server_event(emitter, json).await,
 			EventKind::Health => ManagementInterface::health_changed(emitter, json).await,
 			EventKind::Library => ManagementInterface::library_changed(emitter, json).await,
+			EventKind::History | EventKind::Update => Ok(()),
 		};
 	}
 }

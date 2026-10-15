@@ -19,6 +19,8 @@
 //! | `GET config`, `POST config/validate`, `PUT config` | `PUT` needs the revision it edits |
 //! | `GET library`, `POST library/rescan`, `POST library/hidden` | |
 //! | `GET events/recent`, `POST health/run`, `GET diagnostics/report`, `POST diagnostics/bundle` | |
+//! | `GET history?limit&before`, `GET history/{id}`, `DELETE history` | Session history, newest first |
+//! | `GET updates`, `POST updates/check`, `PUT updates/settings`, `POST updates/dismiss` | Release notifications |
 //! | `GET stream` | Server-Sent Events (see `events`) |
 
 use std::net::SocketAddr;
@@ -82,6 +84,31 @@ struct ValuesRequest {
 struct SaveRequest {
 	values: Value,
 	revision: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateSettings {
+	automatic: bool,
+	channel: String,
+}
+
+#[derive(Deserialize)]
+struct DismissRequest {
+	version: String,
+}
+
+/// `limit` and `before` of a history page.
+fn page_query(query: Option<&str>) -> (u32, Option<i64>) {
+	let mut limit = 50;
+	let mut before = None;
+	for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+		match &*key {
+			"limit" => limit = value.parse().unwrap_or(50),
+			"before" => before = value.parse().ok(),
+			_ => {},
+		}
+	}
+	(limit, before)
 }
 
 #[derive(Deserialize)]
@@ -376,6 +403,39 @@ pub(crate) async fn handle(context: &Context, request: Request<Incoming>, peer: 
 			}
 		},
 
+		(&Method::GET, "history") => {
+			let (limit, before) = page_query(request.uri().query());
+			json(&management.history.page(limit, before).await)
+		},
+		(&Method::DELETE, "history") => {
+			audit!("clear_history");
+			respond(management.history.clear().await.map(|()| no_content()))
+		},
+		(&Method::GET, route) if route.starts_with("history/") => match route["history/".len()..].parse::<i64>() {
+			Ok(id) => respond(management.history.entry(id).await.map(|entry| json(&entry))),
+			Err(_) => error(StatusCode::NOT_FOUND, "not_found", "Unknown session."),
+		},
+
+		(&Method::GET, "updates") => json(&management.updates.status()),
+		(&Method::POST, "updates/check") => {
+			audit!("check_updates");
+			json(&management.updates.check().await)
+		},
+		(&Method::PUT, "updates/settings") => {
+			let settings = body!(UpdateSettings);
+			audit!("update_settings", automatic = settings.automatic);
+			respond(
+				management
+					.updates
+					.set(settings.automatic, &settings.channel)
+					.map(|status| json(&status)),
+			)
+		},
+		(&Method::POST, "updates/dismiss") => {
+			let dismiss = body!(DismissRequest);
+			respond(management.updates.dismiss(&dismiss.version).map(|status| json(&status)))
+		},
+
 		(&Method::GET, "stream") => super::events::stream(context, session).await,
 
 		(_, route) if is_known(route) => error(
@@ -414,7 +474,12 @@ fn is_known(route: &str) -> bool {
 		"health/run",
 		"diagnostics/report",
 		"diagnostics/bundle",
+		"history",
+		"updates",
+		"updates/check",
+		"updates/settings",
+		"updates/dismiss",
 		"stream",
 	];
-	ROUTES.contains(&route) || route.starts_with("auth/sessions/")
+	ROUTES.contains(&route) || route.starts_with("auth/sessions/") || route.starts_with("history/")
 }
