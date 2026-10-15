@@ -340,6 +340,13 @@ client, waits (then `SIGKILL`s via the pidfd), and releases the display lock and
 sockets before the compositor's worker guard drops. A surviving process keeps
 the session `Stopping`. A retained-session reconnect does not touch XWayland.
 
+The **compositor thread** is joined before its worker guard drops, and it holds
+the capture Vulkan device until then. The GPU driver releases the thread's EGL
+state in thread-local destructors after the compositor returns; on NVIDIA,
+destroying a Vulkan device while they run deadlocks inside the driver. Since
+the video pipeline usually drops the last reference to the capture device, the
+device must outlive the thread, not only the compositor loop.
+
 **Teardown** has a single owner per session, started by user cancel, a worker or
 application exit (through a per-session watchdog that only hands over), a failed
 transition, or service shutdown. In order, it stops the application unit while

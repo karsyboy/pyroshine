@@ -18,6 +18,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Add machine-readable benchmark results. `moonshine-bench --json` writes the workload, host, GPU capabilities, latency percentiles, frame pacing at the receiver, dropped frames, capture paths and the benchmark's CPU, GPU-engine and memory use; `--capabilities` prints the capture GPU's codec profiles and `--skip-unsupported` records workloads the GPU cannot encode instead of running them. `scripts/record_baseline.py` gains a `phase0` workload set (every codec at 1080p, 1440p and 2160p at 60 and 120 FPS, plus format, capture-path and transport variants), NVIDIA encoder utilization and runs from a prebuilt binary; `scripts/bench_results.py` validates and compares results. Lifecycle cycles also check DMA-BUF descriptors and the overridden application unit. `scripts/hardware_tests.py` runs the GPU, systemd and device tests a host supports and reports the rest, and CI checks that every such test is registered. See [testing](TESTING.md).
 
+### Fixed
+
+- Stop sessions reliably on NVIDIA. Ending a stream could hang the service in the GPU driver: the video pipeline destroyed the capture GPU's Vulkan device while the exiting compositor thread was still releasing its EGL state, the session exceeded its teardown deadline and the service then needed `SIGKILL` to stop. The capture device now outlives the compositor thread. On an RTX 3080, the compositor tests that hung in most release-build runs pass in every run.
+
 ## [v0.17.6] - 2026-10-14
 
 ### Changed

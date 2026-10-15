@@ -80,6 +80,11 @@ pub(crate) struct CaptureReceiver {
 	state: Arc<AtomicU64>,
 }
 
+/// See [`CaptureSender::context_hold`].
+pub(crate) struct CaptureContextHold {
+	_context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
+}
+
 pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	let (tx, rx) = mpsc::sync_channel(1);
 	let state = Arc::new(AtomicU64::new(IDLE));
@@ -115,6 +120,13 @@ impl CaptureSender {
 			self.context.set(context).is_ok(),
 			"capture context initialized exactly once"
 		);
+	}
+	/// A reference that keeps the capture context, once set, from being
+	/// destroyed while it is held, wherever the other references are dropped.
+	pub(crate) fn context_hold(&self) -> CaptureContextHold {
+		CaptureContextHold {
+			_context: self.context.clone(),
+		}
 	}
 	pub(crate) fn take_demand_source(&mut self) -> Option<PingSource> {
 		self.demand_source.take()

@@ -324,6 +324,15 @@ impl Compositor {
 		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
 		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)
 			.map_err(|()| "the session stopped before the compositor started".to_string())?;
+		// The driver releases the compositor thread's EGL state in thread-local
+		// destructors after the thread body returns. On NVIDIA, destroying a
+		// Vulkan device while they run deadlocks inside the driver:
+		// vkDestroyDevice, the exiting EGL thread and an exiting driver thread
+		// wait on each other forever. The capture device must therefore outlive
+		// the compositor thread itself, not just `run_compositor`, whichever
+		// stream thread drops it last, and completion is released only once the
+		// thread has fully exited.
+		let capture_context = frame_tx.context_hold();
 		let outputs = CompositorOutputs {
 			frame_tx,
 			ready_tx,
@@ -333,10 +342,11 @@ impl Compositor {
 		// sender before reporting, so a disconnected ready channel waits briefly
 		// for the reason.
 		let (failure_tx, failure_rx) = mpsc::sync_channel::<String>(1);
-		std::thread::Builder::new()
+		let stopped = stop.trigger_shutdown_token(SessionShutdownReason::CompositorStopped);
+		let compositor = std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
-				let _worker = worker;
+				let _stopped = stopped;
 				if let Err(e) = run_compositor(config, context, outputs, input_rx, reconfigure_rx, stop) {
 					tracing::error!("Compositor failed: {e}");
 					let _ = failure_tx.try_send(e);
@@ -345,6 +355,17 @@ impl Compositor {
 			.map_err(|e| {
 				tracing::error!("Failed to spawn compositor thread: {e}");
 				format!("the compositor thread could not be created: {e}")
+			})?;
+		std::thread::Builder::new()
+			.name("compositor-exit".to_string())
+			.spawn(move || {
+				let _ = compositor.join();
+				drop(capture_context);
+				drop(worker);
+			})
+			.map_err(|e| {
+				tracing::error!("Failed to spawn compositor exit thread: {e}");
+				format!("the compositor exit thread could not be created: {e}")
 			})?;
 
 		let ready = match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {

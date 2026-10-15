@@ -72,6 +72,12 @@ encode (for example ANV without `ANV_DEBUG=video-encode`) to run the
 no-fallback device-selection test. Select a Vulkan driver with
 `VK_DRIVER_FILES` on multi-GPU hosts.
 
+Run the compositor and XWayland tests from a release build on NVIDIA. They are
+the regression tests for the compositor-thread teardown order (see
+[architecture](ARCHITECTURE.md)): with the capture device destroyed while the
+exiting compositor thread released its EGL state, eight of them hung on an
+RTX 3080 in release builds, while a debug build's slower teardown passed.
+
 The systemd tests create `pyroshine-test-<pid>-*.service` units and never
 touch `moonshine-session.service`; the XWayland tests start private
 compositors. The device test creates virtual controllers through `/dev/uinput`
