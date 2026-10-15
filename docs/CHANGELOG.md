@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.0-alpha.0] - 2026-10-15
+
 ### Added
 
 - Add machine-readable benchmark results. `moonshine-bench --json` writes the workload, host, GPU capabilities, latency percentiles, frame pacing at the receiver, dropped frames, capture paths and the benchmark's CPU, GPU-engine and memory use; `--capabilities` prints the capture GPU's codec profiles and `--skip-unsupported` records workloads the GPU cannot encode instead of running them. `scripts/record_baseline.py` gains a `phase0` workload set (every codec at 1080p, 1440p and 2160p at 60 and 120 FPS, plus format, capture-path and transport variants), NVIDIA encoder utilization and runs from a prebuilt binary; `scripts/bench_results.py` validates and compares results. Lifecycle cycles also check DMA-BUF descriptors and the overridden application unit. `scripts/hardware_tests.py` runs the GPU, systemd and device tests a host supports and reports the rest, and CI checks that every such test is registered. See [testing](TESTING.md).
