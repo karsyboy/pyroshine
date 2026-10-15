@@ -381,3 +381,51 @@ export interface UiError {
   kind: "unavailable" | "access_denied" | "invalid" | "not_found" | "conflict" | "read_only" | "failed" | string;
   message: string;
 }
+
+/// `GetLibrary` / `daemon://library`: the application catalog.
+export interface LibrarySnapshot {
+  generation: number;
+  scanning: boolean;
+  auto_refresh: boolean;
+  poll_interval_secs: number;
+  last_refresh_ms: number | null;
+  notice: string | null;
+  sources: LibrarySource[];
+  applications: LibraryApplication[];
+}
+
+export type SourceStatus = "pending" | "ok" | "partial" | "failed";
+
+export interface LibrarySource {
+  scanner: number;
+  kind: string;
+  label: string;
+  root: string;
+  status: SourceStatus;
+  message: string | null;
+  hint: string | null;
+  applications: number;
+  stale_applications: number;
+  last_scan_ms: number | null;
+  duration_ms: number | null;
+  watched: boolean;
+}
+
+export type ApplicationState = "available" | "stale" | "hidden" | "shadowed" | "duplicate";
+
+export interface LibraryApplication {
+  key: string;
+  id: number;
+  title: string;
+  source: string;
+  source_label: string;
+  manual: boolean;
+  scanner: number | null;
+  native_id: string | null;
+  state: ApplicationState;
+  offered: boolean;
+  state_detail: string | null;
+  can_hide: boolean;
+  artwork: string | null;
+  command: string[];
+}

@@ -59,6 +59,15 @@ pub trait Management {
 	/// configuration and the service log. See `pyroshine diag`.
 	fn get_support_bundle(&self) -> zbus::Result<Vec<u8>>;
 
+	/// [`crate::dto::LibrarySnapshot`].
+	fn get_library(&self) -> zbus::Result<String>;
+	/// Scan every application source now. Returns once the scan is queued;
+	/// `LibraryChanged` reports its progress and result.
+	fn rescan_library(&self) -> zbus::Result<()>;
+	/// Hide (or show again) a discovered application from clients. The
+	/// choice persists across restarts. Manual entries cannot be hidden.
+	fn set_application_hidden(&self, key: &str, hidden: bool) -> zbus::Result<()>;
+
 	#[zbus(signal)]
 	fn session_changed(&self, snapshot: String) -> zbus::Result<()>;
 	#[zbus(signal)]
@@ -78,6 +87,10 @@ pub trait Management {
 	/// A new [`crate::dto::HealthReport`] (after `RunHealthCheck`).
 	#[zbus(signal)]
 	fn health_changed(&self, report: String) -> zbus::Result<()>;
+	/// A new [`crate::dto::LibrarySnapshot`] (scan started or finished,
+	/// catalog changed). Sent while the desktop UI runs.
+	#[zbus(signal)]
+	fn library_changed(&self, snapshot: String) -> zbus::Result<()>;
 }
 
 /// Proxy for a running desktop UI instance.

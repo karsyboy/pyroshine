@@ -20,7 +20,7 @@ const LABEL: &str = "main";
 pub fn sanitize(page: &str) -> String {
 	let (route, query) = page.split_once('?').unwrap_or((page, ""));
 	let route = match route.trim_matches('/') {
-		route @ ("dashboard" | "clients" | "settings" | "diagnostics") => route,
+		route @ ("dashboard" | "clients" | "library" | "settings" | "diagnostics") => route,
 		_ => "dashboard",
 	};
 	let request = query
@@ -133,6 +133,7 @@ mod tests {
 	fn deep_links_are_limited_to_known_pages_and_tokens() {
 		assert_eq!(sanitize("clients?request=00ff"), "clients?request=00ff");
 		assert_eq!(sanitize("/settings"), "settings");
+		assert_eq!(sanitize("library"), "library");
 		assert_eq!(sanitize("clients?request=<script>"), "clients");
 		assert_eq!(sanitize("https://example.com"), "dashboard");
 		assert_eq!(sanitize("../../etc/passwd"), "dashboard");

@@ -3,7 +3,6 @@ use std::{
 	convert::Infallible,
 	net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
 	path::PathBuf,
-	str::FromStr,
 };
 
 use async_shutdown::ShutdownManager;
@@ -15,8 +14,6 @@ use hyper::{
 	service::service_fn,
 };
 use hyper_util::rt::tokio::{TokioIo, TokioTimer};
-use image::ImageFormat;
-use image::imageops::FilterType;
 use network_interface::NetworkInterfaceConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,11 +22,11 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
+	app_scanner::Library,
 	clients::{ClientManager, RevokeError},
 	ingress::Ingress,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
-		application::ApplicationConfig,
 		failure::{Problem, SessionFailure},
 		manager::SessionManager,
 		negotiation::{self, DisplayMode},
@@ -94,7 +91,9 @@ pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
-	applications: Vec<ApplicationConfig>,
+	/// The application catalog. Each request reads the snapshot current when
+	/// it starts; a refresh never changes a request (or a session) in flight.
+	library: Library,
 	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
@@ -147,7 +146,7 @@ impl Webserver {
 		address: String,
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
-		applications: Vec<ApplicationConfig>,
+		library: Library,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		unique_id: String,
@@ -162,7 +161,7 @@ impl Webserver {
 			name,
 			rtsp_port,
 			webserver_config,
-			applications,
+			library,
 			unique_id,
 			client_manager,
 			session_manager,
@@ -424,7 +423,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.app_asset(params)
+					self.app_asset(params).await
 				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
@@ -545,14 +544,15 @@ impl Webserver {
 	}
 
 	fn app_list(&self) -> Response<Full<Bytes>> {
+		let catalog = self.library.catalog();
 		let mut response = "<root status_code=\"200\">".to_string();
-		for application in self.applications.iter() {
+		for entry in catalog.offered() {
 			response += "<App>";
 
 			let hdr_supported = u8::from(self.hdr_supported);
 			response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
-			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&application.title)).as_ref();
-			response += format!("<ID>{}</ID>", application.id()).as_ref();
+			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();
+			response += format!("<ID>{}</ID>", entry.id).as_ref();
 
 			response += "</App>";
 		}
@@ -566,7 +566,7 @@ impl Webserver {
 		response
 	}
 
-	fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
 			None => {
@@ -584,72 +584,33 @@ impl Webserver {
 			},
 		};
 
-		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
-			Some(application) => application,
+		let catalog = self.library.catalog();
+		let entry = match catalog.find(application_id) {
+			Some(entry) => entry,
 			None => {
-				let message = format!("Couldn't find application with ID {}.", application_id - 1);
+				let message = format!("Couldn't find application with ID {application_id}.");
 				tracing::warn!("{message}");
 				return bad_request(message);
 			},
 		};
-
-		let boxart_path = match &application.boxart {
-			Some(boxart) => boxart,
-			None => {
-				let message = format!("No boxart defined for app '{}'.", application.title);
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-		let boxart_path = boxart_path.to_string_lossy();
-		let boxart_path = match shellexpand::full(&boxart_path) {
-			Ok(boxart_path) => boxart_path,
-			Err(e) => {
-				let message = format!("Failed to expand boxart path: {e}");
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-		let boxart_path = match PathBuf::from_str(&boxart_path) {
-			Ok(boxart_path) => boxart_path,
-			Err(e) => {
-				let message = format!("Failed to create boxart path: {e}");
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		let image_bytes = match std::fs::read(&boxart_path) {
-			Ok(bytes) => bytes,
-			Err(e) => {
-				let message = format!("Failed to read boxart at '{}': {e}", boxart_path.display());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		let asset = match image::load_from_memory(&image_bytes) {
-			Ok(asset) => asset,
-			Err(e) => {
-				let message = format!("Failed to load boxart at '{}': {e}", boxart_path.display());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		// Moonlight displays box art at a fixed 200x267 pixel area using stretch mode.
-		// Icons that don't match this ratio (e.g. square desktop icons) get distorted.
-		// Fit the image into a 600x801 canvas (same ratio as 200:267), preserving aspect ratio, centered.
-		let asset = fit_to_boxart(asset);
-
-		let mut buffer = std::io::Cursor::new(vec![]);
-		if let Err(e) = asset.write_to(&mut buffer, ImageFormat::Png) {
-			let message = format!("Failed to encode boxart: {e}");
-			tracing::warn!("{message}");
+		if entry.artwork.is_empty() {
+			let message = format!("No boxart defined for app '{}'.", entry.application.title);
+			tracing::debug!("{message}");
 			return bad_request(message);
 		}
 
-		let mut response = Response::new(Full::new(Bytes::from(buffer.into_inner())));
+		// Decoding and resizing run on a blocking thread, bounded and cached
+		// (see `app_scanner::artwork`), never on the network runtime.
+		let buffer = match self.library.render_artwork(entry.artwork.clone()).await {
+			Ok(buffer) => buffer,
+			Err(reason) => {
+				let message = format!("No usable boxart for app '{}': {reason}", entry.application.title);
+				tracing::warn!("{message}");
+				return bad_request(message);
+			},
+		};
+
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response
 			.headers_mut()
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
@@ -932,10 +893,13 @@ impl Webserver {
 			Err(error) => return xml_error(400, &format!("Invalid clientVrrRequested in launch request: {error}.")),
 		};
 
-		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
-			Some(application) => application,
+		// The session takes its own copy of the entry: later catalog refreshes
+		// cannot change or stop what this launch starts.
+		let catalog = self.library.catalog();
+		let application = match catalog.find(application_id) {
+			Some(entry) => &entry.application,
 			None => {
-				let message = format!("Couldn't find application with ID {}.", application_id - 1);
+				let message = format!("Couldn't find application with ID {application_id}.");
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
@@ -1322,34 +1286,6 @@ fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {
 			bad_request("Failed to build error response.".to_string())
 		},
 	}
-}
-
-const BOXART_WIDTH: u32 = 600;
-const BOXART_HEIGHT: u32 = 801;
-
-fn fit_to_boxart(asset: image::DynamicImage) -> image::DynamicImage {
-	let (w, h) = (asset.width(), asset.height());
-
-	// Already the right aspect ratio (within a small tolerance), return as-is.
-	let target_ratio = BOXART_WIDTH as f64 / BOXART_HEIGHT as f64;
-	let image_ratio = w as f64 / h as f64;
-	if (image_ratio - target_ratio).abs() < 0.01 {
-		return asset;
-	}
-
-	// Scale the image to fit within the box art dimensions while preserving aspect ratio.
-	let scale = f64::min(BOXART_WIDTH as f64 / w as f64, BOXART_HEIGHT as f64 / h as f64);
-	let new_w = (w as f64 * scale).round() as u32;
-	let new_h = (h as f64 * scale).round() as u32;
-	let resized = asset.resize_exact(new_w, new_h, FilterType::Lanczos3);
-
-	// Center the resized image on a transparent canvas.
-	let mut canvas = image::RgbaImage::new(BOXART_WIDTH, BOXART_HEIGHT);
-	let offset_x = (BOXART_WIDTH - new_w) / 2;
-	let offset_y = (BOXART_HEIGHT - new_h) / 2;
-	image::imageops::overlay(&mut canvas, &resized.to_rgba8(), offset_x as i64, offset_y as i64);
-
-	image::DynamicImage::ImageRgba8(canvas)
 }
 
 fn unauthorized(message: &str) -> Response<Full<Bytes>> {

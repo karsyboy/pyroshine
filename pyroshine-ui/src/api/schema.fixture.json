@@ -39,6 +39,10 @@
       "vrr_capture": "auto"
     },
     "inhibit_sleep": true,
+    "library": {
+      "auto_refresh": true,
+      "poll_interval_secs": 300
+    },
     "name": "Pyroshine",
     "stream": {
       "audio": {
@@ -781,7 +785,7 @@
       {
         "advanced": false,
         "caution": null,
-        "help": "Static applications. Discovered applications are added to this list when Pyroshine starts.",
+        "help": "Applications you define. Discovered games are listed with them; a discovered game with the same title as one of these is replaced by it.",
         "kind": {
           "item": [
             {
@@ -937,7 +941,7 @@
       {
         "advanced": false,
         "caution": null,
-        "help": "Scanners run at startup; restart Pyroshine after installing games.",
+        "help": "Launchers whose installed games are offered to clients. Adding or editing a scanner takes effect after a restart; installed and removed games do not need one.",
         "kind": {
           "type": "scanners",
           "variants": [
@@ -1435,6 +1439,34 @@
       {
         "advanced": false,
         "caution": null,
+        "help": "Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan in the Library page.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Follow installs automatically",
+        "path": "library.auto_refresh",
+        "required": false,
+        "section": "scanners"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Seconds between checks for changes that file notifications miss (network drives, libraries that appear later). Only metadata is compared; a launcher is scanned again only if it changed.",
+        "kind": {
+          "max": 86400.0,
+          "min": 30.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "s"
+        },
+        "label": "Periodic check",
+        "path": "library.poll_interval_secs",
+        "required": false,
+        "section": "scanners"
+      },
+      {
+        "advanced": false,
+        "caution": null,
         "help": "Log five-second capture, pipeline, transport and runtime summaries. Disabling also skips their collection.",
         "kind": {
           "type": "bool"
@@ -1504,7 +1536,7 @@
         "title": "Applications"
       },
       {
-        "description": "Scanners that add installed games when Pyroshine starts.",
+        "description": "Scanners that find installed games and keep the application list current.",
         "id": "scanners",
         "title": "Application discovery"
       },

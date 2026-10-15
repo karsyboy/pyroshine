@@ -39,7 +39,7 @@ fn fixture(enable_pairing: bool, limits: WebLimits) -> Fixture {
 			private_key,
 			..Default::default()
 		},
-		applications: vec![],
+		library: crate::app_scanner::Library::fixed(&[]),
 		unique_id: "test".into(),
 		client_manager: client_manager.clone(),
 		session_manager: SessionManager::for_test(shutdown.clone()),
@@ -1039,4 +1039,91 @@ async fn revocation_drains_in_flight_session_authorization() {
 	drop(in_flight);
 	assert_eq!(revoking.await.unwrap().0, 200);
 	assert!(!client_manager.is_cert_paired("cert-A").unwrap());
+}
+
+/// Batch 1.5: a catalog refresh while a session streams changes what
+/// clients are offered, but never the session: no stop, no new epoch, no
+/// re-authorization, no change of the launched command or reported game,
+/// even when the running game disappears from the catalog.
+#[tokio::test]
+async fn catalog_refresh_during_an_active_stream_leaves_it_untouched() {
+	use crate::app_scanner::{CatalogSnapshot, Library, legacy_id};
+	use crate::session::application::ApplicationConfig;
+	use crate::session::stream::audio::AudioChannels;
+
+	let application = |title: &str| ApplicationConfig {
+		title: title.into(),
+		command: vec![format!("/usr/bin/{}", title.to_lowercase().replace(' ', "-"))],
+		..Default::default()
+	};
+	let (library, publish) = Library::for_test(&[application("Steam"), application("Portal 2")]);
+	let mut fixture = fixture(true, WebLimits::default());
+	fixture.server.library = library;
+	let server = &fixture.server;
+
+	// Launch "Portal 2" the way `/launch` does: from the catalog entry.
+	let catalog = server.library.catalog();
+	let entry = catalog.find(legacy_id("Portal 2")).unwrap().clone();
+	let client: IpAddr = "127.0.0.1".parse().unwrap();
+	let _foreground = server
+		.session_manager
+		.reporting_session_for_test(SessionContext {
+			application: entry.application.clone(),
+			application_id: entry.id,
+			resolution: (1920, 1080),
+			refresh_rate: 60,
+			hdr: false,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: client,
+			vrr_requested: false,
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				crate::session::RemoteInputKey::from_bytes([7; 16]),
+				crate::session::RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let grant = server.session_manager.authorize_client_for_test(client).await;
+	let before = server.session_manager.session_view().await.unwrap();
+	let mut status = server.session_manager.subscribe_status();
+	status.borrow_and_update();
+
+	// The refresh: the running game is uninstalled, another one appears.
+	for generation in 1..=3 {
+		publish.send_modify(|view| {
+			let catalog = CatalogSnapshot::new(
+				generation,
+				CatalogSnapshot::from_applications(&[application("Steam"), application("Half-Life")])
+					.entries()
+					.to_vec(),
+			);
+			Arc::make_mut(view).catalog = Arc::new(catalog);
+		});
+	}
+
+	let list = body_text(server.app_list()).await;
+	assert!(list.contains("<AppTitle>Half-Life</AppTitle>"), "{list}");
+	assert!(!list.contains("Portal 2"), "{list}");
+
+	let after = server.session_manager.session_view().await.unwrap();
+	assert_eq!(after.epoch, before.epoch);
+	assert_eq!(after.application_title, "Portal 2");
+	assert_eq!(after.application_id, entry.id);
+	assert_eq!(
+		(after.resolution, after.refresh_rate),
+		(before.resolution, before.refresh_rate)
+	);
+	assert_eq!(server.session_manager.authorize_stream(client).await, Some(grant));
+	assert!(!status.has_changed().unwrap(), "no lifecycle transition");
+
+	// Clients are still told the game they launched is running.
+	let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+	let info = body_text(server.server_info(HashMap::new(), None, peer, None, false, None).await).await;
+	assert!(
+		info.contains(&format!("<currentgame>{}</currentgame>", entry.id)),
+		"{info}"
+	);
+	assert!(info.contains("MOONSHINE_SERVER_BUSY"), "{info}");
+
+	server.session_manager.stop_session().await.unwrap();
 }

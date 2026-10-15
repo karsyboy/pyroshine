@@ -20,6 +20,8 @@ import TuneOutlined from "@mui/icons-material/TuneOutlined";
 import Tune from "@mui/icons-material/Tune";
 import MonitorHeartOutlined from "@mui/icons-material/MonitorHeartOutlined";
 import MonitorHeart from "@mui/icons-material/MonitorHeart";
+import SportsEsportsOutlined from "@mui/icons-material/SportsEsportsOutlined";
+import SportsEsports from "@mui/icons-material/SportsEsports";
 import MoreVert from "@mui/icons-material/MoreVert";
 import Logout from "@mui/icons-material/Logout";
 import { call } from "./api/bridge";
@@ -27,6 +29,7 @@ import { useDaemon } from "./state/daemon";
 import { useRoute, type Page } from "./state/route";
 import { DashboardPage } from "./pages/Dashboard";
 import { ClientsPage } from "./pages/Clients";
+import { LibraryPage } from "./pages/Library";
 import { SettingsPage } from "./pages/Settings";
 import { DiagnosticsPage } from "./pages/Diagnostics";
 import { Unavailable } from "./components/Unavailable";
@@ -34,6 +37,7 @@ import { Unavailable } from "./components/Unavailable";
 const destinations: { page: Page; label: string; icon: typeof Dashboard; active: typeof Dashboard }[] = [
   { page: "dashboard", label: "Dashboard", icon: DashboardOutlined, active: Dashboard },
   { page: "clients", label: "Clients", icon: DevicesOutlined, active: Devices },
+  { page: "library", label: "Library", icon: SportsEsportsOutlined, active: SportsEsports },
   { page: "settings", label: "Settings", icon: TuneOutlined, active: Tune },
   { page: "diagnostics", label: "Diagnostics", icon: MonitorHeartOutlined, active: MonitorHeart },
 ];
@@ -133,6 +137,9 @@ export function App() {
     switch (route.page) {
       case "clients":
         content = <ClientsPage request={route.params.get("request")} />;
+        break;
+      case "library":
+        content = <LibraryPage navigate={navigate} />;
         break;
       case "settings":
         content = <SettingsPage />;

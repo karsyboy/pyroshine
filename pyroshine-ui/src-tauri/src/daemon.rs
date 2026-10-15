@@ -236,6 +236,7 @@ impl Daemon {
 				proxy.receive_stats_updated().await?,
 				proxy.receive_server_event().await?,
 				proxy.receive_health_changed().await?,
+				proxy.receive_library_changed().await?,
 			))
 		};
 		let (
@@ -248,6 +249,7 @@ impl Daemon {
 			mut stats,
 			mut events,
 			mut health,
+			mut library,
 		) = match streams.await {
 			Ok(streams) => streams,
 			Err(error) => {
@@ -354,6 +356,14 @@ impl Daemon {
 					current!();
 					if let Some(value) = signal.args().ok().and_then(|args| json(args.report())) {
 						self.health_changed(&sinks.app, value);
+					}
+				},
+				// Only the window shows the library; it reads `GetLibrary`
+				// when it opens and follows these while it is open.
+				Some(signal) = library.next() => {
+					current!();
+					if let Some(value) = signal.args().ok().and_then(|args| json(args.snapshot())) {
+						let _ = sinks.app.emit("daemon://library", &value);
 					}
 				},
 				else => return Attached::Ended,

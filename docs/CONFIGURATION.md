@@ -86,7 +86,8 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 | `address` | string, `"0.0.0.0"` | Bind address for web and stream listeners. `0.0.0.0` is IPv4; `::` enables dual-stack IPv4/IPv6. With a specific non-loopback address, the pairing PIN page is additionally served on `127.0.0.1` at the HTTP port. |
 | `inhibit_sleep` | boolean, `true` | Ask logind to block suspend while streaming. Requires the shipped polkit rule and `pyroshine` group access; the packaged service grants that group. Failure logs a warning and does not prevent streaming. |
 | `application` | array of tables, Steam entry | Static applications exposed to clients; see below. |
-| `application_scanner` | array of tables, Steam scanner in generated config; `[]` if omitted from an existing file | Discover installed applications at startup and append them to the static list; see below. |
+| `application_scanner` | array of tables, Steam scanner in generated config; `[]` if omitted from an existing file | Discover installed applications and keep them current while Pyroshine runs; see below. |
+| `library` | table | How discovered applications follow installs and removals; see [`[library]`](#library). |
 | `webserver` | table | HTTP/HTTPS ports, pairing, and TLS files. |
 | `stream` | table | RTSP, timeout, video, audio, and control settings. |
 | `compositor` | table | GPU, capture, HDR, window focus, and keyboard settings. |
@@ -327,9 +328,9 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `title` | string, required | Application name shown to clients. Also used to derive its ID, so keep titles distinct and stable. |
+| `title` | string, required | Application name shown to clients. Also used to derive its ID, so keep titles distinct and stable. A discovered game with the same title (ignoring case) is replaced by this entry, which lets you override its command or box art. |
 | `command` | array of strings, required | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
-| `boxart` | optional path string, unset | Local cover image. Missing art is resolved automatically when possible. |
+| `boxart` | optional path string, unset | Local cover image (PNG, JPEG, WebP, BMP or ICO). Missing art is resolved from an icon named like the title when possible. |
 | `output_scale` | optional number, effective `1.0` | Wayland output scale for this application. Finite values from `0.25` through `8.0` are accepted; other values fall back to `1.0`. The physical video resolution stays at the client's requested size. |
 | `pre_command` | array of command arrays, `[]` | Run in order before launching the app, via systemd `ExecStartPre`. A failed command can prevent launch. Every entry must name an executable found in `PATH` (or an absolute path); otherwise the launch fails and the log names the entry (for example `pre_command[1]`). |
 | `post_command` | array of command arrays, `[]` | Run after the session's application unit stops, via systemd `ExecStopPost`. Useful for cleanup. Resolved like `pre_command`; an unresolvable entry fails the launch rather than being skipped. Post commands share the unit's 5-second stop allowance. |
@@ -362,8 +363,11 @@ Desktop sessions have [session and login-screen limitations](TIPS.md#run-a-deskt
 
 ## `[[application_scanner]]`
 
-[Source](../moonshine-core/src/app_scanner/mod.rs). Scanners run at server startup;
-restart after installing games to refresh the list. Each entry requires `type`.
+[Source](../moonshine-core/src/app_scanner/mod.rs). Scanners run when Pyroshine
+starts and again whenever their launcher's metadata changes, so installed,
+removed and renamed games reach clients without a restart (see
+[`[library]`](#library)). Adding, removing or editing a scanner still requires
+a restart. Each entry requires `type`.
 
 All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`, and
 `launch_timeout_secs`, with the same defaults and behavior as applications.
@@ -379,8 +383,24 @@ Those values are copied to each discovered application. Scanners do not accept
 
 Scanner source paths support `~` and environment-variable expansion. Placeholder
 substitution applies to scanner `command` arguments, not pre/post-command hooks.
-Steam, Lutris, and Heroic use their available local cover art; the desktop scanner
-can resolve icons. Scanner launchers must be installed separately.
+Scanner launchers must be installed separately.
+
+Box art comes from local files only, best first: for Steam, art you set in
+Steam (`userdata/*/config/grid`), then the portrait, capsule and header art
+Steam caches in `appcache/librarycache`, then the icon of a Steam desktop
+shortcut; for Lutris, cover art, banners and its shortcut icon; for Heroic, the
+cover art it cached; for desktop entries, the entry's icon. If an image cannot
+be read or decoded, the next one is used; clients show a placeholder when none
+works. Nothing is downloaded.
+
+Each discovered game keeps its client-facing ID across rescans, renames,
+reinstalls and restarts (see [Library management](DESKTOP.md#library)). The
+catalog leaves out what clients do not need twice: a desktop shortcut that
+starts a Steam, Lutris or Heroic game already in the catalog, the same game
+found by two scanners of one launcher, Steam's Proton and runtime tools, and
+DLC. Games with equal titles from different launchers get the launcher in their
+title, for example `Hades (Steam)` and `Hades (Heroic)`. Individual games can be
+hidden from clients in the desktop app's **Library** page.
 
 The desktop scanner also accepts:
 
@@ -388,6 +408,11 @@ The desktop scanner also accepts:
 | --- | --- | --- |
 | `include_terminal` | boolean, `false` | Include entries marked `Terminal=true`. |
 | `resolve_icons` | boolean, `true` | Resolve desktop entry icons into local boxart paths. |
+
+Desktop entries are identified by their desktop file ID, as in the XDG menu
+specification: an entry in a directory listed earlier overrides the entry with
+the same ID in a later directory, and hides it when marked `Hidden=true` or
+`NoDisplay=true`. List user directories before system ones.
 
 Examples (add only the scanners you want; this list replaces the default scanner):
 
@@ -415,6 +440,29 @@ resolve_icons = true
 ```
 
 For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-inside-pyroshines-compositor).
+
+## `[library]`
+
+[Source](../moonshine-core/src/app_scanner/service.rs). Controls how the
+application list follows launcher changes while Pyroshine runs. Discovery never
+interrupts a stream: a game that is removed or hidden while it runs keeps
+running, and clients see the change in their app list.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests and library folders, the Lutris database, Heroic library files, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the desktop app. |
+| `poll_interval_secs` | integer, `300`; `30`–`86400` | Seconds between checks for changes that file notifications cannot report, such as network file systems, a drive that is mounted later or an exhausted inotify watch limit. A check compares file metadata only; a launcher is rescanned only when it changed. |
+
+A launcher location that cannot be read (an unmounted drive holding a Steam
+library, a file the launcher is rewriting) keeps its games offered from the last
+successful scan, for up to seven days, and is retried; the **Library** page
+shows the error and what to do about it.
+
+```toml
+[library]
+auto_refresh = true
+poll_interval_secs = 300
+```
 
 ## Diagnostics outside config.toml
 

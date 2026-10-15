@@ -64,6 +64,10 @@ enum Command {
 	},
 }
 
+/// Longest the server waits for the initial application scan before it
+/// starts serving clients.
+const INITIAL_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn default_config_path() -> PathBuf {
 	match std::env::var("XDG_CONFIG_HOME") {
 		Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("moonshine/config.toml"),
@@ -103,7 +107,7 @@ async fn main() -> Result<(), ()> {
 	}
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
-	let mut config = Config::load_or_create(&config_path)?;
+	let config = Config::load_or_create(&config_path)?;
 
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {
@@ -116,10 +120,14 @@ async fn main() -> Result<(), ()> {
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
-	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
-	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
-	config.applications.extend(scanned_applications);
-	app_scanner::resolve_missing_boxart(&mut config.applications);
+	// The library scans on its own thread while the host checks run, and
+	// keeps the catalog current afterwards (see `app_scanner::service`).
+	let library = app_scanner::Library::start(
+		config.applications.clone(),
+		config.application_scanners.clone(),
+		config.library.clone(),
+		app_scanner::service::LibraryPaths::standard(),
+	);
 
 	tracing::debug!("Waiting for D-Bus session bus...");
 	wait_for_dbus().await?;
@@ -204,7 +212,23 @@ async fn main() -> Result<(), ()> {
 		gpu_name,
 		health,
 	};
-	let moonshine = Moonshine::new(config, supported_codecs, hdr_supported, facts, shutdown.clone())?;
+	// Offer the complete catalog from the first `/applist`, but never let a
+	// hung file system hold up the server: past the deadline, the configured
+	// applications are offered and discovered ones follow when the scan ends.
+	if !library.ready(INITIAL_SCAN_DEADLINE).await {
+		tracing::warn!(
+			"The initial application scan is taking longer than {} s; discovered games appear when it finishes",
+			INITIAL_SCAN_DEADLINE.as_secs()
+		);
+	}
+	let moonshine = Moonshine::new(
+		config,
+		library,
+		supported_codecs,
+		hdr_supported,
+		facts,
+		shutdown.clone(),
+	)?;
 	tracing::info!("Pyroshine is ready and waiting for connections.");
 
 	shutdown.wait_shutdown_triggered().await;
@@ -267,6 +291,7 @@ impl Moonshine {
 	#[allow(clippy::result_unit_err)]
 	pub fn new(
 		config: Config,
+		library: app_scanner::Library,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		facts: ServerFacts,
@@ -289,6 +314,7 @@ impl Moonshine {
 		let management = ManagementService::spawn(
 			facts,
 			&config,
+			library.clone(),
 			session_manager.clone(),
 			client_manager.clone(),
 			shutdown.clone(),
@@ -313,7 +339,7 @@ impl Moonshine {
 				config.address.clone(),
 				config.stream.port,
 				config.webserver.clone(),
-				config.applications.clone(),
+				library,
 				supported_codecs,
 				hdr_supported,
 				client_manager.persistent_state().get_uuid()?.to_string(),

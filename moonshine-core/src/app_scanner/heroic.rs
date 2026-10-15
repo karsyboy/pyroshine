@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::watch::{Filter, WatchTarget};
+use super::{ArtworkOrigin, Discovered, SourceScan, Unit, UnitError, expand_path};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,45 +188,66 @@ struct HeroicInstalledGame {
 	is_dlc: bool,
 }
 
-pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
-	let config_dir = &config.config_dir;
-
-	let binding = config_dir.to_string_lossy();
-	let expanded = shellexpand::full(&binding)
-		.map_err(|e| tracing::warn!("Failed to expand Heroic configuration path {:?}: {e}", config_dir))?;
-
-	let config_dir = PathBuf::from(expanded.as_ref());
+/// Scan every Heroic library file, one unit per file.
+///
+/// A library file or installed-games manifest that does not parse (Heroic
+/// rewrites them in place) fails the units that depend on it, so their games
+/// are kept until a retry reads them again.
+pub(crate) fn scan(config: &HeroicApplicationScannerConfig) -> SourceScan {
+	let Some(config_dir) = expand_path(&config.config_dir) else {
+		return SourceScan::failed(UnitError::Unavailable(format!(
+			"Cannot expand the Heroic configuration path {}",
+			config.config_dir.display()
+		)));
+	};
 
 	if !config_dir.exists() {
-		tracing::warn!(
+		tracing::debug!(
 			"Heroic configuration directory not found at {:?}, no Heroic games will be scanned.",
 			config_dir
 		);
-		return Ok(Vec::new());
+		return SourceScan::default();
 	}
 
-	let mut applications = Vec::new();
+	let mut units = Vec::new();
 	let mut skipped = 0;
 	let mut dlc = 0;
+	let mut found = 0;
 
 	// Manifests are read once per store, the first time one of its games is seen.
-	let mut installed_manifests: HashMap<String, HashMap<String, bool>> = HashMap::new();
+	let mut installed_manifests: HashMap<String, Result<HashMap<String, bool>, UnitError>> = HashMap::new();
 
 	for library_path in find_libraries(&config_dir) {
+		let key = library_path
+			.strip_prefix(&config_dir)
+			.unwrap_or(&library_path)
+			.display()
+			.to_string();
 		let games = match read_library(&library_path) {
 			Ok(games) => games,
-			Err(()) => continue,
+			Err(error) => {
+				units.push(Unit::failed(key, error));
+				continue;
+			},
 		};
 
+		let mut applications = Vec::new();
+		let mut failure = None;
 		for game in games {
 			// Sideloaded entries have no runner of their own.
 			let runner = game.runner.as_deref().unwrap_or("sideload");
 
-			if !installed_manifests.contains_key(runner) {
-				let manifest = read_installed(&installed_manifest(&config_dir, runner));
-				installed_manifests.insert(runner.to_string(), manifest);
-			}
-			let installed_entry = installed_manifests[runner].get(&game.app_name).copied();
+			let manifest = installed_manifests
+				.entry(runner.to_string())
+				.or_insert_with(|| read_installed(&installed_manifest(&config_dir, runner)));
+			let manifest = match manifest {
+				Ok(manifest) => manifest,
+				Err(error) => {
+					failure = Some(error.clone());
+					break;
+				},
+			};
+			let installed_entry = manifest.get(&game.app_name).copied();
 
 			if !game.is_installed && installed_entry.is_none() {
 				skipped += 1;
@@ -243,7 +266,7 @@ pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) 
 			let boxart = find_boxart(&config_dir, &game);
 
 			let application = ApplicationConfig {
-				title: game.title,
+				title: game.title.clone(),
 				pre_command: config.pre_command.clone(),
 				post_command: config.post_command.clone(),
 				command: config
@@ -252,63 +275,110 @@ pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) 
 					.map(|cmd| cmd.replace("{app_name}", &game.app_name).replace("{runner}", runner))
 					.collect(),
 				output_scale: None,
-				boxart,
+				boxart: None,
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),
 				launch_timeout_secs: config.launch_timeout_secs,
 			};
 
-			applications.push(application);
+			applications.push(
+				Discovered::new(format!("{runner}/{}", game.app_name), application)
+					.with_artwork(boxart.into_iter().collect(), ArtworkOrigin::Launcher),
+			);
+		}
+		match failure {
+			Some(error) => units.push(Unit::failed(key, error)),
+			None => {
+				found += applications.len();
+				units.push(Unit::ok(key, applications));
+			},
 		}
 	}
 
 	tracing::debug!(
 		"Scanned {} Heroic games ({} not installed, {} DLC).",
-		applications.len(),
+		found,
 		skipped,
 		dlc
 	);
 
-	Ok(applications)
+	SourceScan { units, failure: None }
 }
 
-fn read_library(path: &Path) -> Result<Vec<HeroicGame>, ()> {
-	let contents =
-		std::fs::read_to_string(path).map_err(|e| tracing::warn!("Failed to read Heroic library {:?}: {e}", path))?;
+/// Library files, installed-games manifests and the directories holding
+/// them; the configuration directory itself catches stores Heroic adds.
+pub(crate) fn watch_targets(config: &HeroicApplicationScannerConfig) -> Vec<WatchTarget> {
+	let Some(config_dir) = expand_path(&config.config_dir) else {
+		return Vec::new();
+	};
+	let mut targets = vec![
+		WatchTarget::directory(config_dir.clone(), Filter::Store),
+		WatchTarget::directory(config_dir.join(STORE_CACHE_DIR), Filter::Suffix(LIBRARY_SUFFIX)),
+		WatchTarget::directory(config_dir.join("sideload_apps"), Filter::Names(&["library.json"])),
+	];
+	let mut stores: Vec<PathBuf> = std::fs::read_dir(&config_dir)
+		.map(|entries| {
+			entries
+				.flatten()
+				.filter(|entry| entry.file_name().to_string_lossy().ends_with("_store"))
+				.map(|entry| entry.path())
+				.collect()
+		})
+		.unwrap_or_default();
+	stores.sort();
+	targets.extend(
+		stores
+			.into_iter()
+			.map(|store| WatchTarget::directory(store, Filter::Names(&["installed.json"]))),
+	);
+	targets.push(WatchTarget::probe(config_dir.join("images-cache")));
+	targets.push(WatchTarget::probe(config_dir.join("icons")));
+	targets
+}
 
-	let library: HeroicLibrary = serde_json::from_str(&contents)
-		.map_err(|e| tracing::warn!("Failed to parse Heroic library {:?}: {e}", path))?;
+fn read_library(path: &Path) -> Result<Vec<HeroicGame>, UnitError> {
+	let contents = std::fs::read_to_string(path).map_err(|e| {
+		tracing::warn!("Failed to read Heroic library {:?}: {e}", path);
+		UnitError::io(path.display(), &e)
+	})?;
+
+	let library: HeroicLibrary = serde_json::from_str(&contents).map_err(|e| {
+		tracing::warn!("Failed to parse Heroic library {:?}: {e}", path);
+		UnitError::Corrupt(format!("Cannot parse {}: {e}", path.display()))
+	})?;
 
 	Ok(library.library)
 }
 
 /// Read a store's installed games, mapping each app name to whether it is DLC.
 ///
-/// A manifest that is missing or unreadable means nothing from that store is
-/// treated as installed, which is the same outcome as before it was consulted.
-fn read_installed(path: &Path) -> HashMap<String, bool> {
-	if !path.exists() {
-		tracing::debug!("Heroic installed games manifest {:?} not found, skipping.", path);
-		return HashMap::new();
-	}
-
-	let Ok(contents) = std::fs::read_to_string(path)
-		.map_err(|e| tracing::warn!("Failed to read Heroic installed games manifest {:?}: {e}", path))
-	else {
-		return HashMap::new();
+/// A missing manifest means the store records install state in its library
+/// cache instead (or nothing is installed from it). A manifest that exists
+/// but cannot be read or parsed is an error: treating it as empty would
+/// uninstall every game of that store from the catalog.
+fn read_installed(path: &Path) -> Result<HashMap<String, bool>, UnitError> {
+	let contents = match std::fs::read_to_string(path) {
+		Ok(contents) => contents,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			tracing::debug!("Heroic installed games manifest {:?} not found, skipping.", path);
+			return Ok(HashMap::new());
+		},
+		Err(error) => {
+			tracing::warn!("Failed to read Heroic installed games manifest {:?}: {error}", path);
+			return Err(UnitError::io(path.display(), &error));
+		},
 	};
 
-	let Ok(manifest) = serde_json::from_str::<HeroicInstalledManifest>(&contents)
-		.map_err(|e| tracing::warn!("Failed to parse Heroic installed games manifest {:?}: {e}", path))
-	else {
-		return HashMap::new();
-	};
+	let manifest = serde_json::from_str::<HeroicInstalledManifest>(&contents).map_err(|error| {
+		tracing::warn!("Failed to parse Heroic installed games manifest {:?}: {error}", path);
+		UnitError::Corrupt(format!("Cannot parse {}: {error}", path.display()))
+	})?;
 
-	manifest
+	Ok(manifest
 		.installed
 		.into_iter()
 		.filter_map(|game| Some((game.app_name?, game.is_dlc)))
-		.collect()
+		.collect())
 }
 
 /// Heroic requests Epic art through a resizing CDN and caches it under whichever
@@ -364,6 +434,55 @@ mod tests {
 	use tempfile::tempdir;
 
 	use super::*;
+
+	fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
+		Ok(scan(config).applications())
+	}
+
+	/// A library or manifest Heroic is rewriting fails only the units that
+	/// depend on it; the others still report their games.
+	#[test]
+	fn half_written_libraries_and_manifests_fail_their_units() {
+		let tempdir = tempdir().unwrap();
+		let config_dir = tempdir.path();
+		write_library(
+			config_dir,
+			"store_cache/legendary_library.json",
+			r#"{"library": [{"app_name": "epic-id", "title": "Epic Game", "runner": "legendary", "is_installed": true}]}"#,
+		);
+		write_library(
+			config_dir,
+			"store_cache/gog_library.json",
+			r#"{"games": [{"app_name": "1", "title": "GOG Game", "runner": "gog", "is_installed": false}]}"#,
+		);
+		write_library(
+			config_dir,
+			"gog_store/installed.json",
+			r#"{"installed": [{"appName": "1""#,
+		);
+		write_library(config_dir, "store_cache/nile_library.json", r#"{"library": ["#);
+
+		let result = scan(&scanner_config(config_dir.to_path_buf()));
+		let units: Vec<(&str, bool)> = result
+			.units
+			.iter()
+			.map(|unit| (unit.key.as_str(), unit.result.is_ok()))
+			.collect();
+		assert_eq!(
+			units,
+			vec![
+				("store_cache/gog_library.json", false),
+				("store_cache/legendary_library.json", true),
+				("store_cache/nile_library.json", false),
+			]
+		);
+		assert!(matches!(result.units[0].result, Err(UnitError::Corrupt(_))));
+		assert_eq!(result.applications().len(), 1);
+		assert_eq!(
+			result.units[1].result.as_ref().unwrap()[0].native_id,
+			"legendary/epic-id"
+		);
+	}
 
 	fn scanner_config(config_dir: PathBuf) -> HeroicApplicationScannerConfig {
 		HeroicApplicationScannerConfig {

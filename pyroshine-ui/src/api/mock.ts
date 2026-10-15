@@ -9,6 +9,8 @@ import type {
   ConfigDocument,
   ConfigValues,
   HealthReport,
+  LibraryApplication,
+  LibrarySnapshot,
   Overview,
   PairingSnapshot,
   ServerEvent,
@@ -333,6 +335,129 @@ if (session.phase === "streaming") {
   setInterval(() => emit("daemon://stats", stats()), 1000);
 }
 
+function discovered(source: string, label: string, scanner: number, nativeId: string, title: string, id: number): LibraryApplication {
+  return {
+    key: `${source}:${nativeId}`,
+    id,
+    title,
+    source,
+    source_label: label,
+    manual: false,
+    scanner,
+    native_id: nativeId,
+    state: "available",
+    offered: true,
+    state_detail: null,
+    can_hide: true,
+    artwork: source === "steam" ? "steam" : "launcher",
+    command: [source, nativeId],
+  };
+}
+
+// A large library, so the page can be checked for responsiveness.
+const steamGames: LibraryApplication[] = Array.from({ length: 1200 }, (_, index) =>
+  discovered("steam", "Steam", 0, String(1000 + index * 10), `Steam Game ${String(index + 1).padStart(4, "0")}`, 500_000 + index),
+);
+let library: LibrarySnapshot = {
+  generation: 7,
+  scanning: false,
+  auto_refresh: scenario !== "manual-refresh",
+  poll_interval_secs: 300,
+  last_refresh_ms: now - 42_000,
+  notice: null,
+  sources: [
+    {
+      scanner: 0,
+      kind: "steam",
+      label: "Steam",
+      root: "$HOME/.local/share/Steam",
+      status: "ok",
+      message: null,
+      hint: null,
+      applications: steamGames.length + 3,
+      stale_applications: 0,
+      last_scan_ms: now - 42_000,
+      duration_ms: 38,
+      watched: true,
+    },
+    {
+      scanner: 1,
+      kind: "heroic",
+      label: "Heroic",
+      root: "~/.config/heroic",
+      status: "partial",
+      message: "Cannot parse /home/player/.config/heroic/gog_store/installed.json: EOF while parsing a list at line 1 column 412",
+      hint: "The launcher may be updating its files; Pyroshine retries shortly and keeps offering the last known games.",
+      applications: 2,
+      stale_applications: 1,
+      last_scan_ms: now - 5_000,
+      duration_ms: 4,
+      watched: true,
+    },
+    {
+      scanner: 2,
+      kind: "desktop",
+      label: "Desktop entries",
+      root: "~/.local/share/applications",
+      status: "ok",
+      message: null,
+      hint: null,
+      applications: 2,
+      stale_applications: 0,
+      last_scan_ms: now - 42_000,
+      duration_ms: 12,
+      watched: false,
+    },
+  ],
+  applications: [
+    {
+      key: "manual:0",
+      id: 1_234_567,
+      title: "Steam",
+      source: "manual",
+      source_label: "Manual",
+      manual: true,
+      scanner: null,
+      native_id: null,
+      state: "available",
+      offered: true,
+      state_detail: null,
+      can_hide: false,
+      artwork: "icon_theme",
+      command: ["/usr/bin/steam", "steam://open/bigpicture"],
+    },
+    {
+      key: "manual:1",
+      id: 7_654_321,
+      title: "Cyberpunk 2077",
+      source: "manual",
+      source_label: "Manual",
+      manual: true,
+      scanner: null,
+      native_id: null,
+      state: "available",
+      offered: true,
+      state_detail: null,
+      can_hide: false,
+      artwork: "manual",
+      command: ["/usr/bin/steam", "-bigpicture", "steam://rungameid/1091500"],
+    },
+    { ...discovered("steam", "Steam", 0, "1091500", "Cyberpunk 2077", 0), state: "shadowed", offered: false, can_hide: false, state_detail: "Replaced by the manual application 'Cyberpunk 2077'." },
+    discovered("steam", "Steam", 0, "1145360", "Hades (Steam)", 81_243),
+    { ...discovered("steam", "Steam", 0, "620", "Portal 2", 92_331), state: "hidden", offered: false, state_detail: "Hidden from clients." },
+    ...steamGames,
+    discovered("heroic", "Heroic", 1, "legendary/Min", "Hades (Heroic)", 45_120),
+    { ...discovered("heroic", "Heroic", 1, "gog/1207658924", "Gwent", 66_001), state: "stale", state_detail: "Its library is not reachable; offered from the last successful scan." },
+    { ...discovered("desktop", "Desktop entries", 2, "Portal 2.desktop", "Portal 2", 0), state: "duplicate", offered: false, can_hide: false, artwork: "desktop_icon", state_detail: "A shortcut to 'Portal 2', which is offered instead." },
+    { ...discovered("desktop", "Desktop entries", 2, "org.prismlauncher.PrismLauncher.desktop", "Prism Launcher", 12_009), artwork: null },
+  ],
+};
+
+function emitLibrary() {
+  library = { ...library, generation: library.generation + 1 };
+  emit("daemon://library", library);
+}
+
 function fail(kind: string, message: string): never {
   throw { kind, message } satisfies UiError;
 }
@@ -407,6 +532,33 @@ export async function mockInvoke<T>(command: string, args: Record<string, unknow
       config = { ...config, values: args.values as ConfigValues, revision: `r${Date.now()}`, restart_required: true };
       emit("daemon://config-saved", { revision: config.revision, restart_required: true });
       return { revision: config.revision, changed_paths: [], restart_required: true } as T;
+    case "library":
+      if (scenario === "old-daemon") fail("incompatible", "Unknown method GetLibrary");
+      return library as T;
+    case "rescan_library":
+      library = { ...library, scanning: true };
+      emit("daemon://library", library);
+      setTimeout(() => {
+        library = { ...library, scanning: false, last_refresh_ms: Date.now(), sources: library.sources.map((s) => ({ ...s, last_scan_ms: Date.now() })) };
+        emitLibrary();
+      }, 1500);
+      return undefined as T;
+    case "set_application_hidden":
+      library = {
+        ...library,
+        applications: library.applications.map((a) =>
+          a.key === args.key
+            ? {
+                ...a,
+                state: args.hidden ? "hidden" : "available",
+                offered: !args.hidden,
+                state_detail: args.hidden ? "Hidden from clients." : null,
+              }
+            : a,
+        ),
+      };
+      emitLibrary();
+      return undefined as T;
     case "events":
       return events as T;
     case "run_health_check":

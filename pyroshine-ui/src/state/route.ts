@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { on } from "../api/bridge";
 
-export type Page = "dashboard" | "clients" | "settings" | "diagnostics";
-const pages: Page[] = ["dashboard", "clients", "settings", "diagnostics"];
+export type Page = "dashboard" | "clients" | "library" | "settings" | "diagnostics";
+const pages: Page[] = ["dashboard", "clients", "library", "settings", "diagnostics"];
 
 export interface Route {
   page: Page;

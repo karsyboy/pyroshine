@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub use crate::app_scanner::ApplicationScannerConfig;
+pub use crate::app_scanner::LibraryConfig;
 pub use crate::app_scanner::lutris::LutrisApplicationScannerConfig;
 pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
 pub use crate::session::application::ApplicationConfig;
@@ -35,6 +36,9 @@ pub struct Config {
 	#[serde(rename = "application_scanner")]
 	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
+
+	/// How the application catalog follows launcher changes.
+	pub library: LibraryConfig,
 
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
@@ -127,6 +131,15 @@ impl Config {
 				}
 			}
 		}
+		let poll = crate::app_scanner::service::POLL_INTERVAL_SECS;
+		if !poll.contains(&self.library.poll_interval_secs) {
+			return Err(format!(
+				"library.poll_interval_secs must be between {} and {} seconds, not {}",
+				poll.start(),
+				poll.end(),
+				self.library.poll_interval_secs
+			));
+		}
 		if !STREAM_TIMEOUT_SECS.contains(&self.stream.timeout) {
 			return Err(format!(
 				"stream.timeout must be between {} and {} seconds, not {}",
@@ -187,6 +200,7 @@ impl Default for Config {
 				stderr: None,
 				launch_timeout_secs: 2,
 			})],
+			library: LibraryConfig::default(),
 			compositor: CompositorConfig::default(),
 			inhibit_sleep: true,
 		}
@@ -212,6 +226,8 @@ mod tests {
 			("[stream]\ntimeout = 0", "stream.timeout"),
 			("[stream]\ntimeout = 86401", "stream.timeout"),
 			("[stream]\ntimeout = 9223372036854775807", "stream.timeout"),
+			("[library]\npoll_interval_secs = 0", "library.poll_interval_secs"),
+			("[library]\npoll_interval_secs = 86401", "library.poll_interval_secs"),
 			("[stream]\nport = 0", "stream.port"),
 			("[stream.video]\nport = 0", "stream.video.port"),
 			("[stream.audio]\nport = 0", "stream.audio.port"),

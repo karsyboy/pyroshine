@@ -464,7 +464,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		section(
 			"scanners",
 			"Application discovery",
-			"Scanners that add installed games when Pyroshine starts.",
+			"Scanners that find installed games and keep the application list current.",
 		),
 		section("diagnostics", "Diagnostics", "Logging for performance investigation."),
 	];
@@ -778,7 +778,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			APPLICATIONS,
 			"applications",
 			"Applications",
-			"Static applications. Discovered applications are added to this list when Pyroshine starts.",
+			"Applications you define. Discovered games are listed with them; a discovered game with the same title as one of these is replaced by it.",
 			FieldKind::Applications {
 				item: application_fields(),
 			},
@@ -787,11 +787,30 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			SCANNERS,
 			"scanners",
 			"Scanners",
-			"Scanners run at startup; restart Pyroshine after installing games.",
+			"Launchers whose installed games are offered to clients. Adding or editing a scanner takes effect after a restart; installed and removed games do not need one.",
 			FieldKind::Scanners {
 				variants: scanner_variants(),
 			},
 		),
+		Field::new(
+			"library.auto_refresh",
+			"scanners",
+			"Follow installs automatically",
+			"Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan in the Library page.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"library.poll_interval_secs",
+			"scanners",
+			"Periodic check",
+			"Seconds between checks for changes that file notifications miss (network drives, libraries that appear later). Only metadata is compared; a launcher is scanned again only if it changed.",
+			integer(
+				*crate::app_scanner::service::POLL_INTERVAL_SECS.start() as f64,
+				*crate::app_scanner::service::POLL_INTERVAL_SECS.end() as f64,
+				Some("s"),
+			),
+		)
+		.advanced(),
 		Field::new(
 			"stream.video.log_stats",
 			"diagnostics",

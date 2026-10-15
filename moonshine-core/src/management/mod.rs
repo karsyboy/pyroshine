@@ -22,6 +22,7 @@ mod dbus;
 #[cfg(test)]
 mod dbus_tests;
 mod findings;
+mod library;
 pub(crate) mod schema;
 pub(crate) mod telemetry;
 
@@ -47,6 +48,7 @@ use self::config_store::ConfigStore;
 use self::dbus::ManagementInterface;
 use self::telemetry::unix_millis;
 use crate::ShutdownReason;
+use crate::app_scanner::Library;
 use crate::clients::{ClientManager, PairingEvent};
 use crate::config::Config;
 use crate::gpu_sensors::{self, GpuSampler};
@@ -77,6 +79,7 @@ const STATS_HISTORY: usize = 120;
 /// Shared state behind the D-Bus interface and the event tasks.
 pub(crate) struct Management {
 	sessions: SessionManager,
+	library: Library,
 	clients: ClientManager,
 	config: ConfigStore,
 	/// `health` is replaced by `RunHealthCheck`; the rest is fixed at startup.
@@ -124,11 +127,12 @@ impl ManagementService {
 	pub fn spawn(
 		facts: ServerFacts,
 		config: &Config,
+		library: Library,
 		sessions: SessionManager,
 		clients: ClientManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Self {
-		let management = Arc::new(Management::new(facts, config, sessions, clients));
+		let management = Arc::new(Management::new(facts, config, library, sessions, clients));
 		let task = tokio::spawn(async move {
 			let _ = shutdown.wrap_cancel(serve(management, management_bus())).await;
 		});
@@ -151,7 +155,13 @@ fn management_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
 }
 
 impl Management {
-	fn new(facts: ServerFacts, config: &Config, sessions: SessionManager, clients: ClientManager) -> Self {
+	fn new(
+		facts: ServerFacts,
+		config: &Config,
+		library: Library,
+		sessions: SessionManager,
+		clients: ClientManager,
+	) -> Self {
 		Self {
 			server: Mutex::new(server_info(&facts, config)),
 			running_config: config.clone(),
@@ -170,6 +180,7 @@ impl Management {
 			stats: watch::channel(None).0,
 			stats_history: Mutex::new(VecDeque::with_capacity(STATS_HISTORY)),
 			runtime: tokio::runtime::Handle::current(),
+			library,
 			sessions,
 			clients,
 		}
@@ -334,8 +345,9 @@ async fn serve(management: Arc<Management>, bus: zbus::Result<zbus::connection::
 		follow_ui(&connection, &management, ui_tx),
 		follow_sessions(&management, &emitter),
 		follow_pairing(&management, &emitter),
-		follow_stats(&management, &emitter, ui_rx),
+		follow_stats(&management, &emitter, ui_rx.clone()),
 		follow_problems(&management, &emitter),
+		library::follow_library(&management, &emitter, ui_rx),
 	);
 }
 

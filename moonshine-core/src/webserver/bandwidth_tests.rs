@@ -115,7 +115,7 @@ async fn authenticated_probe_discovery_exact_payload_and_admission() {
 			private_key: host_key.clone(),
 			..Default::default()
 		},
-		applications: vec![],
+		library: crate::app_scanner::Library::fixed(&[]),
 		unique_id: "test".into(),
 		client_manager,
 		session_manager,

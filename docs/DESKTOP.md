@@ -1,6 +1,6 @@
 # Desktop app
 
-The optional app handles pairing, clients, settings and stream status.
+The optional app handles pairing, clients, the game library, settings and stream status.
 [Install and start the server](../README.md#quick-start) first. The app cannot
 start, stop or restart it; closing the app leaves streaming running.
 
@@ -47,11 +47,42 @@ last-connection times cover the current server run.
 For certificate details and terminal revocation, see
 [Security administration](SECURITY_ADMINISTRATION.md#revoke-a-client).
 
+## Library
+
+**Library** lists every application clients can be offered: the manual entries
+from **Settings** and the games Pyroshine discovered through its scanners
+(Steam, Lutris, Heroic and desktop entries). Installed, removed and renamed
+games appear here, and in clients' app lists, within seconds without a restart;
+an active stream is never interrupted, even when its game is removed or hidden.
+
+- **Search** matches titles, launchers, launcher IDs (a Steam app ID) and the
+  ID clients use. Filter by source, or show only offered, hidden or not offered
+  entries. Large libraries are shown a page at a time.
+- The **switch** next to a discovered game shows or hides it from clients. The
+  choice is kept across restarts, rescans and upgrades, and a hidden game keeps
+  its ID, so clients treat it as the same game when it is shown again.
+- **Manual** entries are edited in **Settings**. A discovered game with the same
+  title as a manual entry is listed as *replaced*; the manual entry is offered.
+- **Duplicate** marks a desktop shortcut to a game another scanner already
+  offers, or the same game found twice.
+- **Rescan** reads every launcher again, for example after changing files the
+  watchers cannot see.
+
+Each launcher has a status card: how many games it provides, when it was last
+scanned and how long that took, and whether changes are noticed immediately
+(**Watching**) or by the periodic check. If a library cannot be read, for
+example a Steam library on a drive that is not mounted, the card says why and
+what to do, and its games stay offered from the last successful scan (marked
+*Offline library*) until the drive is back. Automatic updates can be turned
+off in **Settings → Application discovery** (see [`[library]`](CONFIGURATION.md#library)).
+
 ## Settings
 
 **Settings** edits applications, scanners and server options; **Show advanced**
 reveals less common fields. Fresh native/portable configurations already include
-Steam and library scanning. See the [configuration reference](CONFIGURATION.md).
+Steam and library scanning. Installing or removing games needs no settings
+change or restart (see [Library](#library)). See the
+[configuration reference](CONFIGURATION.md).
 
 Saving validates the whole file and preserves unedited settings/comments.
 Invalid values or external file changes prevent saving. Apply saved changes by

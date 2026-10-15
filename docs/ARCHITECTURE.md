@@ -67,8 +67,9 @@ flowchart LR
 
 | Component | Responsibility | Does not own |
 | --- | --- | --- |
-| `src/main.rs` | Load config, scan applications, wait for the user D-Bus session, run host checks, construct services, handle SIGTERM/SIGINT | Session state |
-| `config.rs`, `app_scanner/` | Deserialize `config.toml`; discover Steam, Lutris, Heroic and desktop-entry applications at startup | Runtime reconfiguration |
+| `src/main.rs` | Load config, start the application library, wait for the user D-Bus session, run host checks, construct services, handle SIGTERM/SIGINT | Session state |
+| `config.rs` | Deserialize `config.toml` | Runtime reconfiguration |
+| `app_scanner/` | The application catalog: discover Steam, Lutris, Heroic and desktop-entry applications, follow their changes, keep stable IDs and visibility choices, render box art | Sessions (a launch copies its entry) |
 | `healthcheck.rs`, `gpu.rs` | Probe GPU, Vulkan, DMA-BUF and encoder profiles; verify the capture and encode devices are the same GPU | Encoding |
 | `discovery.rs` | Advertise `_nvstream._tcp` over mDNS | — |
 | `tls.rs`, `clients.rs`, `state.rs`, `durable.rs` | Server identity, paired-client trust, durable `state.toml` | Session authorization |
@@ -112,14 +113,18 @@ runs on dedicated threads that communicate through bounded channels:
 | Control task | ENet service loop, message decoding, input routing, feedback |
 | `gamepad-input` thread | Inputtino virtual controller state and native feedback callbacks |
 | Manager-owned tasks | Session transitions and teardown |
+| `library` thread | Application discovery, change detection and catalog publication, at nice 10 and idle I/O priority |
 
 Every session worker registers a `lifecycle::WorkerGuard` before it is spawned,
 so session completion means every worker has exited and released what it owns.
 
 ## Startup and capability advertisement
 
-`src/main.rs` loads or creates the configuration, scans applications, waits for
-the user D-Bus session, then runs the health check. `pyroshine healthcheck`
+`src/main.rs` loads or creates the configuration, starts the application
+library (its initial scan runs on the `library` thread while the host checks
+run), waits for the user D-Bus session, then runs the health check. Listeners
+start once the initial catalog is published, or after 30 s with the manual
+entries if a scan hangs. `pyroshine healthcheck`
 runs the same checks and exits. `--no-health-check` skips the report but still
 probes GPU capabilities, and the server refuses to start without DMA-BUF import.
 
@@ -547,6 +552,8 @@ Input routing on the host is separate from virtual-device delivery. See
 | Server configuration | `config.toml` (`$XDG_CONFIG_HOME/moonshine/` by default), read once at startup | `config.rs` and the owning subsystem's config type |
 | TLS identity | `cert.pem`, `key.pem` (default `~/.config/moonshine/`) | `tls.rs` |
 | Server UUID and paired-client trust | `state.toml` in the data directory (default `~/.local/share/moonshine/`) | `state.rs`, `clients.rs`; atomic replacement through `durable.rs` |
+| Application IDs and visibility choices | `library.toml` beside `state.toml` | `app_scanner/identity.rs`; atomic replacement through `durable.rs` |
+| Last successful scan results, rendered box art | `library-cache.json` and `boxart/` in `$XDG_CACHE_HOME/moonshine/` (regenerable) | `app_scanner/service.rs`, `app_scanner/artwork.rs` |
 | Negotiated stream properties | RTSP ANNOUNCE, per stream epoch | `rtsp.rs`, session manager |
 | Diagnostic switches | `MOONSHINE_*` environment variables | Individual subsystems |
 
@@ -565,6 +572,71 @@ Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
 request-header and RTSP-framing deadlines. Pairing trust changes are serialized,
 written atomically and synced before they take effect; revocation drains
 in-flight launch/resume/cancel requests and stops the active session.
+
+## Application catalog
+
+`app_scanner/` owns what clients are offered. The `library` thread runs every
+scanner, follows their metadata and publishes immutable `CatalogSnapshot`s
+through a `watch` channel; `/applist`, `/appasset` and `/launch` clone the
+snapshot current when the request starts, and `/launch` copies the chosen
+entry's `ApplicationConfig` into the `SessionContext`. The catalog is therefore
+never consulted by a running session: a refresh cannot stop, restart or
+reconfigure it, and `/serverinfo` keeps reporting the launched ID. The worker
+never takes session-manager locks.
+
+```text
+launcher metadata ──inotify / periodic fingerprint──► library thread
+  (manifests, pga.db,                                  scan changed sources (units)
+   library JSON, .desktop)                             reconcile + identities + visibility
+                                                       ──watch──► CatalogSnapshot (Arc)
+                                                                   ├─ webserver: applist, appasset, launch
+                                                                   └─ management: GetLibrary, LibraryChanged
+```
+
+**Units and failures.** A scanner reports results per unit (a Steam library
+folder, a Heroic library file, a desktop-entry directory, the Lutris database).
+A unit that cannot be read keeps its previous entries, marked stale, for up to
+seven days; a source that cannot list its units keeps all of them; a single
+unreadable Steam manifest keeps that game. Units are dropped only when the
+launcher stops listing them. Results are retained across restarts in the cache
+directory and reused only under an identical scanner configuration.
+
+**Change detection.** Each scanner names directories and the file names that
+matter in them. They are watched with inotify, non-recursively; unrelated
+activity (downloads, shader caches, API caches) never wakes the worker. A burst
+of changes is scanned once it is quiet for 2 s (at most 10 s after it starts),
+no sooner than 15 s after the source's previous scan, and only that source is
+scanned. Watches are re-armed after every scan, which follows replaced,
+unmounted and newly created directories; a queue overflow marks every source
+changed. Every `[library].poll_interval_secs`, a stat-only fingerprint of each
+source's metadata is compared, covering what inotify cannot report. Units that
+failed to parse are retried after 2, 5, 15, 30 and 60 s. `RescanLibrary` scans
+everything at once.
+
+**Identity.** Manual entries keep the ID earlier releases derived from the title
+(SipHash-1-3 of the title, implemented in `identity.rs` so a toolchain update
+cannot renumber them). Discovered entries are keyed by launcher identity
+(`steam:620`, `heroic:legendary/Fortnite`, `lutris:<slug>`, desktop file ID); a
+new key takes the title-derived ID when it is free, so the first run after an
+upgrade reports the IDs clients already know, and a collision gets a
+SHA-256-derived ID instead. The assignment is recorded in `library.toml`, so
+renames, reinstalls, reordering and restarts keep it. An ID of a removed game is
+not reused for another title; at most 10,000 records are kept, removed visible
+entries first. A file written by a newer version is used but never rewritten; a
+corrupt one is moved aside.
+
+**Reconciliation** (`catalog.rs`): manual entries first; a discovered entry
+with a manual entry's title is shadowed by it; a launcher shortcut to an entry
+another scanner provides, or the same identity found twice, is a duplicate;
+hidden entries keep their ID but are not offered; equal titles from different
+launchers get the launcher's name appended.
+
+**Box art.** Entries carry ordered candidates (launcher art, then icons, then a
+theme icon named like the title). `/appasset` renders the first one that
+decodes on a blocking thread, at most two at a time, letterboxed to Moonlight's
+tile, and caches the PNG keyed by the source's path, size, mtime and inode
+(128 MiB / 2,048 files, least recently used first). Undecodable sources are
+skipped until they change. Nothing is fetched from the network.
 
 ## Desktop management interface
 
@@ -602,6 +674,7 @@ implementation:
 | Name a client | Optional, display-only metadata in `state.toml`, written through the state transaction |
 | Configuration | `config_store` (below) |
 | Run health check | `healthcheck::recheck_in_server` (below), serialized; published with `HealthChanged` |
+| Library, rescan, show/hide | `app_scanner::Library` (see [Application catalog](#application-catalog)); `LibraryChanged` is sent, coalesced, while the desktop app runs |
 
 **Access.** The session bus admits only the user running the service; every
 method additionally checks the caller's Unix user. The interface is not
@@ -793,6 +866,9 @@ Changes must preserve these properties unless a task explicitly redesigns them:
 - The management interface observes and calls the owning components; it never
   holds session, pairing or trust state of its own, and nothing on a media path
   waits for it. The server runs unchanged without it or without a desktop UI.
+- Catalog refreshes never reach a session: launches copy their entry, request
+  handlers read one immutable snapshot, and the library worker takes no
+  session locks. Application IDs, once offered, do not change.
 
 ## Where to go next
 

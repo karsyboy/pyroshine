@@ -638,6 +638,84 @@ pub struct GpuDevice {
 	pub capture: bool,
 }
 
+/// The application catalog, sent by `GetLibrary` and `LibraryChanged`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibrarySnapshot {
+	/// Increments whenever the applications offered to clients change.
+	pub generation: u64,
+	/// A scan is running.
+	pub scanning: bool,
+	/// Launcher changes update the catalog automatically (`[library]`).
+	pub auto_refresh: bool,
+	pub poll_interval_secs: u64,
+	/// When the catalog was last reconciled.
+	pub last_refresh_ms: Option<u64>,
+	/// A problem not tied to one source, for example that visibility choices
+	/// cannot be saved.
+	pub notice: Option<String>,
+	pub sources: Vec<LibrarySource>,
+	/// Manual entries first, then discovered ones, in catalog order.
+	/// Includes entries clients are not offered (hidden, replaced, duplicate).
+	pub applications: Vec<LibraryApplication>,
+}
+
+/// One `[[application_scanner]]` and how its last scan went.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibrarySource {
+	/// Position among the configured scanners.
+	pub scanner: u32,
+	/// `steam`, `lutris`, `heroic` or `desktop`.
+	pub kind: String,
+	pub label: String,
+	/// The configured location it reads.
+	pub root: String,
+	/// `pending`, `ok`, `partial` (some locations failed) or `failed`.
+	pub status: String,
+	pub message: Option<String>,
+	pub hint: Option<String>,
+	pub applications: u32,
+	/// Applications offered from an earlier scan because their location is
+	/// currently unreadable.
+	pub stale_applications: u32,
+	pub last_scan_ms: Option<u64>,
+	pub duration_ms: Option<u64>,
+	/// Changes are noticed immediately (file notifications); otherwise by
+	/// the periodic check only.
+	pub watched: bool,
+}
+
+/// One catalog entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryApplication {
+	/// Stable identity: `manual:<index>` or `<launcher>:<native id>`
+	/// (`steam:620`). Pass it to `SetApplicationHidden`.
+	pub key: String,
+	/// Moonlight application ID; 0 for entries never offered.
+	pub id: i32,
+	/// Title as clients see it.
+	pub title: String,
+	/// `manual`, `steam`, `lutris`, `heroic` or `desktop`.
+	pub source: String,
+	pub source_label: String,
+	pub manual: bool,
+	/// Index of the scanner that found it.
+	pub scanner: Option<u32>,
+	/// Launcher-native identity (Steam app ID, Lutris slug, ...).
+	pub native_id: Option<String>,
+	/// `available`, `stale`, `hidden`, `shadowed` or `duplicate`.
+	pub state: String,
+	/// Clients see it in their app list.
+	pub offered: bool,
+	/// Why it is not offered, or why it is stale.
+	pub state_detail: Option<String>,
+	/// `SetApplicationHidden` applies to it.
+	pub can_hide: bool,
+	/// Where its box art comes from (`steam`, `steam_custom`, `launcher`,
+	/// `desktop_icon`, `manual`, `icon_theme`); `None` without box art.
+	pub artwork: Option<String>,
+	pub command: Vec<String>,
+}
+
 /// Editable configuration settings, sent by `GetConfigSchema`. The daemon
 /// builds it next to the typed configuration it describes, and a test
 /// requires it to cover every setting.

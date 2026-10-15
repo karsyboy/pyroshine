@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -17,7 +15,7 @@ pub fn default_launch_timeout() -> u64 {
 }
 
 /// Configuration for a single application that can be launched in a session.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
@@ -67,15 +65,6 @@ impl Default for ApplicationConfig {
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
 		}
-	}
-}
-
-impl ApplicationConfig {
-	pub fn id(&self) -> i32 {
-		let mut hasher = DefaultHasher::new();
-		self.title.hash(&mut hasher);
-		// Clients only accept non-negative application IDs.
-		(hasher.finish() as i32) & i32::MAX
 	}
 }
 

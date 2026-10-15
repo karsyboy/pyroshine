@@ -14,6 +14,25 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- Keep the game library current without restarting. Pyroshine now watches the metadata of every configured scanner (Steam manifests and library folders, the Lutris database, Heroic library files and installed-games manifests, desktop-entry directories) and rescans only the launcher that changed, a few seconds after the change; installed, removed and renamed games reach clients through their normal app-list refresh. Changes file notifications cannot report (network drives, a drive mounted later) are found by a periodic metadata check, `[library].poll_interval_secs` (300 s); `[library].auto_refresh = false` restores startup-only scanning. Scanning runs on its own low-priority thread and never touches a running session: a game that is removed or hidden while it streams keeps running. See [`[library]`](CONFIGURATION.md#library).
+- Add the **Library** page to the desktop app: search the catalog by title, launcher or ID; filter by source and visibility; hide or show discovered games; rescan; and see each launcher's status, scan time and errors with what to do about them. Manual and discovered applications are marked apart. The management interface gains `GetLibrary`, `RescanLibrary`, `SetApplicationHidden` and the `LibraryChanged` signal.
+- Add `moonshine-library` (in `moonshine-tools`), which scans a configuration's launchers with isolated state and reports what it finds, how long each launcher took and the memory and watches used, and with `--follow` prints games as they are installed, removed or renamed.
+
+### Changed
+
+- Keep application IDs stable. Discovered games keep the ID clients know across renames, reinstalls, rescans and restarts (recorded with visibility choices in `library.toml` beside `state.toml`); the first start after upgrading reports the same IDs as before. Manual entries keep their title-derived IDs.
+- Keep offering games whose library cannot be read. A Steam library on an unmounted drive, or a launcher file that is half-written, no longer drops its games: they stay offered from the last successful scan (also across restarts) for up to seven days, marked in the Library page, and the scan is retried.
+- Offer each game once. A desktop shortcut to a Steam, Lutris or Heroic game that a scanner already provides, or the same game found by two scanners, is no longer listed twice; a manual `[[application]]` with a discovered game's title replaces it (to override its command or box art); equal titles from different launchers are told apart, for example `Hades (Steam)` and `Hades (Heroic)`.
+- Use more local box art: art set in Steam, Steam's cached capsule and header art and shortcut icons, and Lutris banners and icons. An image that cannot be decoded falls back to the next one instead of leaving the game without art. Box art is rendered on blocking threads and cached (at most 128 MiB) instead of being decoded on the network threads for every request.
+- Scan faster at startup. The initial scan runs while the host checks run, and icon lookups no longer walk symlinked theme directories or theme contexts that hold no application icons. With Steam (52 games) and desktop-entry (138 entries) scanners, a scan on a CachyOS/KDE host fell from 1.2–1.7 s to under 40 ms of CPU, with the same box art for every entry; a 2,000-game Steam library scans in about 40 ms.
+
+### Fixed
+
+- Make every application launchable. Two applications with the same title shared one ID, so Moonlight launched the first one for both; they now have distinct IDs.
+- Honor desktop-entry overrides. As in the XDG menu specification, an entry in an earlier directory replaces, or with `Hidden=true` hides, the entry with the same desktop file ID in a later one, instead of both being listed.
+
 ## [v0.18.0-alpha.0] - 2026-10-15
 
 ### Added

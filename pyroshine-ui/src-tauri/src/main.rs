@@ -53,7 +53,7 @@ fn parse_args() -> Options {
 			},
 			"--help" | "-h" => {
 				println!(
-					"Usage: pyroshine-ui [--background] [--page dashboard|clients|settings|diagnostics]\n\n\
+					"Usage: pyroshine-ui [--background] [--page dashboard|clients|library|settings|diagnostics]\n\n\
 					 Desktop app for a running Pyroshine server. --background starts in the system tray."
 				);
 				std::process::exit(0);
@@ -100,6 +100,9 @@ fn main() {
 			commands::load_config,
 			commands::validate_config,
 			commands::save_config,
+			commands::library,
+			commands::rescan_library,
+			commands::set_application_hidden,
 			commands::events,
 			commands::run_health_check,
 			commands::diagnostic_report,

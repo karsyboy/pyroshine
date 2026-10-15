@@ -21,6 +21,7 @@ export function Unavailable({ page }: { page: Page }) {
   const titles: Record<Page, string> = {
     dashboard: "Dashboard",
     clients: "Clients",
+    library: "Library",
     settings: "Settings",
     diagnostics: "Diagnostics",
   };

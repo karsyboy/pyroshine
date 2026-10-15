@@ -7,6 +7,10 @@ edition = "2024"
 name = "moonshine-bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "moonshine-library"
+path = "src/bin/library.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 moonshine-core = { path = "../moonshine-core" }

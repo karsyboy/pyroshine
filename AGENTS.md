@@ -46,7 +46,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | --- | --- |
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown; `pair.rs` and `diag.rs` subcommands |
 | `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
-| `app_scanner/` | Steam, Lutris, Heroic and desktop-entry discovery |
+| `app_scanner/` | Application catalog: Steam, Lutris, Heroic and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
 | `webserver/` (`mod.rs`, `pairing.rs`, `bandwidth.rs`) | GameStream HTTP/HTTPS API, operator pairing, PyroWave bandwidth probe |
 | `rtsp.rs`, `ingress.rs`, `discovery.rs` | RTSP negotiation; bounded connection supervision; mDNS |
@@ -66,7 +66,8 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 
 Other workspace and integration areas:
 
-- `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark.
+- `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark and
+  `moonshine-library` (scan launchers with isolated state, report timing and follow changes).
 - `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
   error names, proxies) shared by the daemon and the desktop app.
 - `pyroshine-ui/`: optional desktop app (Tauri 2, React/Material UI, `ksni` tray) in a

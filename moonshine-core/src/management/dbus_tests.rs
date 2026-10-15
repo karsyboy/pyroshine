@@ -131,7 +131,13 @@ impl Harness {
 			gpu_name: "Test GPU".into(),
 			health: None,
 		};
-		let management = Arc::new(Management::new(facts, &config, sessions.clone(), clients.clone()));
+		let management = Arc::new(Management::new(
+			facts,
+			&config,
+			crate::app_scanner::Library::fixed(&config.applications),
+			sessions.clone(),
+			clients.clone(),
+		));
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
 		let server = tokio::spawn(serve(management, builder));
 		let connection = bus.connect().await;

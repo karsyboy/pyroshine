@@ -88,6 +88,25 @@ pub async fn save_config(daemon: State<'_, Arc<Daemon>>, values: Value, revision
 	)
 }
 
+/// The application catalog and scanner status ([`moonshine_management::dto::LibrarySnapshot`]).
+/// A daemon without a library reports the error kind `incompatible`.
+#[tauri::command]
+pub async fn library(daemon: State<'_, Arc<Daemon>>) -> Result<Value> {
+	parse(&daemon.proxy().await?.get_library().await?)
+}
+
+/// Queue a scan of every source; progress arrives as `daemon://library`.
+#[tauri::command]
+pub async fn rescan_library(daemon: State<'_, Arc<Daemon>>) -> Result<()> {
+	Ok(daemon.proxy().await?.rescan_library().await?)
+}
+
+/// Hide a discovered application from clients, or show it again.
+#[tauri::command]
+pub async fn set_application_hidden(daemon: State<'_, Arc<Daemon>>, key: String, hidden: bool) -> Result<()> {
+	Ok(daemon.proxy().await?.set_application_hidden(&key, hidden).await?)
+}
+
 /// Recent events (oldest first). Empty from a daemon that does not keep them.
 #[tauri::command]
 pub async fn events(daemon: State<'_, Arc<Daemon>>) -> Result<Value> {

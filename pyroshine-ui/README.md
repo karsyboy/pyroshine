@@ -1,8 +1,8 @@
 # Pyroshine desktop app
 
 Optional desktop companion for a running Pyroshine server: system tray, pairing
-notifications and approval, paired-client management, a configuration editor,
-a stream dashboard and diagnostics. User documentation is in
+notifications and approval, paired-client management, the game library, a
+configuration editor, a stream dashboard and diagnostics. User documentation is in
 [Desktop app](../docs/DESKTOP.md); the design is described in
 [Architecture](../docs/ARCHITECTURE.md#desktop-management-interface).
 
@@ -79,8 +79,8 @@ Icons derive from `assets/logo-no-text.png`; regenerate them with
 ## Acceptance checks
 
 Automated tests cover the management interface over a private bus, the
-session-phase derivation, pairing token binding, configuration editing and the
-frontend's draft logic. These checks need a desktop, a GPU and a Moonlight
+session-phase derivation, pairing token binding, configuration editing, the
+frontend's draft logic and the library page's filtering and states. These checks need a desktop, a GPU and a Moonlight
 client; record the desktop environment, session type and client used.
 
 1. **Tray.** With the service running, log in to the desktop: the tray icon
@@ -112,6 +112,13 @@ client; record the desktop environment, session type and client used.
    runs: each brings the Pyroshine window to the front with focus instead of
    only highlighting it in the taskbar. `WAYLAND_DEBUG=client pyroshine-ui`
    shows `xdg_activation_v1.activate` with the compositor's token.
-7. **Isolation.** During a stream, `kill -9` the app: the stream continues.
+7. **Library.** With a Steam scanner configured, open **Library**: Steam games
+   are listed with their status card. Install or uninstall a small game in
+   Steam: within about 15 seconds it appears in or leaves the list and the
+   client's app list (refresh the client's host view). Hide a game: it leaves
+   the client's list; restart the service: it stays hidden, with the same ID
+   when shown again. During a stream, uninstall or hide the streamed game: the
+   stream continues. **Rescan** shows progress and the scan time.
+8. **Isolation.** During a stream, `kill -9` the app: the stream continues.
    Start the app again: it shows the live session. Restart the service with the
    app open: it reports Pyroshine as unavailable, then reconnects.

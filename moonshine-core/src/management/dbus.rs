@@ -349,6 +349,39 @@ impl ManagementInterface {
 		Ok(bundle)
 	}
 
+	async fn get_library(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<String, ManagementError> {
+		authorize(connection, &header).await?;
+		Ok(json(&self.management.library_snapshot()))
+	}
+
+	/// Queue a scan of every source; `LibraryChanged` follows its progress.
+	async fn rescan_library(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<(), ManagementError> {
+		authorize(connection, &header).await?;
+		Ok(self.management.library.rescan()?)
+	}
+
+	async fn set_application_hidden(
+		&self,
+		key: &str,
+		hidden: bool,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<(), ManagementError> {
+		authorize(connection, &header).await?;
+		if key.is_empty() || key.len() > 1024 {
+			return Err(ManagementError::Invalid("An application key is required.".into()));
+		}
+		Ok(self.management.library.set_hidden(key, hidden).await?)
+	}
+
 	#[zbus(signal)]
 	pub(super) async fn session_changed(emitter: &SignalEmitter<'_>, snapshot: &str) -> zbus::Result<()>;
 	#[zbus(signal)]
@@ -367,4 +400,6 @@ impl ManagementInterface {
 	pub(super) async fn server_event(emitter: &SignalEmitter<'_>, event: &str) -> zbus::Result<()>;
 	#[zbus(signal)]
 	pub(super) async fn health_changed(emitter: &SignalEmitter<'_>, report: &str) -> zbus::Result<()>;
+	#[zbus(signal)]
+	pub(super) async fn library_changed(emitter: &SignalEmitter<'_>, snapshot: &str) -> zbus::Result<()>;
 }
