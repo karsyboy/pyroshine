@@ -177,8 +177,10 @@ pub struct ClientManager {
 	events: broadcast::Sender<PairingEvent>,
 	/// Last authenticated request per paired certificate; memory only.
 	last_seen: Arc<Mutex<HashMap<String, (SystemTime, IpAddr)>>>,
-	/// The desktop UI is running and notifies the operator itself.
+	/// The desktop tray is running and notifies the operator itself.
 	operator_ui: Arc<AtomicBool>,
+	/// Where the operator approves pairing: the web interface's pairing page.
+	operator_page: Arc<Mutex<Option<String>>>,
 }
 
 impl ClientManager {
@@ -203,6 +205,7 @@ impl ClientManager {
 			events: broadcast::channel(PAIRING_EVENT_CAPACITY).0,
 			last_seen: Default::default(),
 			operator_ui: Default::default(),
+			operator_page: Default::default(),
 		}
 	}
 
@@ -228,6 +231,7 @@ impl ClientManager {
 			events: broadcast::channel(PAIRING_EVENT_CAPACITY).0,
 			last_seen: Default::default(),
 			operator_ui: Default::default(),
+			operator_page: Default::default(),
 		})
 	}
 
@@ -240,7 +244,19 @@ impl ClientManager {
 		let _ = self.events.send(event);
 	}
 
-	/// Whether the desktop UI handles operator notifications.
+	/// The web page where the operator approves pairing, if the web
+	/// interface runs.
+	pub(crate) fn operator_page(&self) -> Option<String> {
+		self.operator_page.lock().ok().and_then(|page| page.clone())
+	}
+
+	pub(crate) fn set_operator_page(&self, page: Option<String>) {
+		if let Ok(mut current) = self.operator_page.lock() {
+			*current = page;
+		}
+	}
+
+	/// Whether the desktop tray handles operator notifications.
 	pub(crate) fn operator_ui_present(&self) -> bool {
 		self.operator_ui.load(Ordering::Acquire)
 	}
@@ -491,6 +507,7 @@ impl ClientManager {
 	}
 
 	/// Apply the operator's PIN to the pending request identified by `approval`.
+	#[cfg(test)]
 	pub(crate) fn register_pin(&self, id: &str, pin: &str, approval: &str) -> Result<(), ()> {
 		self.register_pin_with_label(id, pin, approval, None)
 	}

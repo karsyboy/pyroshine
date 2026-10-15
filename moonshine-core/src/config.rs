@@ -5,6 +5,7 @@ pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::app_scanner::LibraryConfig;
 pub use crate::app_scanner::lutris::LutrisApplicationScannerConfig;
 pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
+pub use crate::management::web::ManagementConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::StreamConfig;
@@ -24,6 +25,9 @@ pub struct Config {
 
 	/// Configuration for the webserver.
 	pub webserver: WebserverConfig,
+
+	/// The web management interface (separate from the GameStream webserver).
+	pub management: ManagementConfig,
 
 	/// Configuration for the streams.
 	pub stream: StreamConfig,
@@ -109,11 +113,20 @@ impl Config {
 		self.address
 			.parse::<std::net::IpAddr>()
 			.map_err(|error| format!("address '{}' is not an IP address: {error}", self.address))?;
+		self.management.validate()?;
 		let tcp = [
 			("webserver.port", self.webserver.port),
 			("webserver.port_https", self.webserver.port_https),
 			("stream.port", self.stream.port),
 		];
+		if self.management.enabled
+			&& let Some((name, _)) = tcp.iter().find(|(_, port)| *port == self.management.port)
+		{
+			return Err(format!(
+				"management.port and {name} both use TCP port {}",
+				self.management.port
+			));
+		}
 		let udp = [
 			("stream.video.port", self.stream.video.port),
 			("stream.audio.port", self.stream.audio.port),
@@ -180,6 +193,7 @@ impl Default for Config {
 			// disables IPV6_V6ONLY, so that single address covers both).
 			address: "0.0.0.0".to_string(),
 			webserver: Default::default(),
+			management: Default::default(),
 			stream: Default::default(),
 			applications: vec![ApplicationConfig {
 				title: "Steam".to_string(),

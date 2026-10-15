@@ -15,7 +15,7 @@ use moonshine_management::{ManagementError, ManagementProxy, UI_BUS_NAME};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::{Management, ServerFacts, serve};
+use super::{Management, ServerFacts, follow};
 use crate::clients::{ClientManager, PendingClient, new_approval_token};
 use crate::config::Config;
 use crate::session::manager::SessionManager;
@@ -137,9 +137,13 @@ impl Harness {
 			crate::app_scanner::Library::fixed(&config.applications),
 			sessions.clone(),
 			clients.clone(),
+			Arc::new(super::auth::Auth::open(directory.path().join("management.json"))),
+			None,
 		));
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
-		let server = tokio::spawn(serve(management, builder));
+		let server = tokio::spawn(async move {
+			tokio::join!(follow(&management), super::dbus::serve(management.clone(), builder));
+		});
 		let connection = bus.connect().await;
 		let proxy = ManagementProxy::new(&connection).await.unwrap();
 		// The service owns its name once it answers.

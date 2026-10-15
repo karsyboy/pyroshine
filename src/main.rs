@@ -12,6 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod diag;
 mod pair;
+mod web;
 
 pub use moonshine_core::ShutdownReason;
 use moonshine_core::clients::ClientManager;
@@ -62,6 +63,23 @@ enum Command {
 		#[arg(long)]
 		no_health_check: bool,
 	},
+	/// The web management interface of the running server.
+	Web {
+		#[command(subcommand)]
+		action: WebCommand,
+	},
+}
+
+#[derive(Subcommand, Debug)]
+enum WebCommand {
+	/// Print the web interface's address.
+	Url,
+	/// Print a one-time code that sets the administrator password in the browser.
+	Setup {
+		/// Replace a forgotten password (signs out every browser).
+		#[arg(long)]
+		reset: bool,
+	},
 }
 
 /// Longest the server waits for the initial application scan before it
@@ -90,6 +108,16 @@ async fn main() -> Result<(), ()> {
 		return pair::run(name.as_deref().unwrap_or("")).await.map_err(|error| {
 			eprintln!("Pairing failed: {error}");
 		});
+	}
+
+	// Like pairing, these talk to the running server only.
+	if let Some(Command::Web { action }) = &args.command {
+		let action = match action {
+			WebCommand::Url => web::Action::Url,
+			WebCommand::Setup { reset } => web::Action::Setup { reset: *reset },
+		};
+		let bus = std::env::var("MOONSHINE_MANAGEMENT_BUS").ok();
+		return web::run(action, bus).await.map_err(|error| eprintln!("{error}"));
 	}
 
 	// Like pairing, collection must not create a config or touch server state.
@@ -391,6 +419,31 @@ mod cli_tests {
 		assert!(matches!(
 			args.command,
 			Some(Command::Diag { output: Some(output), offline: true, no_health_check: true }) if output == std::path::Path::new("/tmp")
+		));
+	}
+
+	#[test]
+	fn web_setup_takes_an_optional_reset() {
+		let args = Args::try_parse_from(["pyroshine", "web", "setup"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Web {
+				action: WebCommand::Setup { reset: false }
+			})
+		));
+		let args = Args::try_parse_from(["pyroshine", "web", "setup", "--reset"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Web {
+				action: WebCommand::Setup { reset: true }
+			})
+		));
+		let args = Args::try_parse_from(["pyroshine", "web", "url"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Web {
+				action: WebCommand::Url
+			})
 		));
 	}
 

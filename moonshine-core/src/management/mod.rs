@@ -1,30 +1,40 @@
-//! Local management interface for the optional desktop UI.
+//! Management of the running server: the web interface, the desktop tray
+//! and the `pyroshine pair`/`diag` commands.
 //!
-//! The service exports [`moonshine_management::INTERFACE`] on the user's
-//! session bus. It is a control surface over the daemon's own components, not
-//! a parallel implementation: sessions end through `SessionManager`, pairing
-//! approval goes through `ClientManager` with its request tokens, revocation
-//! uses the same path as the loopback `/unpair` route, and configuration
-//! edits go through the configuration store (`config_store`).
+//! One control surface over the daemon's own components, not a parallel
+//! implementation: sessions end through `SessionManager`, pairing approval
+//! goes through `ClientManager` with its request tokens, revocation uses the
+//! same path as the loopback `/unpair` route, and configuration edits go
+//! through the configuration store (`config_store`). The operations live in
+//! `ops`; two transports expose them:
+//!
+//! - `web`: the browser management interface (HTTP API, event stream and the
+//!   frontend's files) with its own administrator authentication (`auth`).
+//! - `dbus`: [`moonshine_management::INTERFACE`] on the user's session bus,
+//!   restricted to the user running Pyroshine, for the tray and the CLI.
 //!
 //! Nothing here is on a media path. Session state arrives through `watch`
 //! channels published on lifecycle and peer-ownership changes; pairing events
 //! through a bounded `broadcast` channel; frame statistics and GPU readings
-//! while a client is streaming (see `telemetry`). Statistics are signalled
-//! only while the desktop UI is present, and the last two minutes are kept
-//! for support bundles (`crate::support`).
-//! Signals are emitted from management tasks; a slow or crashed UI cannot
-//! block any of them, and the daemon runs unchanged when the session bus name
-//! cannot be acquired.
+//! while a client is streaming (see `telemetry`). Changes are published once
+//! to the `hub`, which every transport follows; statistics are published
+//! only while someone watches, and the last two minutes are kept for support
+//! bundles (`crate::support`). A slow or crashed
+//! consumer cannot block any of this, and the daemon runs unchanged when the
+//! session bus name or the web listener is unavailable.
 
+pub(crate) mod auth;
 mod config_store;
 mod dbus;
 #[cfg(test)]
 mod dbus_tests;
 mod findings;
+mod hub;
 mod library;
+mod ops;
 pub(crate) mod schema;
 pub(crate) mod telemetry;
+pub mod web;
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -33,19 +43,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_shutdown::ShutdownManager;
-use futures_util::StreamExt;
 use moonshine_management::dto::{
 	ApplicationSummary, AudioDetails, Capabilities, ClientsSnapshot, CodecCapability, DiagnosticReport, EncoderDetails,
 	HealthCheck, HealthReport, LastStop, Listeners, PairedClient, PairingOutcome, PairingResolution, PairingSnapshot,
 	PendingPairing, RequestedMode, ServerEvent, ServerInfo, SessionDetails, SessionPhase, SessionSnapshot, StreamStats,
 	VideoDetails,
 };
-use moonshine_management::{BUS_NAME, OBJECT_PATH, UI_BUS_NAME};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use self::config_store::ConfigStore;
-use self::dbus::ManagementInterface;
+use self::hub::{EventKind, Hub};
 use self::telemetry::unix_millis;
 use crate::ShutdownReason;
 use crate::app_scanner::Library;
@@ -76,8 +84,14 @@ const EVENT_LOG: usize = 50;
 /// Statistics windows kept for support bundles: two minutes.
 const STATS_HISTORY: usize = 120;
 
-/// Shared state behind the D-Bus interface and the event tasks.
+/// Shared state behind the transports and the event tasks.
 pub(crate) struct Management {
+	/// Where changes are published for the transports.
+	hub: Arc<Hub>,
+	/// Administrator authentication of the web interface.
+	auth: Arc<auth::Auth>,
+	/// The web interface's address, when it is enabled.
+	web_url: Option<String>,
 	sessions: SessionManager,
 	library: Library,
 	clients: ClientManager,
@@ -107,10 +121,11 @@ pub(crate) struct Management {
 	runtime: tokio::runtime::Handle,
 }
 
-/// Running management service. Dropping it releases the bus name and stops
-/// its tasks; it never affects sessions.
+/// Running management service. Dropping it closes the web listener,
+/// releases the bus name and stops its tasks; it never affects sessions.
 pub struct ManagementService {
 	tasks: Vec<JoinHandle<()>>,
+	web_url: Option<String>,
 }
 
 impl Drop for ManagementService {
@@ -122,8 +137,14 @@ impl Drop for ManagementService {
 }
 
 impl ManagementService {
-	/// Start serving on the session bus. Failure to connect or to own the
-	/// name is logged; the server keeps running without the management API.
+	/// The web interface's address, for the server's own pairing notice.
+	pub fn web_url(&self) -> Option<String> {
+		self.web_url.clone()
+	}
+
+	/// Start the event tasks, the web interface and the session-bus service.
+	/// A transport that cannot start is logged; the server keeps running
+	/// without it, and the other transport is unaffected.
 	pub fn spawn(
 		facts: ServerFacts,
 		config: &Config,
@@ -132,11 +153,39 @@ impl ManagementService {
 		clients: ClientManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Self {
-		let management = Arc::new(Management::new(facts, config, library, sessions, clients));
-		let task = tokio::spawn(async move {
-			let _ = shutdown.wrap_cancel(serve(management, management_bus())).await;
-		});
-		Self { tasks: vec![task] }
+		let web = web::WebServer::bind(&config.management, &config.webserver);
+		let auth = Arc::new(auth::Auth::open(auth::auth_path(clients.persistent_state().path())));
+		let web_url = web.as_ref().map(web::WebServer::url);
+		clients.set_operator_page(web_url.as_ref().map(|url| format!("{url}#/clients")));
+		let management = Arc::new(Management::new(
+			facts,
+			config,
+			library,
+			sessions,
+			clients,
+			auth,
+			web_url.clone(),
+		));
+		let mut tasks = vec![tokio::spawn({
+			let management = management.clone();
+			let shutdown = shutdown.clone();
+			async move {
+				let _ = shutdown.wrap_cancel(follow(&management)).await;
+			}
+		})];
+		tasks.push(tokio::spawn({
+			let management = management.clone();
+			let shutdown = shutdown.clone();
+			async move {
+				let _ = shutdown.wrap_cancel(dbus::serve(management, management_bus())).await;
+			}
+		}));
+		if let Some(web) = web {
+			tasks.push(tokio::spawn(async move {
+				let _ = shutdown.clone().wrap_cancel(web.serve(management, shutdown)).await;
+			}));
+		}
+		Self { tasks, web_url }
 	}
 }
 
@@ -161,8 +210,13 @@ impl Management {
 		library: Library,
 		sessions: SessionManager,
 		clients: ClientManager,
+		auth: Arc<auth::Auth>,
+		web_url: Option<String>,
 	) -> Self {
 		Self {
+			hub: Arc::default(),
+			auth,
+			web_url,
 			server: Mutex::new(server_info(&facts, config)),
 			running_config: config.clone(),
 			health: Mutex::new(facts.health),
@@ -190,8 +244,8 @@ impl Management {
 		self.server.lock().unwrap().clone()
 	}
 
-	/// Keep `event` for `GetEvents` and emit it as `ServerEvent`.
-	async fn publish_event(&self, emitter: &zbus::object_server::SignalEmitter<'static>, event: ServerEvent) {
+	/// Keep `event` for `GetEvents` and publish it.
+	fn publish_event(&self, event: ServerEvent) {
 		{
 			let mut events = self.events.lock().unwrap();
 			if events.len() == EVENT_LOG {
@@ -199,7 +253,11 @@ impl Management {
 			}
 			events.push_back(event.clone());
 		}
-		let _ = ManagementInterface::server_event(emitter, &json(&event)).await;
+		self.hub.publish(EventKind::ServerEvent, json(&event));
+	}
+
+	pub(crate) fn web_url(&self) -> Option<String> {
+		self.web_url.clone()
 	}
 
 	fn events(&self) -> Vec<ServerEvent> {
@@ -306,48 +364,14 @@ impl Management {
 	}
 }
 
-async fn serve(management: Arc<Management>, bus: zbus::Result<zbus::connection::Builder<'static>>) {
-	let connection = match bus.and_then(|builder| builder.name(BUS_NAME)).and_then(|builder| {
-		builder.serve_at(
-			OBJECT_PATH,
-			ManagementInterface {
-				management: management.clone(),
-			},
-		)
-	}) {
-		Ok(builder) => builder.build().await,
-		Err(error) => Err(error),
-	};
-	let connection = match connection {
-		Ok(connection) => connection,
-		Err(error) => {
-			tracing::warn!(
-				"Desktop management interface unavailable ({error}); Pyroshine continues without it. \
-				 Pairing approval remains available on the local web page."
-			);
-			return;
-		},
-	};
-	tracing::info!(
-		name = BUS_NAME,
-		"Desktop management interface available on the session bus"
-	);
-	let emitter = match zbus::object_server::SignalEmitter::new(&connection, OBJECT_PATH) {
-		Ok(emitter) => emitter.into_owned(),
-		Err(error) => {
-			tracing::warn!("Cannot emit management signals: {error}");
-			return;
-		},
-	};
-
-	let (ui_tx, ui_rx) = watch::channel(false);
+/// Follow the daemon's state and publish every change to the hub.
+async fn follow(management: &Management) {
 	tokio::join!(
-		follow_ui(&connection, &management, ui_tx),
-		follow_sessions(&management, &emitter),
-		follow_pairing(&management, &emitter),
-		follow_stats(&management, &emitter, ui_rx.clone()),
-		follow_problems(&management, &emitter),
-		library::follow_library(&management, &emitter, ui_rx),
+		follow_sessions(management),
+		follow_pairing(management),
+		follow_stats(management),
+		follow_problems(management),
+		library::follow_library(management),
 	);
 }
 
@@ -355,41 +379,9 @@ fn json<T: serde::Serialize>(value: &T) -> String {
 	serde_json::to_string(value).expect("management documents serialize")
 }
 
-/// Track whether the desktop UI runs (it owns [`UI_BUS_NAME`]).
-async fn follow_ui(connection: &zbus::Connection, management: &Management, present: watch::Sender<bool>) {
-	let proxy = match zbus::fdo::DBusProxy::new(connection).await {
-		Ok(proxy) => proxy,
-		Err(error) => {
-			tracing::warn!("Cannot follow the desktop UI's presence: {error}");
-			return;
-		},
-	};
-	let mut changes = match proxy.receive_name_owner_changed_with_args(&[(0, UI_BUS_NAME)]).await {
-		Ok(changes) => changes,
-		Err(error) => {
-			tracing::warn!("Cannot follow the desktop UI's presence: {error}");
-			return;
-		},
-	};
-	let name = zbus::names::BusName::try_from(UI_BUS_NAME).expect("valid bus name");
-	let set = |owned: bool| {
-		if *present.borrow() != owned {
-			tracing::debug!(present = owned, "Desktop UI presence changed");
-		}
-		management.clients.set_operator_ui_present(owned);
-		present.send_replace(owned);
-	};
-	set(proxy.name_has_owner(name).await.unwrap_or(false));
-	while let Some(change) = changes.next().await {
-		if let Ok(args) = change.args() {
-			set(args.new_owner().is_some());
-		}
-	}
-}
-
 /// Recompute the public session state on lifecycle, client ownership or
 /// compositor foreground changes, or when a waiting session runs out of patience.
-async fn follow_sessions(management: &Management, emitter: &zbus::object_server::SignalEmitter<'static>) {
+async fn follow_sessions(management: &Management) {
 	let mut status = management.sessions.subscribe_status();
 	let mut presence = management.sessions.subscribe_presence();
 	let mut reported_stop = status.borrow().last_stop.clone();
@@ -409,7 +401,7 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 			changed
 		});
 		if changed {
-			let _ = ManagementInterface::session_changed(emitter, &json(&snapshot)).await;
+			management.hub.publish(EventKind::Session, json(&snapshot));
 		}
 		if manager.last_stop != reported_stop {
 			reported_stop = manager.last_stop.clone();
@@ -435,7 +427,7 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 					at_ms: stop.at_ms,
 					hint: stop.hint.clone().filter(|_| stop.completed),
 				};
-				management.publish_event(emitter, event).await;
+				management.publish_event(event);
 			}
 		}
 
@@ -468,7 +460,7 @@ async fn follow_sessions(management: &Management, emitter: &zbus::object_server:
 }
 
 /// Forward problems reported by the launch and negotiation paths.
-async fn follow_problems(management: &Management, emitter: &zbus::object_server::SignalEmitter<'static>) {
+async fn follow_problems(management: &Management) {
 	let mut problems = management.sessions.subscribe_problems();
 	loop {
 		match problems.recv().await {
@@ -480,7 +472,7 @@ async fn follow_problems(management: &Management, emitter: &zbus::object_server:
 					at_ms: unix_millis(problem.at),
 					hint: problem.hint,
 				};
-				management.publish_event(emitter, event).await;
+				management.publish_event(event);
 			},
 			Err(broadcast::error::RecvError::Lagged(missed)) => {
 				tracing::debug!(missed, "Management missed reported problems");
@@ -490,14 +482,14 @@ async fn follow_problems(management: &Management, emitter: &zbus::object_server:
 	}
 }
 
-/// Forward pairing and trust events as signals.
-async fn follow_pairing(management: &Management, emitter: &zbus::object_server::SignalEmitter<'static>) {
+/// Publish pairing and trust events.
+async fn follow_pairing(management: &Management) {
 	let mut events = management.clients.subscribe();
 	loop {
 		let (pairing_changed, clients_changed) = match events.recv().await {
 			Ok(PairingEvent::Requested { client_id, approval }) => {
 				if let Some(request) = management.pending(&client_id, &approval) {
-					let _ = ManagementInterface::pairing_requested(emitter, &json(&request)).await;
+					management.hub.publish(EventKind::PairingRequested, json(&request));
 				}
 				(true, false)
 			},
@@ -512,7 +504,7 @@ async fn follow_pairing(management: &Management, emitter: &zbus::object_server::
 					request: approval,
 					outcome,
 				};
-				let _ = ManagementInterface::pairing_resolved(emitter, &json(&resolution)).await;
+				management.hub.publish(EventKind::PairingResolved, json(&resolution));
 				(true, outcome == PairingOutcome::Paired)
 			},
 			Ok(PairingEvent::TrustChanged) => (false, true),
@@ -521,22 +513,18 @@ async fn follow_pairing(management: &Management, emitter: &zbus::object_server::
 			Err(broadcast::error::RecvError::Closed) => return,
 		};
 		if pairing_changed {
-			let _ = ManagementInterface::pairing_changed(emitter, &json(&management.pairing())).await;
+			management.hub.publish(EventKind::Pairing, json(&management.pairing()));
 		}
 		if clients_changed && let Ok(clients) = management.clients_snapshot() {
-			let _ = ManagementInterface::clients_changed(emitter, &json(&clients)).await;
+			management.hub.publish(EventKind::Clients, json(&clients));
 		}
 	}
 }
 
 /// Aggregate frame statistics and GPU readings while a client streams.
-/// Every window is kept for support bundles; it is signalled while the
-/// desktop UI is present.
-async fn follow_stats(
-	management: &Management,
-	emitter: &zbus::object_server::SignalEmitter<'static>,
-	ui: watch::Receiver<bool>,
-) {
+/// Every window is kept for support bundles; it is published while someone
+/// watches (see `Hub::observed`).
+async fn follow_stats(management: &Management) {
 	let mut session = management.session.subscribe();
 	let (active_tx, active) = watch::channel(false);
 	loop {
@@ -594,14 +582,9 @@ async fn follow_stats(
 				&management.stats,
 				|stats| {
 					management.record_stats(stats);
-					if !*ui.borrow() {
-						return;
+					if management.hub.is_observed() {
+						management.hub.publish(EventKind::Stats, json(stats));
 					}
-					let message = json(stats);
-					let emitter = emitter.clone();
-					tokio::spawn(async move {
-						let _ = ManagementInterface::stats_updated(&emitter, &message).await;
-					});
 				},
 			);
 			tokio::pin!(aggregation);

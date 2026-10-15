@@ -68,6 +68,14 @@ pub trait Management {
 	/// choice persists across restarts. Manual entries cannot be hidden.
 	fn set_application_hidden(&self, key: &str, hidden: bool) -> zbus::Result<()>;
 
+	/// The web management interface's address on this host (for example
+	/// `http://127.0.0.1:47990/`), or an empty string when it is disabled.
+	fn get_web_url(&self) -> zbus::Result<String>;
+	/// A one-time code that sets the web administrator password within 15
+	/// minutes. Fails with `Conflict` once a password is set, unless `reset`
+	/// (which also signs out every browser when the code is used).
+	fn create_web_setup_code(&self, reset: bool) -> zbus::Result<String>;
+
 	#[zbus(signal)]
 	fn session_changed(&self, snapshot: String) -> zbus::Result<()>;
 	#[zbus(signal)]

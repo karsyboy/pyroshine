@@ -1,13 +1,12 @@
 //! The application library over the management interface: the catalog view
-//! for `GetLibrary`/`LibraryChanged`, and its errors.
+//! for `GetLibrary` and library events, and its errors.
 
 use std::time::Duration;
 
 use moonshine_management::ManagementError;
 use moonshine_management::dto::{LibraryApplication, LibrarySnapshot, LibrarySource};
-use tokio::sync::watch;
 
-use super::dbus::ManagementInterface;
+use super::hub::EventKind;
 use super::{Management, json};
 use crate::app_scanner::service::LibraryError;
 use crate::app_scanner::{CatalogEntry, EntryState, LibraryView, Origin, SourceHealth};
@@ -139,28 +138,25 @@ impl Management {
 	}
 }
 
-/// Send `LibraryChanged` while the desktop UI runs; it reads `GetLibrary`
-/// when it starts, so nothing is lost while it is away.
-pub(super) async fn follow_library(
-	management: &Management,
-	emitter: &zbus::object_server::SignalEmitter<'static>,
-	mut ui: watch::Receiver<bool>,
-) {
+/// Publish library changes while someone watches; a viewer reads the
+/// complete snapshot when it starts, so nothing is lost while nobody does.
+pub(super) async fn follow_library(management: &Management) {
 	let mut views = management.library.subscribe();
+	let mut observed = management.hub.observed();
 	loop {
 		tokio::select! {
 			changed = views.changed() => if changed.is_err() { return },
-			changed = ui.changed() => {
+			changed = observed.changed() => {
 				if changed.is_err() { return }
 				continue;
 			},
 		}
-		if !*ui.borrow() {
+		if !*observed.borrow() {
 			continue;
 		}
 		tokio::time::sleep(COALESCE).await;
 		let view = views.borrow_and_update().clone();
-		let _ = ManagementInterface::library_changed(emitter, &json(&snapshot(&view))).await;
+		management.hub.publish(EventKind::Library, json(&snapshot(&view)));
 	}
 }
 

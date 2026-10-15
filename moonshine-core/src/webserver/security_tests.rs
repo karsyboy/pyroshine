@@ -92,28 +92,22 @@ fn post(path: &str, host: &str, headers: &str, body: &str) -> String {
 	)
 }
 
-fn submission(unique_id: &str, request: &str, pin: &str) -> String {
-	format!("uniqueid={unique_id}&request={request}&pin={pin}")
-}
-
 fn xml_value(body: &str, tag: &str) -> String {
 	let start = body.find(&format!("<{tag}>")).unwrap() + tag.len() + 2;
 	let end = body.find(&format!("</{tag}>")).unwrap();
 	body[start..end].to_string()
 }
 
-/// The approval token embedded in the operator page.
-async fn operator_page_token(server: &Webserver, unique_id: &str) -> String {
-	let (status, page) = http(
-		server,
-		LOCAL,
-		get(&format!("/pin?uniqueid={unique_id}"), "localhost:47989"),
-	)
-	.await;
-	assert_eq!(status, 200, "{page}");
-	assert!(page.contains("192.168.1.50"), "page shows the requester");
-	let start = page.find("id=\"request-value\" value=\"").unwrap() + 26;
-	page[start..start + 32].to_string()
+/// The approval token of the request the operator is shown (by the web
+/// interface, the tray or `pyroshine pair`), which names its requester.
+fn shown_token(client_manager: &ClientManager, unique_id: &str) -> String {
+	let pending = client_manager.pending_approval(unique_id).unwrap();
+	assert_eq!(
+		pending.requester.to_string(),
+		"192.168.1.50",
+		"the request names its requester"
+	);
+	pending.approval
 }
 
 /// Moonlight's side of the pairing protocol.
@@ -302,9 +296,12 @@ fn loopback_operator_listener_only_when_needed() {
 	);
 }
 
-/// A remote requester cannot approve its own pairing; the host operator can.
+/// The GameStream listeners offer no approval route at all, to anyone: the
+/// former loopback PIN page trusted any local process and user. Approval
+/// goes through the management operations (authenticated web interface,
+/// same-user tray or `pyroshine pair`), which need the displayed request.
 #[tokio::test]
-async fn pairing_requires_loopback_operator_approval() {
+async fn pairing_requires_operator_approval_outside_the_gamestream_routes() {
 	let Fixture {
 		server,
 		client_manager,
@@ -313,57 +310,30 @@ async fn pairing_requires_loopback_operator_approval() {
 	let client = PairingClient::new("0123456789ABCDEF", "4321");
 	let server_cert = client.request_server_cert(&server);
 	client.wait_pending(&client_manager).await;
-	let token = client_manager.pending_approval(&client.unique_id).unwrap().approval;
+	let token = shown_token(&client_manager, &client.unique_id);
 
-	// Self-approval from the requester, even knowing the token, over IPv4 or
-	// IPv4-mapped IPv6 and with a spoofed loopback Host.
-	for peer in [REMOTE, "[::ffff:192.168.1.50]:50000"] {
+	let body = format!("uniqueid={}&request={token}&pin={}", client.unique_id, client.pin);
+	for peer in [REMOTE, "[::ffff:192.168.1.50]:50000", LOCAL, "[::1]:40000"] {
 		for host in ["192.168.1.10:47989", "localhost:47989"] {
-			let (status, _) = http(&server, peer, get("/pin", host)).await;
-			assert_eq!(status, 403);
-			let body = submission(&client.unique_id, &token, &client.pin);
+			let (status, _) = http(&server, peer, get(&format!("/pin?uniqueid={}", client.unique_id), host)).await;
+			assert_eq!(status, 410, "{peer} {host}");
 			let (status, _) = http(&server, peer, post("/submit-pin", host, "", &body)).await;
-			assert_eq!(status, 403, "{peer} {host}");
+			assert_eq!(status, 410, "{peer} {host}");
 		}
 	}
-	// Cross-site submission through the operator's own browser.
-	let body = submission(&client.unique_id, &token, &client.pin);
-	let csrf = "Origin: https://attacker.example\r\nSec-Fetch-Site: cross-site\r\n";
-	let (status, _) = http(&server, LOCAL, post("/submit-pin", "localhost:47989", csrf, &body)).await;
-	assert_eq!(status, 403);
 	assert!(!server_cert.is_finished(), "still waiting for operator approval");
 	assert!(!client.complete(&server).await, "no pairing without approval");
 
-	// The operator approves the displayed request from the host.
-	assert_eq!(operator_page_token(&server, &client.unique_id).await, token);
-	let wrong_request = submission(&client.unique_id, &"0".repeat(32), &client.pin);
-	let (status, _) = http(
-		&server,
-		LOCAL,
-		post("/submit-pin", "localhost:47989", "", &wrong_request),
-	)
-	.await;
-	assert_eq!(status, 400, "PIN must name the displayed request");
-	let (status, _) = http(
-		&server,
-		LOCAL,
-		post(
-			"/submit-pin",
-			"localhost:47989",
-			"",
-			&submission(&client.unique_id, &token, "12ab"),
-		),
-	)
-	.await;
-	assert_eq!(status, 400, "PIN must be numeric");
-	let same_origin = "Origin: http://localhost:47989\r\nSec-Fetch-Site: same-origin\r\n";
-	let (status, body) = http(
-		&server,
-		"[::1]:40000",
-		post("/submit-pin", "localhost:47989", same_origin, &body),
-	)
-	.await;
-	assert_eq!(status, 200, "{body}");
+	// The operator approves exactly the displayed request with a numeric PIN.
+	assert!(
+		client_manager
+			.register_pin(&client.unique_id, &client.pin, &"0".repeat(32))
+			.is_err()
+	);
+	assert!(client_manager.register_pin(&client.unique_id, "12ab", &token).is_err());
+	client_manager
+		.register_pin(&client.unique_id, &client.pin, &token)
+		.unwrap();
 	let (status, body) = tokio::time::timeout(Duration::from_secs(5), server_cert)
 		.await
 		.unwrap()
@@ -387,17 +357,17 @@ async fn wrong_pin_does_not_pair() {
 	let client = PairingClient::new("0123456789ABCDEF", "1111");
 	let server_cert = client.request_server_cert(&server);
 	client.wait_pending(&client_manager).await;
-	let token = operator_page_token(&server, &client.unique_id).await;
-	let body = submission(&client.unique_id, &token, "2222");
-	let (status, _) = http(&server, LOCAL, post("/submit-pin", "localhost:47989", "", &body)).await;
-	assert_eq!(status, 200);
+	let token = shown_token(&client_manager, &client.unique_id);
+	client_manager.register_pin(&client.unique_id, "2222", &token).unwrap();
 	assert_eq!(server_cert.await.unwrap().0, 200);
 	assert!(!client.complete(&server).await);
 	assert!(!client_manager.is_cert_paired(&client.fingerprint()).unwrap());
 	// The pending request accepts only one PIN.
-	let body = submission(&client.unique_id, &token, &client.pin);
-	let (status, _) = http(&server, LOCAL, post("/submit-pin", "localhost:47989", "", &body)).await;
-	assert_eq!(status, 400);
+	assert!(
+		client_manager
+			.register_pin(&client.unique_id, &client.pin, &token)
+			.is_err()
+	);
 }
 
 /// An approval applies only to the request the operator was shown: a request
@@ -417,7 +387,7 @@ async fn approval_is_bound_to_the_displayed_request() {
 	let first = PairingClient::new("0123456789ABCDEF", "1234");
 	let first_cert = first.request_server_cert(&server);
 	first.wait_pending(&client_manager).await;
-	let shown = operator_page_token(&server, &first.unique_id).await;
+	let shown = shown_token(&client_manager, &first.unique_id);
 
 	let replacement = PairingClient::new("0123456789ABCDEF", "9999");
 	let replacement_cert = replacement.request_server_cert(&server);
@@ -426,9 +396,11 @@ async fn approval_is_bound_to_the_displayed_request() {
 		assert!(Instant::now() < deadline);
 		tokio::task::yield_now().await;
 	}
-	let body = submission(&first.unique_id, &shown, &first.pin);
-	let (status, _) = http(&server, LOCAL, post("/submit-pin", "localhost:47989", "", &body)).await;
-	assert_eq!(status, 400);
+	assert!(
+		client_manager
+			.register_pin(&first.unique_id, &first.pin, &shown)
+			.is_err()
+	);
 
 	let (status, body) = first_cert.await.unwrap();
 	assert_eq!(status, 400, "{body}");
@@ -444,17 +416,10 @@ async fn approval_is_bound_to_the_displayed_request() {
 #[tokio::test]
 async fn disabled_pairing_rejects_every_pairing_route() {
 	let Fixture { server, _directory, .. } = fixture(false, WebLimits::default());
-	for (peer, request) in [
-		(
-			REMOTE,
-			get("/pair?uniqueid=1&phrase=getservercert", "192.168.1.10:47989"),
-		),
-		(LOCAL, get("/pin", "localhost:47989")),
-		(
-			LOCAL,
-			post("/submit-pin", "localhost:47989", "", "uniqueid=1&request=1&pin=1234"),
-		),
-	] {
+	for (peer, request) in [(
+		REMOTE,
+		get("/pair?uniqueid=1&phrase=getservercert", "192.168.1.10:47989"),
+	)] {
 		let (status, body) = http(&server, peer, request).await;
 		assert_eq!((status, body.as_str()), (400, "Pairing is disabled."));
 	}
@@ -965,19 +930,10 @@ async fn failed_pairing_persistence_never_authorizes_and_cleans_pending() {
 	let client = PairingClient::new("d6fbb8e9-35b8-4c82-9f2d-ea68c2ef8d12", "1234");
 	let waiting = client.request_server_cert(&server);
 	client.wait_pending(&client_manager).await;
-	let token = operator_page_token(&server, &client.unique_id).await;
-	let (status, _) = http(
-		&server,
-		LOCAL,
-		post(
-			"/submit-pin",
-			"localhost:47989",
-			"",
-			&submission(&client.unique_id, &token, &client.pin),
-		),
-	)
-	.await;
-	assert_eq!(status, 200);
+	let token = shown_token(&client_manager, &client.unique_id);
+	client_manager
+		.register_pin(&client.unique_id, &client.pin, &token)
+		.unwrap();
 	assert_eq!(waiting.await.unwrap().0, 200);
 	crate::durable::fail_next("rename", libc::ENOSPC);
 	assert!(!client.complete(&server).await);
@@ -998,7 +954,7 @@ async fn approved_protocol_failure_cleans_transaction() {
 	let client = PairingClient::new("malformed-pairing", "1234");
 	let waiting = client.request_server_cert(&server);
 	client.wait_pending(&client_manager).await;
-	let token = operator_page_token(&server, &client.unique_id).await;
+	let token = shown_token(&client_manager, &client.unique_id);
 	client_manager
 		.register_pin(&client.unique_id, &client.pin, &token)
 		.unwrap();

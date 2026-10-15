@@ -40,10 +40,11 @@ impl Drop for PairingWaitGuard<'_> {
 	}
 }
 
-/// Headless fallback notification. While the desktop UI runs it receives the
+/// Fallback desktop notification. While the desktop tray runs it receives the
 /// pairing request over the management interface and notifies the operator
-/// itself (linking to its pairing page), so this is skipped.
-fn notify_operator(pin_url: String) {
+/// itself (opening the request in the web interface), so this is skipped.
+/// The text names where to approve; it carries no request token or secret.
+fn notify_operator(where_to_approve: String) {
 	let Ok(mut last) = LAST_NOTIFICATION.lock() else {
 		return;
 	};
@@ -59,7 +60,7 @@ fn notify_operator(pin_url: String) {
 			let _ = Notification::new()
 				.appname("Pyroshine")
 				.summary("Received pairing request")
-				.body(&format!("Open {pin_url} on the host to enter the PIN."))
+				.body(&where_to_approve)
 				.timeout(30_000)
 				.show();
 			NOTIFICATION_BUSY.store(false, Ordering::Release);
@@ -119,7 +120,6 @@ pub async fn handle_pair_request(
 	peer_address: SocketAddr,
 	server_certs: &str, // Pass as string (PEM)
 	client_manager: &ClientManager,
-	http_port: u16,
 	approval_timeout: Duration,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
@@ -149,7 +149,6 @@ pub async fn handle_pair_request(
 					peer_address,
 					server_certs,
 					client_manager,
-					http_port,
 					approval_timeout,
 					shutdown,
 				)
@@ -190,7 +189,6 @@ async fn get_server_cert(
 	peer_address: SocketAddr,
 	server_pem_str: &str,
 	client_manager: &ClientManager,
-	http_port: u16,
 	approval_timeout: Duration,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
@@ -274,16 +272,18 @@ async fn get_server_cert(
 		approved: false,
 	};
 
-	// Emit a notification, allowing the user to automatically open the PIN page.
-	// Approval is only accepted from the host itself, so link to loopback rather
-	// than to the address the client used.
+	// Tell the operator where to approve. Approval needs the web interface's
+	// sign-in, the tray or `pyroshine pair`; none of them is a link that
+	// approves anything by itself.
 	if local_address.is_some() {
-		let encoded_id: String = url::form_urlencoded::byte_serialize(unique_id.as_bytes()).collect();
-		let pin_url = format!("http://localhost:{http_port}/pin?uniqueid={encoded_id}");
-		tracing::info!(requester = %peer_address, "Waiting for the host operator to enter the PIN in the Pyroshine desktop app or at {pin_url}");
+		let where_to_approve = match client_manager.operator_page() {
+			Some(page) => format!("Open {page} to enter the PIN, or run `pyroshine pair` on the host."),
+			None => "Run `pyroshine pair` on the host to enter the PIN.".to_string(),
+		};
+		tracing::info!(requester = %peer_address, "Waiting for the host operator to approve pairing. {where_to_approve}");
 
 		if !client_manager.operator_ui_present() {
-			notify_operator(pin_url);
+			notify_operator(where_to_approve);
 		}
 	}
 

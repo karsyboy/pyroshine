@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_shutdown::ShutdownManager;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::{
 	Method, Request, Response, StatusCode,
 	body::Bytes,
@@ -110,8 +110,6 @@ const MAX_HTTP_CONNECTIONS: usize = 64;
 /// Hyper read buffer bound per connection. Pairing requests carry a hex PEM
 /// certificate in the query string, which fits comfortably.
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
-/// Bound for operator PIN submission bodies.
-const MAX_PIN_BODY_BYTES: usize = 1024;
 
 /// Deadlines applied to every accepted HTTP/HTTPS connection.
 #[derive(Clone, Copy, Debug)]
@@ -121,8 +119,6 @@ pub(crate) struct WebLimits {
 	/// Time to receive request headers. Hyper also applies it while a keep-alive
 	/// connection waits for the next request, bounding idle connections.
 	pub header_read_timeout: std::time::Duration,
-	/// Time to receive a request body the server reads (PIN submission).
-	pub body_read_timeout: std::time::Duration,
 	/// Time an operator has to approve a pairing request.
 	pub pairing_approval_timeout: std::time::Duration,
 }
@@ -132,7 +128,6 @@ impl Default for WebLimits {
 		Self {
 			tls_handshake_timeout: std::time::Duration::from_secs(10),
 			header_read_timeout: std::time::Duration::from_secs(30),
-			body_read_timeout: std::time::Duration::from_secs(10),
 			pairing_approval_timeout: std::time::Duration::from_secs(300),
 		}
 	}
@@ -176,10 +171,10 @@ impl Webserver {
 		let http_address = resolve_listen_address(&address, server.webserver_config.port)?;
 		server.spawn_listener("http", http_address, None, ShutdownReason::HttpShutdown);
 
-		// PIN approval is restricted to loopback peers. When the configured
-		// address does not accept loopback connections, give the operator a
-		// loopback-only listener on the same port. Failing to bind it only
-		// disables local approval, not the GameStream service.
+		// Operator revocation (`POST /unpair`) is restricted to loopback peers.
+		// When the configured address does not accept loopback connections,
+		// give the operator a loopback-only listener on the same port. Failing
+		// to bind it only disables local revocation, not the GameStream service.
 		if let Some(operator_address) = operator_listen_address(http_address) {
 			tokio::spawn({
 				let server = server.clone();
@@ -189,10 +184,10 @@ impl Webserver {
 						.wrap_cancel(async move {
 							let listener = bind_listener(operator_address).map_err(|e| {
 								tracing::warn!(
-									"Failed to bind the local pairing approval listener on {operator_address}: {e}"
+									"Failed to bind the local revocation listener on {operator_address}: {e}"
 								)
 							})?;
-							tracing::debug!("Local pairing approval available on {operator_address}");
+							tracing::debug!("Local revocation available on {operator_address}");
 							let ingress = Ingress::new("http-operator", MAX_HTTP_CONNECTIONS, server.shutdown.clone());
 							server.serve_listener(listener, None, ingress).await
 						})
@@ -437,7 +432,6 @@ impl Webserver {
 						peer_address,
 						&self.server_certs,
 						&self.client_manager,
-						self.webserver_config.port,
 						self.limits.pairing_approval_timeout,
 						&self.shutdown,
 					)
@@ -499,30 +493,15 @@ impl Webserver {
 						peer_address,
 						&self.server_certs,
 						&self.client_manager,
-						self.webserver_config.port,
 						self.limits.pairing_approval_timeout,
 						&self.shutdown,
 					)
 					.await
 				},
-				(&Method::GET, "/pin") => {
-					if !self.webserver_config.enable_pairing {
-						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
-					}
-					if let Some(response) = self.verify_operator(&request, peer_address) {
-						return Ok(response.map(BodyExt::boxed_unsync));
-					}
-					self.pin(params)
-				},
-				(&Method::POST, "/submit-pin") => {
-					if !self.webserver_config.enable_pairing {
-						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
-					}
-					if let Some(response) = self.verify_operator(&request, peer_address) {
-						return Ok(response.map(BodyExt::boxed_unsync));
-					}
-					self.submit_pin(request).await
-				},
+				// The loopback PIN page trusted any local process and user; approval
+				// now needs the web interface's administrator sign-in, the tray or
+				// `pyroshine pair` (all through the management operations).
+				(&Method::GET, "/pin") | (&Method::POST, "/submit-pin") => self.operator_page_moved(),
 				(&Method::POST, "/unpair") => {
 					if let Some(resp) = self.verify_operator(&request, peer_address) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
@@ -704,79 +683,20 @@ impl Webserver {
 		response
 	}
 
-	fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let Some(unique_id) = params.get("uniqueid").filter(|id| !id.is_empty() && id.len() <= 256) else {
-			return bad_request("A valid pending client ID is required.".to_string());
+	fn operator_page_moved(&self) -> Response<Full<Bytes>> {
+		let message = match self.client_manager.operator_page() {
+			Some(page) => format!(
+				"Pairing requests are approved in the Pyroshine web interface: open {page} on the host, \
+				 or run `pyroshine pair`."
+			),
+			None => "Pairing requests are approved with `pyroshine pair` on the host.".to_string(),
 		};
-
-		// The page approves one specific pending request: its approval token is
-		// required on submission, so a request that replaces it (same client ID)
-		// cannot inherit the operator's PIN. Show the requester so the operator
-		// can recognize it.
-		let Some(pending) = self.client_manager.pending_approval(unique_id) else {
-			return Response::builder()
-				.status(StatusCode::NOT_FOUND)
-				.header(header::CACHE_CONTROL, "no-store")
-				.body(Full::new(Bytes::from("No pending pairing request for this client.")))
-				.unwrap();
-		};
-		let content = include_bytes!("../../../assets/pin.html");
-		let html = String::from_utf8_lossy(content);
-		let html = html
-			.replace("{{REQUEST}}", &pending.approval)
-			.replace("{{REQUESTER}}", &escape_xml(pending.requester.to_string()))
-			.replace(
-				"{{FINGERPRINT}}",
-				&escape_xml(pending.fingerprint.as_deref().unwrap_or("unknown")),
-			)
-			.replace("{{UNIQUE_ID}}", &escape_xml(unique_id));
-		let mut response = Response::new(Full::new(Bytes::from(html)));
-		let headers = response.headers_mut();
-		headers.insert(
-			header::CONTENT_TYPE,
-			HeaderValue::from_static("text/html; charset=UTF-8"),
-		);
-		headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-		headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-		headers.insert(
-			header::CONTENT_SECURITY_POLICY,
-			HeaderValue::from_static("frame-ancestors 'none'"),
-		);
-		headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-
-		response
-	}
-
-	async fn submit_pin(&self, request: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-		// Enforce a hard size limit and deadline while reading the body.
-		let body = Limited::new(request.into_body(), MAX_PIN_BODY_BYTES).collect();
-		let body = match tokio::time::timeout(self.limits.body_read_timeout, body).await {
-			Ok(Ok(body)) => body.to_bytes(),
-			Ok(Err(e)) => {
-				tracing::warn!("Failed to read request body: {e}");
-				return bad_request("Bad request.".to_string());
-			},
-			Err(_) => {
-				tracing::warn!("Timed out reading PIN submission.");
-				return bad_request("Bad request.".to_string());
-			},
-		};
-
-		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-		let (Some(unique_id), Some(pin), Some(approval)) =
-			(params.get("uniqueid"), params.get("pin"), params.get("request"))
-		else {
-			tracing::warn!("PIN submission requires 'uniqueid', 'pin' and 'request'.");
-			return bad_request("Bad request.".to_string());
-		};
-
-		match self.client_manager.register_pin(unique_id, pin, approval) {
-			Ok(()) => {
-				tracing::info!("PIN registered successfully.");
-				Response::new(Full::new(Bytes::from("PIN accepted.")))
-			},
-			Err(()) => bad_request("Failed to register PIN.".to_string()),
-		}
+		Response::builder()
+			.status(StatusCode::GONE)
+			.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+			.header(header::CACHE_CONTROL, "no-store")
+			.body(Full::new(Bytes::from(message)))
+			.unwrap()
 	}
 
 	async fn unpair(&self, id: Option<&str>, fingerprint: Option<&str>) -> Response<Full<Bytes>> {
@@ -1118,14 +1038,14 @@ impl Webserver {
 	}
 }
 
-/// Authorize a request to the operator PIN approval routes.
+/// Authorize a request to the operator route (`POST /unpair`). It can only
+/// remove trust, never grant it.
 ///
-/// - The peer must be loopback: only the host operator may approve pairing.
-///   First pairing cannot rely on a paired client certificate.
+/// - The peer must be loopback.
 /// - `Host` must name a loopback host on our port, defeating DNS rebinding of
 ///   an attacker domain to 127.0.0.1.
 /// - Browser metadata, when present, must describe a same-origin request on a
-///   loopback origin, so another website cannot submit a PIN through the
+///   loopback origin, so another website cannot revoke a client through the
 ///   operator's browser (CSRF). Non-browser clients (curl) send neither header.
 fn authorize_operator_request(peer: SocketAddr, headers: &header::HeaderMap, port: u16) -> Result<(), &'static str> {
 	if !peer.ip().to_canonical().is_loopback() {
@@ -1186,7 +1106,7 @@ fn resolve_listen_address(address: &str, port: u16) -> Result<SocketAddr, ()> {
 		.ok_or_else(|| tracing::error!("Failed to resolve address '{address}' port {port}"))
 }
 
-/// Address of the loopback listener for operator PIN approval, needed only when
+/// Address of the loopback listener for operator revocation, needed only when
 /// the configured HTTP listener cannot accept loopback connections.
 fn operator_listen_address(http_address: SocketAddr) -> Option<SocketAddr> {
 	let ip = http_address.ip();

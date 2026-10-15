@@ -466,6 +466,11 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"Application discovery",
 			"Scanners that find installed games and keep the application list current.",
 		),
+		section(
+			"web",
+			"Web management",
+			"This management interface: its address, HTTPS and the host names browsers may use.",
+		),
 		section("diagnostics", "Diagnostics", "Logging for performance investigation."),
 	];
 
@@ -490,7 +495,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"address",
 			"network",
 			"Bind address",
-			"IP address for the web and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
+			"IP address for the GameStream and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
 			text(false, Some("0.0.0.0"), &["0.0.0.0", "::"]),
 		)
 		.caution("Clients must be able to reach this address."),
@@ -498,7 +503,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"webserver.port",
 			"network",
 			"HTTP port",
-			"GameStream HTTP API and host-local pairing page (TCP).",
+			"GameStream HTTP API and host-local revocation (TCP).",
 		)
 		.caution("Clients and firewalls expect the default ports unless reconfigured."),
 		port(
@@ -519,6 +524,72 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"Seconds a streaming client may go without a ping before it is treated as disconnected. The session and application keep running for a resume.",
 			integer(1.0, 86_400.0, Some("s")),
 		),
+		Field::new(
+			"management.enabled",
+			"web",
+			"Web management interface",
+			"Serve this interface. Without it, manage Pyroshine with the tray and `pyroshine pair`.",
+			FieldKind::Bool,
+		)
+		.caution("Turning it off closes this page after the restart."),
+		Field::new(
+			"management.address",
+			"web",
+			"Listen address",
+			"127.0.0.1 keeps it on this computer; reach it from elsewhere through an SSH tunnel or VPN. \
+			 Any other address requires HTTPS.",
+			text(false, Some("127.0.0.1"), &["127.0.0.1", "::1", "0.0.0.0", "::"]),
+		)
+		.caution("Another address shows the sign-in page to your network; use a strong password."),
+		port(
+			"management.port",
+			"web",
+			"Port",
+			"TCP port of this interface (default 47990).",
+		),
+		Field::new(
+			"management.tls",
+			"web",
+			"HTTPS",
+			"Serve HTTPS. Required when the listen address is not a loopback address.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"management.certificate",
+			"web",
+			"HTTPS certificate",
+			"PEM certificate for HTTPS. Empty uses the server's own certificate, which browsers show a \
+			 warning for until you accept it.",
+			path(true, true, false),
+		)
+		.advanced(),
+		Field::new(
+			"management.private_key",
+			"web",
+			"HTTPS private key",
+			"Private key of the HTTPS certificate (PEM).",
+			path(true, true, false),
+		)
+		.advanced(),
+		Field::new(
+			"management.allowed_hosts",
+			"web",
+			"Allowed host names",
+			"Further names browsers use to reach this interface, such as streambox.lan or a reverse \
+			 proxy's name (name or name:port). Addresses and localhost always work.",
+			FieldKind::TextList {
+				placeholder: Some("streambox.lan".into()),
+			},
+		)
+		.advanced(),
+		Field::new(
+			"management.web_root",
+			"web",
+			"Interface files",
+			"Directory holding this interface's files. Empty uses the packaged location.",
+			path(true, true, true),
+		)
+		.advanced(),
 		Field::new(
 			"webserver.enable_pairing",
 			"security",
@@ -848,6 +919,10 @@ pub(crate) mod tests {
 	pub(crate) fn complete_config() -> Value {
 		let mut config = serde_json::to_value(Config::default()).unwrap();
 		config["compositor"]["gpu"] = json!("/dev/dri/renderD128");
+		config["management"]["certificate"] = json!("/tmp/web.pem");
+		config["management"]["private_key"] = json!("/tmp/web.key");
+		config["management"]["web_root"] = json!("/usr/share/pyroshine/web");
+		config["management"]["allowed_hosts"] = json!(["streambox.lan"]);
 		config["compositor"]["keyboard"]["options"] = json!("caps:escape");
 		config["stream"]["control"]["gamepad"]["home_button"]["trigger"] = json!("back_start");
 		let launch = json!({

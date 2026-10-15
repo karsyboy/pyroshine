@@ -794,6 +794,10 @@ pub enum FieldKind {
 	PathList {
 		expands: bool,
 	},
+	/// A list of short strings (for example host names).
+	TextList {
+		placeholder: Option<String>,
+	},
 	/// `[[application]]` entries.
 	Applications {
 		item: Vec<FieldSpec>,

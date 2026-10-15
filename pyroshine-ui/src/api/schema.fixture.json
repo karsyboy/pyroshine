@@ -43,6 +43,13 @@
       "auto_refresh": true,
       "poll_interval_secs": 300
     },
+    "management": {
+      "address": "127.0.0.1",
+      "allowed_hosts": [],
+      "enabled": true,
+      "port": 47990,
+      "tls": false
+    },
     "name": "Pyroshine",
     "stream": {
       "audio": {
@@ -117,7 +124,7 @@
       {
         "advanced": false,
         "caution": "Clients must be able to reach this address.",
-        "help": "IP address for the web and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
+        "help": "IP address for the GameStream and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
         "kind": {
           "optional": false,
           "placeholder": "0.0.0.0",
@@ -135,7 +142,7 @@
       {
         "advanced": false,
         "caution": "Clients and firewalls expect the default ports unless reconfigured.",
-        "help": "GameStream HTTP API and host-local pairing page (TCP).",
+        "help": "GameStream HTTP API and host-local revocation (TCP).",
         "kind": {
           "type": "port"
         },
@@ -219,6 +226,120 @@
         "path": "stream.timeout",
         "required": false,
         "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": "Turning it off closes this page after the restart.",
+        "help": "Serve this interface. Without it, manage Pyroshine with the tray and `pyroshine pair`.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Web management interface",
+        "path": "management.enabled",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": false,
+        "caution": "Another address shows the sign-in page to your network; use a strong password.",
+        "help": "127.0.0.1 keeps it on this computer; reach it from elsewhere through an SSH tunnel or VPN. Any other address requires HTTPS.",
+        "kind": {
+          "optional": false,
+          "placeholder": "127.0.0.1",
+          "suggestions": [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "::"
+          ],
+          "type": "text"
+        },
+        "label": "Listen address",
+        "path": "management.address",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "TCP port of this interface (default 47990).",
+        "kind": {
+          "type": "port"
+        },
+        "label": "Port",
+        "path": "management.port",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Serve HTTPS. Required when the listen address is not a loopback address.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "HTTPS",
+        "path": "management.tls",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "PEM certificate for HTTPS. Empty uses the server's own certificate, which browsers show a warning for until you accept it.",
+        "kind": {
+          "directory": false,
+          "expands": true,
+          "optional": true,
+          "type": "path"
+        },
+        "label": "HTTPS certificate",
+        "path": "management.certificate",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Private key of the HTTPS certificate (PEM).",
+        "kind": {
+          "directory": false,
+          "expands": true,
+          "optional": true,
+          "type": "path"
+        },
+        "label": "HTTPS private key",
+        "path": "management.private_key",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Further names browsers use to reach this interface, such as streambox.lan or a reverse proxy's name (name or name:port). Addresses and localhost always work.",
+        "kind": {
+          "placeholder": "streambox.lan",
+          "type": "text_list"
+        },
+        "label": "Allowed host names",
+        "path": "management.allowed_hosts",
+        "required": false,
+        "section": "web"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Directory holding this interface's files. Empty uses the packaged location.",
+        "kind": {
+          "directory": true,
+          "expands": true,
+          "optional": true,
+          "type": "path"
+        },
+        "label": "Interface files",
+        "path": "management.web_root",
+        "required": false,
+        "section": "web"
       },
       {
         "advanced": false,
@@ -1539,6 +1660,11 @@
         "description": "Scanners that find installed games and keep the application list current.",
         "id": "scanners",
         "title": "Application discovery"
+      },
+      {
+        "description": "This management interface: its address, HTTPS and the host names browsers may use.",
+        "id": "web",
+        "title": "Web management"
       },
       {
         "description": "Logging for performance investigation.",

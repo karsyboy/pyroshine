@@ -306,6 +306,24 @@ impl TlsAcceptor {
 	}
 }
 
+impl TlsAcceptor {
+	/// An acceptor for browsers (the web management interface): the same
+	/// certificate files, but no client certificate is requested, so browsers
+	/// do not prompt for one.
+	pub(crate) fn for_browsers<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Self, ()> {
+		let certs = load_certs(certificate.as_ref())?;
+		let key = load_private_key(private_key.as_ref())?;
+		let mut config = ServerConfig::builder()
+			.with_no_client_auth()
+			.with_single_cert(certs, key)
+			.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
+		config.alpn_protocols = vec![b"http/1.1".to_vec()];
+		Ok(Self {
+			acceptor: TlsAcceptorTokio::from(Arc::new(config)),
+		})
+	}
+}
+
 fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<ServerConfig, ()> {
 	let certs = load_certs(certificate.as_ref())?;
 	let key = load_private_key(private_key.as_ref())?;
