@@ -258,7 +258,10 @@ Rejecting capture before encoding preserves predictive reference
 chains; discarding encoded reference frames can break decoding until an IDR.
 PyroWave completes one encode and send before requesting the next capture.
 This bounds latency but can limit FPS when capture + encode + paced send consumes
-a refresh interval; enlarging queues is not a free throughput improvement.
+a refresh interval; enlarging queues is not a free throughput improvement. A
+frame whose encode outlasted its bitrate-derived send window is therefore paced
+to finish before the next capture slot (at up to four times the bitrate) rather
+than over a fresh full window.
 PyroWave uses a lazily allocated, reusable CLOCK_MONOTONIC timerfd through Tokio
 AsyncFd for precise packet deadlines. A mutable send borrow enforces one wait
 per timer; cancellation and rearming cannot leak a prior frame's expiry. There

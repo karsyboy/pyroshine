@@ -466,8 +466,9 @@ Reed-Solomon FEC (`fec.rs`) covers plaintext shards, then optional AES-GCM
 encryption is applied per shard. `fec_mode = "auto"` adjusts parity from the
 client's FEC status feedback. `gso_socket.rs` sends with UDP GSO and a
 per-datagram fallback; raw `WouldBlock` retries must go through Tokio readiness. PyroWave frames are paced across a
-bitrate-derived window anchored to capture time (`pacing_timer.rs`) and rebase
-after backpressure rather than bursting.
+bitrate-derived window anchored to capture time (`pacing_timer.rs`); a frame
+whose window elapsed during encode is sent before the next capture slot, and
+the schedule rebases after backpressure rather than bursting.
 
 **Failures.** Both encoder backends report frame failures through
 `pipeline/failure.rs` with the failed stage, a recovery (`DropFrame`,

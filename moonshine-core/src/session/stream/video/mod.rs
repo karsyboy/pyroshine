@@ -30,7 +30,7 @@ pub use format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 	VideoChromaSampling, VideoCodec, VideoDynamicRange, VideoFormat,
 };
-use gso_socket::{UdpGsoSocket, duration_micros_u64};
+use gso_socket::{FramePacing, UdpGsoSocket, duration_micros_u64};
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
@@ -254,6 +254,15 @@ pub struct VideoStreamContext {
 }
 
 impl VideoStreamContext {
+	/// Transmit pacing for the intra-only PyroWave path; conventional
+	/// inter-frame codecs send immediately.
+	fn frame_pacing(&self) -> Option<FramePacing> {
+		(self.format.codec == VideoCodec::PyroWave).then(|| FramePacing {
+			bitrate_bps: u64::try_from(self.bitrate).unwrap_or(u64::MAX),
+			frame_interval: std::time::Duration::from_secs(1) / self.fps.max(1),
+		})
+	}
+
 	/// Check every value that timing, allocation, encoder and transport code
 	/// consume. Callers validate before pausing or reconfiguring a live epoch.
 	pub(crate) fn validate(&self) -> Result<(), String> {
@@ -618,8 +627,7 @@ impl VideoStream {
 			diagnostics::spawn_watchdog(stop.clone(), packet_tx.downgrade());
 		}
 		let (reconfigure_tx, reconfigure_rx) = std::sync::mpsc::channel();
-		let pacing_bitrate =
-			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
+		let pacing = context.frame_pacing();
 
 		// Spawn packet handler — registered now, gated behind the start latch.
 		let demand = MediaDemand::new();
@@ -634,7 +642,7 @@ impl VideoStream {
 			start.waiter(),
 			stop.clone(),
 			worker,
-			pacing_bitrate,
+			pacing,
 			context.fps,
 			config.log_stats,
 		);
@@ -695,7 +703,7 @@ fn spawn_handle_video_packets(
 	start: StartWaiter,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	worker: WorkerGuard,
-	mut pacing_bitrate: Option<u64>,
+	mut pacing: Option<FramePacing>,
 	mut fps: u32,
 	log_stats: bool,
 ) {
@@ -752,8 +760,7 @@ fn spawn_handle_video_packets(
 							let _ = ready.send(());
 						},
 						Ok(Some(VideoPacketMessage::BeginEpoch { context, generation, ready })) => {
-							pacing_bitrate = (context.format.codec == VideoCodec::PyroWave)
-								.then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
+							pacing = context.frame_pacing();
 							fps = context.fps;
 							active_generation = generation;
 							paused = false;
@@ -774,7 +781,7 @@ fn spawn_handle_video_packets(
 								// stops draining cannot block session shutdown. A pause
 								// or a replaced authorization stops the remaining shards.
 								let interrupted = {
-									let send = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing_bitrate));
+									let send = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing));
 									tokio::pin!(send);
 									loop {
 										tokio::select! {
@@ -1108,7 +1115,10 @@ mod tests {
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
-			Some(650_000_000),
+			Some(FramePacing {
+				bitrate_bps: 650_000_000,
+				frame_interval: Duration::from_secs(1) / 120,
+			}),
 			120,
 			false,
 		);

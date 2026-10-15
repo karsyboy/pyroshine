@@ -201,6 +201,26 @@ sudo usermod -aG gamemode "$USER"
 
 Without a working daemon, games may run without the requested optimizations.
 
+## Lower PyroWave latency on a lightly loaded NVIDIA GPU
+
+With only the desktop, a video or a frame-capped game running, an NVIDIA GPU can
+stay at idle clocks while it streams. PyroWave then encodes several milliseconds
+more slowly: on an RTX 3080 at 1080p60, host latency was 8.5 ms instead of 3.5 ms.
+A game that loads the GPU raises the clocks by itself. To hold them while you
+stream lighter content, lock the graphics clock (pick a value your GPU supports,
+listed by `nvidia-smi -q -d SUPPORTED_CLOCKS`):
+
+```sh
+sudo nvidia-smi -lgc 1710,1710
+```
+
+The lock lasts until you reset it or the driver unloads, and the GPU draws more
+power while it holds. Reset it after streaming:
+
+```sh
+sudo nvidia-smi -rgc
+```
+
 ## Use Gamescope with the client's resolution
 
 Install Gamescope and set the game's Steam launch option:

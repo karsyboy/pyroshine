@@ -130,10 +130,15 @@ instead of submitting every chunk back-to-back. The schedule is anchored to the
 capture timestamp, so GPU encode time consumes part of the window rather than
 being added to it. The sender distributes chunks across the remaining time
 without reordering or interleaving frames. If the whole window elapsed during
-encode, or socket backpressure consumes scheduled slots, it rebases the
-remaining schedule instead of emitting an unbounded catch-up burst. The
-pipeline holds capture admission until actual send completion, so paced sending
-cannot accumulate a backlog of rendered scenes. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
+encode, the frame is spread across the time left before the next capture slot
+(nine tenths of the frame interval after capture), never slower than the bitrate
+window and never faster than four times the bitrate. Restarting a full window
+there would add it to the encode time and lose the next capture whenever encode
+time exceeds the window, for example while the GPU stays at idle clocks or a game
+contends for its queue. If socket backpressure consumes scheduled slots, the
+sender rebases the remaining schedule instead of emitting an unbounded catch-up
+burst. The pipeline holds capture admission until actual send completion, so
+paced sending cannot accumulate a backlog of rendered scenes. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
 
 Packet size and GSO limits are derived from negotiated shard layout, not a fixed
 number of submissions per frame. `stream.video.max_packet_size` can cap client

@@ -21,6 +21,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 ### Fixed
 
 - Stop sessions reliably on NVIDIA. Ending a stream could hang the service in the GPU driver: the video pipeline destroyed the capture GPU's Vulkan device while the exiting compositor thread was still releasing its EGL state, the session exceeded its teardown deadline and the service then needed `SIGKILL` to stop. The capture device now outlives the compositor thread. On an RTX 3080, the compositor tests that hung in most release-build runs pass in every run.
+- Keep PyroWave at its frame rate when encoding is slow. A frame whose encode outlasted its bitrate-derived send window was then sent over a fresh full window, so encode and send together missed the next capture and the stream fell to as little as half its rate. This happened when an NVIDIA GPU stayed at idle clocks under light content, or when a GPU-bound game delayed the encode. Such frames are now sent before the next capture, at up to four times the bitrate. On an RTX 3080 streaming vkcube at 500 Mbps, 4K60 rose from 41 to 60 FPS, 1440p120 from 90 to 120 and 1080p120 from 103 to 120, and 99th-percentile frame time fell by up to a third; with a GPU-bound game running, 4K60 rose from 44 to 60 FPS. Streams whose encode fits in its window, including every RX 9070 XT workload measured, are unchanged.
 
 ## [v0.17.6] - 2026-10-14
 
