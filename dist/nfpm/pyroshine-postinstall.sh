@@ -15,3 +15,4 @@ modprobe uhid || true
 echo "pyroshine: enable for your user with:"
 echo "  sudo loginctl enable-linger <user>   # optional, for headless use"
 echo "  sudo systemctl enable --now pyroshine@<user>"
+echo "Then run 'pyroshine web setup' as that user and open http://127.0.0.1:47990/"

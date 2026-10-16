@@ -11,7 +11,7 @@ release: "1"
 maintainer: "Pyroshine contributors"
 description: |
   Pyroshine streaming server for Moonlight clients.
-  Includes native PyroWave support.
+  Includes native PyroWave support and its web management interface.
 homepage: "https://github.com/karsyboy/pyroshine"
 license: "BSD-2-Clause"
 replaces:
@@ -38,6 +38,11 @@ contents:
     dst: /usr/share/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules
   - src: ./dist/pyroshine-sysusers.conf
     dst: /usr/lib/sysusers.d/pyroshine.conf
+  # The web management interface's files, built from pyroshine-ui/ (the
+  # release builds them first; Node.js is not needed at runtime).
+  - src: ./pyroshine-ui/dist
+    dst: /usr/share/pyroshine/web
+    type: tree
   # License locations differ per distro.
   - src: ./LICENSE
     dst: /usr/share/licenses/pyroshine/LICENSE

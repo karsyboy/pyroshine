@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Pyroshine
-Comment=Pyroshine system tray and pairing notifications
-Exec=pyroshine-ui --background
+Name=Pyroshine tray
+Comment=Pyroshine status icon and pairing notifications
+Exec=pyroshine-tray
 Icon=pyroshine
 Terminal=false
 NoDisplay=true

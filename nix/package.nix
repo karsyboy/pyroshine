@@ -15,14 +15,15 @@
   libglvnd,
   callPackage,
   pyrowave ? callPackage ./pyrowave.nix { },
+  pyroshine-web ? callPackage ./web.nix { },
 }:
 
 let
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
   # Only what the build actually consumes, so touching flake.nix, the README,
-  # or CI config doesn't rebuild the world. assets/ is required: the webserver
-  # embeds assets/pin.html via include_bytes!.
+  # or CI config doesn't rebuild the world. The web interface is its own
+  # derivation (web.nix).
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -32,7 +33,7 @@ let
       ../moonshine-core
       ../moonshine-management
       ../moonshine-tools
-      ../assets
+      ../pyroshine-tray
       ../dist
       ../vendor
     ];
@@ -96,6 +97,15 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
+    # The web management interface, found next to the executable
+    # (bin/../share/pyroshine/web). The workspace build also installs
+    # bin/pyroshine-tray, the optional desktop tray.
+    mkdir -p $out/share/pyroshine
+    cp -r ${pyroshine-web} $out/share/pyroshine/web
+    install -Dm644 dist/pyroshine.desktop $out/share/applications/pyroshine.desktop
+    substituteInPlace $out/share/applications/pyroshine.desktop \
+      --replace-fail 'Exec=pyroshine-tray' "Exec=$out/bin/pyroshine-tray"
+
     # Input-group access + active-seat ACLs for /dev/uinput and /dev/uhid,
     # picked up by services.udev.packages.
     install -Dm644 dist/60-moonshine.rules $out/lib/udev/rules.d/60-moonshine.rules
