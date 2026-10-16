@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"The main window: application commands and event delivery only.","local":true,"windows":["main"],"permissions":["core:event:default"]}}

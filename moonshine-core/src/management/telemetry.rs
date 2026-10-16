@@ -9,7 +9,7 @@
 //! pipeline never waits on it: a timer drains the channel four times a second
 //! (no per-frame wakeups), and a receiver that falls behind loses the oldest
 //! samples, which are counted. Once per second the window is summarized into a
-//! [`StreamStats`] for the desktop UI and the support bundle's history,
+//! [`StreamStats`] for the web interface and the support bundle's history,
 //! together with one reading of the capture GPU ([`GpuProbe`]) taken on a
 //! blocking thread.
 

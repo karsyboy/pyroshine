@@ -138,25 +138,16 @@ jobs:
         if: matrix.name == 'Test Suite'
         run: python3 scripts/known_defects.py --json "$RUNNER_TEMP/known-defects.json"
 
-  desktop:
-    name: Desktop app
+  # The web interface's frontend (Node.js is needed to build it, never at
+  # runtime). The tray is a workspace member, checked with the server.
+  web:
+    name: Web interface
     runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: pyroshine-ui
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
 
       - uses: actions/setup-node@v7
         with:
@@ -170,12 +161,4 @@ jobs:
           npm run typecheck
           npm test
           npm run build
-
-      - name: Rustfmt
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-
-      - name: Clippy
-        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+          test -f dist/index.html && test -f dist/pyroshine-web.json

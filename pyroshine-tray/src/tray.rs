@@ -1,5 +1,10 @@
 //! System tray icon over the StatusNotifierItem D-Bus protocol (KDE Plasma
 //! natively; GNOME with the AppIndicator extension; most other panels).
+//!
+//! The icon and menu show the server's authoritative session state (no state
+//! machine of their own). Clicks open web interface pages in the browser;
+//! only End Session acts directly, through the server's management
+//! interface, so it works without a browser.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,12 +12,12 @@ use std::sync::Arc;
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Category, Icon, Status, ToolTip, Tray, TrayMethods};
 use moonshine_management::dto::{PairingSnapshot, SessionDetails, SessionPhase, SessionSnapshot};
-use tauri::AppHandle;
+use tokio::runtime::Handle;
+use tokio::sync::Notify;
 
-use crate::daemon::{Daemon, Overview};
 use crate::icons::{self, Badge};
 use crate::notifications::Notifier;
-use crate::window;
+use crate::service::Service;
 
 /// What the tray shows.
 #[derive(Clone, Debug)]
@@ -99,9 +104,10 @@ impl View {
 }
 
 pub struct PyroTray {
-	app: AppHandle,
-	daemon: Arc<Daemon>,
+	runtime: Handle,
+	service: Arc<Service>,
 	notifier: Notifier,
+	quit: Arc<Notify>,
 	view: View,
 	icons: HashMap<Badge, Vec<Icon>>,
 	/// Token the tray host provided for the click being handled.
@@ -110,7 +116,52 @@ pub struct PyroTray {
 
 impl PyroTray {
 	fn open(&mut self, page: &str) {
-		window::show(&self.app, page, self.activation_token.take());
+		let service = self.service.clone();
+		let notifier = self.notifier.clone();
+		let token = self.activation_token.take();
+		let page = page.to_string();
+		self.runtime.spawn(async move {
+			if let Err(error) = service.open(&page, token).await {
+				tracing::warn!("Cannot open the browser: {error}");
+				notifier.error("Could not open Pyroshine in the browser", &error).await;
+			}
+		});
+	}
+
+	/// Ask the server for a web setup code and show it with the setup page.
+	fn setup_web_access(&mut self) {
+		let service = self.service.clone();
+		let notifier = self.notifier.clone();
+		let token = self.activation_token.take();
+		self.runtime.spawn(async move {
+			let code = match service.proxy().await {
+				Ok(proxy) => proxy.create_web_setup_code(false).await.map_err(crate::service::UiError::from),
+				Err(error) => Err(error),
+			};
+			match code {
+				Ok(code) => {
+					notifier
+						.info(
+							"Pyroshine setup code",
+							&format!("Enter {code} in the browser within 15 minutes to choose the administrator password."),
+						)
+						.await;
+					if let Err(error) = service.open("dashboard", token).await {
+						notifier.error("Could not open Pyroshine in the browser", &error).await;
+					}
+				},
+				Err(error) if error.kind == "conflict" => {
+					notifier
+						.info(
+							"Web access is already set up",
+							"Sign in with the administrator password. To replace a forgotten one, run pyroshine web setup --reset in a terminal.",
+						)
+						.await;
+					let _ = service.open("dashboard", token).await;
+				},
+				Err(error) => notifier.error("Could not get a setup code", &error.message).await,
+			}
+		});
 	}
 }
 
@@ -158,10 +209,10 @@ impl Tray for PyroTray {
 	/// Plasma passes the activation token for a click on the item just
 	/// before activating it.
 	fn provide_xdg_activation_token(&mut self, token: String) {
-		self.activation_token = window::activation_token(&token);
+		self.activation_token = crate::browser::activation_token(&token);
 	}
 
-	/// Left click opens the window (at a waiting pairing request first).
+	/// Left click opens the dashboard (at a waiting pairing request first).
 	fn activate(&mut self, _x: i32, _y: i32) {
 		let page = match self.view.requests.last() {
 			Some(request) => format!("clients?request={request}"),
@@ -185,7 +236,7 @@ impl Tray for PyroTray {
 		items.push(
 			StandardItem {
 				label: "_Open Pyroshine".into(),
-				icon_name: "window-new".into(),
+				icon_name: "internet-web-browser".into(),
 				activate: Box::new(|tray: &mut Self| tray.open("dashboard")),
 				..Default::default()
 			}
@@ -222,10 +273,10 @@ impl Tray for PyroTray {
 					label: format!("_End Session (closes {application})"),
 					icon_name: "media-playback-stop".into(),
 					activate: Box::new(|tray: &mut Self| {
-						let daemon = tray.daemon.clone();
+						let service = tray.service.clone();
 						let notifier = tray.notifier.clone();
-						tauri::async_runtime::spawn(async move {
-							let result = match daemon.proxy().await {
+						tray.runtime.spawn(async move {
+							let result = match service.proxy().await {
 								Ok(proxy) => proxy.end_session().await.map_err(Into::into),
 								Err(error) => Err(error),
 							};
@@ -242,9 +293,40 @@ impl Tray for PyroTray {
 		items.push(MenuItem::Separator);
 		items.push(
 			StandardItem {
-				label: "_Quit Pyroshine UI".into(),
+				label: "Session _History".into(),
+				icon_name: "document-open-recent".into(),
+				activate: Box::new(|tray: &mut Self| tray.open("history")),
+				..Default::default()
+			}
+			.into(),
+		);
+		items.push(
+			StandardItem {
+				label: "_Updates".into(),
+				icon_name: "system-software-update".into(),
+				activate: Box::new(|tray: &mut Self| tray.open("updates")),
+				..Default::default()
+			}
+			.into(),
+		);
+		items.push(
+			StandardItem {
+				label: "Set Up _Web Access…".into(),
+				icon_name: "dialog-password".into(),
+				enabled: self.view.connected,
+				activate: Box::new(|tray: &mut Self| tray.setup_web_access()),
+				..Default::default()
+			}
+			.into(),
+		);
+		items.push(MenuItem::Separator);
+		items.push(
+			StandardItem {
+				// Only the tray exits: the server, its web interface and any
+				// stream keep running.
+				label: "_Quit Pyroshine Tray".into(),
 				icon_name: "application-exit".into(),
-				activate: Box::new(|tray: &mut Self| tray.app.exit(0)),
+				activate: Box::new(|tray: &mut Self| tray.quit.notify_one()),
 				..Default::default()
 			}
 			.into(),
@@ -260,7 +342,8 @@ fn pairing_label(count: usize) -> String {
 	}
 }
 
-/// Cheap, cloneable access to the running tray (absent when no session bus).
+/// Cheap, cloneable access to the running tray (absent without a tray host
+/// connection).
 #[derive(Clone)]
 pub struct TrayHandle(Option<ksni::Handle<PyroTray>>);
 
@@ -271,24 +354,13 @@ impl TrayHandle {
 		}
 	}
 
-	pub async fn update(&self, overview: &Overview) {
-		let session = overview
-			.session
-			.as_ref()
-			.and_then(|value| serde_json::from_value::<SessionSnapshot>(value.clone()).ok());
-		let pairing = overview
-			.pairing
-			.as_ref()
-			.and_then(|value| serde_json::from_value::<PairingSnapshot>(value.clone()).ok());
-		self.change(|view| {
-			view.connected = overview.connected;
-			if let Some(session) = session {
-				view.phase = session.phase;
-				view.session = session.session;
-			}
-			if let Some(pairing) = pairing {
-				view.requests = pairing.requests.into_iter().map(|request| request.request).collect();
-			}
+	pub async fn connected(&self, session: &SessionSnapshot, pairing: &PairingSnapshot) {
+		let (session, requests) = (session.clone(), requests(pairing));
+		self.change(move |view| {
+			view.connected = true;
+			view.phase = session.phase;
+			view.session = session.session;
+			view.requests = requests;
 		})
 		.await;
 	}
@@ -303,11 +375,7 @@ impl TrayHandle {
 	}
 
 	pub async fn pairing(&self, snapshot: &PairingSnapshot) {
-		let requests: Vec<_> = snapshot
-			.requests
-			.iter()
-			.map(|request| request.request.clone())
-			.collect();
+		let requests = requests(snapshot);
 		self.change(move |view| view.requests = requests).await;
 	}
 
@@ -316,10 +384,17 @@ impl TrayHandle {
 	}
 }
 
-pub fn spawn(app: AppHandle, daemon: Arc<Daemon>, notifier: Notifier) -> TrayHandle {
-	if daemon.connection().is_none() {
-		return TrayHandle(None);
-	}
+/// Request tokens waiting for the operator, newest last.
+fn requests(snapshot: &PairingSnapshot) -> Vec<String> {
+	snapshot
+		.requests
+		.iter()
+		.filter(|request| !request.approved)
+		.map(|request| request.request.clone())
+		.collect()
+}
+
+pub async fn spawn(service: Arc<Service>, notifier: Notifier, quit: Arc<Notify>) -> TrayHandle {
 	let icons = [
 		Badge::None,
 		Badge::Streaming,
@@ -334,16 +409,17 @@ pub fn spawn(app: AppHandle, daemon: Arc<Daemon>, notifier: Notifier) -> TrayHan
 	.map(|badge| (badge, icons::pixmaps(badge)))
 	.collect();
 	let tray = PyroTray {
-		app,
-		daemon,
+		runtime: Handle::current(),
+		service,
 		notifier,
+		quit,
 		view: View::default(),
 		icons,
 		activation_token: None,
 	};
-	// The panel may start after the app (autostart), so a missing
+	// The panel may start after the tray (autostart), so a missing
 	// StatusNotifierWatcher is not fatal: the icon appears once one does.
-	match tauri::async_runtime::block_on(tray.assume_sni_available(true).spawn()) {
+	match tray.assume_sni_available(true).spawn().await {
 		Ok(handle) => TrayHandle(Some(handle)),
 		Err(error) => {
 			tracing::warn!("System tray unavailable: {error}");
@@ -359,7 +435,7 @@ mod tests {
 	#[test]
 	fn retained_session_lines_prefer_foreground_and_fall_back_to_launch_entry() {
 		let snapshot: SessionSnapshot =
-			serde_json::from_str(include_str!("../../src/api/session.fixture.json")).unwrap();
+			serde_json::from_str(include_str!("../../pyroshine-ui/src/api/session.fixture.json")).unwrap();
 		let mut view = View {
 			connected: true,
 			phase: snapshot.phase,

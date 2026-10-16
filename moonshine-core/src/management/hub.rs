@@ -9,8 +9,8 @@
 //! consumer never blocks a publisher.
 //!
 //! The hub also counts live observers. Statistics and library changes are
-//! published only while someone watches (a tray that shows them, or an open
-//! browser tab), so an idle host does no serialization work for them.
+//! published only while an open browser tab watches them (the tray shows
+//! neither), so a host nobody looks at does no serialization work for them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,7 +78,7 @@ pub(crate) struct Event {
 
 pub(crate) struct Hub {
 	events: broadcast::Sender<Event>,
-	/// Whether a desktop tray that shows live state owns its bus name.
+	/// Whether the desktop tray owns its bus name (it shows notifications).
 	desktop: watch::Sender<bool>,
 	/// Open web event streams.
 	web_streams: AtomicUsize,
@@ -121,7 +121,6 @@ impl Hub {
 
 	pub(crate) fn set_desktop_present(&self, present: bool) {
 		self.desktop.send_replace(present);
-		self.recompute();
 	}
 
 	pub(crate) fn desktop_present(&self) -> bool {
@@ -140,7 +139,7 @@ impl Hub {
 	}
 
 	fn recompute(&self) {
-		let observed = *self.desktop.borrow() || self.web_streams.load(Ordering::Acquire) > 0;
+		let observed = self.web_streams.load(Ordering::Acquire) > 0;
 		self.observed.send_if_modified(|current| {
 			let changed = *current != observed;
 			*current = observed;
@@ -165,7 +164,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn observation_follows_desktop_and_web_streams() {
+	fn observation_follows_web_streams_only() {
 		let hub = Arc::new(Hub::default());
 		let observed = hub.observed();
 		assert!(!*observed.borrow());
@@ -177,10 +176,10 @@ mod tests {
 		assert!(hub.is_observed());
 		drop(second);
 		assert!(!hub.is_observed());
+		// The tray shows neither statistics nor the library.
 		hub.set_desktop_present(true);
-		assert!(hub.is_observed());
-		hub.set_desktop_present(false);
 		assert!(!hub.is_observed());
+		assert!(hub.desktop_present());
 	}
 
 	#[tokio::test]

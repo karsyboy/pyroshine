@@ -1,10 +1,12 @@
 //! Desktop notifications through `org.freedesktop.Notifications`.
 //!
-//! While the UI runs it owns operator notifications (the daemon's own
-//! fallback is suppressed). Pairing requests share one notification that is
+//! While the tray runs it owns operator notifications (the server's own
+//! fallback is suppressed while the tray holds its bus name, so the desktop
+//! never gets both). Pairing requests share one notification that is
 //! replaced, not repeated, so a client retrying pairing cannot flood the
-//! desktop; clicking it opens the pending request. Error notifications are
-//! limited to one per minute and skipped while the window is visible.
+//! desktop; clicking it opens the pending request in the web interface.
+//! Error notifications are limited to one per minute. Without the tray, the
+//! web interface still lists pending requests and recent problems.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,11 +15,10 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use moonshine_management::dto::PairingSnapshot;
 use serde_json::Value;
-use tauri::AppHandle;
 use tokio::sync::Mutex;
 use zbus::zvariant::Value as Variant;
 
-use crate::window;
+use crate::service::Service;
 
 #[zbus::proxy(
 	interface = "org.freedesktop.Notifications",
@@ -53,10 +54,11 @@ struct State {
 	latest: Option<String>,
 	error: Option<u32>,
 	last_error: Option<Instant>,
+	info: Option<u32>,
 }
 
 struct Inner {
-	app: AppHandle,
+	service: Arc<Service>,
 	proxy: NotificationsProxy<'static>,
 	state: Mutex<State>,
 }
@@ -106,6 +108,8 @@ impl Inner {
 					None => "clients".into(),
 				}
 			} else if Some(id) == state.error {
+				"diagnostics".into()
+			} else if Some(id) == state.info {
 				"dashboard".into()
 			} else {
 				continue;
@@ -116,8 +120,12 @@ impl Inner {
 					tokens.insert(id, text);
 				},
 				"ActionInvoked" => {
-					let token = tokens.remove(&id).and_then(|token| window::activation_token(&token));
-					window::show(&self.app, &page, token);
+					let token = tokens
+						.remove(&id)
+						.and_then(|token| crate::browser::activation_token(&token));
+					if let Err(error) = self.service.open(&page, token).await {
+						tracing::warn!("Cannot open the browser: {error}");
+					}
 				},
 				_ => {},
 			}
@@ -129,11 +137,9 @@ impl Inner {
 pub struct Notifier(Option<Arc<Inner>>);
 
 impl Notifier {
-	pub fn new(app: AppHandle, connection: Option<zbus::Connection>) -> Self {
-		let Some(connection) = connection else {
-			return Self(None);
-		};
-		let proxy = match tauri::async_runtime::block_on(NotificationsProxy::new(&connection)) {
+	pub async fn new(service: Arc<Service>) -> Self {
+		let connection = service.connection().clone();
+		let proxy = match NotificationsProxy::new(&connection).await {
 			Ok(proxy) => proxy,
 			Err(error) => {
 				tracing::warn!("Desktop notifications unavailable: {error}");
@@ -141,18 +147,18 @@ impl Notifier {
 			},
 		};
 		let inner = Arc::new(Inner {
-			app,
+			service,
 			proxy,
 			state: Mutex::default(),
 		});
 		let listener = inner.clone();
-		tauri::async_runtime::spawn(async move { listener.follow_clicks(connection).await });
+		tokio::spawn(async move { listener.follow_clicks(connection).await });
 		Self(Some(inner))
 	}
 
 	async fn notify(inner: &Inner, replaces: Option<u32>, summary: &str, body: &str, urgency: u8) -> Option<u32> {
 		let hints = HashMap::from([
-			("desktop-entry", Variant::from("pyroshine-ui")),
+			("desktop-entry", Variant::from("pyroshine")),
 			("urgency", Variant::from(urgency)),
 		]);
 		match inner
@@ -238,11 +244,16 @@ impl Notifier {
 		}
 	}
 
+	/// A message the operator asked for (a setup code); replaces the last one.
+	pub async fn info(&self, summary: &str, message: &str) {
+		let Some(inner) = &self.0 else { return };
+		let mut state = inner.state.lock().await;
+		let replaces = state.info;
+		state.info = Self::notify(inner, replaces, summary, message, 1).await.or(replaces);
+	}
+
 	pub async fn error(&self, summary: &str, message: &str) {
 		let Some(inner) = &self.0 else { return };
-		if window::is_visible(&inner.app) {
-			return;
-		}
 		let mut state = inner.state.lock().await;
 		if state.last_error.is_some_and(|last| last.elapsed() < ERROR_INTERVAL) {
 			return;

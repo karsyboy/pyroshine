@@ -1,5 +1,5 @@
 //! End-to-end tests of the management interface over a private D-Bus
-//! daemon, through the same client proxy the desktop UI uses.
+//! daemon, through the same client proxy the tray and the commands use.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -564,7 +564,7 @@ async fn the_desktop_ui_name_suppresses_fallback_notifications() {
 	}
 }
 
-/// Rejected launches and negotiations reach the desktop app as events with
+/// Rejected launches and negotiations reach the management clients as events with
 /// their cause and hint, are kept for `GetEvents`, and appear in the
 /// diagnostic report.
 #[tokio::test]

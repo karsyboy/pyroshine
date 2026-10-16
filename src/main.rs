@@ -306,7 +306,7 @@ async fn wait_for_dbus() -> Result<(), ()> {
 }
 
 pub struct Moonshine {
-	// Dropped first: the desktop UI sees the daemon leave before listeners close.
+	// Dropped first: management clients see the daemon leave before listeners close.
 	_management: ManagementService,
 	_rtsp_server: RtspServer,
 	_session_manager: SessionManager,

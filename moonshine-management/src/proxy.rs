@@ -96,22 +96,22 @@ pub trait Management {
 	#[zbus(signal)]
 	fn health_changed(&self, report: String) -> zbus::Result<()>;
 	/// A new [`crate::dto::LibrarySnapshot`] (scan started or finished,
-	/// catalog changed). Sent while the desktop UI runs.
+	/// catalog changed). Sent while a web interface page is open.
 	#[zbus(signal)]
 	fn library_changed(&self, snapshot: String) -> zbus::Result<()>;
 }
 
-/// Proxy for a running desktop UI instance.
+/// Proxy for the running desktop tray.
 #[zbus::proxy(
 	interface = "io.github.karsyboy.PyroshineUi1",
 	default_service = "io.github.karsyboy.PyroshineUi",
 	default_path = "/io/github/karsyboy/PyroshineUi"
 )]
 pub trait Ui {
-	/// Show the main window at `page` (for example `dashboard` or
-	/// `clients?request=<token>`).
+	/// Open the web interface at `page` (for example `dashboard` or
+	/// `clients?request=<token>`) in the default browser.
 	fn show(&self, page: &str) -> zbus::Result<()>;
-	/// [`Self::show`], activating the window with the XDG activation token
-	/// the caller received for the user's action (Wayland focus requires one).
+	/// [`Self::show`], passing the XDG activation token the caller received
+	/// for the user's action, so the browser may take focus on Wayland.
 	fn activate(&self, page: &str, activation_token: &str) -> zbus::Result<()>;
 }

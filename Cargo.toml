@@ -1,8 +1,7 @@
 [workspace]
-members = [".", "moonshine-core", "moonshine-management", "moonshine-tools"]
-# The optional desktop UI is a separate workspace so headless builds never
-# compile its GUI dependencies; see pyroshine-ui/README.md.
-exclude = ["pyroshine-ui"]
+# pyroshine-ui/ is the web interface's npm project (no Rust); pyroshine-tray
+# links no GUI toolkit, so every member builds on a headless host.
+members = [".", "moonshine-core", "moonshine-management", "moonshine-tools", "pyroshine-tray"]
 resolver = "2"
 
 [workspace.package]

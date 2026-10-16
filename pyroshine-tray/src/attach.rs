@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 
-use crate::daemon::UiError;
+use crate::service::UiError;
 
 /// How one attachment attempt ended.
 #[derive(Debug)]
@@ -40,7 +40,7 @@ impl Attached {
 pub const INITIAL_RETRY: Duration = Duration::from_millis(500);
 pub const MAX_RETRY: Duration = Duration::from_secs(30);
 
-/// Effects of supervision, injected so the policy is testable without Tauri.
+/// Effects of supervision, injected so the policy is testable without a bus.
 pub trait Attachment: Send + 'static {
 	type Attempt: Future<Output = Attached> + Send + 'static;
 

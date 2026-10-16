@@ -1103,7 +1103,7 @@ pub(crate) mod tests {
 		}
 	}
 
-	/// The desktop app renders forms from this schema. Its tests and browser
+	/// The web interface renders forms from this schema. Its tests and browser
 	/// preview read a committed copy, which must match the daemon's schema.
 	/// Regenerate it with `MOONSHINE_UPDATE_UI_FIXTURES=1 cargo test -p
 	/// moonshine-core ui_schema_fixture_is_current`.
@@ -1121,7 +1121,7 @@ pub(crate) mod tests {
 		let committed = std::fs::read_to_string(&path).unwrap_or_default();
 		assert!(
 			committed == fixture,
-			"{} is out of date; regenerate it with MOONSHINE_UPDATE_UI_FIXTURES=1 and check the desktop app renders the change",
+			"{} is out of date; regenerate it with MOONSHINE_UPDATE_UI_FIXTURES=1 and check the web interface renders the change",
 			path.display()
 		);
 	}

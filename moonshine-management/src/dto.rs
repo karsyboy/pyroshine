@@ -589,7 +589,7 @@ pub struct ServerEvent {
 }
 
 /// Everything needed to diagnose the host in one document, sent by
-/// `GetDiagnosticReport` for the desktop app's "Copy diagnostics".
+/// `GetDiagnosticReport` (and the web interface's "Copy diagnostics").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticReport {
 	pub generated_at_ms: u64,

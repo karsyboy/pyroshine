@@ -870,7 +870,7 @@ fn codec_capabilities(supported: u32) -> Vec<CodecCapability> {
 		.collect()
 }
 
-/// The health report for the desktop app. Each check's message is split into
+/// The health report for the management clients. Each check's message is split into
 /// what it found (the first line) and what to do (the remaining lines, which
 /// the command-line report prints indented below it).
 pub(crate) fn health_report(report: &healthcheck::HealthReport, rechecked: bool) -> HealthReport {
@@ -1025,7 +1025,7 @@ mod health_report_tests {
 	}
 
 	/// The command line prints a check's remedy indented below its finding;
-	/// the desktop app receives the two separately.
+	/// the web interface receives the two separately.
 	#[test]
 	fn failed_checks_separate_the_finding_from_the_remedy() {
 		let dto = health_report(
