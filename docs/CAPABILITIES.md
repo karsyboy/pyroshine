@@ -97,6 +97,16 @@ same Vulkan Video probe, and vendor differences are handled where they occur.
 | Audio capture (embedded Pulse server) and reconnect | Implemented | `session/stream/audio/` | `audio::tests` (epochs, ordered activation, 100 real sessions), `pulse_server` | `hw:real_pulse_clients_play_every_layout_and_may_vanish` |
 | Application catalog: automatic Steam/Lutris/Heroic/desktop discovery, stable IDs, visibility | Implemented | `app_scanner/` (`service.rs`, `catalog.rs`, `identity.rs`, `watch.rs`) | `app_scanner::service::tests` (installs, removals, renames, library folders, unavailable storage, corrupt metadata, restarts, debouncing), `identity::tests` (legacy IDs, persistence, interrupted saves), `catalog::tests`, `webserver::security_tests::catalog_refresh_during_an_active_stream_leaves_it_untouched` | `moonshine-library --follow` against real launchers; Lutris and Heroic on real installs unverified here |
 
+## Management
+
+| Capability | Status | Code | Automated tests | Hardware check |
+| --- | --- | --- | --- | --- |
+| Web management interface: API, SSE, static files | Implemented | `management/web/`, `management/ops.rs`, `management/hub.rs`, `pyroshine-ui/` | `management::web::tests` (real listener), `web::http::tests`, `web::assets::tests`, `hub::tests`, frontend `npm test` | Live against an isolated instance: setup, pairing approval, settings conflict, restart recovery, phone layout (Chromium); Firefox sign-in page only |
+| Administrator authentication and HTTP protections | Implemented | `management/auth.rs`, `management/web/http.rs` | `auth::tests` (setup codes, hashing, expiry, revocation, lockout, damaged file), `web::tests` (CSRF, Origin, Host, body limits, rate limit, sign-out) | Live probes: rebinding Host, forged cookie, cross-site and form posts, path traversal |
+| Session history | Implemented | `management/history.rs` | `history::tests` (recorder, retention, pagination, interrupted sessions, damaged database, unwritable storage) | Not yet recorded from a real stream |
+| Release notifications | Implemented, off by default | `management/updates.rs` | `updates::tests` (semver precedence, channels, link validation, failures, install detection) | GitHub request not exercised in tests |
+| Desktop tray | Implemented | `pyroshine-tray/` | `pyroshine-tray` tests (routes, addresses, activation tokens, session detection, attach supervision, icons) | KDE Plasma 6 Wayland: icon state, notification replacement, portal launch, quit, crash and server-restart recovery; End Session with a live stream and GNOME not checked |
+
 ## Known gaps
 
 - The benchmark has no Moonlight client: client decode, display latency, ENet

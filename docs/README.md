@@ -2,10 +2,10 @@
 
 ## Getting started
 
-- [README quick start](../README.md): requirements and **Install → Start → Pair → Play** for a standard desktop.
+- [README quick start](../README.md): requirements and **Install → Start → Set up → Pair → Play**.
 - [Installation](INSTALLATION.md): platform compatibility, SteamOS/portable setup, headless use, networking and upgrades.
-- [Desktop app](DESKTOP.md): open the app, pair devices, manage clients, save settings and read stream status.
-- [Pair without the GUI](INSTALLATION.md#pair-without-the-desktop-app): `pyroshine pair`, including over SSH; browser fallback.
+- [Web interface and tray](MANAGEMENT.md): sign in locally or over SSH, pair devices, manage clients, save settings, read stream status, history and updates; the desktop tray.
+- [Manage a headless host](INSTALLATION.md#manage-a-headless-host) and [pair from a terminal](INSTALLATION.md#pair-from-a-terminal): `pyroshine web setup` and `pyroshine pair`, including over SSH.
 - [NixOS](NIXOS.md): declarative installation, Steam configuration and the `moonshine` service.
 
 ## Advanced configuration and troubleshooting
@@ -27,7 +27,7 @@ the guide for the area being changed:
 | --- | --- |
 | Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
 | Inputtino and Pixelforge patch maintenance | [Vendored dependencies](../vendor/README.md) |
-| Management interface and desktop app | [Architecture](ARCHITECTURE.md#desktop-management-interface), [pyroshine-ui](../pyroshine-ui/README.md) |
+| Web management interface, tray and management API | [Architecture](ARCHITECTURE.md#management), [pyroshine-ui](../pyroshine-ui/README.md) |
 | Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |

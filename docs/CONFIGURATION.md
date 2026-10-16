@@ -24,7 +24,7 @@ at startup; restart the server after edits. Invalid TOML or missing required
 fields prevents startup. Unknown fields are not rejected by the current parser,
 so check spelling carefully.
 
-The [desktop app](DESKTOP.md#settings) edits every setting below. It validates
+The [web interface](MANAGEMENT.md#settings) edits every setting below. It validates
 the whole configuration before saving, changes only the settings you edit
 (keeping comments, formatting and unrelated entries), refuses to overwrite a
 file changed since it was loaded, and replaces the file atomically. Saving does
@@ -108,7 +108,7 @@ private_key = "$HOME/.config/moonshine/key.pem"
 
 | Setting | Type / default when table is omitted | Effect |
 | --- | --- | --- |
-| `port` | integer, `47989` | HTTP GameStream API and pairing PIN page port (TCP). The PIN page only accepts requests from the host itself. Required in an explicit table. |
+| `port` | integer, `47989` | HTTP GameStream API port (TCP), also used for host-local revocation (`POST /unpair`). Required in an explicit table. |
 | `port_https` | integer, `47984` | HTTPS GameStream API port (TCP). Required in an explicit table. |
 | `enable_pairing` | boolean, `true` | Allow new clients to pair. Set `false` after pairing to disable new pairings. |
 | `certificate` | path string, `$HOME/.config/moonshine/cert.pem` | TLS certificate file, created if needed. Required in an explicit table. Supports `~` and environment-variable expansion. |
@@ -121,20 +121,59 @@ they must be fixed), two TCP listeners (`webserver.port`,
 `webserver.port_https`, `stream.port`) or two UDP listeners
 (`stream.video.port`, `stream.audio.port`, `stream.control.port`) share a
 port, `[stream].timeout` is outside 1–86400, or whose `address` is not an IP
-address. The desktop settings editor applies the same checks.
+address. The web interface's settings editor applies the same checks.
 
-Pair through the [desktop app](DESKTOP.md#pair-a-client), or follow the
-[headless/browser procedure](INSTALLATION.md#pair-without-the-desktop-app).
-The page needs the complete logged `/pin?uniqueid=...` URL; bare `/pin` fails.
-It provides the request-specific approval token used by `/submit-pin`, which
-requires `uniqueid`, `pin` and `request`.
-
-Operator approval routes require a loopback peer and a loopback `Host` on the
-configured HTTP port; browser Origin/site checks also apply. For SSH forwarding,
-keep the local and remote port equal to `webserver.port`. A different local
-port is rejected by Host/origin validation. See
+Pair through the [web interface](MANAGEMENT.md#pair-a-client) or
+[from a terminal](INSTALLATION.md#pair-from-a-terminal). See
 [Security administration](SECURITY_ADMINISTRATION.md) for request lifetimes,
 identity recovery and revocation.
+
+## `[management]`
+
+[Source](../moonshine-core/src/management/web/mod.rs). The
+[web management interface](MANAGEMENT.md): a separate listener from the
+GameStream ports, with its own administrator sign-in.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `enabled` | boolean, `true` | Serve the web interface. Without it, manage Pyroshine with the tray and `pyroshine pair`. |
+| `address` | IP string, `"127.0.0.1"` | Listen address. Loopback keeps it on the host; reach it through an SSH tunnel. Any other address (for example `"0.0.0.0"` or `"::"` for all) requires `tls = true`. |
+| `port` | integer, `47990` | TCP port. Must differ from the GameStream TCP ports. |
+| `tls` | boolean, `false` | Serve HTTPS. Required for a non-loopback `address`. |
+| `certificate` | optional path | PEM certificate for HTTPS. Defaults to `[webserver] certificate` (self-signed: browsers warn until you accept it). |
+| `private_key` | optional path | Private key for `certificate`; set both or neither. |
+| `allowed_hosts` | list of strings, `[]` | Further host names browsers may use (`name` or `name:port`), for example `["streambox.lan"]`. IP addresses and `localhost` always work; other names are refused to defeat DNS rebinding. |
+| `web_root` | optional directory | The interface's files. Defaults to `share/pyroshine/web` next to the executable, then `/usr/share/pyroshine/web`. |
+
+```toml
+[management]
+address = "0.0.0.0"
+tls = true
+allowed_hosts = ["streambox.lan"]
+```
+
+Startup logs **Web management interface not started** with the reason when
+the listener cannot start (invalid settings, port in use, unreadable
+certificate); streaming still works. The administrator password is not a
+setting: set it with `pyroshine web setup`.
+
+## `[history]`
+
+[Source](../moonshine-core/src/management/history.rs). The
+[session history](MANAGEMENT.md#session-history), stored in
+`~/.local/share/moonshine/history.sqlite3`.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `enabled` | boolean, `true` | Record sessions. |
+| `retention_days` | integer, `90`; `1`–`3650` | Remove sessions older than this. |
+| `max_sessions` | integer, `1000`; `10`–`100000` | Keep at most this many sessions; the oldest go first. |
+| `record_client_address` | boolean, `true` | Store each session's client IP address and the name you gave that client. |
+
+Only host-side measurements are recorded; no keys, PINs, credentials or stream
+contents. Writing never delays a stream: when storage fails (full or read-only
+disk) the web interface reports it and the stream continues. A damaged database
+is moved aside (`history.sqlite3.corrupt-<time>`) and a new one started.
 
 ## `[stream]`
 
@@ -394,13 +433,13 @@ be read or decoded, the next one is used; clients show a placeholder when none
 works. Nothing is downloaded.
 
 Each discovered game keeps its client-facing ID across rescans, renames,
-reinstalls and restarts (see [Library management](DESKTOP.md#library)). The
+reinstalls and restarts (see [Applications](MANAGEMENT.md#applications)). The
 catalog leaves out what clients do not need twice: a desktop shortcut that
 starts a Steam, Lutris or Heroic game already in the catalog, the same game
 found by two scanners of one launcher, Steam's Proton and runtime tools, and
 DLC. Games with equal titles from different launchers get the launcher in their
 title, for example `Hades (Steam)` and `Hades (Heroic)`. Individual games can be
-hidden from clients in the desktop app's **Library** page.
+hidden from clients in the web interface's **Applications** page.
 
 The desktop scanner also accepts:
 
@@ -450,12 +489,12 @@ running, and clients see the change in their app list.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests and library folders, the Lutris database, Heroic library files, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the desktop app. |
+| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests and library folders, the Lutris database, Heroic library files, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
 | `poll_interval_secs` | integer, `300`; `30`–`86400` | Seconds between checks for changes that file notifications cannot report, such as network file systems, a drive that is mounted later or an exhausted inotify watch limit. A check compares file metadata only; a launcher is rescanned only when it changed. |
 
 A launcher location that cannot be read (an unmounted drive holding a Steam
 library, a file the launcher is rewriting) keeps its games offered from the last
-successful scan, for up to seven days, and is retried; the **Library** page
+successful scan, for up to seven days, and is retried; the **Applications** page
 shows the error and what to do about it.
 
 ```toml

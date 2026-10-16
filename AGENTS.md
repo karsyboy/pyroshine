@@ -60,7 +60,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), Pixelforge encoding, HDR metadata, failure classification |
 | `session/stream/video/pyrowave.rs`, `pyrowave_protocol.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership; dialect/profile negotiation |
 | `session/status.rs` | Public session phase from manager status and control-stream peer ownership |
-| `management/` | Session-bus management interface for the desktop app: status, pairing, clients, config store (`config_store.rs`), editor schema (`schema.rs`), telemetry aggregation |
+| `management/` | Management of the running server: shared operations (`ops.rs`), event hub (`hub.rs`), web interface (`web/`: HTTP API, SSE, static files) with administrator auth (`auth.rs`), session-bus adapter (`dbus.rs`), config store (`config_store.rs`), editor schema (`schema.rs`), telemetry, session history (`history.rs`), release checks (`updates.rs`) |
 | `gpu_sensors/` | Capture GPU readings for telemetry: sysfs/hwmon sensors, per-process DRM fdinfo engine time, runtime-loaded NVML |
 | `support/` | Redacted support bundles (`pyroshine diag`, `GetSupportBundle`): collection, redaction, tar writer |
 
@@ -69,10 +69,13 @@ Other workspace and integration areas:
 - `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark and
   `moonshine-library` (scan launchers with isolated state, report timing and follow changes).
 - `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
-  error names, proxies) shared by the daemon and the desktop app.
-- `pyroshine-ui/`: optional desktop app (Tauri 2, React/Material UI, `ksni` tray) in a
-  separate Cargo workspace and npm project, packaged by `nfpm-ui.yaml`. It is a client of
-  the management interface only; server crates must never depend on it.
+  error names, proxies) shared by the daemon, the web interface, the tray and the CLI.
+- `pyroshine-tray/`: optional desktop tray (`ksni` StatusNotifierItem, notifications,
+  browser launcher); a workspace member that links no GUI toolkit.
+- `pyroshine-ui/`: the web management interface (React/Material UI, npm only), built
+  into static files the server serves (packaged with the server; the tray by
+  `nfpm-tray.yaml`). Both are clients of the management interface only; server crates
+  must never depend on them.
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
   (`build-shaders.sh`), changelog tooling/tests, measurement harnesses, the
   baseline recorder and result comparison (`record_baseline.py`,
@@ -80,7 +83,7 @@ Other workspace and integration areas:
   (`hardware_tests.toml`, `hardware_tests.py`).
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
   installers, systemd, device permissions and system policy. The Arch
-  `pyroshine-bin`/`pyroshine-ui-bin` PKGBUILDs live in `karsyboy/pyrowave-packages`.
+  `pyroshine-bin`/`pyroshine-tray-bin` PKGBUILDs live in `karsyboy/pyrowave-packages`.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
 - `vendor/inputtino/`, `vendor/pixelforge/`: generated dependencies with numbered
   patch series; shared maintenance workflow in `vendor/README.md`.
@@ -101,7 +104,7 @@ Other workspace and integration areas:
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |
-| Management interface, desktop app | `docs/ARCHITECTURE.md` (Desktop management interface), `docs/DESKTOP.md`, `pyroshine-ui/README.md` |
+| Web interface, management API, tray | `docs/ARCHITECTURE.md` (Management), `docs/MANAGEMENT.md`, `docs/SECURITY_ADMINISTRATION.md` (Web management), `pyroshine-ui/README.md` |
 | Packaging, service or host integration | `docs/INSTALLATION.md`, `CONTRIBUTING.md`; `docs/NIXOS.md` for Nix |
 | Release notes and inherited history | `docs/CHANGELOG.md`; `docs/UPSTREAM_CHANGELOG.md` is the upstream archive |
 
@@ -192,9 +195,11 @@ On GPU hosts run them with `python3 scripts/hardware_tests.py run --json <file>`
 and record baselines with `scripts/record_baseline.py`; `docs/TESTING.md` has
 the full command set, including hosts without a toolchain.
 
-- Desktop app changes run the `pyroshine-ui` checks listed in `CONTRIBUTING.md`
-  (npm typecheck/test/build, and fmt/clippy/test with `--manifest-path
-  pyroshine-ui/src-tauri/Cargo.toml`). Management-interface tests need `dbus-daemon`.
+- Web interface changes run the `pyroshine-ui` checks listed in `CONTRIBUTING.md`
+  (npm typecheck/test/build); the tray is checked with the workspace.
+  Management-interface tests need `dbus-daemon`. Management HTTP changes keep
+  `management/web/tests.rs` (authentication, CSRF, Host/origin, limits) passing;
+  never weaken a web protection to make a client work.
 - Documentation-only work needs Markdown, relative-link and path checks and
   `git diff --check`, not a full native build. Select other checks according to
   the affected behavior.

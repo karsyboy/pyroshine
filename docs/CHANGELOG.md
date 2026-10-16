@@ -16,6 +16,12 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
+- Manage Pyroshine in the browser. The server serves its management interface at `http://127.0.0.1:47990/` (`[management]`), the same on a desktop and on a headless host, with no desktop, browser, GTK or Node.js needed on the host: dashboard, applications, clients and pairing, session history, settings, diagnostics, updates and maintenance, live over Server-Sent Events, usable on phones. Reach it from another computer through an SSH tunnel, or over HTTPS on another address. See [Web interface and tray](MANAGEMENT.md).
+- Protect the web interface with an administrator password. `pyroshine web setup` prints a one-time code that sets it (`--reset` replaces a forgotten one); sessions use HttpOnly SameSite=Strict cookies with expiry, sign-out and per-browser revocation; changes need same-origin requests and a CSRF token; unknown host names are refused; repeated wrong passwords are locked out; sensitive actions are audit-logged. A loopback address or a paired client grants no access.
+- Keep a session history: application, client, negotiated mode, codec, HDR, encoder and GPU, disconnects and resumes, how the session ended, and a performance summary measured on the host, compared with the previous session of the application (`[history]`, 90 days by default). Recording never delays a stream; storage failures are reported on the page.
+- Check for new releases on request, or daily when enabled, on the stable or prerelease channel, with update steps for how Pyroshine was installed. Nothing is downloaded or installed automatically.
+- Add `pyroshine-tray`, a small desktop tray with the existing status icon, indicators, session details, End Session and pairing notifications. Its clicks, the notifications and the new **Pyroshine** menu entry open the matching web page in the default browser. It starts at desktop login only, runs once per session and never affects the server or a stream.
+
 - Keep the game library current without restarting. Pyroshine now watches the metadata of every configured scanner (Steam manifests and library folders, the Lutris database, Heroic library files and installed-games manifests, desktop-entry directories) and rescans only the launcher that changed, a few seconds after the change; installed, removed and renamed games reach clients through their normal app-list refresh. Changes file notifications cannot report (network drives, a drive mounted later) are found by a periodic metadata check, `[library].poll_interval_secs` (300 s); `[library].auto_refresh = false` restores startup-only scanning. Scanning runs on its own low-priority thread and never touches a running session: a game that is removed or hidden while it streams keeps running. See [`[library]`](CONFIGURATION.md#library).
 - Add the **Library** page to the desktop app: search the catalog by title, launcher or ID; filter by source and visibility; hide or show discovered games; rescan; and see each launcher's status, scan time and errors with what to do about them. Manual and discovered applications are marked apart. The management interface gains `GetLibrary`, `RescanLibrary`, `SetApplicationHidden` and the `LibraryChanged` signal.
 - Add `moonshine-library` (in `moonshine-tools`), which scans a configuration's launchers with isolated state and reports what it finds, how long each launcher took and the memory and watches used, and with `--follow` prints games as they are installed, removed or renamed.
@@ -32,6 +38,11 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Make every application launchable. Two applications with the same title shared one ID, so Moonlight launched the first one for both; they now have distinct IDs.
 - Honor desktop-entry overrides. As in the XDG menu specification, an entry in an earlier directory replaces, or with `Hidden=true` hides, the entry with the same desktop file ID in a later one, instead of both being listed.
+
+### Removed
+
+- Remove the GTK/WebKitGTK desktop app (`pyroshine-ui`): the web interface replaces its window and `pyroshine-tray` its tray. The `pyroshine-tray` package replaces `pyroshine-ui` on upgrade.
+- Remove the host-local pairing page (`/pin`, `/submit-pin` on the GameStream HTTP port), which accepted a PIN from any local user or process. Approve pairing in the web interface or with `pyroshine pair`.
 
 ## [v0.18.0-alpha.0] - 2026-10-15
 
@@ -165,7 +176,7 @@ hooks and listener ports against the stricter configuration checks below.
 
 ### Added
 
-- Add the optional `pyroshine-ui` desktop app and package: a tray icon showing whether a client is streaming, the session is retained without a client, or a client waits to pair; pairing notifications with PIN approval and rejection; paired-client naming and revocation; a settings editor for every `config.toml` setting; a stream dashboard with one-second statistics and the compositor's current foreground application; and diagnostics. It manages, but never starts or stops, the service. See [Desktop app](DESKTOP.md).
+- Add the optional `pyroshine-ui` desktop app and package: a tray icon showing whether a client is streaming, the session is retained without a client, or a client waits to pair; pairing notifications with PIN approval and rejection; paired-client naming and revocation; a settings editor for every `config.toml` setting; a stream dashboard with one-second statistics and the compositor's current foreground application; and diagnostics. It manages, but never starts or stops, the service. See [Desktop app](MANAGEMENT.md).
 - Add a local management interface on the service user's D-Bus session bus (`io.github.karsyboy.Pyroshine`), used by the desktop app. Pyroshine runs unchanged without it or without a graphical session. Newly paired clients record an optional operator name and pairing time in `state.toml`.
 - Preserve explicitly identified Xbox Elite Series 1/2 (four native grip events), classic Steam Controller and Steam Deck models in automatic gamepad emulation, including motion and Deck touch events when the client supplies them.
 - Add `--cycles`, `--reconnect-cycles` and `--cursor static|moving` to `moonshine-bench` for repeated launch/stop and reconnect acceptance on real hardware and for measuring cursor capture paths.

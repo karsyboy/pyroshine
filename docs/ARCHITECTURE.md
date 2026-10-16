@@ -16,8 +16,9 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 | Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown |
 | `moonshine-core` | Library | Every server subsystem: protocol endpoints, pairing, sessions, compositor, encoders, transport, input |
 | `moonshine-tools` | `moonshine-bench` | Developer benchmark that drives the production session stack without a client |
-| `moonshine-management` | Library | Local management API contract: D-Bus names, JSON documents, error names and client proxies |
-| `pyroshine-ui/` (separate workspace) | `pyroshine-ui` | Optional desktop app: tray, notifications, pairing, settings and dashboard |
+| `moonshine-management` | Library | Management contract: JSON documents, D-Bus names, error names and client proxies |
+| `pyroshine-tray` | `pyroshine-tray` | Optional desktop tray: status icon, notifications, browser launcher (no GUI toolkit) |
+| `pyroshine-ui/` (npm, not Cargo) | Static files in `share/pyroshine/web` | The web management interface's React/Material UI frontend |
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
 (Vulkan Video encoding, vendored at its upstream release plus the patches in
@@ -183,9 +184,9 @@ sequenceDiagram
 ```
 
 1. **Discovery and pairing.** Clients find the host through mDNS or manually.
-   Pairing is approved by the host operator in the desktop app or on the
-   loopback-only `/pin` page; trust is persisted in `state.toml` before it is
-   published. See [Security administration](SECURITY_ADMINISTRATION.md).
+   Pairing is approved by the host operator through the management operations
+   (web interface, tray or `pyroshine pair`); trust is persisted in
+   `state.toml` before it is published. See [Security administration](SECURITY_ADMINISTRATION.md).
 2. **Launch.** An authenticated HTTPS `/launch` validates the request, creates an
    authorization generation and session keys, then initializes and launches the
    session: the compositor starts (with XWayland), and the application starts as
@@ -638,49 +639,84 @@ tile, and caches the PNG keyed by the source's path, size, mtime and inode
 (128 MiB / 2,048 files, least recently used first). Undecodable sources are
 skipped until they change. Nothing is fetched from the network.
 
-## Desktop management interface
+## Management
 
-`management/` exports `io.github.karsyboy.Pyroshine` (interface
-`…Pyroshine.Management1`) on the service user's D-Bus session bus. The
-optional desktop app (`pyroshine-ui/`) and terminal pairing (`src/pair.rs`) are
-clients; the contract lives in `moonshine-management`. The CLI pins the current
-unique bus owner and matches completion by client ID and request token. A
-restart requires a new invocation; PIN submission alone never reports success.
+`management/` is the one control surface over the running server. Its
+operations (`management/ops.rs`) call the existing owners; two transports
+expose them, and the contract (`moonshine-management`) is shared by both:
 
 ```text
-pyroshine-ui (desktop session)              pyroshine (service)
-  tray (ksni) · notifications · window        management/ ── SessionManager
-            │                                      │       ── ClientManager / state.toml
-            └──── session bus: methods, signals ───┘       ── config store (config.toml)
-                                                            ── frame stats broadcast
+browser (any device)                     pyroshine (service)
+  pyroshine-ui (React) ── HTTP/SSE ──▶ web/   ─┐
+                                               ├─ ops ── SessionManager, ClientManager,
+pyroshine-tray, pyroshine pair/web/diag        │         config store, Library, history,
+  ── session bus: methods, signals ──▶ dbus.rs┘         updates, telemetry
+                                         hub ◀── follow_* tasks (state changes)
 ```
-
-The desktop app follows ownership of the bus name and supervises each
-attachment (`pyroshine-ui/src-tauri/src/attach.rs`): while the same owner
-stays, a failed subscription or snapshot is retried with backoff from 0.5 s
-doubling to 30 s; an incompatible or denied daemon is reported and waits for a
-new owner; a new owner abandons the pending attempt. Each attempt carries a
-generation and publishes only while it is current, so an abandoned attempt
-cannot overwrite the new owner's state.
-
-The interface is a control surface over the existing owners, never a parallel
-implementation:
 
 | Operation | Owner and path |
 | --- | --- |
 | End session | `SessionManager::stop_session`, the same teardown as `/cancel` (behind the authorization gate) |
-| Approve / reject pairing | `ClientManager` pending requests; the approval token (`request`) must match the shown request, as on `/pin` |
+| Approve / reject pairing | `ClientManager` pending requests; the approval token (`request`) must match the shown request, and the PIN is decimal, at most 16 digits |
 | Revoke client | `ClientManager::revoke_and_stop_session`, shared with loopback `/unpair` |
 | Name a client | Optional, display-only metadata in `state.toml`, written through the state transaction |
 | Configuration | `config_store` (below) |
-| Run health check | `healthcheck::recheck_in_server` (below), serialized; published with `HealthChanged` |
-| Library, rescan, show/hide | `app_scanner::Library` (see [Application catalog](#application-catalog)); `LibraryChanged` is sent, coalesced, while the desktop app runs |
+| Run health check | `healthcheck::recheck_in_server` (below), serialized |
+| Library, rescan, show/hide | `app_scanner::Library` (see [Application catalog](#application-catalog)) |
+| History, updates | `management/history.rs`, `management/updates.rs` (below; web only) |
+| Web setup code | `management/auth.rs` (D-Bus only: proves control of the streaming account) |
 
-**Access.** The session bus admits only the user running the service; every
-method additionally checks the caller's Unix user. The interface is not
-reachable from the GameStream listeners. Documents are sanitized views: no
-session keys, PINs, pairing secrets or private keys are exposed. The approval
-token and certificate fingerprints are operator identification, as on `/pin`.
+Transports authenticate the caller and map results; they never re-implement a
+rule. Documents are sanitized views: no session keys, PINs, pairing secrets or
+private keys cross either transport.
+
+**Event hub.** The `follow_*` tasks (session, pairing, statistics, problems,
+library) and the history writer publish each change once to `management/hub.rs`,
+a bounded `broadcast`. The D-Bus service turns events into signals; each web
+event stream turns them into Server-Sent Events. A transport that lags loses
+events and resynchronizes from complete snapshots; no publisher waits for a
+consumer. The hub counts open web event streams: statistics and library
+progress are serialized only while a page watches them (the tray shows neither).
+
+**Web transport.** `management/web/` serves the frontend's files and
+`/api/v1/` on a listener of its own (`[management]`, default
+`127.0.0.1:47990`), never on the GameStream ports, with bounded connections
+(`Ingress`), header and body deadlines and body limits. Files under
+`share/pyroshine/web` are read once at startup into a map; request paths are
+only keys into it. Every request passes, in order: the `Host` allow-list (IP
+literals, `localhost`, the host's names on non-loopback listeners and
+`allowed_hosts`, defeating DNS rebinding); same-origin checks (`Origin` equal to
+`scheme://Host`, `Sec-Fetch-Site`); for changes a JSON content type; then the
+session (`auth.rs`) and, for changes, the session's CSRF token. Responses carry
+a strict CSP and are never CORS-enabled. A non-loopback address requires HTTPS
+(browser-facing rustls config without client-certificate requests).
+`GET /api/v1/stream` starts with a complete overview after subscribing to the
+hub, then forwards events with increasing IDs; it re-checks its session on
+revocation and every 20 s heartbeat and closes with an `auth` event when the
+session ends.
+
+**Administrator authentication.** `auth.rs` stores one PBKDF2-HMAC-SHA256
+password verifier and SHA-256 hashes of session tokens in `management.json`
+beside `state.toml` (0600, durable replace). The first password needs a
+one-time setup code, issued only over the same-user D-Bus interface
+(`CreateWebSetupCode`, `pyroshine web setup`, the tray), so neither a loopback
+browser nor a paired client can claim the server. Sign-in always issues a new
+token (no fixation); sessions expire idle (7 days) and absolutely (30 days);
+the CSRF token is derived from the session token. Failed attempts lock the peer
+address out progressively within a global budget, and PBKDF2 runs on blocking
+threads, at most two at a time. A damaged credentials file fails closed until
+a reset code replaces it. Sensitive actions are logged under `pyroshine::audit`.
+
+**D-Bus transport.** `dbus.rs` exports `io.github.karsyboy.Pyroshine` (interface
+`…Pyroshine.Management1`) on the service user's session bus (or
+`MOONSHINE_MANAGEMENT_BUS` for a test instance). The bus admits only that user
+and every method also checks the caller's Unix user. zbus serves methods on its
+own executor; work that needs Tokio is handed to the server runtime. The
+interface is optional: without a bus name the server and its web interface run
+unchanged. `pyroshine pair` pins the current unique bus owner and matches
+completion by client ID and request token; PIN submission alone never reports
+success. The tray's bus name (`io.github.karsyboy.PyroshineUi`) marks it
+present, which hands pairing notifications to it.
 
 **Session status.** `SessionManager` publishes a `ManagerStatus` snapshot when
 its mutex is released after a change (the guard publishes, so no transition can
@@ -703,8 +739,8 @@ streaming, and a peer of a replaced generation cannot make it so.
 current `StreamAuthorization`, falling back to the launch context only during
 initialization before the first grant exists. An accepted HTTPS resume rotates
 that authorization and publishes its new generation through `ManagerStatus`,
-so management emits `SessionChanged` with the new address through the existing
-Tauri/React bridge. The launch address stays in `SessionContext`; the session
+so management publishes a session event with the new address to both
+transports. The launch address stays in `SessionContext`; the session
 epoch, start time and application lifetime survive client changes. A rejected
 resume does not rotate authorization. An accepted resume owns the reported
 address even if the client has not completed ANNOUNCE/PLAY.
@@ -714,7 +750,7 @@ compositor's primary application metadata. The compositor publishes only
 changed values on primary-focus selection and title/class/app-ID events.
 Management subscribes before reading session details and also waits on that
 receiver, so focus-only changes produce `SessionChanged` without a lifecycle
-transition. The existing Tauri signal bridge updates React state and the tray.
+transition; the event reaches the web interface and the tray.
 `SessionDetails.application` remains the configured Moonlight entry and ID;
 the additive, optional `foreground_application` contains only a display title.
 The channel belongs to the session lifetime, surviving disconnect/resume and
@@ -741,8 +777,8 @@ serialized from the Rust enums.
 benchmark's `broadcast` channel. The management service subscribes while a
 client is streaming, drains the channel on a 250 ms timer (no per-frame
 wakeups) and summarizes one-second windows. It keeps the last 120 windows for
-support bundles and signals each one (`StatsUpdated`) while the desktop UI owns
-its bus name. `broadcast::send` never blocks: a receiver that falls behind
+support bundles, feeds each to the session history and publishes it while a
+web page observes (see the event hub). `broadcast::send` never blocks: a receiver that falls behind
 loses the oldest samples, which are counted, and with no receiver (no
 streaming client) it remains a no-op. Each sample also carries the frame's
 capture pacing, content age and content-time interval since the previous new
@@ -825,24 +861,64 @@ instead of creating encoders next to the live stream. Capabilities advertised
 to clients stay those probed at startup; a recheck whose verified profiles
 differ adds a warning that a restart applies them.
 
-**Notifications.** While the UI owns `io.github.karsyboy.PyroshineUi` it
-receives `PairingRequested` and notifies the operator; the daemon's own
-notify-rust notification (coalesced to one per 30 s) is the fallback when no
-UI runs. The bus releases the UI's name when it exits or crashes.
+**Support bundles over the web.** `POST /api/v1/diagnostics/bundle` returns the
+same archive as an attachment; it needs the CSRF token like a change because it
+is expensive and holds logs.
 
-**Desktop app.** Tauri 2 (WebKitGTK) with a React/Material UI frontend, chosen
-for permissive licensing, a complete Material component set and a browser
-preview for UI development; the tray uses `ksni` (StatusNotifierItem) rather
-than Tauri's appindicator tray, for click activation and runtime icons. The app
-follows the daemon's bus name instead of polling, subscribes before reading
-snapshots, and creates its window on demand (closing destroys the webview), so
-the tray-only app holds no web content process. On Wayland it raises the window
-with the XDG activation token of the user's click (notification
-`ActivationToken`, tray `ProvideXdgActivationToken`, launcher
-`XDG_ACTIVATION_TOKEN`, forwarded by `Activate` to a running instance) through
-`gtk_window_set_startup_id`; GTK's own token request would be refused because
-the click did not happen in the app. Its Cargo workspace is
-separate, so server builds never compile GTK or WebKitGTK.
+**Session history.** `history.rs` keeps a `Recorder` that follows the session
+snapshots and statistics windows in memory and produces a row write when a
+session opens, its client disconnects or resumes, and when it ends (with the
+stop record and a summary of the windows: frame rate, bitrates, drops,
+per-stage averages and worst p95, GPU load and temperature, finding counts).
+Writes go to one writer thread owning SQLite (`history.sqlite3`, bundled
+`rusqlite`) over a bounded channel with `try_send`: a slow disk drops a write
+and counts it; nothing on a management task, let alone a media path, waits for
+storage. The writer applies age and count retention after each write, migrates
+by `user_version` (records are versioned JSON, so fields can be added), moves a
+database that fails `quick_check` aside and starts a new one, closes rows left
+open by a previous run as `interrupted`, and reports storage failures to the
+page. Only host measurements are stored; client addresses and labels only when
+`record_client_address` is on.
+
+**Release notifications.** `updates.rs` fetches GitHub's release list over
+HTTPS (hyper client, rustls with the system trust store, 20 s and 2 MiB bounds)
+only when the operator asks or enabled daily checks (preferences in
+`updates.json`, not configuration). Versions are compared by semver precedence
+on the stable or prerelease channel; the release link is built from the
+validated version, never taken from the response. Update steps follow the
+detected installation (package databases, executable location). Nothing is
+downloaded or installed.
+
+**Notifications.** While the tray owns `io.github.karsyboy.PyroshineUi` it
+follows pairing snapshots and notifies the operator; the daemon's own
+notify-rust notification (coalesced to one per 30 s) is the fallback when no
+tray runs. The bus releases the tray's name when it exits or crashes. Neither
+notification carries a link that approves anything.
+
+**Web frontend.** `pyroshine-ui/` is React/Material UI built by Vite into
+static files at release time (Node.js only then). A typed `Backend` contract
+(`src/api/backend.ts`) has an HTTP implementation (`http.ts`: JSON requests with
+the session cookie and CSRF token, the event stream) and a development mock. State
+follows the event stream: every (re)connection starts with an overview that
+replaces whatever was missed, so a lost connection, a server restart or a
+reload never leaves stale state. Pages are hash routes (`#/clients?request=…`)
+the tray and notifications can open. The build writes `pyroshine-web.json`
+with its version; the server logs a mismatch and the page asks to reload or to
+install matching packages.
+
+**Desktop tray.** `pyroshine-tray` shows the server's state as a
+StatusNotifierItem (`ksni` on async-io, matching the server's zbus executor in
+workspace builds) and owns no streaming resources. It follows the server's bus
+name with the supervision of `attach.rs`: while the same owner stays, a failed
+subscription or snapshot is retried with backoff from 0.5 s doubling to 30 s;
+an incompatible or denied daemon is reported and waits for a new owner; a new
+owner abandons the pending attempt, and each attempt publishes only while its
+generation is current. Clicks open web pages through the portal's `OpenURI`
+with the click's XDG activation token (`xdg-open` as an argv fallback); the
+address comes from `GetWebUrl` and is limited to known routes, so no credential
+is ever in it. End Session calls the server directly. One tray runs per session
+(its bus name); it exits without an answering Wayland/X11 socket and when the
+session bus closes. XDG autostart starts it at graphical login only.
 
 ## Architectural invariants
 
@@ -865,7 +941,11 @@ Changes must preserve these properties unless a task explicitly redesigns them:
   narrow `unsafe` scopes, explicit ownership and child-before-parent cleanup.
 - The management interface observes and calls the owning components; it never
   holds session, pairing or trust state of its own, and nothing on a media path
-  waits for it. The server runs unchanged without it or without a desktop UI.
+  waits for it (history writes included). The server streams unchanged without
+  a browser, the tray, the D-Bus name or the web listener.
+- Management access is authenticated per transport: the session bus by Unix
+  user, the web interface by administrator session plus same-origin and CSRF
+  checks. A loopback address or a paired client certificate never grants it.
 - Catalog refreshes never reach a session: launches copy their entry, request
   handlers read one immutable snapshot, and the library worker takes no
   session locks. Application IDs, once offered, do not change.

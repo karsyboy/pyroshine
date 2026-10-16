@@ -1,31 +1,52 @@
 # Pairing, identity and revocation
 
-Pair using the [desktop app](DESKTOP.md#pair-a-client) or
-[`pyroshine pair`](INSTALLATION.md#pair-without-the-desktop-app). Both approve
-through the existing same-user management interface, using the exact pending
-request token and the PIN shown by the client. The CLI waits for that request's
-completion; accepted PIN submission alone is not proof of trust.
+Pair using the [web interface](MANAGEMENT.md#pair-a-client) or
+[`pyroshine pair`](INSTALLATION.md#pair-from-a-terminal). Both approve through
+the server's management operations, using the exact pending request token and
+the PIN shown by the client. The CLI waits for that request's completion;
+accepted PIN submission alone is not proof of trust.
 
 Approve only pairings you initiated. Check the requester address and, when you
 can compare it, the certificate fingerprint. A remote client cannot approve
 itself. Keep streaming on a trusted LAN/VPN.
 
-## Browser approval
+The GameStream listeners offer no approval route: the former host-local
+`/pin` page answers 410, because any local user or process could use it.
 
-The [browser/SSH procedure](INSTALLATION.md#browser-pairing) remains available.
-The complete logged `/pin?uniqueid=...` URL selects a pending request. The page
-fetches its approval token in the hidden `request` field; POST `/submit-pin`
-requires `uniqueid`, `pin` **and** `request`. The token is not in the logged URL.
-Bare `/pin`, stale tokens and submissions containing only an ID/PIN fail.
-Peer, Host and browser Origin/site checks require loopback on the configured
-HTTP port; do not weaken them to make forwarding work.
+## Web management
+
+The [web interface](MANAGEMENT.md) has its own listener (default
+`127.0.0.1:47990`), separate from the GameStream ports, and its own
+administrator authentication. Nothing else grants access: not a loopback
+address (other local users and the streamed applications share it), not a
+paired Moonlight certificate, and not the desktop tray, which only opens pages.
+
+| Protection | Behavior |
+| --- | --- |
+| First password | Set with a one-time setup code (`pyroshine web setup`, valid 15 minutes, 5 wrong entries withdraw it). Only the streaming user can request one, over the same-user D-Bus interface. `--reset` replaces a forgotten password and signs out every browser. |
+| Password storage | PBKDF2-HMAC-SHA256 with a random salt in `~/.local/share/moonshine/management.json` (mode 0600). The password is never logged. |
+| Sessions | A new random 256-bit token at every sign-in, in an `HttpOnly`, `SameSite=Strict` cookie (`Secure` and `__Host-` over HTTPS). Only its SHA-256 is stored. Expiry after 7 idle days or 30 days; sign-out, password change and **Maintenance → Sign out** end sessions at once, including open event streams. |
+| Guessing | 5 failed passwords or codes from an address lock it out for 30 s, doubling up to 15 minutes; a global budget slows distributed guessing. |
+| Cross-site requests | Changes need a JSON body, a matching `Origin`/`Sec-Fetch-Site` and the session's CSRF token (`X-CSRF-Token`). No CORS is offered. |
+| DNS rebinding | `Host` must be an IP address, `localhost`, this machine's name (on non-loopback listeners) or an `allowed_hosts` entry. |
+| Remote access | Any non-loopback `address` requires `tls = true`; startup refuses otherwise. |
+| Page content | Only the installed files are served (read once at startup; request paths are never file paths), with a strict Content-Security-Policy, `frame-ancestors 'none'` and `nosniff`. |
+| Limits | 128 connections, 16 event streams, 1 MiB bodies (16 KiB except configuration saves), header and body deadlines. |
+| Audit | Sign-ins, failures, lockouts, password changes and every change (pairing, revocation, configuration, session end, support bundle) are logged under the `pyroshine::audit` target with the session's public identifier and peer address. |
+
+If `management.json` is damaged, sign-in is refused (the file is left as it
+is) until `pyroshine web setup --reset` replaces it. Deleting the file has the
+same effect as a reset: the next browser needs a setup code.
+
+Support bundles are downloads of the same redacted archive `pyroshine diag`
+writes; they cannot include other files.
 
 ## Local management interface
 
-The desktop app uses the service's management interface on the D-Bus session
-bus of the user running Pyroshine. Only that user can reach the bus, and the
-service also rejects calls from any other Unix user. Like the loopback `/pin`
-and `/unpair` routes, it is available to every process of that user (including
+The tray and the `pyroshine pair`/`web`/`diag` commands use the service's
+management interface on the D-Bus session bus of the user running Pyroshine.
+Only that user can reach the bus, and the service also rejects calls from any
+other Unix user. It is available to every process of that user (including
 streamed applications): approving a request still requires the PIN shown by the
 client, and the interface never exposes session keys, pairing secrets or private
 keys. It is not reachable over the network.
@@ -42,12 +63,12 @@ their transaction. Approved requests abandoned between protocol steps expire.
 Older approval waiters cannot remove replacement requests. Challenges and PINs
 are accepted once per transaction.
 
-While the desktop app runs it notifies the operator about pairing requests;
-repeated requests replace one notification. Without the app, the server's own
+While the tray runs it notifies the operator about pairing requests;
+repeated requests replace one notification. Without the tray, the server's own
 desktop notifications are coalesced to at most one per 30 seconds, with at most
-one notification worker, and do not wait for a click. Use the logged loopback
-URL when notifications are unavailable or coalesced. Global shutdown clears
-pending requests. New approval is required after restart.
+one notification worker, and do not wait for a click. They and the service log
+name where to approve; no link approves anything by itself. Global shutdown
+clears pending requests. New approval is required after restart.
 
 ## Durable trust and migration
 
@@ -82,10 +103,10 @@ versions without it ignore the table. Revocation removes a certificate's entry.
 
 ## Revoke a client
 
-In the desktop app, select **Revoke** on the client in **Clients**; it revokes
-that certificate. Without the app, the host operator uses **POST** to the
-loopback HTTP `/unpair` route, with the same peer, Host and browser-origin
-checks as PIN approval:
+In the web interface, select **Revoke** on the client in **Clients**; it revokes
+that certificate. Without it, the host operator can use **POST** to the
+loopback HTTP `/unpair` route, with peer, Host and browser-origin checks. It can
+only remove trust, never grant it:
 
 ```sh
 curl --fail -X POST 'http://localhost:47989/unpair?uniqueid=CLIENT_ID'

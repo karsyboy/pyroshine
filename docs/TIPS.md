@@ -8,12 +8,12 @@ If journal access is denied, prefix `journalctl` with `sudo`.
 | --- | --- |
 | Host missing or connection fails | [Check address and firewall](#host-not-found-or-connection-fails). |
 | Server fails to start | Read `journalctl -u "pyroshine@$USER" -b -n 100 --no-pager`, then [check the host](#healthcheck-fails). |
-| Pairing does not finish | [Use a fresh request and correct approval URL](#pairing-does-not-complete). |
-| Launch or stream fails with an error | Read the client's error message, then **Diagnostics → Recent problems** in the desktop app; [details](#read-why-a-launch-or-stream-failed). |
+| Pairing does not finish | [Use a fresh request and its PIN](#pairing-does-not-complete). |
+| Launch or stream fails with an error | Read the client's error message, then **Diagnostics → Recent problems** in the web interface; [details](#read-why-a-launch-or-stream-failed). |
 | Steam opens locally / client reports 503 | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
 | Steam or games missing / cannot launch | [Check default applications](#steam-or-games-are-missing). |
 | Keyboard, mouse or gamepad unavailable | [Check input access](#keyboard-mouse-or-gamepads-do-not-work). |
-| Desktop app unavailable / no tray | [GUI troubleshooting](DESKTOP.md#troubleshooting); browser pairing still works. |
+| Web interface unreachable / no tray | [Web interface troubleshooting](MANAGEMENT.md#troubleshooting); `pyroshine pair` still works. |
 | New settings have no effect | Restart the service after saving; this ends an active session. |
 
 ## Host not found or connection fails
@@ -75,14 +75,12 @@ streams. Each failed check shows what to change.
 - Start pairing in the client first. An empty **Clients** page or "No pending
   pairing request" can mean the request expired, disconnected or was replaced.
   Retry and use the latest PIN/link.
-- Without the GUI, run `pyroshine pair` as the server's user, without sudo.
-  If the command cannot connect, check the service and lingering/session bus.
-  For [browser pairing](INSTALLATION.md#browser-pairing), use the complete
-  logged URL; bare `/pin` cannot select a request.
-- A 403 on approval means loopback/Host/origin validation failed. Open the URL
-  on the host or use an SSH tunnel with the configured HTTP port at both ends.
-  A host LAN address or a different local forwarding port will not work.
-- If new requests are disabled, enable **Allow new pairings** in GUI settings
+- Approve in the web interface's **Clients** page, or run `pyroshine pair` as
+  the server's user, without sudo. If the command cannot connect, check the
+  service and lingering/session bus. A PIN applies to the request it was
+  entered for; after the client sends a new request, enter its new PIN.
+- The host-local `/pin` page of older releases answers 410; use one of the above.
+- If new requests are disabled, enable **Allow new pairings** in the web interface's settings
   (or `webserver.enable_pairing`), save, and restart before retrying.
 - **PIN accepted** is not proof that pairing completed. Wait for the client's
   application list; a wrong PIN can still fail the later handshake.
@@ -321,21 +319,23 @@ Pyroshine reports the cause of a failure where you can see it:
   or signal.
 - **Rejected stream settings** (a codec, 4:4:4 or HDR combination the GPU did not
   pass at startup, invalid audio settings) reach Moonlight only as an RTSP error
-  code. The desktop app's **Diagnostics → Recent problems** lists the exact
+  code. The web interface's **Diagnostics → Recent problems** lists the exact
   request and the profiles that work.
 - **Sessions that end unexpectedly** show the cause on the dashboard: the
   application's exit status or signal and how long after launch it ended, or
   the encoder failure that stopped the stream.
 
-The desktop app also notifies about these when its window is closed.
+The desktop tray also notifies about these. **History** keeps each session's stop
+reason after the page is closed.
 **Copy diagnostics** on the Diagnostics page copies the host checks, session,
 latest stream statistics and recent problems as one JSON report for a bug report;
 it contains no keys, PINs or certificates.
 
 ## Collect a support bundle
 
-For a bug report, attach a support bundle. On a host without the desktop app,
-or over SSH, run as the streaming user (without sudo):
+For a bug report, attach a support bundle. In the web interface, use
+**Diagnostics → Save support bundle**. From a terminal or over SSH, run as the
+streaming user (without sudo):
 
 ```sh
 pyroshine diag
@@ -345,8 +345,8 @@ It writes `pyroshine-diag-<date>-<time>.tar.gz` to the current directory
 (`-o <file or directory>` chooses another place). The bundle holds the
 diagnostic report, the last two minutes of stream statistics with GPU
 readings, host and GPU details, the configuration, the service status and its
-recent log, and `vulkaninfo --summary`. The desktop app's **Diagnostics → Save
-support bundle** saves the same file.
+recent log, and `vulkaninfo --summary`. The web interface downloads the same
+file.
 
 Identifying values are replaced: the home directory, user and host names, the
 server name, client names and IDs, certificate fingerprints, UUIDs and IP

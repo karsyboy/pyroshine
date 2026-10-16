@@ -354,7 +354,7 @@ pub const GPU_CHECKS: &[&str] = &[
 	"DMA-BUF",
 ];
 
-/// Run the checks again inside the running server (the desktop app's
+/// Run the checks again inside the running server (the web interface's
 /// "Run checks"). Unlike [`run_healthcheck`] it never binds the server's own
 /// listeners, and while a session runs it reports the GPU probes of
 /// `previous` instead of creating encoders next to the live stream.

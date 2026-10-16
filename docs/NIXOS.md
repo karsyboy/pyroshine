@@ -9,7 +9,11 @@ ARM system can stream.
 
 Nix retains the upstream names: executable **`moonshine`**, module
 **`services.moonshine`**, system service **`moonshine.service`**. There is no
-`pyroshine@<user>` unit here. The optional desktop app is not included.
+`pyroshine@<user>` unit here. The package includes the web management
+interface, the `pyroshine-tray` desktop tray and its application-menu entry;
+to start the tray at login, add the package to `environment.systemPackages`
+and an autostart entry running `pyroshine-tray` (for example with
+`environment.etc."xdg/autostart/pyroshine-tray.desktop"`).
 
 ## Install and configure
 
@@ -73,9 +77,10 @@ Nix retains the upstream names: executable **`moonshine`**, module
    while the service is listening; it will report the service's ports as conflicts.
 4. Install/sign in to Steam as the configured user, install a game, and quit
    local Steam. Restart `sudo systemctl restart moonshine` to refresh scanning.
-   Run `moonshine pair` as that user, then start pairing in Moonlight/Pyrolight
-   and follow the terminal prompts. Select Steam to play. Older builds can use
-   [browser pairing](INSTALLATION.md#browser-pairing) with `journalctl -u moonshine -f -o cat`.
+   Run `moonshine web setup` as that user and open <http://127.0.0.1:47990/>
+   (over SSH: [tunnel the port](INSTALLATION.md#manage-a-headless-host)) to
+   pair in the browser, or run `moonshine pair` and follow the terminal
+   prompts. Select Steam to play.
 
 The built-in Steam command paths use `/usr/bin/steam`, which is unsuitable on
 NixOS; set both the application and scanner as above. Omit the scanner or use

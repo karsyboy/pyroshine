@@ -354,7 +354,7 @@ impl RtspServer {
 
 	/// Report a rejected negotiation to the operator. Clients show only the
 	/// RTSP status (stock Moonlight: "RTSP ANNOUNCE failed: 400"); the cause
-	/// reaches the desktop app.
+	/// reaches the web interface and the tray.
 	fn report_rejection(&self, code: &'static str, message: impl Into<String>, hint: impl Into<String>) {
 		self.session_manager
 			.report_problem(Problem::new(code, message, Some(hint.into())));

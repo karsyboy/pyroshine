@@ -21,7 +21,9 @@ so your local desktop stays usable. A monitor or desktop login is optional.
 - Native model support for Xbox Elite, classic Steam Controller, Steam Deck,
   and DualSense Edge with matching Pyrolight clients; see
   [controller support and limits](docs/NATIVE_CONTROLLERS.md).
-- An optional desktop app for pairing, settings, clients, and stream status.
+- A [web management interface](docs/MANAGEMENT.md) for pairing, settings,
+  clients, stream status, session history and diagnostics, the same on a
+  desktop or a headless server, plus an optional desktop tray.
 
 PyroWave is an intra-only wavelet codec designed for high-bandwidth local
 networks. Select it explicitly in Pyrolight; Moonlight clients use the
@@ -62,9 +64,11 @@ pacman repository on Arch Linux / CachyOS:
 | SteamOS / other Linux | `pyroshine-install.sh` | Follow the [portable installation guide](docs/INSTALLATION.md#portable-installer-and-steamos) |
 | NixOS | Flake / service module | Follow the [NixOS guide](docs/NIXOS.md) |
 
-For desktop pairing and settings, also install `pyroshine-ui-bin` from the
-pacman repository, or the matching `pyroshine-ui` release package. The desktop
-app is optional; the portable installer includes only the server.
+Every installation includes the web management interface. On a desktop, also
+install `pyroshine-tray-bin` from the pacman repository, or the matching
+`pyroshine-tray` release package, for a status icon, pairing notifications and
+an application-menu entry; the portable installer includes it unless you pass
+`--no-tray`. Neither needs GTK, WebKitGTK or Node.js.
 
 - Native packages install the server, PyroWave library, service, and device
   permissions. They do not start the server or configure the firewall.
@@ -72,7 +76,7 @@ app is optional; the portable installer includes only the server.
   releases. Check the glibc baseline above before installing.
 - Each release includes `SHA256SUMS` for checking downloads.
 - To upgrade, install the newer release the same way, or run `sudo pacman -Syu`
-  with the repository. Update the server and desktop app together, then restart
+  with the repository. Update the server and tray together, then restart
   the service; this ends active streams. See [upgrades](docs/INSTALLATION.md#upgrades-and-configuration).
 
 ## Quick start
@@ -119,29 +123,46 @@ journalctl -u "pyroshine@$USER" -b -n 60 --no-pager
 Expect **active (running)** and **Pyroshine is ready and waiting for connections.**
 Fresh configurations include Steam and Steam library scanning automatically.
 
-### 3. Pair
+### 3. Set up the web interface
 
-Open **Pyroshine** from the host's application menu, or run `pyroshine-ui`.
-Select the host in Moonlight or Pyrolight to start pairing. On the host, open
-the pairing notification or **Clients → Pairing requests**, verify the
+Pyroshine serves its management interface at <http://127.0.0.1:47990/> on the
+host. Choose the administrator password once with a setup code:
+
+```sh
+pyroshine web setup
+```
+
+Open the printed address, enter the code and a password. On a desktop, the
+**Pyroshine** menu entry or the tray opens the same page. On a headless host,
+forward the port from your computer first and open the address there:
+
+```sh
+ssh -L 47990:127.0.0.1:47990 user@host
+```
+
+See [the web interface guide](docs/MANAGEMENT.md) for details and remote access.
+
+### 4. Pair
+
+Select the host in Moonlight or Pyrolight to start pairing. In the web
+interface, open **Clients** (or the tray's pairing notification), verify the
 requester, enter the client's PIN, and select **Pair**. Wait for the device
 under **Paired clients** and the application list on the client.
 
-Without the desktop app, run this on the host or in an SSH terminal as the
-streaming user, without sudo:
+To pair from a terminal instead, run this on the host or in an SSH terminal as
+the streaming user, without sudo:
 
 ```sh
 pyroshine pair
 ```
 
 Start pairing in the client, verify and confirm the requester in the terminal,
-and enter the client's PIN when prompted. Wait for **Device paired**. Older releases
-can use [browser pairing](docs/INSTALLATION.md#browser-pairing).
+and enter the client's PIN when prompted. Wait for **Device paired**.
 
 If the host is missing, add its LAN or VPN IP manually in the client. Run
 `hostname -I` on the host to find its addresses.
 
-### 4. Play
+### 5. Play
 
 Quit Steam on the host's local desktop first. In Moonlight or Pyrolight,
 select **Steam** or an installed game and sign in if needed.
@@ -153,9 +174,9 @@ and refresh the library; this ends active streams:
 sudo systemctl restart "pyroshine@$USER"
 ```
 
-Add other applications in the desktop app's **Settings** or follow the
-[configuration guide](docs/CONFIGURATION.md#application). The desktop app
-cannot start or restart the server.
+Add other applications in the web interface's **Settings** or follow the
+[configuration guide](docs/CONFIGURATION.md#application). The web interface
+and tray never restart the server themselves.
 
 ## Streaming with PyroWave
 
@@ -180,7 +201,7 @@ for client settings and bitrate guidance.
   [healthcheck troubleshooting](docs/TIPS.md#healthcheck-fails). Stop a running
   server before repeating the standalone healthcheck.
 - **Pairing does not finish:** retry with a fresh request and PIN. If no
-  notification appears, open **Clients** directly. See
+  notification appears, open **Clients** in the web interface. See
   [pairing help](docs/TIPS.md#pairing-does-not-complete).
 - **Steam opens locally or the client reports 503:** quit the host's desktop
   Steam before launching streamed Steam. See the
@@ -188,8 +209,8 @@ for client settings and bitrate guidance.
 - **Gamepads do not work when logged out:** check
   [headless setup](docs/INSTALLATION.md#headless-setup) and
   [input permissions](docs/TIPS.md#keyboard-mouse-or-gamepads-do-not-work).
-- **PyroWave is unavailable:** check the host's healthcheck or desktop
-  **Diagnostics**, use matching server/client releases, and compare with
+- **PyroWave is unavailable:** check the host's healthcheck or the web
+  interface's **Diagnostics**, use matching server/client releases, and compare with
   H.264, HEVC, or AV1 to isolate codec-specific issues.
 
 When [reporting a bug](https://github.com/karsyboy/pyroshine/issues), include the
@@ -201,7 +222,7 @@ use `sudo journalctl` if access is denied. See
 ## Documentation
 
 - [Installation, headless setup, networking, and upgrades](docs/INSTALLATION.md)
-- [Desktop app](docs/DESKTOP.md)
+- [Web interface and tray](docs/MANAGEMENT.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Troubleshooting and application recipes](docs/TIPS.md)
 - [Security administration and recovery](docs/SECURITY_ADMINISTRATION.md)

@@ -379,7 +379,7 @@ cargo test -p moonshine-core --all-features --lib -- --ignored xwayland_tests
 
 ### Hardware acceptance
 
-For foreground reporting, run these checks with the desktop app open. They
+For foreground reporting, run these checks with the web interface's dashboard open. They
 require a GPU host, Moonlight, Steam and a game; automated metadata tests do not
 establish real game behavior:
 
