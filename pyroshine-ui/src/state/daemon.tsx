@@ -1,19 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { call, on } from "../api/bridge";
+import { api } from "../api/client";
+import type { StreamEventName, StreamEvents } from "../api/backend";
 import type {
-  ClientsSnapshot,
-  HealthReport,
+  HistoryEntry,
+  LibrarySnapshot,
   Overview,
   PairingResolution,
-  PairingSnapshot,
   ServerEvent,
-  SessionSnapshot,
   StreamStats,
+  UpdateStatus,
 } from "../api/types";
+import { useAuth } from "./auth";
 
 /// Seconds of statistics kept for the dashboard's charts.
 export const HISTORY = 90;
-/// Events kept for the Diagnostics page (the daemon keeps 50).
+/// Events kept for the Diagnostics page (the server keeps 50).
 export const EVENTS = 50;
 
 interface Notice {
@@ -25,14 +26,22 @@ interface Notice {
 interface DaemonState extends Overview {
   /// The first overview arrived (avoids flashing "not running" at startup).
   loaded: boolean;
+  /// The live connection to the server is being re-established.
+  reconnecting: boolean;
   history: StreamStats[];
-  /// Recent daemon events, oldest first.
+  /// Recent server events, oldest first.
   events: ServerEvent[];
   notices: Notice[];
   /// The last pairing resolution, for the pairing page.
   resolution: PairingResolution | null;
-  /// Bumped when the daemon saves the configuration.
+  /// Bumped when the server saves the configuration.
   configRevision: string | null;
+  /// The last session added to the history.
+  lastHistoryEntry: HistoryEntry | null;
+  /// The last automatic update check.
+  update: UpdateStatus | null;
+  /// The latest library snapshot the stream carried (while a page watches).
+  librarySnapshot: LibrarySnapshot | null;
   notify: (severity: Notice["severity"], message: string) => void;
   dismiss: (id: number) => void;
   refresh: () => Promise<void>;
@@ -51,71 +60,83 @@ const outcomes: Record<string, [Notice["severity"], string]> = {
   replaced: ["info", "The client sent a new pairing request."],
 };
 
+/// Live server state from the event stream. Every (re)connection starts
+/// with a complete overview that replaces whatever was missed, so a lost
+/// connection, a server restart or a reload never leaves stale state.
 export function DaemonProvider({ children }: { children: ReactNode }) {
+  const auth = useAuth();
   const [overview, setOverview] = useState<Overview>(empty);
   const [loaded, setLoaded] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const [history, setHistory] = useState<StreamStats[]>([]);
   const [events, setEvents] = useState<ServerEvent[]>([]);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [resolution, setResolution] = useState<PairingResolution | null>(null);
   const [configRevision, setConfigRevision] = useState<string | null>(null);
+  const [lastHistoryEntry, setLastHistoryEntry] = useState<HistoryEntry | null>(null);
+  const [update, setUpdate] = useState<UpdateStatus | null>(null);
+  const [librarySnapshot, setLibrarySnapshot] = useState<LibrarySnapshot | null>(null);
   const nextNotice = useRef(1);
 
   const notify = useCallback((severity: Notice["severity"], message: string) => {
     const id = nextNotice.current++;
-    // Keep at most three; a burst of events must not bury the window.
+    // Keep at most three; a burst of events must not bury the page.
     setNotices((current) => [...current.slice(-2), { id, severity, message }]);
   }, []);
   const dismiss = useCallback((id: number) => setNotices((current) => current.filter((n) => n.id !== id)), []);
 
   const apply = useCallback((next: Overview) => {
-    setOverview(next);
+    setOverview({ ...next, connected: true });
     setLoaded(true);
+    setReconnecting(false);
     if (!next.stats) setHistory([]);
-    if (next.connected) {
-      // Older daemons do not keep events; the command then returns none.
-      call<ServerEvent[]>("events").then(setEvents, () => setEvents([]));
-    } else {
-      setEvents([]);
-    }
+    api.recentEvents().then(setEvents, () => setEvents([]));
   }, []);
 
   const refresh = useCallback(async () => {
-    apply(await call<Overview>("refresh"));
+    apply(await api.overview());
   }, [apply]);
 
+  const authenticated = auth.state?.authenticated ?? false;
+  const { signedOut } = auth;
   useEffect(() => {
-    const unlisten: Promise<() => void>[] = [
-      on<Overview>("daemon://overview", apply),
-      on<SessionSnapshot>("daemon://session", (session) =>
+    if (!authenticated) return;
+    const handlers: { [K in StreamEventName]?: (payload: StreamEvents[K]) => void } = {
+      overview: apply,
+      session: (session) =>
         setOverview((current) => ({ ...current, session, stats: session.phase === "streaming" ? current.stats : null })),
-      ),
-      on<PairingSnapshot>("daemon://pairing", (pairing) => setOverview((current) => ({ ...current, pairing }))),
-      on<ClientsSnapshot>("daemon://clients", (clients) => setOverview((current) => ({ ...current, clients }))),
-      on<StreamStats>("daemon://stats", (stats) => {
+      pairing: (pairing) => setOverview((current) => ({ ...current, pairing })),
+      clients: (clients) => setOverview((current) => ({ ...current, clients })),
+      stats: (stats) => {
         setOverview((current) => ({ ...current, stats }));
         setHistory((current) => [...current.filter((s) => s.epoch === stats.epoch).slice(-(HISTORY - 1)), stats]);
-      }),
-      on<PairingResolution>("daemon://pairing-resolved", (resolved) => {
+      },
+      "pairing-resolved": (resolved) => {
         setResolution(resolved);
         const outcome = outcomes[resolved.outcome];
         if (outcome) notify(outcome[0], outcome[1]);
-      }),
-      on<{ revision: string }>("daemon://config-saved", (saved) => setConfigRevision(saved.revision)),
-      on<ServerEvent>("daemon://server-event", (event) => {
+      },
+      "config-saved": (saved) => setConfigRevision(saved.revision),
+      "server-event": (event) => {
         notify(event.level === "error" ? "error" : "warning", event.message);
         setEvents((current) => [...current.slice(-(EVENTS - 1)), event]);
-      }),
-      on<HealthReport>("daemon://health", (health) =>
+      },
+      health: (health) =>
         setOverview((current) => (current.server ? { ...current, server: { ...current.server, health } } : current)),
-      ),
-    ];
-    // Subscribe first, then read the cached state, so nothing falls between.
-    void call<Overview>("overview").then(apply);
-    return () => {
-      unlisten.forEach((promise) => void promise.then((stop) => stop()));
+      history: setLastHistoryEntry,
+      update: setUpdate,
+      library: setLibrarySnapshot,
     };
-  }, [apply, notify]);
+    return api.stream({
+      event: (name, payload) => (handlers[name] as ((payload: unknown) => void) | undefined)?.(payload),
+      disconnected: () => {
+        setReconnecting(true);
+        setOverview((current) => ({ ...current, connected: false }));
+        setLoaded(true);
+      },
+      signedOut: () => signedOut(),
+    });
+  }, [authenticated, apply, notify, signedOut]);
 
   // Clear history when the stream ends.
   useEffect(() => {
@@ -123,8 +144,38 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   }, [overview.session?.phase]);
 
   const value = useMemo(
-    () => ({ ...overview, loaded, history, events, notices, resolution, configRevision, notify, dismiss, refresh }),
-    [overview, loaded, history, events, notices, resolution, configRevision, notify, dismiss, refresh],
+    () => ({
+      ...overview,
+      loaded,
+      reconnecting,
+      history,
+      events,
+      notices,
+      resolution,
+      configRevision,
+      lastHistoryEntry,
+      update,
+      librarySnapshot,
+      notify,
+      dismiss,
+      refresh,
+    }),
+    [
+      overview,
+      loaded,
+      reconnecting,
+      history,
+      events,
+      notices,
+      resolution,
+      configRevision,
+      lastHistoryEntry,
+      update,
+      librarySnapshot,
+      notify,
+      dismiss,
+      refresh,
+    ],
   );
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }

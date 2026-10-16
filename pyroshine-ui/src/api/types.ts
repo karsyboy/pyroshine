@@ -286,20 +286,15 @@ export interface ServerEvent {
   hint?: string | null;
 }
 
-export interface AttachError {
-  kind: string;
-  message: string;
-}
-
 export interface Overview {
   connected: boolean;
-  /** Set when Pyroshine runs but this app cannot attach to it. */
-  attach_error?: AttachError | null;
   server: ServerInfo | null;
   session: SessionSnapshot | null;
   pairing: PairingSnapshot | null;
   clients: ClientsSnapshot | null;
   stats: StreamStats | null;
+  /** The web interface itself: its address and the version its files were built for. */
+  web?: { url: string | null; assets_version?: string | null } | null;
 }
 
 // Configuration editor.
@@ -351,6 +346,7 @@ export type FieldKind =
   | { type: "command"; placeholders: string[] }
   | { type: "command_list" }
   | { type: "path_list"; expands: boolean }
+  | { type: "text_list"; placeholder: string | null }
   | { type: "applications"; item: FieldSpec[] }
   | { type: "scanners"; variants: ScannerVariant[] };
 
@@ -377,9 +373,126 @@ export interface ConfigSchema {
   fields: FieldSpec[];
 }
 
+/** API error: `{"error": {"kind", "message"}}` from the server, or a client-side failure. */
 export interface UiError {
-  kind: "unavailable" | "access_denied" | "invalid" | "not_found" | "conflict" | "read_only" | "failed" | string;
+  kind:
+    | "unavailable"
+    | "unauthenticated"
+    | "invalid_credentials"
+    | "rate_limited"
+    | "not_configured"
+    | "csrf"
+    | "cross_origin"
+    | "access_denied"
+    | "invalid"
+    | "not_found"
+    | "conflict"
+    | "read_only"
+    | "failed"
+    | string;
   message: string;
+}
+
+// Web sign-in (`/api/v1/auth`).
+
+export interface AuthState {
+  /** An administrator password exists. */
+  configured: boolean;
+  /** A setup code was issued and is still valid. */
+  setup_pending: boolean;
+  /** The credentials file is damaged; only a reset code helps. */
+  locked: string | null;
+  min_password_length: number;
+  authenticated: boolean;
+  csrf_token: string | null;
+  session: { id: string; expires_at_ms: number } | null;
+  api_version: number;
+}
+
+/** A signed-in browser (`/api/v1/auth/sessions`). */
+export interface WebSession {
+  id: string;
+  created_at_ms: number;
+  last_used_at_ms: number;
+  expires_at_ms: number;
+  address: string;
+  agent: string;
+  current: boolean;
+}
+
+// Session history (`/api/v1/history`). Every value is measured on the host.
+
+export interface HistoryEntry {
+  id: number;
+  epoch: number;
+  application: string;
+  foreground_application?: string | null;
+  client_address?: string | null;
+  client_label?: string | null;
+  started_at_ms: number;
+  ended_at_ms?: number | null;
+  requested?: { width: number; height: number; refresh_rate: number; hdr: boolean } | null;
+  video?: {
+    codec: string;
+    codec_label: string;
+    chroma: string;
+    bit_depth: number;
+    hdr: boolean;
+    width: number;
+    height: number;
+    fps: number;
+    bitrate_bps: number;
+    encoder?: string | null;
+    gpu?: string | null;
+  } | null;
+  audio_channels?: number | null;
+  disconnects: number;
+  reconnects: number;
+  events: { at_ms: number; kind: "disconnected" | "reconnected" | "stopped" | string; detail?: string | null }[];
+  stop?: { reason: string; message: string; detail?: string | null; hint?: string | null; unexpected: boolean } | null;
+  performance?: PerformanceSummary | null;
+}
+
+export interface PerformanceSummary {
+  windows: number;
+  streaming_ms: number;
+  frames: number;
+  fps_avg: number;
+  fps_min: number;
+  encoded_bitrate_avg_bps: number;
+  wire_bitrate_avg_bps: number;
+  stale_frames_dropped: number;
+  failed_packets: number;
+  discarded_packets: number;
+  stages: { id: string; label: string; avg_us: number; p95_max_us: number }[];
+  gpu_busy_avg_percent?: number | null;
+  encoder_busy_avg_percent?: number | null;
+  gpu_temperature_max_c?: number | null;
+  findings: { id: string; severity: string; title: string; windows: number }[];
+}
+
+export interface HistoryPage {
+  available: boolean;
+  error?: string | null;
+  retention_days: number;
+  max_sessions: number;
+  total: number;
+  entries: HistoryEntry[];
+}
+
+// Release notifications (`/api/v1/updates`).
+
+export interface UpdateStatus {
+  current_version: string;
+  automatic: boolean;
+  channel: "stable" | "prerelease";
+  checking: boolean;
+  last_checked_ms?: number | null;
+  last_error?: string | null;
+  latest?: { version: string; prerelease: boolean; published_at?: string | null; url: string } | null;
+  update_available: boolean;
+  dismissed: boolean;
+  install: { kind: string; label: string; steps: string[] };
 }
 
 /// `GetLibrary` / `daemon://library`: the application catalog.

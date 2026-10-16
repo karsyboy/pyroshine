@@ -1,22 +1,41 @@
 import { useCallback, useEffect, useState } from "react";
-import { on } from "../api/bridge";
 
-export type Page = "dashboard" | "clients" | "library" | "settings" | "diagnostics";
-const pages: Page[] = ["dashboard", "clients", "library", "settings", "diagnostics"];
+export type Page =
+  | "dashboard"
+  | "library"
+  | "clients"
+  | "history"
+  | "settings"
+  | "diagnostics"
+  | "updates"
+  | "maintenance";
+const pages: Page[] = ["dashboard", "library", "clients", "history", "settings", "diagnostics", "updates", "maintenance"];
+
+/// Other names a link may use for a page (the tray and older bookmarks).
+const aliases: Record<string, Page> = {
+  applications: "library",
+  pairing: "clients",
+  sessions: "history",
+  session: "dashboard",
+  performance: "dashboard",
+  account: "maintenance",
+};
 
 export interface Route {
   page: Page;
   params: URLSearchParams;
 }
 
-function parse(hash: string): Route {
+export function parse(hash: string): Route {
   const [path, query = ""] = hash.replace(/^#\/?/, "").split("?");
-  const page = pages.includes(path as Page) ? (path as Page) : "dashboard";
+  const name = path.replace(/\/+$/, "");
+  const page = pages.includes(name as Page) ? (name as Page) : (aliases[name] ?? "dashboard");
   return { page, params: new URLSearchParams(query) };
 }
 
-/// Hash routing (`#/clients?request=…`). The Rust side opens the window at a
-/// hash and sends `ui://navigate` when an already open window should move.
+/// Hash routing (`#/clients?request=…`): every page has an address the tray,
+/// notifications and bookmarks can open directly, and the server only ever
+/// serves one document.
 export function useRoute(): [Route, (to: string) => void] {
   const [route, setRoute] = useState(() => parse(window.location.hash));
   const navigate = useCallback((to: string) => {
@@ -26,12 +45,10 @@ export function useRoute(): [Route, (to: string) => void] {
     const changed = () => setRoute(parse(window.location.hash));
     window.addEventListener("hashchange", changed);
     window.addEventListener("popstate", changed);
-    const stop = on<string>("ui://navigate", navigate);
     return () => {
       window.removeEventListener("hashchange", changed);
       window.removeEventListener("popstate", changed);
-      void stop.then((unlisten) => unlisten());
     };
-  }, [navigate]);
+  }, []);
   return [route, navigate];
 }

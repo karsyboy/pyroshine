@@ -20,7 +20,7 @@ import EditOutlined from "@mui/icons-material/EditOutlined";
 import Fingerprint from "@mui/icons-material/Fingerprint";
 import Devices from "@mui/icons-material/Devices";
 import PhonelinkLock from "@mui/icons-material/PhonelinkLock";
-import { call, errorKind, errorMessage } from "../api/bridge";
+import { api, errorKind, errorMessage } from "../api/client";
 import type { PairedClient, PendingPairing } from "../api/types";
 import { ConfirmDialog, PageHeader } from "../components/common";
 import { useDaemon, useNow } from "../state/daemon";
@@ -56,7 +56,7 @@ function PendingCard({ request, deadline, focused }: { request: PendingPairing; 
     setBusy(true);
     setError(null);
     try {
-      await call("approve_pairing", { clientId: request.client_id, request: request.request, pin, label });
+      await api.approvePairing(request.client_id, request.request, pin, label);
     } catch (e) {
       setError(errorMessage(e));
       if (errorKind(e) === "not_found") daemon.notify("warning", errorMessage(e));
@@ -67,7 +67,7 @@ function PendingCard({ request, deadline, focused }: { request: PendingPairing; 
   const reject = async () => {
     setBusy(true);
     try {
-      await call("reject_pairing", { clientId: request.client_id, request: request.request });
+      await api.rejectPairing(request.client_id, request.request);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -160,7 +160,7 @@ function ClientRow({ client }: { client: PairedClient }) {
 
   const rename = async () => {
     try {
-      await call("rename_client", { fingerprint: client.fingerprint, label });
+      await api.renameClient(client.fingerprint, label);
       setEditing(false);
     } catch (e) {
       daemon.notify("error", errorMessage(e));
@@ -169,7 +169,7 @@ function ClientRow({ client }: { client: PairedClient }) {
   const revoke = async () => {
     setBusy(true);
     try {
-      await call("revoke_client", { fingerprint: client.fingerprint });
+      await api.revokeClient(client.fingerprint);
       daemon.notify("success", `${client.label ?? "Client"} can no longer connect.`);
       setConfirm(false);
     } catch (e) {
@@ -264,7 +264,6 @@ export function ClientsPage({ request }: { request: string | null }) {
   const missing = request && !seen.current.has(request);
   const [missingDismissed, setMissingDismissed] = useState(false);
   useEffect(() => setMissingDismissed(false), [request]);
-  const port = daemon.server?.listeners.http_port ?? 47989;
 
   return (
     <>
@@ -332,11 +331,9 @@ export function ClientsPage({ request }: { request: string | null }) {
         </Alert>
       )}
       <Typography variant="body2" color="text.secondary">
-        Without this app (for example on a headless host), run <Box component="code">pyroshine pair</Box> on the host
-        or over SSH as the streaming user, without sudo, then start pairing in the client, confirm the requester and
-        enter its PIN in the terminal. Older releases can approve pairing on the host-local page linked in the
-        Pyroshine log (<Box component="code">http://localhost:{port}/pin?uniqueid=…</Box>), forwarding the port over SSH
-        if needed.
+        To pair from a terminal instead (for example when this page is unreachable), run{" "}
+        <Box component="code">pyroshine pair</Box> on the host or over SSH as the streaming user, without sudo, then
+        start pairing in the client, confirm the requester and enter its PIN in the terminal.
       </Typography>
     </>
   );

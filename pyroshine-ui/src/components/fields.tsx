@@ -18,7 +18,7 @@ import Add from "@mui/icons-material/Add";
 import Close from "@mui/icons-material/Close";
 import FolderOutlined from "@mui/icons-material/FolderOutlined";
 import WarningAmber from "@mui/icons-material/WarningAmber";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { FieldSpec } from "../api/types";
 
 export interface ControlProps {
@@ -162,8 +162,23 @@ function CommandListEditor({ value, onChange, disabled }: { value: string[][]; o
   );
 }
 
-function PathListEditor({ value, onChange, disabled }: { value: string[]; onChange: (value: string[]) => void; disabled?: boolean }) {
+function PathListEditor({
+  value,
+  onChange,
+  disabled,
+  placeholder = "$HOME/.local/share/applications",
+  noun = "directory",
+  icon = true,
+}: {
+  value: string[];
+  onChange: (value: string[]) => void;
+  disabled?: boolean;
+  placeholder?: string;
+  noun?: string;
+  icon?: boolean;
+}) {
   const paths = value.length === 0 ? [""] : value;
+  const Noun = noun.charAt(0).toUpperCase() + noun.slice(1);
   return (
     <Stack sx={{ gap: 1 }}>
       {paths.map((path, index) => (
@@ -171,24 +186,57 @@ function PathListEditor({ value, onChange, disabled }: { value: string[]; onChan
           <TextField
             value={path}
             disabled={disabled}
-            placeholder="$HOME/.local/share/applications"
+            placeholder={placeholder}
             onChange={(event) => onChange(paths.map((p, i) => (i === index ? event.target.value : p)))}
             slotProps={{
-              htmlInput: { "aria-label": `Directory ${index + 1}`, spellCheck: false },
-              input: { startAdornment: <InputAdornment position="start"><FolderOutlined fontSize="small" /></InputAdornment> },
+              htmlInput: { "aria-label": `${Noun} ${index + 1}`, spellCheck: false },
+              input: icon ? { startAdornment: <InputAdornment position="start"><FolderOutlined fontSize="small" /></InputAdornment> } : undefined,
             }}
           />
-          <IconButton size="small" aria-label="Remove directory" disabled={disabled || paths.length === 1} onClick={() => onChange(paths.filter((_, i) => i !== index))}>
+          <IconButton size="small" aria-label={`Remove ${noun}`} disabled={disabled || paths.length === 1} onClick={() => onChange(paths.filter((_, i) => i !== index))}>
             <Close fontSize="small" />
           </IconButton>
         </Stack>
       ))}
       <Box>
         <Button size="small" startIcon={<Add />} disabled={disabled} onClick={() => onChange([...paths, ""])}>
-          Add directory
+          Add {noun}
         </Button>
       </Box>
     </Stack>
+  );
+}
+
+/// Short strings (host names). Rows being typed, including a newly added
+/// empty one, stay in the editor; the setting receives the non-empty ones.
+function TextListEditor({
+  value,
+  onChange,
+  disabled,
+  placeholder,
+}: {
+  value: string[];
+  onChange: (value: string[]) => void;
+  disabled?: boolean;
+  placeholder: string;
+}) {
+  const [rows, setRows] = useState<string[]>(value);
+  const external = value.join("\n");
+  useEffect(() => {
+    setRows((current) => (current.map((row) => row.trim()).filter(Boolean).join("\n") === external ? current : external ? external.split("\n") : []));
+  }, [external]);
+  return (
+    <PathListEditor
+      value={rows}
+      disabled={disabled}
+      placeholder={placeholder}
+      noun="entry"
+      icon={false}
+      onChange={(next) => {
+        setRows(next);
+        onChange(next.map((row) => row.trim()).filter(Boolean));
+      }}
+    />
   );
 }
 
@@ -307,6 +355,13 @@ export function FieldControl(props: ControlProps) {
           {error && <FormHelperText error>{error}</FormHelperText>}
         </>
       );
+    case "text_list":
+      return (
+        <>
+          <TextListEditor value={(value as string[]) ?? []} disabled={disabled} placeholder={kind.placeholder ?? ""} onChange={onChange} />
+          {error && <FormHelperText error>{error}</FormHelperText>}
+        </>
+      );
     default:
       return null;
   }
@@ -315,7 +370,7 @@ export function FieldControl(props: ControlProps) {
 /// Label, help and markers for one field, with its control.
 export function FieldRow({ spec, changed, children }: { spec: FieldSpec; changed?: boolean; children: ReactNode }) {
   const inline = spec.kind.type === "bool";
-  const wide = ["command", "command_list", "path_list"].includes(spec.kind.type);
+  const wide = ["command", "command_list", "path_list", "text_list"].includes(spec.kind.type);
   return (
     <Stack
       direction={{ xs: "column", md: inline ? "row" : wide ? "column" : "row" }}

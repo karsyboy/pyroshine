@@ -22,7 +22,7 @@ import Search from "@mui/icons-material/Search";
 import ImageOutlined from "@mui/icons-material/ImageOutlined";
 import HideImageOutlined from "@mui/icons-material/HideImageOutlined";
 import EditOutlined from "@mui/icons-material/EditOutlined";
-import { call, errorMessage } from "../api/bridge";
+import { api, errorMessage } from "../api/client";
 import type { LibraryApplication, LibrarySnapshot, LibrarySource, SourceStatus } from "../api/types";
 import { PageHeader } from "../components/common";
 import { useDaemon, useNow } from "../state/daemon";
@@ -368,7 +368,7 @@ export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
   const onToggle = useCallback(
     (application: LibraryApplication) => {
       setBusyKeys((current) => new Set(current).add(application.key));
-      call("set_application_hidden", { key: application.key, hidden: application.state !== "hidden" })
+      api.setApplicationHidden(application.key, application.state !== "hidden")
         .then(reload)
         .catch((e: unknown) => notify("error", errorMessage(e)))
         .finally(() =>
@@ -415,7 +415,7 @@ export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
   const rescan = async () => {
     setRescanning(true);
     try {
-      await call("rescan_library");
+      await api.rescanLibrary();
     } catch (e) {
       notify("error", errorMessage(e));
     } finally {

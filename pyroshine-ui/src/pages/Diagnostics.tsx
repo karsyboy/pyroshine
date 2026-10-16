@@ -23,7 +23,7 @@ import ErrorIcon from "@mui/icons-material/Error";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import Refresh from "@mui/icons-material/Refresh";
 import Warning from "@mui/icons-material/Warning";
-import { call, errorKind, errorMessage } from "../api/bridge";
+import { api, download, errorKind, errorMessage } from "../api/client";
 import type { HealthCheck, HealthReport, ServerEvent } from "../api/types";
 import { Facts, Hint, PageHeader } from "../components/common";
 import { useDaemon, useNow } from "../state/daemon";
@@ -183,7 +183,7 @@ export function DiagnosticsPage() {
     setRunning(true);
     try {
       // The daemon announces the new report, which replaces the shown one.
-      await call<HealthReport>("run_health_check");
+      await api.runHealthCheck();
       notify("success", "Host checks finished.");
     } catch (error) {
       notify(
@@ -199,8 +199,9 @@ export function DiagnosticsPage() {
   const saveBundle = async () => {
     setSaving(true);
     try {
-      const path = await call<string>("save_support_bundle");
-      notify("success", `Support bundle saved to ${path}. Identifying values are redacted; review it before sharing.`);
+      const bundle = await api.supportBundle();
+      download(bundle.blob, bundle.name);
+      notify("success", `Support bundle ${bundle.name} downloaded. Identifying values are redacted; review it before sharing.`);
     } catch (error) {
       notify(
         "error",
@@ -214,7 +215,7 @@ export function DiagnosticsPage() {
   const copyReport = async () => {
     let text: string;
     try {
-      text = await call<string>("diagnostic_report");
+      text = await api.diagnosticReport();
     } catch (error) {
       notify("error", errorMessage(error));
       return;
@@ -314,11 +315,12 @@ export function DiagnosticsPage() {
         <Card>
           <CardContent>
             <Typography variant="h6" sx={{ mb: 1 }}>
-              Desktop app
+              Management
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              This app talks to Pyroshine over your session bus. Closing or quitting it never stops Pyroshine or a stream;
-              Pyroshine keeps working headless, with pairing on its local web page.
+              This page is served by Pyroshine itself. Closing it never stops Pyroshine or a
+              stream. The desktop tray, when installed, only opens these pages and shows notifications; without it,
+              open this address in any browser, or pair from a terminal with <code>pyroshine pair</code>.
             </Typography>
           </CardContent>
         </Card>

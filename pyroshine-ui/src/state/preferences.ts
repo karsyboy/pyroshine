@@ -1,8 +1,8 @@
 import { useSyncExternalStore } from "react";
 
-/// Preferences of this desktop app. They only change what the window shows,
-/// so they live in the webview's storage, apply at once and need no daemon
-/// restart; the daemon's reports (Copy diagnostics) are unaffected.
+/// Preferences of this browser. They only change what the page shows, so
+/// they live in the browser's storage, apply at once and need no server
+/// restart; the server's reports (Copy diagnostics) are unaffected.
 export interface Preferences {
   /// Show the dashboard's informational findings, not only its warnings.
   infoFindings: boolean;

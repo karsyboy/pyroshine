@@ -17,17 +17,17 @@ import type { SessionPhase } from "../api/types";
 export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: ReactNode; actions?: ReactNode }) {
   return (
     <Stack direction="row" sx={{ alignItems: "flex-end", justifyContent: "space-between", mb: 3, gap: 2, flexWrap: "wrap" }}>
-      <Box>
-        <Typography variant="h4" component="h1">
+      <Box sx={{ minWidth: 0, flex: "1 1 280px" }}>
+        <Typography variant="h4" component="h1" sx={{ overflowWrap: "anywhere" }}>
           {title}
         </Typography>
         {subtitle && (
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, overflowWrap: "anywhere" }}>
             {subtitle}
           </Typography>
         )}
       </Box>
-      {actions && <Stack direction="row" sx={{ gap: 1 }}>{actions}</Stack>}
+      {actions && <Stack direction="row" sx={{ gap: 1, flexWrap: "wrap" }}>{actions}</Stack>}
     </Stack>
   );
 }

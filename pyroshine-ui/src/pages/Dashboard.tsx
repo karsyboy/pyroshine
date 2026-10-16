@@ -18,7 +18,7 @@ import AddLink from "@mui/icons-material/AddLink";
 import CheckCircleOutlined from "@mui/icons-material/CheckCircleOutlined";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import WarningAmber from "@mui/icons-material/WarningAmber";
-import { call, errorMessage } from "../api/bridge";
+import { api, errorMessage } from "../api/client";
 import type { AudioDetails, CapturePathStats, CaptureStats, Finding, GpuEngineStats, GpuStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
 import { ConfirmDialog, Facts, Hint, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
@@ -627,7 +627,7 @@ export function DashboardPage({ navigate }: { navigate: (to: string) => void }) 
   const end = async () => {
     setEnding(true);
     try {
-      await call("end_session");
+      await api.endSession();
       daemon.notify("success", "Session ended.");
     } catch (error) {
       daemon.notify("error", errorMessage(error));

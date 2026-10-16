@@ -1,10 +1,18 @@
-// Development-only stand-in for the Rust side, used when the UI runs in a
-// plain browser (`npm run dev`). It simulates a daemon with a stream, a
-// pending pairing request and paired clients so every page can be exercised.
-// Production builds never import this module (see bridge.ts).
+// Development-only stand-in for the Pyroshine server, selected with
+// `?mock=<scenario>` under `npm run dev`. It simulates a server with a
+// stream, a pending pairing request and paired clients so every page can be
+// exercised. Production builds never import this module (see client.ts).
+//
+// Scenarios: streaming (default), idle, retained, pairing, offline,
+// composited, crashed, old-daemon, signin (signed out), setup (first run).
 
 import fixture from "./schema.fixture.json";
+import type { Backend, StreamEventName, StreamHandlers } from "./backend";
 import type {
+  AuthState,
+  HistoryEntry,
+  UpdateStatus,
+  WebSession,
   ClientsSnapshot,
   ConfigDocument,
   ConfigValues,
@@ -19,14 +27,13 @@ import type {
   UiError,
 } from "./types";
 
-type Handler = (payload: unknown) => void;
-const listeners = new Map<string, Set<Handler>>();
+const streams = new Set<StreamHandlers>();
 
-function emit(event: string, payload: unknown) {
-  listeners.get(event)?.forEach((handler) => handler(payload));
+function emit(event: StreamEventName, payload: unknown) {
+  streams.forEach((handlers) => handlers.event(event, payload as never));
 }
 
-const scenario = new URLSearchParams(window.location.search).get("mock") ?? "streaming";
+const scenario = new URLSearchParams(window.location.search).get("mock") || "streaming";
 const now = Date.now();
 
 const session: SessionSnapshot =
@@ -332,7 +339,7 @@ const overview = (): Overview => ({
 });
 
 if (session.phase === "streaming") {
-  setInterval(() => emit("daemon://stats", stats()), 1000);
+  setInterval(() => emit("stats", stats()), 1000);
 }
 
 function discovered(source: string, label: string, scanner: number, nativeId: string, title: string, id: number): LibraryApplication {
@@ -455,131 +462,363 @@ let library: LibrarySnapshot = {
 
 function emitLibrary() {
   library = { ...library, generation: library.generation + 1 };
-  emit("daemon://library", library);
+  emit("library", library);
 }
 
 function fail(kind: string, message: string): never {
   throw { kind, message } satisfies UiError;
 }
 
-export async function mockInvoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  switch (command) {
-    case "overview":
-    case "refresh":
-      return overview() as T;
-    case "end_session":
-      session.phase = "stopping";
-      emit("daemon://session", { ...session });
-      setTimeout(() => {
-        emit("daemon://session", { phase: "idle", session: null, last_stop: null });
-      }, 1200);
-      return undefined as T;
-    case "approve_pairing": {
-      if (!/^\d{1,16}$/.test(String(args.pin))) fail("invalid", "Enter the PIN shown by Moonlight (digits only).");
-      pairing = { ...pairing, requests: pairing.requests.map((r) => (r.request === args.request ? { ...r, approved: true } : r)) };
-      emit("daemon://pairing", pairing);
-      setTimeout(() => {
-        pairing = { ...pairing, requests: pairing.requests.filter((r) => r.request !== args.request) };
-        clients = {
-          ...clients,
-          clients: [
-            ...clients.clients,
-            {
-              fingerprint: "4c1f9a0e7b2d3c5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6",
-              client_ids: ["0123456789ABCDEF"],
-              label: (args.label as string) || null,
-              paired_at_ms: Date.now(),
-              last_seen_ms: Date.now(),
-              last_address: "10.0.0.57",
-            },
+const delay = (ms = 150) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let auth: AuthState = {
+  configured: scenario !== "setup",
+  setup_pending: false,
+  locked: null,
+  min_password_length: 8,
+  authenticated: scenario !== "signin" && scenario !== "setup",
+  csrf_token: "mock",
+  session: { id: "0123456789abcdef", expires_at_ms: now + 7 * 86_400_000 },
+  api_version: 1,
+};
+
+const webSessions: WebSession[] = [
+  {
+    id: "0123456789abcdef",
+    created_at_ms: now - 3 * 86_400_000,
+    last_used_at_ms: now,
+    expires_at_ms: now + 7 * 86_400_000,
+    address: "127.0.0.1",
+    agent: "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    current: true,
+  },
+  {
+    id: "fedcba9876543210",
+    created_at_ms: now - 9 * 86_400_000,
+    last_used_at_ms: now - 2 * 86_400_000,
+    expires_at_ms: now + 5 * 86_400_000,
+    address: "10.0.0.20",
+    agent: "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36",
+    current: false,
+  },
+];
+
+function historyEntry(id: number, hoursAgo: number, application: string, unexpected = false): HistoryEntry {
+  const started = now - hoursAgo * 3_600_000;
+  const ended = started + 47 * 60_000;
+  return {
+    id,
+    epoch: id,
+    application,
+    foreground_application: application === "Steam" ? "Hades II" : null,
+    client_address: "10.0.0.42",
+    client_label: "Living room TV",
+    started_at_ms: started,
+    ended_at_ms: ended,
+    requested: { width: 3840, height: 2160, refresh_rate: 120, hdr: true },
+    video: {
+      codec: "pyrowave",
+      codec_label: "PyroWave",
+      chroma: "4:4:4",
+      bit_depth: 10,
+      hdr: true,
+      width: 3840,
+      height: 2160,
+      fps: 120,
+      bitrate_bps: 1_200_000_000,
+      encoder: "PyroWave (Vulkan compute)",
+      gpu: "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+    },
+    audio_channels: 2,
+    disconnects: unexpected ? 0 : 1,
+    reconnects: unexpected ? 0 : 1,
+    events: unexpected
+      ? [{ at_ms: ended, kind: "stopped", detail: "The application exited." }]
+      : [
+          { at_ms: started + 20 * 60_000, kind: "disconnected" },
+          { at_ms: started + 21 * 60_000, kind: "reconnected" },
+          { at_ms: ended, kind: "stopped", detail: "The client ended the session." },
+        ],
+    stop: unexpected
+      ? {
+          reason: "application_stopped",
+          message: "The application exited.",
+          detail: `${application} crashed (SIGSEGV, core dumped), 12 s after launch.`,
+          hint: "Set stdout = \"journal\" and stderr = \"journal\" for this application to keep its output.",
+          unexpected: true,
+        }
+      : { reason: "user_stopped", message: "The client ended the session.", unexpected: false },
+    performance: unexpected
+      ? null
+      : {
+          windows: 2820,
+          streaming_ms: 2_820_000,
+          frames: 338_400,
+          fps_avg: 119.6,
+          fps_min: 88.0,
+          encoded_bitrate_avg_bps: 960_000_000,
+          wire_bitrate_avg_bps: 1_105_000_000,
+          stale_frames_dropped: 12,
+          failed_packets: 0,
+          discarded_packets: 3,
+          stages: [
+            { id: "convert", label: "Color conversion", avg_us: 410, p95_max_us: 980 },
+            { id: "encode", label: "Encode", avg_us: 2_150, p95_max_us: 4_900 },
+            { id: "send", label: "Packetize and send", avg_us: 620, p95_max_us: 1_700 },
           ],
-        };
-        emit("daemon://pairing", pairing);
-        emit("daemon://pairing-resolved", { client_id: args.clientId, request: args.request, outcome: "paired" });
-        emit("daemon://clients", clients);
-      }, 1500);
-      return undefined as T;
-    }
-    case "reject_pairing":
-      pairing = { ...pairing, requests: pairing.requests.filter((r) => r.request !== args.request) };
-      emit("daemon://pairing", pairing);
-      emit("daemon://pairing-resolved", { client_id: args.clientId, request: args.request, outcome: "rejected" });
-      return undefined as T;
-    case "revoke_client":
-      clients = { ...clients, clients: clients.clients.filter((c) => c.fingerprint !== args.fingerprint) };
-      emit("daemon://clients", clients);
-      return undefined as T;
-    case "rename_client":
-      clients = {
-        ...clients,
-        clients: clients.clients.map((c) => (c.fingerprint === args.fingerprint ? { ...c, label: (args.label as string) || null } : c)),
-      };
-      emit("daemon://clients", clients);
-      return undefined as T;
-    case "load_config":
-      return { document: config, schema: fixture.schema } as T;
-    case "validate_config": {
-      const next = args.values as Record<string, Record<string, unknown>>;
-      const issues = [] as { path: string | null; message: string }[];
-      if (typeof next.address === "string" && !/^[0-9a-f:.]+$/i.test(next.address)) {
-        issues.push({ path: null, message: `address '${next.address}' is not an IP address` });
-      }
-      return { valid: issues.length === 0, issues, changed_paths: [], restart_required: true } as T;
-    }
-    case "save_config":
-      if (args.revision !== config.revision) fail("conflict", "The configuration file changed since it was loaded.");
-      config = { ...config, values: args.values as ConfigValues, revision: `r${Date.now()}`, restart_required: true };
-      emit("daemon://config-saved", { revision: config.revision, restart_required: true });
-      return { revision: config.revision, changed_paths: [], restart_required: true } as T;
-    case "library":
-      if (scenario === "old-daemon") fail("incompatible", "Unknown method GetLibrary");
-      return library as T;
-    case "rescan_library":
-      library = { ...library, scanning: true };
-      emit("daemon://library", library);
-      setTimeout(() => {
-        library = { ...library, scanning: false, last_refresh_ms: Date.now(), sources: library.sources.map((s) => ({ ...s, last_scan_ms: Date.now() })) };
-        emitLibrary();
-      }, 1500);
-      return undefined as T;
-    case "set_application_hidden":
-      library = {
-        ...library,
-        applications: library.applications.map((a) =>
-          a.key === args.key
-            ? {
-                ...a,
-                state: args.hidden ? "hidden" : "available",
-                offered: !args.hidden,
-                state_detail: args.hidden ? "Hidden from clients." : null,
-              }
-            : a,
-        ),
-      };
-      emitLibrary();
-      return undefined as T;
-    case "events":
-      return events as T;
-    case "run_health_check":
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      health = { ...health, rechecked: true, checked_at_ms: Date.now() };
-      emit("daemon://health", health);
-      return health as T;
-    case "diagnostic_report":
-      return JSON.stringify({ generated_at_ms: Date.now(), ...overview(), events }, null, 2) as T;
-    case "save_support_bundle":
-      await new Promise((resolve) => setTimeout(resolve, 800));
-      return "/home/user/Downloads/pyroshine-diag-20261014-155902.tar.gz" as T;
-    case "quit":
-      return undefined as T;
-    default:
-      return fail("failed", `Unknown command ${command}`);
-  }
+          gpu_busy_avg_percent: 71,
+          encoder_busy_avg_percent: null,
+          gpu_temperature_max_c: 74,
+          findings: [{ id: "game_below_target", severity: "info", title: "The game renders below the stream's frame rate", windows: 140 }],
+        },
+  };
 }
 
-export function mockListen(event: string, handler: Handler): () => void {
-  if (!listeners.has(event)) listeners.set(event, new Set());
-  listeners.get(event)!.add(handler);
-  return () => listeners.get(event)?.delete(handler);
+let history: HistoryEntry[] =
+  scenario === "offline" ? [] : [historyEntry(12, 3, "Cyberpunk 2077"), historyEntry(11, 27, "Steam"), historyEntry(10, 50, "Heroic", true)];
+
+let updates: UpdateStatus = {
+  current_version: "0.18.0",
+  automatic: false,
+  channel: "stable",
+  checking: false,
+  last_checked_ms: null,
+  last_error: null,
+  latest: null,
+  update_available: false,
+  dismissed: false,
+  install: {
+    kind: "arch",
+    label: "Arch Linux / CachyOS package",
+    steps: ["Update from the [pyrowave] repository: sudo pacman -Syu", 'Restart the service to run the new version: sudo systemctl restart "pyroshine@$USER"'],
+  },
+};
+
+function requireAuth() {
+  if (!auth.authenticated) fail("unauthenticated", "Sign in to manage Pyroshine.");
 }
+
+function offline() {
+  if (scenario === "offline") fail("unavailable", "Pyroshine cannot be reached. Check that the service is running; this page reconnects on its own.");
+}
+
+export const mock: Backend = {
+  auth: async () => {
+    await delay();
+    return auth;
+  },
+  setup: async (code, password) => {
+    await delay(400);
+    if (code.replace(/[-\s]/g, "").length !== 16) fail("invalid_credentials", "The password or setup code is not correct.");
+    if (password.length < 8) fail("invalid", "Choose a password of at least 8 characters.");
+    auth = { ...auth, configured: true, authenticated: true };
+    return auth;
+  },
+  login: async (password) => {
+    await delay(400);
+    if (password !== "pyroshine") fail("invalid_credentials", "The password or setup code is not correct. (The mock password is “pyroshine”.)");
+    auth = { ...auth, authenticated: true };
+    return auth;
+  },
+  logout: async () => {
+    await delay();
+    auth = { ...auth, authenticated: false };
+  },
+  changePassword: async (current) => {
+    await delay(400);
+    if (current !== "pyroshine") fail("invalid_credentials", "The password or setup code is not correct.");
+  },
+  webSessions: async () => {
+    await delay();
+    return webSessions;
+  },
+  revokeWebSession: async (id) => {
+    await delay();
+    const index = webSessions.findIndex((session) => session.id === id);
+    if (index < 0) fail("not_found", "This session already ended.");
+    webSessions.splice(index, 1);
+  },
+
+  overview: async () => {
+    await delay();
+    requireAuth();
+    offline();
+    return overview();
+  },
+  endSession: async () => {
+    await delay();
+    session.phase = "stopping";
+    emit("session", { ...session });
+    setTimeout(() => {
+      emit("session", { phase: "idle", session: null, last_stop: null });
+    }, 1200);
+  },
+  approvePairing: async (clientId, request, pin, label) => {
+    await delay();
+    if (!/^\d{1,16}$/.test(pin)) fail("invalid", "Enter the PIN shown by Moonlight (digits only).");
+    pairing = { ...pairing, requests: pairing.requests.map((r) => (r.request === request ? { ...r, approved: true } : r)) };
+    emit("pairing", pairing);
+    setTimeout(() => {
+      pairing = { ...pairing, requests: pairing.requests.filter((r) => r.request !== request) };
+      clients = {
+        ...clients,
+        clients: [
+          ...clients.clients,
+          {
+            fingerprint: "4c1f9a0e7b2d3c5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6",
+            client_ids: ["0123456789ABCDEF"],
+            label: label || null,
+            paired_at_ms: Date.now(),
+            last_seen_ms: Date.now(),
+            last_address: "10.0.0.57",
+          },
+        ],
+      };
+      emit("pairing", pairing);
+      emit("pairing-resolved", { client_id: clientId, request, outcome: "paired" });
+      emit("clients", clients);
+    }, 1500);
+  },
+  rejectPairing: async (clientId, request) => {
+    await delay();
+    pairing = { ...pairing, requests: pairing.requests.filter((r) => r.request !== request) };
+    emit("pairing", pairing);
+    emit("pairing-resolved", { client_id: clientId, request, outcome: "rejected" });
+  },
+  revokeClient: async (fingerprint) => {
+    await delay();
+    clients = { ...clients, clients: clients.clients.filter((c) => c.fingerprint !== fingerprint) };
+    emit("clients", clients);
+  },
+  renameClient: async (fingerprint, label) => {
+    await delay();
+    clients = {
+      ...clients,
+      clients: clients.clients.map((c) => (c.fingerprint === fingerprint ? { ...c, label: label || null } : c)),
+    };
+    emit("clients", clients);
+  },
+
+  loadConfig: async () => {
+    await delay();
+    return { document: config, schema: fixture.schema as never };
+  },
+  validateConfig: async (next) => {
+    await delay();
+    const issues = [] as { path: string | null; message: string }[];
+    if (typeof next.address === "string" && !/^[0-9a-f:.]+$/i.test(next.address)) {
+      issues.push({ path: null, message: `address '${next.address}' is not an IP address` });
+    }
+    return { valid: issues.length === 0, issues, changed_paths: [], restart_required: true };
+  },
+  saveConfig: async (next, revision) => {
+    await delay();
+    if (revision !== config.revision) fail("conflict", "The configuration file changed since it was loaded.");
+    config = { ...config, values: next, revision: `r${Date.now()}`, restart_required: true };
+    emit("config-saved", { revision: config.revision, restart_required: true });
+    return { revision: config.revision, changed_paths: [], restart_required: true };
+  },
+
+  library: async () => {
+    await delay();
+    if (scenario === "old-daemon") fail("incompatible", "Unknown method GetLibrary");
+    return library;
+  },
+  rescanLibrary: async () => {
+    await delay();
+    library = { ...library, scanning: true };
+    emit("library", library);
+    setTimeout(() => {
+      library = { ...library, scanning: false, last_refresh_ms: Date.now(), sources: library.sources.map((s) => ({ ...s, last_scan_ms: Date.now() })) };
+      emitLibrary();
+    }, 1500);
+  },
+  setApplicationHidden: async (key, hidden) => {
+    await delay();
+    library = {
+      ...library,
+      applications: library.applications.map((a) =>
+        a.key === key
+          ? { ...a, state: hidden ? "hidden" : "available", offered: !hidden, state_detail: hidden ? "Hidden from clients." : null }
+          : a,
+      ),
+    };
+    emitLibrary();
+  },
+
+  recentEvents: async () => {
+    await delay();
+    return events;
+  },
+  runHealthCheck: async () => {
+    await delay(1200);
+    health = { ...health, rechecked: true, checked_at_ms: Date.now() };
+    emit("health", health);
+    return health;
+  },
+  diagnosticReport: async () => {
+    await delay();
+    return JSON.stringify({ generated_at_ms: Date.now(), ...overview(), events }, null, 2);
+  },
+  supportBundle: async () => {
+    await delay(800);
+    return { blob: new Blob(["mock bundle"], { type: "application/gzip" }), name: "pyroshine-diag-20261014-155902.tar.gz" };
+  },
+
+  history: async (limit, before) => {
+    await delay();
+    if (scenario === "old-daemon") fail("not_found", "Unknown management API route.");
+    const entries = history.filter((entry) => before === undefined || entry.id < before).slice(0, limit);
+    return { available: true, error: null, retention_days: 90, max_sessions: 1000, total: history.length, entries };
+  },
+  historyEntry: async (id) => {
+    await delay();
+    return history.find((entry) => entry.id === id) ?? fail("not_found", "This session is no longer in the history.");
+  },
+  clearHistory: async () => {
+    await delay();
+    history = [];
+  },
+
+  updates: async () => {
+    await delay();
+    return updates;
+  },
+  checkUpdates: async () => {
+    await delay(900);
+    updates = {
+      ...updates,
+      last_checked_ms: Date.now(),
+      latest: { version: "0.18.1", prerelease: false, published_at: "2026-10-20T10:00:00Z", url: "https://github.com/karsyboy/pyroshine/releases/tag/v0.18.1" },
+      update_available: true,
+      dismissed: false,
+    };
+    return updates;
+  },
+  updateSettings: async (automatic, channel) => {
+    await delay();
+    updates = { ...updates, automatic, channel };
+    return updates;
+  },
+  dismissUpdate: async () => {
+    await delay();
+    updates = { ...updates, dismissed: true };
+    return updates;
+  },
+
+  stream: (handlers) => {
+    if (!auth.authenticated) {
+      setTimeout(() => handlers.signedOut(), 0);
+      return () => {};
+    }
+    if (scenario === "offline") {
+      setTimeout(() => handlers.disconnected(), 0);
+      return () => {};
+    }
+    streams.add(handlers);
+    setTimeout(() => handlers.event("overview", overview()), 50);
+    return () => {
+      streams.delete(handlers);
+    };
+  },
+};

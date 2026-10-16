@@ -2,7 +2,7 @@
   "name": "pyroshine-ui",
   "private": true,
   "version": "0.18.0-alpha.0",
-  "description": "Optional Pyroshine desktop app: system tray, pairing, dashboard and settings",
+  "description": "Pyroshine web management interface: pairing, clients, dashboard, settings, history and diagnostics",
   "license": "BSD-2-Clause",
   "type": "module",
   "scripts": {
@@ -10,8 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev -- --no-default-features"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
@@ -19,12 +18,10 @@
     "@fontsource/roboto": "5.3.0",
     "@mui/icons-material": "9.4.0",
     "@mui/material": "9.4.0",
-    "@tauri-apps/api": "2.12.1",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.12.1",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.1",

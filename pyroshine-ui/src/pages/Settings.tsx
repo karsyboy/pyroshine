@@ -13,8 +13,8 @@ import Stack from "@mui/material/Stack";
 import Switch from "@mui/material/Switch";
 import Typography from "@mui/material/Typography";
 import RestartAlt from "@mui/icons-material/RestartAlt";
-import { call, errorKind, errorMessage } from "../api/bridge";
-import type { ConfigDocument, ConfigIssue, ConfigSchema, ConfigValues, FieldSpec, SaveOutcome, ValidationReport } from "../api/types";
+import { api, errorKind, errorMessage } from "../api/client";
+import type { ConfigDocument, ConfigIssue, ConfigSchema, ConfigValues, FieldSpec } from "../api/types";
 import { ConfirmDialog, CopyableCommand, PageHeader } from "../components/common";
 import { FieldControl, FieldRow } from "../components/fields";
 import { ApplicationsEditor, ScannersEditor } from "../components/lists";
@@ -34,17 +34,17 @@ function RestartNotice({ saved }: { saved: boolean }) {
   );
 }
 
-/// Preferences of this app shown beside the server's diagnostics settings.
-/// They apply at once and are not part of the configuration file.
+/// Preferences of this browser shown beside the server's diagnostics
+/// settings. They apply at once and are not part of the configuration file.
 function DiagnosticsPreferences() {
   const { infoFindings } = usePreferences();
   return (
     <Box sx={{ mt: 3 }}>
       <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-        Desktop app
+        This browser
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        Saved in this app and applied immediately; no restart needed.
+        Saved in this browser and applied immediately; no restart needed.
       </Typography>
       <Card sx={{ px: 3 }}>
         <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: { xs: 1, md: 3 }, py: 2, alignItems: { md: "center" } }}>
@@ -130,7 +130,7 @@ export function SettingsPage() {
   const load = useCallback(async () => {
     setLoadError(null);
     try {
-      const loaded = await call<{ document: ConfigDocument; schema: ConfigSchema }>("load_config");
+      const loaded = await api.loadConfig();
       setDocument(loaded.document);
       setSchema(loaded.schema);
       setDraft(loaded.document.values);
@@ -195,7 +195,7 @@ export function SettingsPage() {
     setIssues([]);
     try {
       const values = normalize(draft, schema.fields);
-      const report = await call<ValidationReport>("validate_config", { values });
+      const report = await api.validateConfig(values);
       if (!report.valid) {
         setIssues(report.issues);
         const first = report.issues.map((issue) => issueField(issue.path)).find(Boolean);
@@ -203,7 +203,7 @@ export function SettingsPage() {
         if (target) setSection(target.section);
         return;
       }
-      const outcome = await call<SaveOutcome>("save_config", { values, revision: document.revision });
+      const outcome = await api.saveConfig(values, document.revision);
       await load();
       setJustSaved(outcome.restart_required);
       daemon.notify("success", outcome.restart_required ? "Configuration saved. Restart Pyroshine to apply it." : "Configuration saved.");
@@ -359,7 +359,7 @@ export function SettingsPage() {
         }}
         onClose={() => setConflict(false)}
       >
-        The configuration file was changed outside this window since it was loaded. Reload it and apply your changes
+        The configuration file was changed outside this page since it was loaded. Reload it and apply your changes
         again; nothing was overwritten.
       </ConfirmDialog>
     </Box>
