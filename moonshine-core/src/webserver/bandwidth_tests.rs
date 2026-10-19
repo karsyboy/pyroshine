@@ -98,6 +98,7 @@ async fn authenticated_probe_discovery_exact_payload_and_admission() {
 		"127.0.0.1".into(),
 		30,
 		false,
+		Default::default(),
 		shutdown.clone(),
 	)
 	.unwrap();

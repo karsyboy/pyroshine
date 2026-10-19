@@ -106,6 +106,16 @@ impl ApplicationScannerConfig {
 		}
 	}
 
+	/// Frame limit overrides applied to every discovered application.
+	pub fn frame_limit(&self) -> &crate::session::frame_limit::FrameLimitOverride {
+		match self {
+			Self::Steam(config) => &config.frame_limit,
+			Self::Desktop(config) => &config.frame_limit,
+			Self::Lutris(config) => &config.frame_limit,
+			Self::Heroic(config) => &config.frame_limit,
+		}
+	}
+
 	/// The location this scanner reads, for display.
 	pub fn root(&self) -> String {
 		match self {

@@ -34,6 +34,7 @@ pub mod application;
 pub mod authorization;
 pub mod compositor;
 pub mod failure;
+pub mod frame_limit;
 pub mod inhibit;
 pub mod keys;
 pub(crate) mod lifecycle;
@@ -172,6 +173,8 @@ pub(crate) struct SystemSession {
 	pub(crate) inhibit_sleep: bool,
 	pub(crate) stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	pub(crate) presence_tx: std::sync::Arc<watch::Sender<status::ClientPresence>>,
+	/// `[frame_limit]`, applied when an application launches.
+	pub(crate) frame_limit: frame_limit::FrameLimitConfig,
 }
 
 impl SessionBackend for SystemSession {
@@ -202,7 +205,7 @@ impl SessionBackend for SystemSession {
 	}
 
 	async fn launch(&self, session: InitializedSession) -> Result<LaunchedSession, SessionFailure> {
-		session.launch().await
+		session.launch(&self.frame_limit).await
 	}
 
 	async fn start(
@@ -361,7 +364,10 @@ impl InitializedSession {
 	///
 	/// The manager records the application unit before calling this, so a
 	/// cancellation after systemd accepted the unit is still cleaned up.
-	pub(crate) async fn launch(self) -> Result<LaunchedSession, SessionFailure> {
+	pub(crate) async fn launch(
+		self,
+		frame_limit: &frame_limit::FrameLimitConfig,
+	) -> Result<LaunchedSession, SessionFailure> {
 		let Self {
 			context,
 			compositor,
@@ -405,6 +411,9 @@ impl InitializedSession {
 				// Keep HDR-capable application paths enabled so a later reconnect can
 				// switch SDR/HDR without relaunching the application.
 				hdr: ready.hdr_capable,
+				// Fixed for the application's lifetime: a resume at another frame
+				// rate keeps the limit the launching stream set.
+				frame_limit: frame_limit::resolve(frame_limit, &context.application.frame_limit, context.refresh_rate),
 				// Populate extra_env with width, height and refreshrate values of the client for e.g. scripting
 				extra_env: HashMap::from([
 					("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),

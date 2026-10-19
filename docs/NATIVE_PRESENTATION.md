@@ -169,6 +169,17 @@ Do not retain the old Steam dynamic-FPS/HDR advertisements used by interception:
 `STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER` and `STEAM_GAMESCOPE_HDR_SUPPORTED` are no
 longer set by Pyroshine. Ordinary Steam overlay and input integration remains.
 
+## Optional frame limiting
+
+The removed layer also capped frame rates. Pyroshine does not intercept
+presentation for that again: the optional [`[frame_limit]`](CONFIGURATION.md#frame_limit)
+setting asks games to limit themselves through limiters already in their
+process (DXVK and vkd3d-proton under Proton, or MangoHud's Vulkan layer when the
+user installed and selected it). It only sets environment variables on the
+application unit, one limiter per launch, and never overrides values the user
+set. Capture pacing stays authoritative: a game limited to the stream rate and
+a game that renders faster are captured the same way.
+
 ## Runtime acceptance
 
 Build with `cargo build --release --workspace`. Use the pinned PyroWave library
