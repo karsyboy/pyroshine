@@ -86,6 +86,13 @@ impl Management {
 		Ok(())
 	}
 
+	/// Show the desktop tray again after it was hidden from its menu. Without
+	/// a desktop session, with `[management] tray = false` or while the tray
+	/// is shown, nothing changes.
+	pub(crate) fn op_show_tray(&self) {
+		self.tray_requests.notify_one();
+	}
+
 	pub(crate) fn op_pairing(&self) -> PairingSnapshot {
 		self.pairing()
 	}

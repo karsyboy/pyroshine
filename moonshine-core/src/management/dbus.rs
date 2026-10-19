@@ -97,6 +97,16 @@ impl ManagementInterface {
 		self.management.op_restart(ACTOR)
 	}
 
+	async fn show_tray(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<(), ManagementError> {
+		authorize(connection, &header).await?;
+		self.management.op_show_tray();
+		Ok(())
+	}
+
 	async fn get_pairing(
 		&self,
 		#[zbus(connection)] connection: &zbus::Connection,

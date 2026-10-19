@@ -105,6 +105,7 @@ struct Harness {
 	clients: ClientManager,
 	proxy: ManagementProxy<'static>,
 	config_path: std::path::PathBuf,
+	tray_requests: Arc<Notify>,
 	_directory: tempfile::TempDir,
 	_server: tokio::task::JoinHandle<()>,
 }
@@ -141,6 +142,7 @@ impl Harness {
 			None,
 			shutdown,
 		));
+		let tray_requests = management.tray_requests.clone();
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
 		let server = tokio::spawn(async move {
 			tokio::join!(follow(&management), super::dbus::serve(management.clone(), builder));
@@ -159,6 +161,7 @@ impl Harness {
 			clients,
 			proxy,
 			config_path,
+			tray_requests,
 			_directory: directory,
 			_server: server,
 		}
@@ -225,6 +228,15 @@ async fn server_session_and_capabilities_are_reported() {
 	// Ending a session that does not exist is a no-op, not an error.
 	harness.proxy.end_session().await.unwrap();
 	assert_eq!(harness.proxy.get_stats().await.unwrap(), "null");
+}
+
+#[tokio::test]
+async fn show_tray_wakes_the_tray_launcher() {
+	let harness = Harness::start().await;
+	harness.proxy.show_tray().await.unwrap();
+	tokio::time::timeout(Duration::from_secs(5), harness.tray_requests.notified())
+		.await
+		.expect("the launcher is woken");
 }
 
 #[tokio::test]

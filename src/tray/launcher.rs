@@ -15,13 +15,16 @@
 //! does; the service's cgroup ends it too. A desktop logout or a changed
 //! session stops it; a crash restarts it with a growing delay; hiding it
 //! from its menu (a clean exit) keeps it hidden until the next desktop
-//! session or server start. The checks run every few seconds and cost a
+//! session, server start or `ShowTray` request (`pyroshine open`, the
+//! application menu entry, sends one when no tray answers). The checks run every few seconds and cost a
 //! property read and a socket connect, nothing on the streaming path.
 
 use std::os::unix::process::CommandExt as _;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 /// How often the desktop session is checked.
@@ -65,9 +68,10 @@ pub struct Launcher {
 }
 
 impl Launcher {
-	pub fn spawn() -> Self {
+	/// `requests` is notified when a management client asks for the tray.
+	pub fn spawn(requests: Arc<Notify>) -> Self {
 		Self {
-			task: tokio::spawn(supervise()),
+			task: tokio::spawn(supervise(requests)),
 		}
 	}
 }
@@ -169,7 +173,16 @@ fn restart_delay(failures: u32) -> Duration {
 		.min(RESTART_DELAY_MAX)
 }
 
-async fn supervise() {
+/// Wait `delay`; true when the tray was asked for meanwhile. A request
+/// while no tray is hidden is consumed and changes nothing.
+async fn wait(requests: &Notify, delay: Duration) -> bool {
+	tokio::select! {
+		() = tokio::time::sleep(delay) => false,
+		() = requests.notified() => true,
+	}
+}
+
+async fn supervise(requests: Arc<Notify>) {
 	let connection = match zbus::Connection::session().await {
 		Ok(connection) => connection,
 		Err(error) => {
@@ -183,11 +196,14 @@ async fn supervise() {
 	loop {
 		let Some(session) = desktop(&connection).await else {
 			hidden = None;
-			tokio::time::sleep(POLL).await;
+			wait(&requests, POLL).await;
 			continue;
 		};
 		if hidden.as_ref() == Some(&session) {
-			tokio::time::sleep(POLL).await;
+			if wait(&requests, POLL).await {
+				tracing::info!("The tray was asked for; showing it again");
+				hidden = None;
+			}
 			continue;
 		}
 
@@ -207,8 +223,8 @@ async fn supervise() {
 		let exited = loop {
 			tokio::select! {
 				status = child.wait() => break Some(status),
-				() = tokio::time::sleep(POLL) => {
-					if desktop(&connection).await.as_ref() != Some(&session) {
+				asked = wait(&requests, POLL) => {
+					if !asked && desktop(&connection).await.as_ref() != Some(&session) {
 						break None;
 					}
 				},
@@ -224,7 +240,7 @@ async fn supervise() {
 				failures = 0;
 			},
 			Some(Ok(status)) if status.success() => {
-				tracing::info!("The tray was hidden; it returns with the next desktop session");
+				tracing::info!("The tray was hidden; it returns with the next desktop session or `pyroshine open`");
 				hidden = Some(session);
 				failures = 0;
 			},

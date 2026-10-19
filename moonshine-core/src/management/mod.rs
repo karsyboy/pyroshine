@@ -53,7 +53,7 @@ use moonshine_management::dto::{
 	PendingPairing, RequestedMode, ServerEvent, ServerInfo, SessionDetails, SessionPhase, SessionSnapshot, StreamStats,
 	VideoDetails,
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use self::config_store::ConfigStore;
@@ -125,6 +125,8 @@ pub(crate) struct Management {
 	stats_history: Mutex<VecDeque<StreamStats>>,
 	/// Shuts the server down for an operator restart.
 	shutdown: ShutdownManager<ShutdownReason>,
+	/// Asks the server's tray launcher to show a tray hidden from its menu.
+	tray_requests: Arc<Notify>,
 	/// The server's Tokio runtime. zbus serves methods on its own executor,
 	/// so work that needs Tokio (session teardown, blocking file I/O) is
 	/// handed to this runtime.
@@ -136,6 +138,7 @@ pub(crate) struct Management {
 pub struct ManagementService {
 	tasks: Vec<JoinHandle<()>>,
 	web_url: Option<String>,
+	tray_requests: Arc<Notify>,
 }
 
 impl Drop for ManagementService {
@@ -150,6 +153,12 @@ impl ManagementService {
 	/// The web interface's address, for the server's own pairing notice.
 	pub fn web_url(&self) -> Option<String> {
 		self.web_url.clone()
+	}
+
+	/// Notified when a management client asks for the desktop tray
+	/// (`ShowTray`); the server's tray launcher waits on it.
+	pub fn tray_requests(&self) -> Arc<Notify> {
+		self.tray_requests.clone()
 	}
 
 	/// Start the event tasks, the web interface and the session-bus service.
@@ -177,6 +186,7 @@ impl ManagementService {
 			web_url.clone(),
 			shutdown.clone(),
 		));
+		let tray_requests = management.tray_requests.clone();
 		let mut tasks = vec![tokio::spawn({
 			let management = management.clone();
 			let shutdown = shutdown.clone();
@@ -207,7 +217,11 @@ impl ManagementService {
 				let _ = shutdown.clone().wrap_cancel(web.serve(management, shutdown)).await;
 			}));
 		}
-		Self { tasks, web_url }
+		Self {
+			tasks,
+			web_url,
+			tray_requests,
+		}
 	}
 }
 
@@ -266,6 +280,7 @@ impl Management {
 			stats: watch::channel(None).0,
 			stats_history: Mutex::new(VecDeque::with_capacity(STATS_HISTORY)),
 			shutdown,
+			tray_requests: Arc::new(Notify::new()),
 			runtime: tokio::runtime::Handle::current(),
 			library,
 			sessions,

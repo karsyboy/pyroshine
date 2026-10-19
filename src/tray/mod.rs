@@ -10,7 +10,8 @@
 //! untouched. Every management task opens in the browser.
 //!
 //! `pyroshine open [page]` (the application launcher) opens a page of the web
-//! interface, through the running tray when there is one.
+//! interface, through the running tray when there is one; otherwise it asks
+//! the server to show a tray hidden from its menu again.
 
 mod appearance;
 mod attach;
@@ -88,10 +89,15 @@ pub async fn open(page: &str) -> Result<(), String> {
 		Some(connection) => instance::management_bus(connection).await.ok(),
 		None => None,
 	};
-	let base = match &management {
-		Some(management) => match moonshine_management::ManagementProxy::new(management).await {
-			Ok(proxy) => proxy.get_web_url().await.ok().filter(|url| !url.is_empty()),
-			Err(_) => None,
+	let proxy = match &management {
+		Some(management) => moonshine_management::ManagementProxy::new(management).await.ok(),
+		None => None,
+	};
+	let base = match &proxy {
+		Some(proxy) => {
+			// Older servers have no ShowTray; the browser opens regardless.
+			let _ = proxy.show_tray().await;
+			proxy.get_web_url().await.ok().filter(|url| !url.is_empty())
 		},
 		None => None,
 	};

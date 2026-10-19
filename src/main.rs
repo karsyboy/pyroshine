@@ -386,7 +386,10 @@ impl Moonshine {
 		);
 
 		// In desktop sessions only; a headless host never starts it.
-		let tray = config.management.tray.then(tray::Launcher::spawn);
+		let tray = config
+			.management
+			.tray
+			.then(|| tray::Launcher::spawn(management.tray_requests()));
 
 		Ok(Self {
 			_tray: tray,

@@ -17,6 +17,9 @@ pub trait Management {
 	fn end_session(&self) -> zbus::Result<()>;
 	/// Shut down normally and start again (ends a running session).
 	fn restart(&self) -> zbus::Result<()>;
+	/// Show the desktop tray again after it was hidden from its menu (no
+	/// effect without a desktop session or with the tray turned off).
+	fn show_tray(&self) -> zbus::Result<()>;
 
 	/// [`crate::dto::PairingSnapshot`].
 	fn get_pairing(&self) -> zbus::Result<String>;
