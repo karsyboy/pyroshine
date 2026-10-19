@@ -28,21 +28,22 @@ These are optional; see [PyroWave](PYROWAVE.md) and [HDR](NATIVE_PRESENTATION.md
 ## Native packages
 
 For maintained Arch/CachyOS updates, use the [pacman repository](../README.md#1-install).
-Otherwise download the server and, on a desktop, the optional `pyroshine-tray`
-from the same [release](https://github.com/karsyboy/pyroshine/releases). In the
-download directory, keep one version of each and run your distribution's command:
+Otherwise download the package for your distribution from the
+[release](https://github.com/karsyboy/pyroshine/releases). In the download
+directory, keep one version and run your distribution's command:
 
-| Distribution | Server | Optional desktop tray (add to the same install command) |
-| --- | --- | --- |
-| Arch / CachyOS | `sudo pacman -U ./pyroshine-[0-9]*.pkg.tar.zst` | `./pyroshine-tray-[0-9]*.pkg.tar.zst` |
-| Debian / Ubuntu | `sudo apt install ./pyroshine_*.deb` | `./pyroshine-tray_*.deb` |
-| Fedora / RHEL | `sudo dnf install ./pyroshine-[0-9]*.rpm` | `./pyroshine-tray-[0-9]*.rpm` |
+| Distribution | Install |
+| --- | --- |
+| Arch / CachyOS | `sudo pacman -U ./pyroshine-[0-9]*.pkg.tar.zst` |
+| Debian / Ubuntu | `sudo apt install ./pyroshine_*.deb` |
+| Fedora / RHEL | `sudo dnf install ./pyroshine-[0-9]*.rpm` |
 
-The package manager resolves runtime dependencies. Packages install the server,
-its web management interface, PyroWave library, systemd unit, udev rules,
-`uinput`/`uhid` module configuration and sleep-inhibition policy. The tray adds
-a status icon, desktop autostart and the **Pyroshine** application-menu entry;
-it needs no GUI toolkit and replaces the older `pyroshine-ui` desktop app.
+The package manager resolves runtime dependencies. The package installs the
+server, its web management interface, the desktop tray, the **Pyroshine**
+application-menu entry, PyroWave library, systemd unit, udev rules,
+`uinput`/`uhid` module configuration and sleep-inhibition policy. It replaces
+the older `pyroshine-ui` desktop app. The service shows the tray only while you
+are signed in to a desktop; it needs no GUI toolkit.
 Steam and a suitable GPU driver must already be installed separately. Packages
 do not start the server or open the firewall.
 
@@ -76,13 +77,13 @@ The host supplies Opus, libevdev, libxkbcommon, GBM/EGL, Wayland, Vulkan/driver,
 C++ runtime and Xwayland; the archive does not bundle them. Use your host's
 supported package mechanism for missing libraries. See
 [dependency troubleshooting](TIPS.md#missing-libraries-or-an-older-system).
-The installer also deploys the web interface and the desktop tray with its
-autostart and menu entries; pass `--no-tray` on a headless host.
+The installer also deploys the web interface and its application-menu entry;
+the service shows the desktop tray itself in desktop sessions only.
 
 For unattended headless installation:
 
 ```sh
-bash pyroshine-install.sh --user "$USER" --enable --linger --no-start --no-healthcheck --no-tray
+bash pyroshine-install.sh --user "$USER" --enable --linger --no-start --no-healthcheck
 /opt/pyroshine/start-pyroshine.sh "$HOME/.config/moonshine/config.toml" healthcheck && sudo systemctl start "pyroshine@$USER"
 ```
 
@@ -208,7 +209,7 @@ do not forward these ports to the internet. Use a VPN.
 - NixOS: update the flake input and rebuild; see [NixOS](NIXOS.md).
 
 After a native package upgrade, restart `sudo systemctl restart "pyroshine@$USER"`.
-Update server and tray together. Restarts end active streams; they also apply
+Restarts end active streams; they also apply
 saved settings. Open web interface pages reconnect on their own; reload them
 after an upgrade when they say so. The web interface's **Updates** page can
 check for new releases and shows these steps for your installation.

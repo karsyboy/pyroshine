@@ -9,14 +9,13 @@ history, diagnostics, updates and maintenance. User documentation is in
 It is a React, TypeScript and Material UI application that the server serves
 as static files (`share/pyroshine/web`). It talks only to the server's HTTP API
 (`/api/v1/`) and its event stream; Node.js is needed to build it, never at
-runtime. The desktop tray (`../pyroshine-tray`) only opens these pages.
+runtime. The desktop tray (`../src/tray`) only opens these pages.
 
 | Part | Where |
 | --- | --- |
 | Pages and components | `src/pages/`, `src/components/` |
 | API contract | `src/api/backend.ts` (typed operations and stream events) |
 | Server client | `src/api/http.ts` (JSON with the session cookie and CSRF token; Server-Sent Events) |
-| Development server stand-in | `src/api/mock.ts` (`?mock=…`, never in production builds) |
 | Sign-in and live state | `src/state/auth.tsx`, `src/state/daemon.tsx` |
 | Routes | `src/state/route.ts` (hash routes the tray and notifications open) |
 
@@ -25,7 +24,7 @@ runtime. The desktop tray (`../pyroshine-tray`) only opens these pages.
 Prerequisites: Node.js 20 or newer with npm.
 
 ```sh
-cd pyroshine-ui
+cd web
 npm ci
 npm run build
 ```
@@ -47,13 +46,9 @@ version into them, and CI's changelog check fails while they differ.
 npm run dev   # http://localhost:1420
 ```
 
-With `?mock=<scenario>` in the address the page runs against a simulated
-server: `streaming` (default), `idle`, `retained`, `pairing`, `offline`,
-`composited`, `crashed`, `old-daemon`, `signin` (signed out; the mock password is
-`pyroshine`) or `setup` (first run; any 16-character code). Without it, the dev
-server proxies `/api` to a running Pyroshine at `http://127.0.0.1:47990`
-(`PYROSHINE_URL` selects another), so the page can be developed against real
-state with hot reload.
+The dev server proxies `/api` to a running Pyroshine at
+`http://127.0.0.1:47990` (`PYROSHINE_URL` selects another), so the page is
+developed against real state with hot reload; sign in as usual.
 
 ## Checks
 
@@ -64,15 +59,14 @@ npm run build
 ```
 
 The settings editor renders forms from the server's configuration schema.
-`src/api/schema.fixture.json` is a copy of that schema used by the tests and the
-mock; a server test fails when it is out of date. Regenerate it with:
+`src/api/schema.fixture.json` is a copy of that schema used by the tests; a server test fails when it is out of date. Regenerate it with:
 
 ```sh
 MOONSHINE_UPDATE_UI_FIXTURES=1 cargo test -p moonshine-core ui_schema_fixture_is_current
 ```
 
 Icons derive from `assets/logo-no-text.png`; regenerate them with
-`python3 pyroshine-ui/scripts/generate-icons.py` (requires Pillow).
+`python3 web/scripts/generate-icons.py` (requires Pillow).
 
 ## Acceptance checks
 
@@ -110,8 +104,10 @@ desktop environment and client used.
    A pairing request turns the icon indigo and shows one notification (a
    retrying client updates it); clicking it opens that request. Streaming shows
    the green badge, a disconnected client the amber one; **End Session** works
-   without a browser. **Quit Pyroshine Tray** and `kill -9` leave the server and
-   stream running; starting the tray again shows the current state.
+   without a browser. **Hide Tray Icon** and `kill -9` of the tray leave the
+   server and stream running; after `kill -9` the service starts the tray again
+   within seconds with the current state. Log out and in: the icon follows the
+   session. On a host without a desktop, no tray process starts.
 7. **Browsers.** Repeat 1–5 briefly in Firefox and a Chromium-based browser, and
    check the layout on a phone-sized window (navigation drawer, no sideways
    scrolling).

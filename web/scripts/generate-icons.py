@@ -3,7 +3,7 @@
 
 Requires Pillow. Run from the repository root:
 
-    python3 pyroshine-ui/scripts/generate-icons.py
+    python3 web/scripts/generate-icons.py
 """
 
 from pathlib import Path
@@ -12,9 +12,9 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "assets" / "logo-no-text.png"
-TRAY_ICON = ROOT / "pyroshine-tray" / "icons" / "tray.png"
+TRAY_ICON = ROOT / "src" / "tray" / "tray.png"
 HICOLOR = ROOT / "dist" / "icons" / "hicolor"
-PUBLIC = ROOT / "pyroshine-ui" / "public"
+PUBLIC = ROOT / "web" / "public"
 
 # The tray embeds this and renders its status badges on it.
 TRAY_SIZE = 128

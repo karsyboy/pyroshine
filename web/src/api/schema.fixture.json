@@ -54,7 +54,8 @@
       "allowed_hosts": [],
       "enabled": true,
       "port": 47990,
-      "tls": false
+      "tls": false,
+      "tray": true
     },
     "name": "Pyroshine",
     "stream": {
@@ -232,6 +233,18 @@
         "path": "stream.timeout",
         "required": false,
         "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Show the status icon and pairing notifications while you are signed in to a desktop. Headless hosts never show it.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Desktop tray icon",
+        "path": "management.tray",
+        "required": false,
+        "section": "general"
       },
       {
         "advanced": false,

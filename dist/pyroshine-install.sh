@@ -81,7 +81,6 @@ print_help() {
   echo "  --healthcheck    Run a health check after install (default: prompt)"
   echo "  --no-healthcheck Skip the health check"
   echo "  --user USER      Install for this user (default: current user)"
-  echo "  --no-tray        Skip the desktop tray and launcher (headless hosts)"
   echo "  --help           Show this message"
   echo ""
   echo "Run as your normal user. The script will ask for sudo when needed."
@@ -114,7 +113,6 @@ LINGER=""
 START_NOW=""
 HEALTHCHECK=""
 TARGET_USER=""
-TRAY=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -128,7 +126,6 @@ while [[ $# -gt 0 ]]; do
     --healthcheck) HEALTHCHECK=true; shift ;;
     --no-healthcheck) HEALTHCHECK=false; shift ;;
     --user) TARGET_USER="$2"; shift 2 ;;
-    --no-tray) TRAY=false; shift ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -158,7 +155,7 @@ if [[ "$UNINSTALL" == "true" ]]; then
   sudo rm -f /etc/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules
   sudo rm -f /etc/profile.d/pyroshine.sh
   sudo rm -f /etc/atomic-update.conf.d/pyroshine.conf
-  sudo rm -f /etc/xdg/autostart/pyroshine-tray.desktop /usr/local/share/applications/pyroshine.desktop
+  sudo rm -f /usr/local/share/applications/pyroshine.desktop
   sudo systemctl daemon-reload || true
   sudo udevadm control --reload || true
 
@@ -315,18 +312,12 @@ CMDS=(
   "systemctl reload-or-restart polkit.service || true"
 )
 
-if [[ "$TRAY" == "true" ]]; then
-  CMDS+=(
-    # Desktop tray and launcher (start only in graphical sessions)
-    "cp '${S}/bin/pyroshine-tray' '${PYROSHINE_HOME}/bin/pyroshine-tray'"
-    "chmod 755 '${PYROSHINE_HOME}/bin/pyroshine-tray'"
-    "mkdir -p /etc/xdg/autostart /usr/local/share/applications"
-    "sed 's|^Exec=pyroshine-tray|Exec=${PYROSHINE_HOME}/bin/pyroshine-tray|' '${S}/share/pyroshine/pyroshine-tray-autostart.desktop' > /etc/xdg/autostart/pyroshine-tray.desktop"
-    "sed 's|^Exec=pyroshine-tray|Exec=${PYROSHINE_HOME}/bin/pyroshine-tray|' '${S}/share/pyroshine/pyroshine.desktop' > /usr/local/share/applications/pyroshine.desktop"
-  )
-else
-  CMDS+=("rm -f '${PYROSHINE_HOME}/bin/pyroshine-tray' /etc/xdg/autostart/pyroshine-tray.desktop /usr/local/share/applications/pyroshine.desktop")
-fi
+CMDS+=(
+  # Application-menu entry for the web interface. The server shows the tray
+  # itself in desktop sessions.
+  "mkdir -p /usr/local/share/applications"
+  "sed 's|^Exec=pyroshine |Exec=${PYROSHINE_HOME}/bin/pyroshine |' '${S}/share/pyroshine/pyroshine.desktop' > /usr/local/share/applications/pyroshine.desktop"
+)
 
 if $LINGER_NEEDED && [[ "$LINGER" == "true" ]]; then
   CMDS+=("loginctl enable-linger '${USER}' || true")

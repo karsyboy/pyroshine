@@ -3,7 +3,7 @@
 //! Owning [`UI_BUS_NAME`] also tells the server that a tray runs, so it
 //! leaves pairing notifications to the tray. The bus releases the name when
 //! the process exits or crashes, so a restarted tray takes over cleanly and
-//! a second autostart exits at once. Other processes (the application
+//! a second start exits at once. Other processes (the application
 //! launcher) ask the running tray to open a page with the click's activation
 //! token.
 
@@ -34,13 +34,13 @@ struct TrayObject {
 #[zbus::interface(name = "io.github.karsyboy.PyroshineUi1")]
 impl TrayObject {
 	fn show(&self, page: &str) {
-		let _ = self.requests.send((crate::browser::page(page), None));
+		let _ = self.requests.send((super::browser::page(page), None));
 	}
 
 	fn activate(&self, page: &str, activation_token: &str) {
 		let _ = self.requests.send((
-			crate::browser::page(page),
-			crate::browser::activation_token(activation_token),
+			super::browser::page(page),
+			super::browser::activation_token(activation_token),
 		));
 	}
 }

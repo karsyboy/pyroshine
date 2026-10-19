@@ -530,6 +530,13 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			integer(1.0, 86_400.0, Some("s")),
 		),
 		Field::new(
+			"management.tray",
+			"general",
+			"Desktop tray icon",
+			"Show the status icon and pairing notifications while you are signed in to a desktop. Headless hosts never show it.",
+			FieldKind::Bool,
+		),
+		Field::new(
 			"management.enabled",
 			"web",
 			"Web management interface",
@@ -1109,7 +1116,7 @@ pub(crate) mod tests {
 	/// moonshine-core ui_schema_fixture_is_current`.
 	#[test]
 	fn ui_schema_fixture_is_current() {
-		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../pyroshine-ui/src/api/schema.fixture.json");
+		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/src/api/schema.fixture.json");
 		let fixture = serde_json::to_string_pretty(&json!({
 			"schema": config_schema(),
 			"defaults": Config::default(),

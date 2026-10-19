@@ -56,11 +56,10 @@ MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.1 \
   ./target/release/moonshine healthcheck
 ```
 
-The workspace build also produces `pyroshine-tray`, the optional desktop tray;
-it links no GUI toolkit. The web interface's files are built separately with
-Node.js (`cd pyroshine-ui && npm ci && npm run build`); point a local server at
-them with `MOONSHINE_WEB_ROOT=$PWD/pyroshine-ui/dist`. See
-[pyroshine-ui/README.md](pyroshine-ui/README.md).
+The server binary includes the desktop tray (`src/tray/`, run as `moonshine
+tray`); it links no GUI toolkit. The web interface's files are built separately
+with Node.js (`cd web && npm ci && npm run build`); point a local server at
+them with `MOONSHINE_WEB_ROOT=$PWD/web/dist`. See [web/README.md](web/README.md).
 
 A successful compile alone does not install device rules.
 Use the installation steps below before validating streaming. When the optional
@@ -168,7 +167,7 @@ The web interface has its own checks (CI runs them in the `Web interface`
 job); the tray is checked with the workspace above:
 
 ```sh
-cd pyroshine-ui
+cd web
 npm ci && npm run typecheck && npm test && npm run build
 ```
 
@@ -334,17 +333,16 @@ It can also be run with `workflow_dispatch` for an existing tag. Check that the
 workflow succeeded and all assets are attached, then test installation and an
 upgrade from the previous release.
 
-Packaging is defined in [nfpm.yaml](nfpm.yaml) (the server, including the web
-interface's files), [nfpm-tray.yaml](nfpm-tray.yaml) (the optional desktop
-tray, which replaces the former `pyroshine-ui` package) and [dist/](dist/).
+Packaging is defined in [nfpm.yaml](nfpm.yaml) (one package: the server with
+its tray, the web interface's files and the application-menu entry; it replaces
+the former `pyroshine-ui` package) and [dist/](dist/).
 Keep the portable and native package integration files consistent when
 changing service, udev, policy or desktop-entry paths.
 
 ### Pacman repository
 
 The [`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages) publishes
-`pyroshine-bin` and `pyroshine-tray-bin`, which repackage the release's Arch
-packages. After a stable release is published, the release workflow's `pacman`
+`pyroshine-bin`, which repackages the release's Arch package. After a stable release is published, the release workflow's `pacman`
 job starts that repository's **Publish** workflow, so a release needs no further
 step; prereleases are not published. The job needs the `PACKAGES_DISPATCH_TOKEN`
 secret: a fine-grained token with access to `pyrowave-packages` only and the

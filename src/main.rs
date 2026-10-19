@@ -12,6 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod diag;
 mod pair;
+mod tray;
 mod web;
 
 pub use moonshine_core::ShutdownReason;
@@ -68,6 +69,20 @@ enum Command {
 		#[command(subcommand)]
 		action: WebCommand,
 	},
+	/// Open the web interface in the default browser.
+	Open {
+		/// Page to open: dashboard, library, clients, history, settings,
+		/// diagnostics, updates or maintenance.
+		#[arg(default_value = "dashboard")]
+		page: String,
+	},
+	/// Show the desktop tray (the server starts it in desktop sessions).
+	#[command(hide = true)]
+	Tray {
+		/// Exit when standard input closes (started by the server).
+		#[arg(long)]
+		attached: bool,
+	},
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,6 +133,13 @@ async fn main() -> Result<(), ()> {
 		};
 		let bus = std::env::var("MOONSHINE_MANAGEMENT_BUS").ok();
 		return web::run(action, bus).await.map_err(|error| eprintln!("{error}"));
+	}
+
+	// The desktop side talks to the running server only, too.
+	match &args.command {
+		Some(Command::Open { page }) => return tray::open(page).await.map_err(|error| eprintln!("{error}")),
+		Some(Command::Tray { attached }) => return tray::run(*attached).await.map_err(|error| eprintln!("{error}")),
+		_ => {},
 	}
 
 	// Like pairing, collection must not create a config or touch server state.
@@ -306,7 +328,9 @@ async fn wait_for_dbus() -> Result<(), ()> {
 }
 
 pub struct Moonshine {
-	// Dropped first: management clients see the daemon leave before listeners close.
+	// Dropped first: the tray, then management clients see the daemon leave
+	// before listeners close.
+	_tray: Option<tray::Launcher>,
 	_management: ManagementService,
 	_rtsp_server: RtspServer,
 	_session_manager: SessionManager,
@@ -348,7 +372,11 @@ impl Moonshine {
 			shutdown.clone(),
 		);
 
+		// In desktop sessions only; a headless host never starts it.
+		let tray = config.management.tray.then(tray::Launcher::spawn);
+
 		Ok(Self {
+			_tray: tray,
 			_management: management,
 			_rtsp_server: RtspServer::new(
 				config.address.clone(),
@@ -452,5 +480,15 @@ mod cli_tests {
 		let args = Args::try_parse_from(["pyroshine", "/tmp/config.toml", "healthcheck"]).unwrap();
 		assert_eq!(args.config, Some(PathBuf::from("/tmp/config.toml")));
 		assert!(matches!(args.command, Some(Command::Healthcheck)));
+	}
+
+	#[test]
+	fn open_defaults_to_the_dashboard_and_the_tray_runs_attached_for_the_server() {
+		let args = Args::try_parse_from(["pyroshine", "open"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Open { page }) if page == "dashboard"));
+		let args = Args::try_parse_from(["pyroshine", "open", "clients"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Open { page }) if page == "clients"));
+		let args = Args::try_parse_from(["pyroshine", "tray", "--attached"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Tray { attached: true })));
 	}
 }

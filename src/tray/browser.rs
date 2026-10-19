@@ -103,10 +103,15 @@ pub async fn open(
 		}
 	}
 	let mut command = tokio::process::Command::new("xdg-open");
-	command.arg(address).kill_on_drop(false);
-	if let Some(token) = activation {
-		command.env("XDG_ACTIVATION_TOKEN", token);
-	}
+	// The click's token only, never one inherited from this process's launch.
+	command
+		.arg(address)
+		.kill_on_drop(false)
+		.env_remove("DESKTOP_STARTUP_ID");
+	match activation {
+		Some(token) => command.env("XDG_ACTIVATION_TOKEN", token),
+		None => command.env_remove("XDG_ACTIVATION_TOKEN"),
+	};
 	match command.status().await {
 		Ok(status) if status.success() => Ok(()),
 		Ok(status) => Err(format!(

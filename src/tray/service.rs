@@ -18,9 +18,9 @@ use moonshine_management::dto::{PairingSnapshot, SessionSnapshot};
 use moonshine_management::{BUS_NAME, ManagementError, ManagementProxy};
 use tokio::sync::RwLock;
 
-use crate::attach::{Attached, Attachment};
-use crate::notifications::Notifier;
-use crate::tray::TrayHandle;
+use super::attach::{Attached, Attachment};
+use super::item::TrayHandle;
+use super::notifications::Notifier;
 
 /// Why a call to the server failed.
 #[derive(Clone, Debug)]
@@ -127,9 +127,9 @@ impl Service {
 	/// Open `page` of the web interface in the default browser.
 	pub async fn open(&self, page: &str, activation: Option<String>) -> Result<(), String> {
 		let base = self.web_url().await;
-		let address = crate::browser::address(base.as_deref(), page);
+		let address = super::browser::address(base.as_deref(), page);
 		tracing::debug!(page, "Opening the web interface");
-		crate::browser::open(Some(&self.connection), &address, activation).await
+		super::browser::open(Some(&self.connection), &address, activation).await
 	}
 
 	pub fn start(self: &Arc<Self>, tray: TrayHandle, notifier: Notifier) -> tokio::task::JoinHandle<()> {
@@ -160,7 +160,7 @@ impl Service {
 		let name = zbus::names::BusName::try_from(BUS_NAME).expect("valid bus name");
 		let owned = dbus.name_has_owner(name).await.unwrap_or(false);
 		let owners = owners.map(|change| change.args().map(|args| args.new_owner().is_some()).unwrap_or(false));
-		crate::attach::supervise(owners, owned, Supervisor { service: self, sinks }).await;
+		super::attach::supervise(owners, owned, Supervisor { service: self, sinks }).await;
 	}
 
 	async fn detach(&self, sinks: &Sinks) {

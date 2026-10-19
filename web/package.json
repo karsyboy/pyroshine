@@ -1,5 +1,5 @@
 {
-  "name": "pyroshine-ui",
+  "name": "pyroshine-web",
   "private": true,
   "version": "0.18.0-alpha.0",
   "description": "Pyroshine web management interface: pairing, clients, dashboard, settings, history and diagnostics",

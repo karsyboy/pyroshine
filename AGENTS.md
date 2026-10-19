@@ -70,12 +70,12 @@ Other workspace and integration areas:
   `moonshine-library` (scan launchers with isolated state, report timing and follow changes).
 - `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
   error names, proxies) shared by the daemon, the web interface, the tray and the CLI.
-- `pyroshine-tray/`: optional desktop tray (`ksni` StatusNotifierItem, notifications,
-  browser launcher); a workspace member that links no GUI toolkit.
-- `pyroshine-ui/`: the web management interface (React/Material UI, npm only), built
-  into static files the server serves (packaged with the server; the tray by
-  `nfpm-tray.yaml`). Both are clients of the management interface only; server crates
-  must never depend on them.
+- `web/`: the web management interface (React/Material UI, npm only), built into
+  static files the server serves (packaged with the server).
+- Root `src/tray/`: the desktop tray (`ksni` StatusNotifierItem, notifications, browser
+  launcher; no GUI toolkit), run by the server as a child process in desktop sessions
+  (`launcher.rs`). The web interface and the tray are clients of the management
+  interface only; `moonshine-core` and `moonshine-management` must never depend on them.
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
   (`build-shaders.sh`), changelog tooling/tests, measurement harnesses, the
   baseline recorder and result comparison (`record_baseline.py`,
@@ -83,7 +83,7 @@ Other workspace and integration areas:
   (`hardware_tests.toml`, `hardware_tests.py`).
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
   installers, systemd, device permissions and system policy. The Arch
-  `pyroshine-bin`/`pyroshine-tray-bin` PKGBUILDs live in `karsyboy/pyrowave-packages`.
+  `pyroshine-bin` PKGBUILD lives in `karsyboy/pyrowave-packages`.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
 - `vendor/inputtino/`, `vendor/pixelforge/`: generated dependencies with numbered
   patch series; shared maintenance workflow in `vendor/README.md`.
@@ -104,7 +104,7 @@ Other workspace and integration areas:
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |
-| Web interface, management API, tray | `docs/ARCHITECTURE.md` (Management), `docs/MANAGEMENT.md`, `docs/SECURITY_ADMINISTRATION.md` (Web management), `pyroshine-ui/README.md` |
+| Web interface, management API, tray | `docs/ARCHITECTURE.md` (Management), `docs/MANAGEMENT.md`, `docs/SECURITY_ADMINISTRATION.md` (Web management), `web/README.md` |
 | Packaging, service or host integration | `docs/INSTALLATION.md`, `CONTRIBUTING.md`; `docs/NIXOS.md` for Nix |
 | Release notes and inherited history | `docs/CHANGELOG.md`; `docs/UPSTREAM_CHANGELOG.md` is the upstream archive |
 
@@ -195,7 +195,7 @@ On GPU hosts run them with `python3 scripts/hardware_tests.py run --json <file>`
 and record baselines with `scripts/record_baseline.py`; `docs/TESTING.md` has
 the full command set, including hosts without a toolchain.
 
-- Web interface changes run the `pyroshine-ui` checks listed in `CONTRIBUTING.md`
+- Web interface changes run the `web/` checks listed in `CONTRIBUTING.md`
   (npm typecheck/test/build); the tray is checked with the workspace.
   Management-interface tests need `dbus-daemon`. Management HTTP changes keep
   `management/web/tests.rs` (authentication, CSRF, Host/origin, limits) passing;

@@ -13,12 +13,11 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 
 | Crate | Output | Role |
 | --- | --- | --- |
-| Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown |
+| Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown; the desktop tray (`src/tray/`, run as a child process) |
 | `moonshine-core` | Library | Every server subsystem: protocol endpoints, pairing, sessions, compositor, encoders, transport, input |
 | `moonshine-tools` | `moonshine-bench` | Developer benchmark that drives the production session stack without a client |
 | `moonshine-management` | Library | Management contract: JSON documents, D-Bus names, error names and client proxies |
-| `pyroshine-tray` | `pyroshine-tray` | Optional desktop tray: status icon, notifications, browser launcher (no GUI toolkit) |
-| `pyroshine-ui/` (npm, not Cargo) | Static files in `share/pyroshine/web` | The web management interface's React/Material UI frontend |
+| `web/` (npm, not Cargo) | Static files in `share/pyroshine/web` | The web management interface's React/Material UI frontend |
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
 (Vulkan Video encoding, vendored at its upstream release plus the patches in
@@ -647,9 +646,9 @@ expose them, and the contract (`moonshine-management`) is shared by both:
 
 ```text
 browser (any device)                     pyroshine (service)
-  pyroshine-ui (React) ── HTTP/SSE ──▶ web/   ─┐
+  web/ (React)  ──────── HTTP/SSE ──▶ web/   ─┐
                                                ├─ ops ── SessionManager, ClientManager,
-pyroshine-tray, pyroshine pair/web/diag        │         config store, Library, history,
+pyroshine tray/pair/web/diag/open              │         config store, Library, history,
   ── session bus: methods, signals ──▶ dbus.rs┘         updates, telemetry
                                          hub ◀── follow_* tasks (state changes)
 ```
@@ -895,20 +894,33 @@ notify-rust notification (coalesced to one per 30 s) is the fallback when no
 tray runs. The bus releases the tray's name when it exits or crashes. Neither
 notification carries a link that approves anything.
 
-**Web frontend.** `pyroshine-ui/` is React/Material UI built by Vite into
-static files at release time (Node.js only then). A typed `Backend` contract
-(`src/api/backend.ts`) has an HTTP implementation (`http.ts`: JSON requests with
-the session cookie and CSRF token, the event stream) and a development mock. State
+**Web frontend.** `web/` is React/Material UI built by Vite into static files
+at release time (Node.js only then). A typed `Backend` contract
+(`src/api/backend.ts`) is implemented over HTTP (`http.ts`: JSON requests with
+the session cookie and CSRF token, the event stream). State
 follows the event stream: every (re)connection starts with an overview that
 replaces whatever was missed, so a lost connection, a server restart or a
 reload never leaves stale state. Pages are hash routes (`#/clients?request=…`)
 the tray and notifications can open. The build writes `pyroshine-web.json`
-with its version; the server logs a mismatch and the page asks to reload or to
-install matching packages.
+with its version; the server logs a mismatch and the page asks to reload.
 
-**Desktop tray.** `pyroshine-tray` shows the server's state as a
-StatusNotifierItem (`ksni` on async-io, matching the server's zbus executor in
-workspace builds) and owns no streaming resources. It follows the server's bus
+**Desktop tray.** The server starts the tray (`src/tray/launcher.rs`) while
+the user's desktop session runs, as a child process of its own executable
+(`/proc/self/exe tray --attached`, so an upgrade never mixes versions). A
+service starts before any login, so the session is read from the user's
+systemd manager environment (the desktop exports `WAYLAND_DISPLAY`/`DISPLAY`
+there), with the process environment as fallback; it counts while its display
+socket answers and the session bus has a tray host or a notification server.
+The launcher checks every 10 s: a logout or new login stops or replaces the
+tray, a crash restarts it after 5 s doubling to 5 min, and a clean exit
+(**Hide Tray Icon**) keeps it hidden until the next session or server start.
+The child exits when its standard-input pipe from the server closes; the
+service cgroup also ends it. Headless hosts never start it, and
+`[management] tray = false` disables it.
+
+The tray shows the server's state as a StatusNotifierItem (`ksni` on
+async-io, matching the server's zbus executor) and owns no streaming
+resources. Process isolation keeps a tray fault away from streaming. It follows the server's bus
 name with the supervision of `attach.rs`: while the same owner stays, a failed
 subscription or snapshot is retried with backoff from 0.5 s doubling to 30 s;
 an incompatible or denied daemon is reported and waits for a new owner; a new
@@ -918,7 +930,8 @@ with the click's XDG activation token (`xdg-open` as an argv fallback); the
 address comes from `GetWebUrl` and is limited to known routes, so no credential
 is ever in it. End Session calls the server directly. One tray runs per session
 (its bus name); it exits without an answering Wayland/X11 socket and when the
-session bus closes. XDG autostart starts it at graphical login only.
+session bus closes. `pyroshine open [page]` (the application-menu entry) asks
+the running tray to open a page, or opens it directly.
 
 ## Architectural invariants
 

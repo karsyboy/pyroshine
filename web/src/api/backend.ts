@@ -1,7 +1,5 @@
-// The management API as the UI uses it. `http.ts` implements it against the
-// Pyroshine server (`/api/v1/`); `mock.ts` simulates a server for UI
-// development (`npm run dev` with `?mock=…`) and is never part of a
-// production build.
+// The management API as the UI uses it; `http.ts` implements it against the
+// Pyroshine server (`/api/v1/`).
 
 import type {
   AuthState,

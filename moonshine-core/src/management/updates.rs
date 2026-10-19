@@ -202,7 +202,8 @@ pub(crate) fn install_guidance(executable: &Path, root: &Path) -> InstallGuidanc
 			"debian",
 			"Debian / Ubuntu package",
 			vec![
-				"Download pyroshine_<version>_amd64.deb (and pyroshine-tray if you use the tray) from the release page and verify it against SHA256SUMS.".to_string(),
+				"Download pyroshine_<version>_amd64.deb from the release page and verify it against SHA256SUMS."
+					.to_string(),
 				"Install it: sudo apt install ./pyroshine_<version>_amd64.deb".to_string(),
 				restart,
 			],
@@ -212,7 +213,8 @@ pub(crate) fn install_guidance(executable: &Path, root: &Path) -> InstallGuidanc
 			"rpm",
 			"Fedora / openSUSE package",
 			vec![
-				"Download pyroshine-<version>-1.x86_64.rpm (and pyroshine-tray if you use the tray) from the release page and verify it against SHA256SUMS.".to_string(),
+				"Download pyroshine-<version>-1.x86_64.rpm from the release page and verify it against SHA256SUMS."
+					.to_string(),
 				"Install it: sudo dnf install ./pyroshine-<version>-1.x86_64.rpm".to_string(),
 				restart,
 			],

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 
-use crate::service::UiError;
+use super::service::UiError;
 
 /// How one attachment attempt ended.
 #[derive(Debug)]

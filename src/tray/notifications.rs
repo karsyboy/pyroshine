@@ -18,7 +18,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use zbus::zvariant::Value as Variant;
 
-use crate::service::Service;
+use super::service::Service;
 
 #[zbus::proxy(
 	interface = "org.freedesktop.Notifications",
@@ -122,7 +122,7 @@ impl Inner {
 				"ActionInvoked" => {
 					let token = tokens
 						.remove(&id)
-						.and_then(|token| crate::browser::activation_token(&token));
+						.and_then(|token| super::browser::activation_token(&token));
 					if let Err(error) = self.service.open(&page, token).await {
 						tracing::warn!("Cannot open the browser: {error}");
 					}

@@ -8,7 +8,7 @@ export interface Preferences {
   infoFindings: boolean;
 }
 
-const KEY = "pyroshine-ui.preferences";
+const KEY = "pyroshine.preferences";
 const defaults: Preferences = { infoFindings: true };
 
 const listeners = new Set<() => void>();

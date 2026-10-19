@@ -1025,7 +1025,7 @@ mod tests {
 	#[test]
 	fn session_fixture_preserves_launch_identity_and_round_trips() {
 		let fixture: serde_json::Value =
-			serde_json::from_str(include_str!("../../pyroshine-ui/src/api/session.fixture.json")).unwrap();
+			serde_json::from_str(include_str!("../../web/src/api/session.fixture.json")).unwrap();
 		let snapshot: SessionSnapshot = serde_json::from_value(fixture.clone()).unwrap();
 		let session = snapshot.session.as_ref().unwrap();
 		assert_eq!(

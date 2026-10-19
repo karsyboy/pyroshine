@@ -74,6 +74,9 @@ pub struct ManagementConfig {
 	/// Directory with the web UI's files. Defaults to the packaged location.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub web_root: Option<PathBuf>,
+	/// Show the desktop tray (status icon and pairing notifications) while
+	/// the user's desktop session runs. Headless hosts never start it.
+	pub tray: bool,
 }
 
 impl Default for ManagementConfig {
@@ -87,6 +90,7 @@ impl Default for ManagementConfig {
 			private_key: None,
 			allowed_hosts: Vec::new(),
 			web_root: None,
+			tray: true,
 		}
 	}
 }

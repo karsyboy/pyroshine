@@ -15,9 +15,9 @@ use moonshine_management::dto::{PairingSnapshot, SessionDetails, SessionPhase, S
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
-use crate::icons::{self, Badge};
-use crate::notifications::Notifier;
-use crate::service::Service;
+use super::icons::{self, Badge};
+use super::notifications::Notifier;
+use super::service::Service;
 
 /// What the tray shows.
 #[derive(Clone, Debug)]
@@ -107,7 +107,7 @@ pub struct PyroTray {
 	runtime: Handle,
 	service: Arc<Service>,
 	notifier: Notifier,
-	quit: Arc<Notify>,
+	hide: Arc<Notify>,
 	view: View,
 	icons: HashMap<Badge, Vec<Icon>>,
 	/// Token the tray host provided for the click being handled.
@@ -135,7 +135,7 @@ impl PyroTray {
 		let token = self.activation_token.take();
 		self.runtime.spawn(async move {
 			let code = match service.proxy().await {
-				Ok(proxy) => proxy.create_web_setup_code(false).await.map_err(crate::service::UiError::from),
+				Ok(proxy) => proxy.create_web_setup_code(false).await.map_err(super::service::UiError::from),
 				Err(error) => Err(error),
 			};
 			match code {
@@ -167,6 +167,8 @@ impl PyroTray {
 
 impl Tray for PyroTray {
 	fn id(&self) -> String {
+		// The earlier desktop app's id: panels keep the user's visibility
+		// choice for the icon under it.
 		"pyroshine-ui".into()
 	}
 
@@ -209,7 +211,7 @@ impl Tray for PyroTray {
 	/// Plasma passes the activation token for a click on the item just
 	/// before activating it.
 	fn provide_xdg_activation_token(&mut self, token: String) {
-		self.activation_token = crate::browser::activation_token(&token);
+		self.activation_token = super::browser::activation_token(&token);
 	}
 
 	/// Left click opens the dashboard (at a waiting pairing request first).
@@ -322,11 +324,12 @@ impl Tray for PyroTray {
 		items.push(MenuItem::Separator);
 		items.push(
 			StandardItem {
-				// Only the tray exits: the server, its web interface and any
-				// stream keep running.
-				label: "_Quit Pyroshine Tray".into(),
-				icon_name: "application-exit".into(),
-				activate: Box::new(|tray: &mut Self| tray.quit.notify_one()),
+				// Only the tray exits, until the next desktop login or server
+				// start: the server, its web interface and any stream keep
+				// running.
+				label: "_Hide Tray Icon".into(),
+				icon_name: "view-hidden".into(),
+				activate: Box::new(|tray: &mut Self| tray.hide.notify_one()),
 				..Default::default()
 			}
 			.into(),
@@ -394,7 +397,7 @@ fn requests(snapshot: &PairingSnapshot) -> Vec<String> {
 		.collect()
 }
 
-pub async fn spawn(service: Arc<Service>, notifier: Notifier, quit: Arc<Notify>) -> TrayHandle {
+pub async fn spawn(service: Arc<Service>, notifier: Notifier, hide: Arc<Notify>) -> TrayHandle {
 	let icons = [
 		Badge::None,
 		Badge::Streaming,
@@ -412,12 +415,12 @@ pub async fn spawn(service: Arc<Service>, notifier: Notifier, quit: Arc<Notify>)
 		runtime: Handle::current(),
 		service,
 		notifier,
-		quit,
+		hide,
 		view: View::default(),
 		icons,
 		activation_token: None,
 	};
-	// The panel may start after the tray (autostart), so a missing
+	// The panel may start after the tray, so a missing
 	// StatusNotifierWatcher is not fatal: the icon appears once one does.
 	match tray.assume_sni_available(true).spawn().await {
 		Ok(handle) => TrayHandle(Some(handle)),
@@ -435,7 +438,7 @@ mod tests {
 	#[test]
 	fn retained_session_lines_prefer_foreground_and_fall_back_to_launch_entry() {
 		let snapshot: SessionSnapshot =
-			serde_json::from_str(include_str!("../../pyroshine-ui/src/api/session.fixture.json")).unwrap();
+			serde_json::from_str(include_str!("../../web/src/api/session.fixture.json")).unwrap();
 		let mut view = View {
 			connected: true,
 			phase: snapshot.phase,

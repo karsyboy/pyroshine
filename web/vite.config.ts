@@ -15,8 +15,8 @@ function buildInfo(): Plugin {
 }
 
 // The server serves `dist/` (installed as share/pyroshine/web). `npm run dev`
-// serves the UI with hot reload: with `?mock=<scenario>` against a simulated
-// server, otherwise against a running Pyroshine whose API it proxies.
+// serves the UI with hot reload against a running Pyroshine whose API it
+// proxies.
 const environment = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {};
 const target = environment.PYROSHINE_URL ?? "http://127.0.0.1:47990";
 

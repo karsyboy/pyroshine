@@ -30,7 +30,7 @@ pub enum Badge {
 const SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];
 
 static BASE: LazyLock<Vec<RgbaImage>> = LazyLock::new(|| {
-	let logo = image::load_from_memory_with_format(include_bytes!("../icons/tray.png"), image::ImageFormat::Png)
+	let logo = image::load_from_memory_with_format(include_bytes!("tray.png"), image::ImageFormat::Png)
 		.expect("embedded tray icon decodes")
 		.into_rgba8();
 	SIZES

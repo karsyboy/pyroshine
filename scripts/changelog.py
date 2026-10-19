@@ -71,13 +71,13 @@ def workspace_version(root):
 
 
 # Packages whose Cargo.lock entries carry the workspace version: the
-# workspace's members, including the desktop tray.
-SERVER_LOCK = ("Cargo.lock", ["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools", "pyroshine-tray"])
+# workspace's members.
+SERVER_LOCK = ("Cargo.lock", ["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools"])
 # The web interface's npm project: its build records this version for the
 # server's compatibility check (pyroshine-web.json).
 NPM_FILES = {
-    "pyroshine-ui/package.json": [("version",)],
-    "pyroshine-ui/package-lock.json": [("version",), ("packages", "", "version")],
+    "web/package.json": [("version",)],
+    "web/package-lock.json": [("version",), ("packages", "", "version")],
 }
 
 

@@ -1,4 +1,4 @@
-# The web management interface's static files (pyroshine-ui/). Node.js is
+# The web management interface's static files (web/). Node.js is
 # needed only to build them; the server serves them from
 # share/pyroshine/web next to its executable. importNpmLock reads the
 # committed package-lock.json, so there is no separate dependency hash.
@@ -9,7 +9,7 @@
 }:
 
 let
-  root = ../pyroshine-ui;
+  root = ../web;
 in
 buildNpmPackage {
   pname = "pyroshine-web";

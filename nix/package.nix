@@ -33,7 +33,6 @@ let
       ../moonshine-core
       ../moonshine-management
       ../moonshine-tools
-      ../pyroshine-tray
       ../dist
       ../vendor
     ];
@@ -98,13 +97,13 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     # The web management interface, found next to the executable
-    # (bin/../share/pyroshine/web). The workspace build also installs
-    # bin/pyroshine-tray, the optional desktop tray.
+    # (bin/../share/pyroshine/web). The server shows the desktop tray itself
+    # (a child process of bin/moonshine) in desktop sessions.
     mkdir -p $out/share/pyroshine
     cp -r ${pyroshine-web} $out/share/pyroshine/web
     install -Dm644 dist/pyroshine.desktop $out/share/applications/pyroshine.desktop
     substituteInPlace $out/share/applications/pyroshine.desktop \
-      --replace-fail 'Exec=pyroshine-tray' "Exec=$out/bin/pyroshine-tray"
+      --replace-fail 'Exec=pyroshine ' "Exec=$out/bin/moonshine "
 
     # Input-group access + active-seat ACLs for /dev/uinput and /dev/uhid,
     # picked up by services.udev.packages.

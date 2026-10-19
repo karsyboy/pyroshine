@@ -1,94 +1,46 @@
-//! Pyroshine desktop tray: a status icon, pairing notifications and
-//! shortcuts into the web interface.
+//! Desktop tray: a status icon, pairing notifications and shortcuts into the
+//! web interface.
 //!
-//! The tray is a small, optional companion of a separately running server.
-//! It never starts, stops or supervises the server and owns no streaming
-//! resources; quitting it (or a crash) leaves the server, its web interface
-//! and any stream untouched. All state comes from the server's management
-//! interface on the session bus; every management task opens in the browser.
+//! The server starts the tray itself while the user's desktop session runs
+//! (see [`launcher`]), as a child process of the same executable
+//! (`pyroshine tray --attached`); on a headless host nothing starts. The tray
+//! owns no streaming resources and talks to the server only through its
+//! management interface on the session bus, so hiding it, a crash or a
+//! desktop logout leaves the server, its web interface and any stream
+//! untouched. Every management task opens in the browser.
 //!
-//! - `pyroshine-tray` runs the tray (desktop autostart). It exits at once
-//!   outside a graphical session or when the session already has a tray, and
-//!   when the session bus goes away (logout).
-//! - `pyroshine-tray --open [page]` opens a page of the web interface (the
-//!   application launcher), through the running tray when there is one.
+//! `pyroshine open [page]` (the application launcher) opens a page of the web
+//! interface, through the running tray when there is one.
 
 mod attach;
 mod browser;
 mod icons;
 mod instance;
+mod item;
+mod launcher;
 mod notifications;
 mod service;
-mod tray;
 
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
-use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "Usage: pyroshine-tray [--open [PAGE]]
+pub use launcher::Launcher;
 
-Desktop tray for a running Pyroshine server. Without options it shows the
-status icon (started at desktop login). --open opens the web interface in the
-default browser at PAGE (dashboard, clients, library, history, settings,
-diagnostics, updates or maintenance).";
-
-enum Mode {
-	Tray,
-	Open(String),
-}
-
-fn parse_args() -> Mode {
-	let mut mode = Mode::Tray;
-	let mut args = std::env::args().skip(1);
-	while let Some(arg) = args.next() {
-		match arg.as_str() {
-			"--open" => mode = Mode::Open(args.next().unwrap_or_else(|| "dashboard".into())),
-			// The old desktop app's flags, still used by stale autostart entries.
-			"--background" => mode = Mode::Tray,
-			"--page" => mode = Mode::Open(args.next().unwrap_or_else(|| "dashboard".into())),
-			"--version" => {
-				println!("pyroshine-tray {}", env!("CARGO_PKG_VERSION"));
-				std::process::exit(0);
-			},
-			"--help" | "-h" => {
-				println!("{USAGE}");
-				std::process::exit(0);
-			},
-			other => eprintln!("Ignoring unknown argument {other}"),
-		}
-	}
-	mode
-}
-
-/// The XDG activation token the launcher passed for the user's click. It is
-/// removed from the environment so it is used for this launch only.
-fn take_launch_activation_token() -> Option<String> {
-	let token = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
+/// The XDG activation token the launcher passed for the user's click.
+fn launch_activation_token() -> Option<String> {
+	["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
 		.iter()
 		.find_map(|name| std::env::var(name).ok())
-		.and_then(|token| browser::activation_token(&token));
-	// SAFETY: called before the runtime or any other thread exists.
-	unsafe {
-		std::env::remove_var("XDG_ACTIVATION_TOKEN");
-		std::env::remove_var("DESKTOP_STARTUP_ID");
-	}
-	token
+		.and_then(|token| browser::activation_token(&token))
 }
 
 /// Whether a display server answers: the Wayland socket or the X11 socket
-/// named by the environment accepts a connection. A variable alone proves
+/// named by the given variables accepts a connection. A variable alone proves
 /// nothing (it may be left over from an ended session).
-fn graphical_session() -> Option<String> {
-	display_server(
-		std::env::var_os("WAYLAND_DISPLAY"),
-		std::env::var_os("XDG_RUNTIME_DIR"),
-		std::env::var("DISPLAY").ok(),
-	)
-}
-
 fn display_server(
 	wayland: Option<std::ffi::OsString>,
 	runtime: Option<std::ffi::OsString>,
@@ -120,10 +72,13 @@ fn display_server(
 	None
 }
 
-async fn open(page: &str, activation: Option<String>) -> Result<(), String> {
+/// Open `page` of the web interface in the default browser.
+pub async fn open(page: &str) -> Result<(), String> {
+	let activation = launch_activation_token();
+	let page = browser::page(page);
 	let connection = instance::session_bus().await.ok();
 	if let Some(connection) = &connection
-		&& instance::forward(connection, page, activation.as_deref()).await
+		&& instance::forward(connection, &page, activation.as_deref()).await
 	{
 		return Ok(());
 	}
@@ -147,14 +102,24 @@ async fn open(page: &str, activation: Option<String>) -> Result<(), String> {
 	}
 	browser::open(
 		connection.as_ref(),
-		&browser::address(base.as_deref(), page),
+		&browser::address(base.as_deref(), &page),
 		activation,
 	)
 	.await
 }
 
-async fn run_tray() -> Result<(), String> {
-	let Some(session) = graphical_session() else {
+/// Run the tray until it is hidden, the session ends or, when `attached`,
+/// the server that started it exits (its end of standard input closes).
+pub async fn run(attached: bool) -> Result<(), String> {
+	// The server starts the tray as /proc/self/exe, which process lists would
+	// show as "exe".
+	let _ = std::fs::write("/proc/self/comm", "pyroshine-tray");
+	let session = display_server(
+		std::env::var_os("WAYLAND_DISPLAY"),
+		std::env::var_os("XDG_RUNTIME_DIR"),
+		std::env::var("DISPLAY").ok(),
+	);
+	let Some(session) = session else {
 		println!("No graphical session (no answering Wayland or X11 display); the tray is not needed here.");
 		return Ok(());
 	};
@@ -178,8 +143,8 @@ async fn run_tray() -> Result<(), String> {
 		.map_err(|error| format!("The management bus is unavailable: {error}"))?;
 	let service = Arc::new(service::Service::new(connection.clone(), management));
 	let notifier = notifications::Notifier::new(service.clone()).await;
-	let quit = Arc::new(Notify::new());
-	let tray = tray::spawn(service.clone(), notifier.clone(), quit.clone()).await;
+	let hide = Arc::new(Notify::new());
+	let tray = item::spawn(service.clone(), notifier.clone(), hide.clone()).await;
 	let following = service.start(tray, notifier.clone());
 
 	let opener = {
@@ -194,10 +159,28 @@ async fn run_tray() -> Result<(), String> {
 		})
 	};
 
+	let parent = async {
+		if attached {
+			// The server keeps the write end open and never writes; end of
+			// file means it exited, however it exited. A detached thread, not
+			// tokio's stdin, so the blocked read never holds up exiting.
+			let (exited, wait) = tokio::sync::oneshot::channel::<()>();
+			std::thread::spawn(move || {
+				let mut byte = [0u8; 1];
+				while matches!(std::io::stdin().read(&mut byte), Ok(1..)) {}
+				let _ = exited.send(());
+			});
+			let _ = wait.await;
+		} else {
+			std::future::pending::<()>().await;
+		}
+	};
+
 	let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
 	let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
 	tokio::select! {
-		() = quit.notified() => tracing::info!("Quit from the tray menu; Pyroshine keeps running"),
+		() = hide.notified() => tracing::info!("Tray icon hidden from its menu; Pyroshine keeps running"),
+		() = parent => tracing::info!("The server exited; the tray exits"),
 		_ = tokio::signal::ctrl_c() => {},
 		_ = terminate.recv() => {},
 		_ = hangup.recv() => {},
@@ -206,29 +189,6 @@ async fn run_tray() -> Result<(), String> {
 	}
 	opener.abort();
 	Ok(())
-}
-
-fn main() {
-	let mode = parse_args();
-	let activation = take_launch_activation_token();
-	tracing_subscriber::fmt()
-		.with_env_filter(EnvFilter::try_from_env("PYROSHINE_TRAY_LOG").unwrap_or_else(|_| EnvFilter::new("warn")))
-		.init();
-	let runtime = tokio::runtime::Builder::new_multi_thread()
-		.worker_threads(2)
-		.enable_all()
-		.build()
-		.expect("the runtime starts");
-	let result = runtime.block_on(async {
-		match mode {
-			Mode::Tray => run_tray().await,
-			Mode::Open(page) => open(&page, activation).await,
-		}
-	});
-	if let Err(error) = result {
-		eprintln!("{error}");
-		std::process::exit(1);
-	}
 }
 
 #[cfg(test)]

@@ -2376,6 +2376,8 @@ dependencies = [
  "async-shutdown",
  "clap",
  "futures-util",
+ "image",
+ "ksni",
  "moonshine-core",
  "moonshine-management",
  "serde",
@@ -2384,6 +2386,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zbus",
 ]
 
@@ -3057,23 +3060,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "pyroshine-tray"
-version = "0.18.0-alpha.0"
-dependencies = [
- "futures-util",
- "image",
- "ksni",
- "moonshine-management",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "zbus",
-]
 
 [[package]]
 name = "qoi"

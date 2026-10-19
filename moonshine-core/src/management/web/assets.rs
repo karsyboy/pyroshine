@@ -1,6 +1,6 @@
 //! The browser UI's files.
 //!
-//! The frontend (`pyroshine-ui/`) is built at release time into static
+//! The frontend (`web/`) is built at release time into static
 //! files; Node.js is never needed at runtime. Packages install them under
 //! `share/pyroshine/web`; the server reads that directory once at startup
 //! into memory. A request path is only ever a key into that map, never a

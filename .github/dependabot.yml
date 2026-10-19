@@ -26,14 +26,14 @@ updates:
       - dependency-name: pixelforge
       - dependency-name: smithay
       - dependency-name: ash
-      # Git-pinned for an unreleased tray API (see pyroshine-tray/Cargo.toml).
+      # Git-pinned for an unreleased tray API (see Cargo.toml).
       - dependency-name: ksni
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
 
   - package-ecosystem: npm
-    directory: /pyroshine-ui
+    directory: /web
     schedule:
       interval: weekly
       day: monday

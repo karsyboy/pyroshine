@@ -10,10 +10,9 @@ ARM system can stream.
 Nix retains the upstream names: executable **`moonshine`**, module
 **`services.moonshine`**, system service **`moonshine.service`**. There is no
 `pyroshine@<user>` unit here. The package includes the web management
-interface, the `pyroshine-tray` desktop tray and its application-menu entry;
-to start the tray at login, add the package to `environment.systemPackages`
-and an autostart entry running `pyroshine-tray` (for example with
-`environment.etc."xdg/autostart/pyroshine-tray.desktop"`).
+interface and its application-menu entry (add the package to
+`environment.systemPackages` to list it). The service shows the desktop tray
+itself while its user is signed in to a desktop, as on other distributions.
 
 ## Install and configure
 

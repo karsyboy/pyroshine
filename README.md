@@ -64,11 +64,10 @@ pacman repository on Arch Linux / CachyOS:
 | SteamOS / other Linux | `pyroshine-install.sh` | Follow the [portable installation guide](docs/INSTALLATION.md#portable-installer-and-steamos) |
 | NixOS | Flake / service module | Follow the [NixOS guide](docs/NIXOS.md) |
 
-Every installation includes the web management interface. On a desktop, also
-install `pyroshine-tray-bin` from the pacman repository, or the matching
-`pyroshine-tray` release package, for a status icon, pairing notifications and
-an application-menu entry; the portable installer includes it unless you pass
-`--no-tray`. Neither needs GTK, WebKitGTK or Node.js.
+Every installation is one package with the server, its web management
+interface and a desktop tray: while you are signed in to a desktop, the
+service shows a status icon with pairing notifications; on a headless host it
+skips it. Nothing needs GTK, WebKitGTK or Node.js.
 
 - Native packages install the server, PyroWave library, service, and device
   permissions. They do not start the server or configure the firewall.
@@ -76,8 +75,7 @@ an application-menu entry; the portable installer includes it unless you pass
   releases. Check the glibc baseline above before installing.
 - Each release includes `SHA256SUMS` for checking downloads.
 - To upgrade, install the newer release the same way, or run `sudo pacman -Syu`
-  with the repository. Update the server and tray together, then restart
-  the service; this ends active streams. See [upgrades](docs/INSTALLATION.md#upgrades-and-configuration).
+  with the repository, then restart the service; this ends active streams. See [upgrades](docs/INSTALLATION.md#upgrades-and-configuration).
 
 ## Quick start
 

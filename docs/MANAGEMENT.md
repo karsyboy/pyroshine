@@ -3,7 +3,7 @@
 Pyroshine has one management interface: a web page the server itself serves.
 It is the same on a desktop and on a headless server, needs no desktop
 environment, browser or Node.js on the host, and keeps working whether or not
-the optional desktop tray runs. Closing the page never affects the server or a
+the desktop tray runs. Closing the page never affects the server or a
 stream.
 
 [Install and start the server](../README.md#quick-start) first.
@@ -215,11 +215,13 @@ password and the signed-in browsers.
 
 ## Desktop tray
 
-The optional `pyroshine-tray` package adds a status icon, pairing
-notifications and the **Pyroshine** application-menu entry. It starts at
-desktop login (only in graphical sessions, once per session) and ends with
-the session. It holds no streaming resources: quitting it or a crash leaves
-the server, the web interface and any stream running. Every management task
+The service shows a status icon with pairing notifications while you are
+signed in to a desktop: it starts the tray when your desktop session appears
+(also when you log in after the service started) and stops it when you log
+out. On a headless host, or with `[management] tray = false`, it never starts.
+The tray is a separate process of the same program and holds no streaming
+resources: hiding it or a crash leaves the server, the web interface and any
+stream running; after a crash the service starts it again. Every management task
 opens in the browser, where you sign in as usual; the tray never passes a
 password or token to the page.
 
@@ -239,8 +241,8 @@ the session (application, mode, codec, HDR, client) and opens **Pyroshine**,
 **Pair a Client** (or the waiting request), **Session History** and
 **Updates**. **End Session** closes the streamed application and disconnects
 the client directly, without a browser; save progress first. **Set Up Web
-Access** shows a setup code. **Quit Pyroshine Tray** closes only the tray;
-start it again from a terminal with `pyroshine-tray` or at the next login.
+Access** shows a setup code. **Hide Tray Icon** closes only the tray, until
+your next desktop login or service restart.
 
 Pairing requests share one notification, replaced rather than repeated when a
 client retries; clicking it opens that request. Failed launches and unexpected
@@ -250,8 +252,9 @@ its own.
 
 KDE Plasma shows the icon natively. GNOME needs the AppIndicator and
 KStatusNotifierItem Support extension; other panels need a StatusNotifierItem
-host. Without one, use the application-menu entry. Disable autostart in your
-desktop's autostart settings.
+host. Without one, use the application-menu entry (`pyroshine open` from a
+terminal). To turn the tray off, set **Settings → General → Desktop tray icon**
+off (`[management] tray = false`) and restart the service.
 
 ## Troubleshooting
 
@@ -260,11 +263,11 @@ desktop's autostart settings.
 | The page does not load | Check `systemctl status "pyroshine@$USER"` and that the log shows **Web management interface available**. Over SSH, keep the tunnel open. |
 | **Pyroshine can't be reached** on the page | The service stopped or restarts; the page reconnects by itself. |
 | **Open Pyroshine through its own address** | Use `127.0.0.1` (or `localhost`), or add the name to `allowed_hosts`. |
-| The page says it is from another version | Reload it after an upgrade; install the server and tray from the same release. |
+| The page says it is from another version | Reload it after an upgrade. |
 | No notification | Open **Clients**, retry pairing, check desktop notification settings. |
 | A launch or stream fails | Open **Diagnostics → Recent problems** for the cause and fix; see [failure causes](TIPS.md#read-why-a-launch-or-stream-failed). |
 | No request | Check server/network; enable **Settings → Pairing & security → Allow new pairings**, save and restart. [More pairing help](TIPS.md#pairing-does-not-complete). |
-| No tray icon | Check desktop support above; run `PYROSHINE_TRAY_LOG=info pyroshine-tray` to see why. |
+| No tray icon | Check desktop support above and that the service runs as your user. The service log says when it found your desktop session (`journalctl -u "pyroshine@$USER" -g tray`). |
 | The browser does not open | Install `xdg-desktop-portal` or `xdg-utils`, or open the address yourself. |
 
 Use `sudo journalctl` if journal access is denied.

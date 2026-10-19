@@ -144,6 +144,7 @@ GameStream ports, with its own administrator sign-in.
 | `private_key` | optional path | Private key for `certificate`; set both or neither. |
 | `allowed_hosts` | list of strings, `[]` | Further host names browsers may use (`name` or `name:port`), for example `["streambox.lan"]`. IP addresses and `localhost` always work; other names are refused to defeat DNS rebinding. |
 | `web_root` | optional directory | The interface's files. Defaults to `share/pyroshine/web` next to the executable, then `/usr/share/pyroshine/web`. |
+| `tray` | boolean, `true` | Show the [desktop tray](MANAGEMENT.md#desktop-tray) while you are signed in to a desktop. The service starts and stops it with your desktop session; headless hosts never start it. |
 
 ```toml
 [management]
