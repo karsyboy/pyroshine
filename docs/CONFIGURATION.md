@@ -29,8 +29,9 @@ the whole configuration before saving, changes only the settings you edit
 (keeping comments, formatting and unrelated entries), refuses to overwrite a
 file changed since it was loaded, and replaces the file atomically. Saving does
 not reload the configuration; restart the server to apply it (the web
-interface's **Restart now** does). Your own `[[application]]` entries are
-edited on its **Applications** page.
+interface's **Restart now** does). `[[application]]`,
+`[[application_scanner]]` and `[library]` are edited on its **Applications**
+page.
 
 The packaged systemd unit explicitly passes `/home/<user>/.config/moonshine/config.toml`.
 To use another location, run `sudo systemctl edit "pyroshine@$USER"` and add

@@ -114,17 +114,25 @@ an active stream is never interrupted, even when its game is removed or hidden.
 - **Rescan** reads every launcher again, for example after changing files the
   watchers cannot see.
 
-Each launcher has a status card: how many games it provides, when it was last
-scanned and how long that took, and whether changes are noticed immediately
-(**Watching**) or by the periodic check. If a library cannot be read, for
-example a Steam library on a drive that is not mounted, the card says why and
-what to do, and its games stay offered from the last successful scan (marked
-*Offline library*) until the drive is back. Automatic updates can be turned
-off in **Settings → Application discovery** (see [`[library]`](CONFIGURATION.md#library)).
+Under **Game launchers** each scanner has a status card: how many games it
+provides, when it was last scanned and how long that took, and whether changes
+are noticed immediately (**Watching**) or by the periodic check. If a library
+cannot be read, for example a Steam library on a drive that is not mounted, the
+card says why and what to do, and its games stay offered from the last
+successful scan (marked *Offline library*) until the drive is back.
+
+- **Add launcher** adds a Steam, Lutris, Heroic or desktop-entry scanner with
+  its usual paths and launch command filled in; **Edit** on a card changes its
+  library location, launch command and options, or removes it.
+- **Discovery options** turns automatic updates on or off and sets the
+  periodic check (see [`[library]`](CONFIGURATION.md#library)).
+
+Launcher and application changes are saved to the configuration file with the
+same checks as **Settings** and apply after a restart (**Restart now**).
 
 ## Settings
 
-**Settings** edits scanners and server options (your own applications are on
+**Settings** edits the server options (applications and game launchers are on
 the [Applications](#applications) page); **Show advanced**
 reveals less common fields. Fresh native/portable configurations already include
 Steam and library scanning. Installing or removing games needs no settings

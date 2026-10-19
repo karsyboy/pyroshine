@@ -1635,7 +1635,7 @@
       {
         "advanced": false,
         "caution": null,
-        "help": "Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan in the Library page.",
+        "help": "Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan on the Applications page.",
         "kind": {
           "type": "bool"
         },

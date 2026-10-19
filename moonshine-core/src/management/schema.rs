@@ -917,7 +917,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"library.auto_refresh",
 			"scanners",
 			"Follow installs automatically",
-			"Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan in the Library page.",
+			"Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan on the Applications page.",
 			FieldKind::Bool,
 		),
 		Field::new(

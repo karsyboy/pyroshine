@@ -1,26 +1,38 @@
-// The static `[[application]]` entries of the configuration file, edited on
-// the Applications page. Saves go through the same validation and revision
-// check as the settings page; like every setting they apply after a restart.
+// The configuration the Applications page edits: static `[[application]]`
+// entries, `[[application_scanner]]` entries and the discovery options
+// (`[library]`). Saves go through the same validation and revision check as
+// the settings page; like every setting they apply after a restart.
 
 import { useCallback, useEffect, useState } from "react";
 import { api, errorKind, errorMessage } from "../api/client";
-import type { ConfigDocument, ConfigSchema, FieldSpec, LibraryApplication } from "../api/types";
+import type { ConfigDocument, ConfigSchema, FieldSpec, LibraryApplication, LibrarySource, ScannerVariant } from "../api/types";
 import { getPath, normalize, setPath } from "../config/draft";
 import { useDaemon } from "./daemon";
 
 export type Item = Record<string, unknown>;
 
-export interface ManualApplications {
-  /// Settings of one entry; null until the configuration has loaded.
-  fields: FieldSpec[] | null;
-  items: Item[];
+export interface LibraryConfig {
+  /// False until the configuration has loaded.
+  ready: boolean;
+  /// Settings of one static application.
+  applicationFields: FieldSpec[];
+  applications: Item[];
+  scannerVariants: ScannerVariant[];
+  scanners: Item[];
+  /// Discovery options beside the scanners (automatic updates).
+  discoveryFields: FieldSpec[];
+  /// The saved value of a setting.
+  value: (path: string) => unknown;
   writable: boolean;
   readOnlyReason: string | null;
   /// Saved changes wait for a restart.
   restartRequired: boolean;
   error: string | null;
-  /// Replace the list and save the file. Rejects with the reason.
-  save: (items: Item[]) => Promise<void>;
+  /// Static applications.
+  saveApplications: (items: Item[]) => Promise<void>;
+  saveScanners: (items: Item[]) => Promise<void>;
+  /// Set settings by path and save the file. Rejects with the reason.
+  save: (changes: Record<string, unknown>) => Promise<void>;
 }
 
 /// The configuration entry behind a manual library entry (`manual:<index>`),
@@ -32,7 +44,14 @@ export function configIndex(application: LibraryApplication, items: Item[]): num
   return byTitle >= 0 ? byTitle : null;
 }
 
-export function useManualApplications(): ManualApplications {
+/// The configuration entry behind a running scanner, confirmed by its type.
+export function scannerIndex(source: LibrarySource, items: Item[]): number | null {
+  if (items[source.scanner]?.type === source.kind) return source.scanner;
+  const ofKind = items.flatMap((item, index) => (item.type === source.kind ? [index] : []));
+  return ofKind.length === 1 ? ofKind[0] : null;
+}
+
+export function useLibraryConfig(): LibraryConfig {
   const daemon = useDaemon();
   const [loaded, setLoaded] = useState<{ document: ConfigDocument; schema: ConfigSchema } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,36 +71,48 @@ export function useManualApplications(): ManualApplications {
     if (daemon.connected) void load();
   }, [daemon.connected, startedAt, daemon.configRevision, load]);
 
-  const field = loaded?.schema.fields.find((candidate) => candidate.kind.type === "applications") ?? null;
-  const items = (field && loaded ? (getPath(loaded.document.values, field.path) as Item[] | undefined) : undefined) ?? [];
+  const fields = loaded?.schema.fields ?? [];
+  const applicationsField = fields.find((field) => field.kind.type === "applications");
+  const scannersField = fields.find((field) => field.kind.type === "scanners");
+  const values = loaded?.document.values;
+  const list = (field: FieldSpec | undefined) => ((field && values ? getPath(values, field.path) : undefined) as Item[] | undefined) ?? [];
 
   const save = useCallback(
-    async (next: Item[]) => {
-      if (!loaded || !field) throw new Error("The configuration is not loaded yet.");
-      const values = normalize(setPath(structuredClone(loaded.document.values), field.path, next), loaded.schema.fields);
-      const report = await api.validateConfig(values);
+    async (changes: Record<string, unknown>) => {
+      if (!loaded) throw new Error("The configuration is not loaded yet.");
+      let next = structuredClone(loaded.document.values);
+      for (const [path, value] of Object.entries(changes)) next = setPath(next, path, value);
+      next = normalize(next, loaded.schema.fields);
+      const report = await api.validateConfig(next);
       if (!report.valid) throw new Error(report.issues.map((issue) => issue.message).join(" "));
       try {
-        await api.saveConfig(values, loaded.document.revision);
+        await api.saveConfig(next, loaded.document.revision);
       } catch (failure) {
         if (errorKind(failure) === "conflict") {
           await load();
-          throw new Error("The configuration file changed meanwhile; it was reloaded. Check the entry and save again.");
+          throw new Error("The configuration file changed meanwhile; it was reloaded. Check the change and save again.");
         }
         throw failure;
       }
       await load();
     },
-    [loaded, field, load],
+    [loaded, load],
   );
 
   return {
-    fields: field && field.kind.type === "applications" ? field.kind.item : null,
-    items,
+    ready: loaded !== null && applicationsField !== undefined && scannersField !== undefined,
+    applicationFields: applicationsField?.kind.type === "applications" ? applicationsField.kind.item : [],
+    applications: list(applicationsField),
+    scannerVariants: scannersField?.kind.type === "scanners" ? scannersField.kind.variants : [],
+    scanners: list(scannersField),
+    discoveryFields: scannersField ? fields.filter((field) => field.section === scannersField.section && field !== scannersField) : [],
+    value: (path) => (values ? getPath(values, path) : undefined),
     writable: loaded?.document.writable ?? false,
     readOnlyReason: loaded?.document.read_only_reason ?? null,
     restartRequired: loaded?.document.restart_required ?? false,
     error,
+    saveApplications: (items) => save(applicationsField ? { [applicationsField.path]: items } : {}),
+    saveScanners: (items) => save(scannersField ? { [scannersField.path]: items } : {}),
     save,
   };
 }

@@ -9,6 +9,8 @@ import Chip from "@mui/material/Chip";
 import Divider from "@mui/material/Divider";
 import InputAdornment from "@mui/material/InputAdornment";
 import LinearProgress from "@mui/material/LinearProgress";
+import ListItemText from "@mui/material/ListItemText";
+import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import Stack from "@mui/material/Stack";
 import Switch from "@mui/material/Switch";
@@ -23,12 +25,13 @@ import HideImageOutlined from "@mui/icons-material/HideImageOutlined";
 import EditOutlined from "@mui/icons-material/EditOutlined";
 import Add from "@mui/icons-material/Add";
 import RestartAlt from "@mui/icons-material/RestartAlt";
+import Tune from "@mui/icons-material/Tune";
 import { api, artworkUrl, errorMessage } from "../api/client";
-import type { LibraryApplication, LibrarySnapshot, LibrarySource, SourceStatus } from "../api/types";
+import type { LibraryApplication, LibrarySnapshot, LibrarySource, ScannerVariant, SourceStatus } from "../api/types";
 import { ConfirmDialog, PageHeader } from "../components/common";
-import { ItemDialog } from "../components/lists";
+import { ItemDialog, newScanner } from "../components/lists";
 import { RestartButton } from "../components/Restart";
-import { configIndex, useManualApplications, type Item } from "../state/applications";
+import { configIndex, scannerIndex, useLibraryConfig, type Item } from "../state/applications";
 import { useDaemon, useNow } from "../state/daemon";
 import { useLibrary } from "../state/library";
 import { relative } from "../util/format";
@@ -96,7 +99,7 @@ const artworkLabels: Record<string, string> = {
   icon_theme: "Matching icon",
 };
 
-function SourceCard({ source, now }: { source: LibrarySource; now: number }) {
+function SourceCard({ source, now, onEdit }: { source: LibrarySource; now: number; onEdit?: (source: LibrarySource) => void }) {
   const [label, color] = statusLabels[source.status];
   return (
     <Card>
@@ -115,6 +118,11 @@ function SourceCard({ source, now }: { source: LibrarySource; now: number }) {
           >
             <Chip size="small" variant="outlined" label={source.watched ? "Watching" : "Periodic checks"} />
           </Tooltip>
+          {onEdit && (
+            <Button size="small" startIcon={<EditOutlined />} onClick={() => onEdit(source)}>
+              Edit
+            </Button>
+          )}
         </Stack>
         <Typography variant="body2" sx={{ fontFamily: "monospace", color: "text.secondary", mt: 0.5, wordBreak: "break-all" }}>
           {source.root}
@@ -223,22 +231,31 @@ const ApplicationRow = memo(function ApplicationRow({
 
 export function LibraryContent({
   snapshot,
-  navigate,
   onRescan,
   onToggle,
   onAdd,
   onEdit,
+  onEditSource,
+  scannerVariants = [],
+  onAddScanner,
+  onOptions,
   notice,
   busyKeys = new Set(),
   rescanning = false,
 }: {
   snapshot: LibrarySnapshot;
-  navigate: (to: string) => void;
+  navigate?: (to: string) => void;
   onRescan: () => void;
   onToggle: (application: LibraryApplication) => void;
   /// Add a static application; absent while the configuration cannot be edited.
   onAdd?: () => void;
   onEdit?: (application: LibraryApplication) => void;
+  /// Edit a launcher's scanner; absent while the configuration cannot be edited.
+  onEditSource?: (source: LibrarySource) => void;
+  scannerVariants?: ScannerVariant[];
+  onAddScanner?: (type: string) => void;
+  /// Discovery options (automatic updates).
+  onOptions?: () => void;
   /// Shown under the header (restart and read-only notices).
   notice?: ReactNode;
   busyKeys?: Set<string>;
@@ -262,6 +279,7 @@ export function LibraryContent({
     [snapshot.applications],
   );
   const scanning = snapshot.scanning || rescanning;
+  const [scannerMenu, setScannerMenu] = useState<HTMLElement | null>(null);
 
   return (
     <>
@@ -293,27 +311,45 @@ export function LibraryContent({
       )}
       {!snapshot.auto_refresh && (
         <Alert severity="info" sx={{ mb: 2 }}>
-          Automatic updates are off: after installing or removing games, choose Rescan. Turn them on in Settings ›
-          Application discovery.
+          Automatic updates are off: after installing or removing games, choose Rescan, or turn them on in Discovery
+          options.
         </Alert>
       )}
 
+      <Stack direction="row" sx={{ alignItems: "center", gap: 1, mb: 1.5, flexWrap: "wrap" }}>
+        <Typography variant="h6" sx={{ flexGrow: 1 }}>
+          Game launchers
+        </Typography>
+        <Button startIcon={<Tune />} onClick={onOptions} disabled={!onOptions}>
+          Discovery options
+        </Button>
+        <Button startIcon={<Add />} onClick={(event) => setScannerMenu(event.currentTarget)} disabled={!onAddScanner}>
+          Add launcher
+        </Button>
+      </Stack>
+      <Menu anchorEl={scannerMenu} open={scannerMenu !== null} onClose={() => setScannerMenu(null)}>
+        {scannerVariants.map((variant) => (
+          <MenuItem
+            key={variant.id}
+            onClick={() => {
+              setScannerMenu(null);
+              onAddScanner?.(variant.id);
+            }}
+          >
+            <ListItemText primary={variant.label} secondary={variant.description} />
+          </MenuItem>
+        ))}
+      </Menu>
       {snapshot.sources.length > 0 ? (
         <Box sx={{ display: "grid", gap: 2, gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, mb: 3 }}>
           {snapshot.sources.map((source) => (
-            <SourceCard key={source.scanner} source={source} now={now} />
+            <SourceCard key={source.scanner} source={source} now={now} onEdit={onEditSource} />
           ))}
         </Box>
       ) : (
         <Alert severity="info" sx={{ mb: 3 }}>
           <AlertTitle>No launchers are scanned</AlertTitle>
-          Add Steam, Lutris, Heroic or desktop-entry scanners in Settings › Application discovery to offer installed
-          games automatically.
-          <Box sx={{ mt: 1 }}>
-            <Button size="small" variant="outlined" onClick={() => navigate("settings")}>
-              Open Settings
-            </Button>
-          </Box>
+          Add Steam, Lutris, Heroic or desktop entries with Add launcher to offer installed games automatically.
         </Alert>
       )}
 
@@ -409,46 +445,101 @@ export function LibraryContent({
 /// Starting values of a new static application.
 const NEW_APPLICATION: Item = { title: "", command: [""], launch_timeout_secs: 2 };
 
-export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
+/// What the dialog edits: a static application, a launcher's scanner or the
+/// discovery options; `index` is null for a new entry.
+interface Editing {
+  what: "application" | "scanner" | "options";
+  index: number | null;
+  item: Item;
+}
+
+export function LibraryPage(_props: { navigate: (to: string) => void }) {
   const daemon = useDaemon();
   const { snapshot, error, reload } = useLibrary(daemon.connected);
   const [busyKeys, setBusyKeys] = useState<Set<string>>(new Set());
   const [rescanning, setRescanning] = useState(false);
   const { notify } = daemon;
-  const manual = useManualApplications();
-  /// The static application being edited (`index` null for a new one).
-  const [editing, setEditing] = useState<{ index: number | null; item: Item } | null>(null);
+  const config = useLibraryConfig();
+  const [editing, setEditing] = useState<Editing | null>(null);
   const [removing, setRemoving] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const editable = manual.fields !== null && manual.writable;
-  const onAdd = useCallback(() => {
+  const editable = config.ready && config.writable;
+  const open = useCallback((next: Editing) => {
     setSaveError(null);
-    setEditing({ index: null, item: structuredClone(NEW_APPLICATION) });
+    setEditing(next);
   }, []);
-  const { items } = manual;
+  const { applications, scanners, discoveryFields, value } = config;
+  const onAdd = useCallback(() => open({ what: "application", index: null, item: structuredClone(NEW_APPLICATION) }), [open]);
   const onEdit = useCallback(
     (application: LibraryApplication) => {
-      const index = configIndex(application, items);
+      const index = configIndex(application, applications);
       if (index === null) {
         notify("warning", `${application.title} is no longer in the configuration file; it was changed or removed there.`);
         return;
       }
-      setSaveError(null);
-      setEditing({ index, item: structuredClone(items[index]) });
+      open({ what: "application", index, item: structuredClone(applications[index]) });
     },
-    [items, notify],
+    [applications, notify, open],
   );
+  const onAddScanner = useCallback((type: string) => open({ what: "scanner", index: null, item: newScanner(type) }), [open]);
+  const onEditSource = useCallback(
+    (source: LibrarySource) => {
+      const index = scannerIndex(source, scanners);
+      if (index === null) {
+        notify("warning", `The ${source.label} scanner changed in the configuration file; restart Pyroshine to edit it here.`);
+        return;
+      }
+      open({ what: "scanner", index, item: structuredClone(scanners[index]) });
+    },
+    [scanners, notify, open],
+  );
+  const onOptions = useCallback(() => {
+    const item: Item = {};
+    for (const field of discoveryFields) {
+      const current = value(field.path);
+      if (current !== undefined) item[field.path] = current;
+    }
+    open({ what: "options", index: null, item });
+  }, [discoveryFields, value, open]);
 
-  const store = async (next: Item[], done: string) => {
+  const variant = (item: Item) => config.scannerVariants.find((candidate) => candidate.id === item.type);
+  const fields = (target: Editing) =>
+    target.what === "application"
+      ? config.applicationFields
+      : target.what === "scanner"
+        ? variant(target.item)?.fields ?? []
+        : discoveryFields;
+  const name = (target: Editing) =>
+    target.what === "application"
+      ? String(target.item.title || "application")
+      : target.what === "scanner"
+        ? `${variant(target.item)?.label ?? String(target.item.type)} launcher`
+        : "discovery options";
+
+  const replace = (items: Item[], index: number | null, item: Item | null) =>
+    index === null
+      ? item
+        ? [...items, item]
+        : items
+      : item
+        ? items.map((existing, position) => (position === index ? item : existing))
+        : items.filter((_, position) => position !== index);
+
+  /// Save `item` (null removes the entry) for `target`.
+  const store = async (target: Editing, item: Item | null) => {
     setSaving(true);
     setSaveError(null);
     try {
-      await manual.save(next);
+      if (target.what === "application") await config.saveApplications(replace(applications, target.index, item));
+      else if (target.what === "scanner")
+        await config.saveScanners(replace(scanners, target.index, item && { ...item, type: target.item.type }));
+      else await config.save(Object.fromEntries(discoveryFields.map((field) => [field.path, item?.[field.path]])));
       setEditing(null);
       setRemoving(false);
-      notify("success", `${done} Restart Pyroshine to offer the change to clients.`);
+      const done = item === null ? "Removed." : target.index === null && target.what !== "options" ? "Added." : "Saved.";
+      notify("success", `${done} Restart Pyroshine to apply the change.`);
     } catch (failure) {
       setRemoving(false);
       setSaveError(errorMessage(failure));
@@ -518,7 +609,7 @@ export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
 
   const notice = (
     <>
-      {manual.restartRequired && (
+      {config.restartRequired && (
         <Alert
           severity="info"
           icon={<RestartAlt />}
@@ -528,9 +619,10 @@ export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
           Saved changes apply when Pyroshine restarts. Restarting ends any active session.
         </Alert>
       )}
-      {manual.fields !== null && !manual.writable && (
+      {config.ready && !config.writable && (
         <Alert severity="warning" sx={{ mb: 2 }}>
-          Applications cannot be added or edited here: {manual.readOnlyReason ?? "the configuration file is read-only."}
+          Applications and launchers cannot be changed here:{" "}
+          {config.readOnlyReason ?? "the configuration file is read-only."}
         </Alert>
       )}
     </>
@@ -540,51 +632,47 @@ export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
     <>
       <LibraryContent
         snapshot={snapshot}
-        navigate={navigate}
         onRescan={() => void rescan()}
         onToggle={onToggle}
         onAdd={editable ? onAdd : undefined}
         onEdit={editable ? onEdit : undefined}
+        onEditSource={editable ? onEditSource : undefined}
+        scannerVariants={config.scannerVariants}
+        onAddScanner={editable ? onAddScanner : undefined}
+        onOptions={editable ? onOptions : undefined}
         notice={notice}
         busyKeys={busyKeys}
         rescanning={rescanning}
       />
-      {editing && manual.fields && (
+      {editing && (
         <ItemDialog
-          title={editing.index === null ? "Add application" : `Edit ${String(editing.item.title || "application")}`}
-          fields={manual.fields}
+          title={
+            editing.what === "options"
+              ? "Discovery options"
+              : `${editing.index === null ? "Add" : "Edit"} ${name(editing)}`
+          }
+          fields={fields(editing)}
           initial={editing.item}
           busy={saving}
           error={saveError}
           saveLabel="Save"
           onClose={() => setEditing(null)}
           onRemove={editing.index === null ? undefined : () => setRemoving(true)}
-          onSave={(item) =>
-            void store(
-              editing.index === null
-                ? [...manual.items, item]
-                : manual.items.map((existing, index) => (index === editing.index ? item : existing)),
-              editing.index === null ? "Application added." : "Application saved.",
-            )
-          }
+          onSave={(item) => void store(editing, item)}
         />
       )}
       <ConfirmDialog
         open={removing && editing !== null}
-        title={`Remove ${String(editing?.item.title || "this application")}?`}
+        title={editing ? `Remove ${name(editing)}?` : "Remove?"}
         confirm="Remove"
         destructive
         busy={saving}
         onClose={() => setRemoving(false)}
-        onConfirm={() =>
-          editing?.index != null &&
-          void store(
-            manual.items.filter((_, index) => index !== editing.index),
-            "Application removed.",
-          )
-        }
+        onConfirm={() => editing && void store(editing, null)}
       >
-        It is removed from the configuration file; clients stop seeing it after Pyroshine restarts.
+        {editing?.what === "scanner"
+          ? "Its games are no longer offered after Pyroshine restarts."
+          : "It is removed from the configuration file; clients stop seeing it after Pyroshine restarts."}
       </ConfirmDialog>
     </>
   );

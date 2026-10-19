@@ -18,14 +18,13 @@ import type { ConfigDocument, ConfigIssue, ConfigSchema, ConfigValues, FieldSpec
 import { ConfirmDialog, PageHeader } from "../components/common";
 import { RestartButton } from "../components/Restart";
 import { FieldControl, FieldRow } from "../components/fields";
-import { ScannersEditor } from "../components/lists";
 import { changedFields, getPath, issueField, normalize, setPath } from "../config/draft";
 import { useDaemon } from "../state/daemon";
 import { setPreference, usePreferences } from "../state/preferences";
 
-/// Sections edited on another page: the static applications live on the
-/// Applications page, beside the discovered ones.
-const ELSEWHERE = new Set(["applications"]);
+/// Sections edited on another page: static applications, scanners and
+/// discovery options live on the Applications page, beside what they produce.
+const ELSEWHERE = new Set(["applications", "scanners"]);
 
 function RestartNotice({ saved }: { saved: boolean }) {
   return (
@@ -271,22 +270,6 @@ export function SettingsPage() {
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             {current.description}
           </Typography>
-          {fields.map((field) =>
-            field.kind.type === "scanners" ? (
-              <Box key={field.path} sx={{ mb: 2 }}>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-                  {field.help}
-                </Typography>
-                {fieldError(field) && <Alert severity="error" sx={{ mb: 1.5 }}>{fieldError(field)}</Alert>}
-                <ScannersEditor
-                  variants={field.kind.variants}
-                  value={(getPath(draft, field.path) as Record<string, unknown>[]) ?? []}
-                  onChange={(value) => update(field.path, value)}
-                  disabled={readOnly}
-                />
-              </Box>
-            ) : null,
-          )}
           {fields.some((field) => field.kind.type !== "applications" && field.kind.type !== "scanners") && (
             <Card sx={{ px: 3 }}>
               {fields
