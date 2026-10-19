@@ -173,19 +173,17 @@ pub enum MenuIcon {
 	EndSession,
 	History,
 	Updates,
-	WebAccess,
 	Hide,
 }
 
 impl MenuIcon {
-	const ALL: [MenuIcon; 8] = [
+	const ALL: [MenuIcon; 7] = [
 		MenuIcon::Dashboard,
 		MenuIcon::Pair,
 		MenuIcon::Pairing,
 		MenuIcon::EndSession,
 		MenuIcon::History,
 		MenuIcon::Updates,
-		MenuIcon::WebAccess,
 		MenuIcon::Hide,
 	];
 
@@ -198,7 +196,6 @@ impl MenuIcon {
 			MenuIcon::EndSession => include_bytes!("menu-icons/end-session.png"),
 			MenuIcon::History => include_bytes!("menu-icons/history.png"),
 			MenuIcon::Updates => include_bytes!("menu-icons/updates.png"),
-			MenuIcon::WebAccess => include_bytes!("menu-icons/web-access.png"),
 			MenuIcon::Hide => include_bytes!("menu-icons/hide.png"),
 		}
 	}

@@ -699,7 +699,7 @@ session ends.
 password verifier and SHA-256 hashes of session tokens in `management.json`
 beside `state.toml` (0600, durable replace). The first password needs a
 one-time setup code, issued only over the same-user D-Bus interface
-(`CreateWebSetupCode`, `pyroshine web setup`, the tray), so neither a loopback
+(`CreateWebSetupCode`, `pyroshine web setup`), so neither a loopback
 browser nor a paired client can claim the server. Sign-in always issues a new
 token (no fixation); sessions expire idle (7 days) and absolutely (30 days);
 the CSRF token is derived from the session token. Failed attempts lock the peer

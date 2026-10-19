@@ -54,7 +54,6 @@ struct State {
 	latest: Option<String>,
 	error: Option<u32>,
 	last_error: Option<Instant>,
-	info: Option<u32>,
 }
 
 struct Inner {
@@ -109,8 +108,6 @@ impl Inner {
 				}
 			} else if Some(id) == state.error {
 				"diagnostics".into()
-			} else if Some(id) == state.info {
-				"dashboard".into()
 			} else {
 				continue;
 			};
@@ -242,14 +239,6 @@ impl Notifier {
 			let (summary, body) = server_event_text(event);
 			self.error(summary, &body).await;
 		}
-	}
-
-	/// A message the operator asked for (a setup code); replaces the last one.
-	pub async fn info(&self, summary: &str, message: &str) {
-		let Some(inner) = &self.0 else { return };
-		let mut state = inner.state.lock().await;
-		let replaces = state.info;
-		state.info = Self::notify(inner, replaces, summary, message, 1).await.or(replaces);
 	}
 
 	pub async fn error(&self, summary: &str, message: &str) {

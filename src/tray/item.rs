@@ -134,42 +134,6 @@ impl PyroTray {
 			}
 		});
 	}
-
-	/// Ask the server for a web setup code and show it with the setup page.
-	fn setup_web_access(&mut self) {
-		let service = self.service.clone();
-		let notifier = self.notifier.clone();
-		let token = self.activation_token.take();
-		self.runtime.spawn(async move {
-			let code = match service.proxy().await {
-				Ok(proxy) => proxy.create_web_setup_code(false).await.map_err(super::service::UiError::from),
-				Err(error) => Err(error),
-			};
-			match code {
-				Ok(code) => {
-					notifier
-						.info(
-							"Pyroshine setup code",
-							&format!("Enter {code} in the browser within 15 minutes to choose the administrator password."),
-						)
-						.await;
-					if let Err(error) = service.open("dashboard", token).await {
-						notifier.error("Could not open Pyroshine in the browser", &error).await;
-					}
-				},
-				Err(error) if error.kind == "conflict" => {
-					notifier
-						.info(
-							"Web access is already set up",
-							"Sign in with the administrator password. To replace a forgotten one, run pyroshine web setup --reset in a terminal.",
-						)
-						.await;
-					let _ = service.open("dashboard", token).await;
-				},
-				Err(error) => notifier.error("Could not get a setup code", &error.message).await,
-			}
-		});
-	}
 }
 
 impl Tray for PyroTray {
@@ -314,16 +278,6 @@ impl Tray for PyroTray {
 				label: "_Updates".into(),
 				icon_data: self.icon(MenuIcon::Updates),
 				activate: Box::new(|tray: &mut Self| tray.open("updates")),
-				..Default::default()
-			}
-			.into(),
-		);
-		items.push(
-			StandardItem {
-				label: "Set Up _Web Access…".into(),
-				icon_data: self.icon(MenuIcon::WebAccess),
-				enabled: self.view.connected,
-				activate: Box::new(|tray: &mut Self| tray.setup_web_access()),
 				..Default::default()
 			}
 			.into(),

@@ -32,7 +32,6 @@ MENU = {
     "end-session": "StopCircle",
     "history": "History",
     "updates": "NewReleases",
-    "web-access": "Key",
     "hide": "VisibilityOff",
 }
 MENU_SIZE = 48

@@ -30,9 +30,8 @@ pyroshine web setup
 ```
 
 Enter the printed code (valid for 15 minutes) and the new password on the
-page; you are signed in. On a desktop, the tray's **Set Up Web Access** shows
-a code in a notification instead. Later, sign in with the password. A browser
-stays signed in for up to 30 days, or 7 days without use.
+page; you are signed in. Later, sign in with the password. A browser stays
+signed in for up to 30 days, or 7 days without use.
 
 - **Forgot the password:** `pyroshine web setup --reset` issues a code that
   sets a new password and signs out every browser.
@@ -257,9 +256,8 @@ Left-click opens the dashboard, or the waiting pairing request. The menu shows
 the session (application, mode, codec, HDR, client) and opens **Pyroshine**,
 **Pair a Client** (or the waiting request), **Session History** and
 **Updates**. **End Session** closes the streamed application and disconnects
-the client directly, without a browser; save progress first. **Set Up Web
-Access** shows a setup code. **Hide Tray Icon** closes only the tray, until
-your next desktop login or service restart.
+the client directly, without a browser; save progress first. **Hide Tray
+Icon** closes only the tray, until your next desktop login or service restart.
 
 Pairing requests share one notification, replaced rather than repeated when a
 client retries; clicking it opens that request. Failed launches and unexpected
