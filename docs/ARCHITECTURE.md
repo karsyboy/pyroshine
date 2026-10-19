@@ -661,7 +661,8 @@ pyroshine tray/pair/web/diag/open              │         config store, Library
 | Name a client | Optional, display-only metadata in `state.toml`, written through the state transaction |
 | Configuration | `config_store` (below) |
 | Run health check | `healthcheck::recheck_in_server` (below), serialized |
-| Library, rescan, show/hide | `app_scanner::Library` (see [Application catalog](#application-catalog)) |
+| Library, rescan, show/hide, box art | `app_scanner::Library` (see [Application catalog](#application-catalog)); box art is the cached `/appasset` rendering |
+| Restart | Triggers the global shutdown with `ShutdownReason::Restart` after answering; once shutdown completes, `src/restart.rs` marks every descriptor close-on-exec and executes the executable path recorded at startup (an upgrade takes effect) with the original arguments, keeping the PID, so it works without a supervisor |
 | History, updates | `management/history.rs`, `management/updates.rs` (below; web only) |
 | Web setup code | `management/auth.rs` (D-Bus only: proves control of the streaming account) |
 

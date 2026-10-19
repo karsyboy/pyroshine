@@ -32,7 +32,7 @@ paired Moonlight certificate, and not the desktop tray, which only opens pages.
 | Remote access | Any non-loopback `address` requires `tls = true`; startup refuses otherwise. |
 | Page content | Only the installed files are served (read once at startup; request paths are never file paths), with a strict Content-Security-Policy, `frame-ancestors 'none'` and `nosniff`. |
 | Limits | 128 connections, 16 event streams, 1 MiB bodies (16 KiB except configuration saves), header and body deadlines. |
-| Audit | Sign-ins, failures, lockouts, password changes and every change (pairing, revocation, configuration, session end, support bundle) are logged under the `pyroshine::audit` target with the session's public identifier and peer address. |
+| Audit | Sign-ins, failures, lockouts, password changes and every change (pairing, revocation, configuration, session end, restart, support bundle) are logged under the `pyroshine::audit` target with the session's public identifier and peer address. |
 
 If `management.json` is damaged, sign-in is refused (the file is left as it
 is) until `pyroshine web setup --reset` replaces it. Deleting the file has the

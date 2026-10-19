@@ -1,4 +1,5 @@
-// Editors for `[[application]]` and `[[application_scanner]]` entries.
+// Editors for `[[application_scanner]]` entries, and the item dialog the
+// Applications page uses for `[[application]]` entries.
 
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -49,13 +50,17 @@ function missing(fields: FieldSpec[], item: Item): string[] {
     .map((field) => field.label);
 }
 
-function ItemDialog({
+export function ItemDialog({
   title,
   fields,
   initial,
   onSave,
   onClose,
   disabled,
+  busy,
+  error,
+  saveLabel = "Done",
+  onRemove,
 }: {
   title: string;
   fields: FieldSpec[];
@@ -63,6 +68,11 @@ function ItemDialog({
   onSave: (item: Item) => void;
   onClose: () => void;
   disabled?: boolean;
+  busy?: boolean;
+  /// Why the last save failed.
+  error?: string | null;
+  saveLabel?: string;
+  onRemove?: () => void;
 }) {
   const [item, setItem] = useState(initial);
   // Open the advanced settings when the entry uses hooks or output redirection.
@@ -76,9 +86,14 @@ function ItemDialog({
   const absent = missing(fields, item);
   const visible = fields.filter((field) => advanced || !field.advanced);
   return (
-    <Dialog open onClose={onClose} maxWidth="md" fullWidth>
+    <Dialog open onClose={busy ? undefined : onClose} maxWidth="md" fullWidth>
       <DialogTitle>{title}</DialogTitle>
       <DialogContent dividers>
+        {error && (
+          <Alert severity="error" sx={{ mb: 2, overflowWrap: "anywhere" }}>
+            {error}
+          </Alert>
+        )}
         {visible.map((field, index) => (
           <Box key={field.path}>
             {index > 0 && <Divider />}
@@ -101,19 +116,28 @@ function ItemDialog({
         ))}
       </DialogContent>
       <DialogActions sx={{ px: 3, py: 2, justifyContent: "space-between" }}>
-        <FormControlLabel control={<Switch checked={advanced} onChange={(event) => setAdvanced(event.target.checked)} />} label="Advanced settings" />
+        <Stack direction="row" sx={{ gap: 1, alignItems: "center", flexWrap: "wrap" }}>
+          <FormControlLabel control={<Switch checked={advanced} onChange={(event) => setAdvanced(event.target.checked)} />} label="Advanced settings" />
+          {onRemove && (
+            <Button color="error" startIcon={<DeleteOutline />} disabled={disabled || busy} onClick={onRemove}>
+              Remove
+            </Button>
+          )}
+        </Stack>
         <Stack direction="row" sx={{ gap: 1, alignItems: "center" }}>
           {tried && absent.length > 0 && <Alert severity="error" sx={{ py: 0 }}>Missing: {absent.join(", ")}</Alert>}
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
           <Button
             variant="contained"
-            disabled={disabled}
+            disabled={disabled || busy}
             onClick={() => {
               setTried(true);
               if (absent.length === 0) onSave(item);
             }}
           >
-            Done
+            {saveLabel}
           </Button>
         </Stack>
       </DialogActions>
@@ -195,46 +219,6 @@ function ListShell({
         );
       })}
     </Card>
-  );
-}
-
-export function ApplicationsEditor({ fields, value, onChange, disabled }: { fields: FieldSpec[]; value: Item[]; onChange: (value: Item[]) => void; disabled?: boolean }) {
-  const [editing, setEditing] = useState<number | "new" | null>(null);
-  return (
-    <>
-      <ListShell
-        items={value}
-        disabled={disabled}
-        onChange={onChange}
-        onEdit={setEditing}
-        empty="No static applications. Clients only see discovered applications."
-        render={(item) => ({
-          title: String(item.title || "Untitled"),
-          subtitle: commandLine(item.command),
-          chips: [
-            ...(item.output_scale != null ? [`scale ${item.output_scale}`] : []),
-            ...(Array.isArray(item.pre_command) && item.pre_command.length ? ["pre-launch"] : []),
-            ...(Array.isArray(item.post_command) && item.post_command.length ? ["post-session"] : []),
-          ],
-        })}
-      />
-      <Button startIcon={<Add />} disabled={disabled} onClick={() => setEditing("new")}>
-        Add application
-      </Button>
-      {editing !== null && (
-        <ItemDialog
-          title={editing === "new" ? "Add application" : "Edit application"}
-          fields={fields}
-          disabled={disabled}
-          initial={editing === "new" ? { title: "", command: [""], launch_timeout_secs: 2 } : value[editing]}
-          onClose={() => setEditing(null)}
-          onSave={(item) => {
-            onChange(editing === "new" ? [...value, item] : value.map((existing, index) => (index === editing ? item : existing)));
-            setEditing(null);
-          }}
-        />
-      )}
-    </>
   );
 }
 

@@ -88,6 +88,15 @@ impl ManagementInterface {
 		on_runtime(&self.management, async move { management.op_end_session(ACTOR).await }).await
 	}
 
+	async fn restart(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<(), ManagementError> {
+		authorize(connection, &header).await?;
+		self.management.op_restart(ACTOR)
+	}
+
 	async fn get_pairing(
 		&self,
 		#[zbus(connection)] connection: &zbus::Connection,

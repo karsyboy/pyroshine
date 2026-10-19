@@ -2,7 +2,7 @@
 // (`npm run dev`) the dev server proxies `/api` to a running Pyroshine (see
 // vite.config.ts).
 
-export { http as api } from "./http";
+export { http as api, artworkUrl } from "./http";
 
 /** Save `blob` as a download named `name`. */
 export function download(blob: Blob, name: string) {

@@ -228,7 +228,12 @@ export function App() {
       )}
       <Box component="main" sx={{ flexGrow: 1, overflow: "auto" }}>
         <Box sx={{ maxWidth: 1240, mx: "auto", px: { xs: 2, md: 4 }, py: { xs: 2, md: 3 } }}>
-          {daemon.reconnecting && daemon.server && (
+          {daemon.restarting && (
+            <Alert severity="info" icon={<CircularProgress size={18} />} sx={{ mb: 2 }}>
+              Pyroshine is restarting. This page reconnects when it is back.
+            </Alert>
+          )}
+          {!daemon.restarting && daemon.reconnecting && daemon.server && (
             <Alert severity="warning" icon={<CircularProgress size={18} />} sx={{ mb: 2 }}>
               Connection to Pyroshine lost; reconnecting. What this page shows may be out of date.
             </Alert>

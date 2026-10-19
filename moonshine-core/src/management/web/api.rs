@@ -13,11 +13,11 @@
 //! | `POST auth/logout`, `POST auth/password` | Sign out; change the password (signs out other browsers) |
 //! | `GET auth/sessions`, `DELETE auth/sessions/{id}` | Signed-in browsers; sign one out |
 //! | `GET overview` | Server, session, pairing, clients and statistics at once |
-//! | `GET server`, `GET session`, `POST session/end` | |
+//! | `GET server`, `POST server/restart`, `GET session`, `POST session/end` | |
 //! | `GET pairing`, `POST pairing/approve`, `POST pairing/reject` | Exact request token required |
 //! | `GET clients`, `POST clients/rename`, `POST clients/revoke` | |
 //! | `GET config`, `POST config/validate`, `PUT config` | `PUT` needs the revision it edits |
-//! | `GET library`, `POST library/rescan`, `POST library/hidden` | |
+//! | `GET library`, `GET library/artwork?key=`, `POST library/rescan`, `POST library/hidden` | |
 //! | `GET events/recent`, `POST health/run`, `GET diagnostics/report`, `POST diagnostics/bundle` | |
 //! | `GET history?limit&before`, `GET history/{id}`, `DELETE history` | Session history, newest first |
 //! | `GET updates`, `POST updates/check`, `PUT updates/settings`, `POST updates/dismiss` | Release notifications |
@@ -279,6 +279,10 @@ pub(crate) async fn handle(context: &Context, request: Request<Incoming>, peer: 
 			},
 		})),
 		(&Method::GET, "server") => json(&management.op_server()),
+		(&Method::POST, "server/restart") => {
+			audit!("restart");
+			respond(management.op_restart(&actor).map(|()| no_content()))
+		},
 		(&Method::GET, "session") => json(&management.op_session()),
 		(&Method::POST, "session/end") => {
 			audit!("end_session");
@@ -381,6 +385,26 @@ pub(crate) async fn handle(context: &Context, request: Request<Incoming>, peer: 
 		(&Method::GET, "diagnostics/report") => json_bytes(management.op_diagnostic_report().await),
 		// POST: collecting is expensive and the archive holds logs, so it
 		// needs the CSRF token like a change.
+		(&Method::GET, "library/artwork") => {
+			let key = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+				.find(|(name, _)| name == "key")
+				.map(|(_, value)| value.into_owned())
+				.unwrap_or_default();
+			match management.op_library_artwork(&key).await {
+				Ok(png) => {
+					let mut response = Response::new(super::http::body(png));
+					let headers = response.headers_mut();
+					headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+					// The page versions the address with the catalog generation.
+					headers.insert(
+						header::CACHE_CONTROL,
+						HeaderValue::from_static("private, max-age=86400"),
+					);
+					response
+				},
+				Err(failure) => management_error(&failure),
+			}
+		},
 		(&Method::POST, "diagnostics/bundle") => {
 			audit!("support_bundle");
 			match management.op_support_bundle().await {
@@ -457,6 +481,7 @@ fn is_known(route: &str) -> bool {
 		"auth/sessions",
 		"overview",
 		"server",
+		"server/restart",
 		"session",
 		"session/end",
 		"pairing",
@@ -468,6 +493,7 @@ fn is_known(route: &str) -> bool {
 		"config",
 		"config/validate",
 		"library",
+		"library/artwork",
 		"library/rescan",
 		"library/hidden",
 		"events/recent",

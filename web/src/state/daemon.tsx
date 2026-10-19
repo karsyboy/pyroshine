@@ -28,6 +28,10 @@ interface DaemonState extends Overview {
   loaded: boolean;
   /// The live connection to the server is being re-established.
   reconnecting: boolean;
+  /// This page asked the server to restart and it is not back yet.
+  restarting: boolean;
+  /// Call after asking the server to restart.
+  expectRestart: () => void;
   history: StreamStats[];
   /// Recent server events, oldest first.
   events: ServerEvent[];
@@ -68,6 +72,9 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   const [overview, setOverview] = useState<Overview>(empty);
   const [loaded, setLoaded] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  /// The start time of the server instance a restart was asked of.
+  const restartedFrom = useRef<number | null>(null);
   const [history, setHistory] = useState<StreamStats[]>([]);
   const [events, setEvents] = useState<ServerEvent[]>([]);
   const [notices, setNotices] = useState<Notice[]>([]);
@@ -86,12 +93,33 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   const dismiss = useCallback((id: number) => setNotices((current) => current.filter((n) => n.id !== id)), []);
 
   const apply = useCallback((next: Overview) => {
+    // A new server instance (its start time changed) completes a restart.
+    if (restartedFrom.current !== null && next.server && next.server.started_at_ms !== restartedFrom.current) {
+      restartedFrom.current = null;
+      setRestarting(false);
+      notify("success", "Pyroshine restarted.");
+    }
     setOverview({ ...next, connected: true });
     setLoaded(true);
     setReconnecting(false);
     if (!next.stats) setHistory([]);
     api.recentEvents().then(setEvents, () => setEvents([]));
-  }, []);
+  }, [notify]);
+
+  const expectRestart = useCallback(() => {
+    restartedFrom.current = overview.server?.started_at_ms ?? null;
+    setRestarting(true);
+  }, [overview.server?.started_at_ms]);
+
+  // A restart that never comes back falls back to the reconnecting notice.
+  useEffect(() => {
+    if (!restarting) return;
+    const timer = setTimeout(() => {
+      restartedFrom.current = null;
+      setRestarting(false);
+    }, 120_000);
+    return () => clearTimeout(timer);
+  }, [restarting]);
 
   const refresh = useCallback(async () => {
     apply(await api.overview());
@@ -148,6 +176,8 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       ...overview,
       loaded,
       reconnecting,
+      restarting,
+      expectRestart,
       history,
       events,
       notices,
@@ -164,6 +194,8 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       overview,
       loaded,
       reconnecting,
+      restarting,
+      expectRestart,
       history,
       events,
       notices,

@@ -17,7 +17,11 @@ use moonshine_management::dto::{
 
 use super::hub::EventKind;
 use super::{Management, json};
+use crate::ShutdownReason;
 use crate::clients::{RevokeError, normalize_client_label};
+
+/// How long a restart waits after answering, so the caller gets the answer.
+const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A certificate fingerprint as 64 lowercase hexadecimal digits.
 pub(crate) fn fingerprint(value: &str) -> Result<String, ManagementError> {
@@ -66,6 +70,20 @@ impl Management {
 			.stop_session()
 			.await
 			.map_err(|()| ManagementError::Failed("The session did not stop cleanly; see the Pyroshine log.".into()))
+	}
+
+	/// Restart the server: the normal shutdown (a session ends through its
+	/// teardown), after which the process starts its executable again (see
+	/// the server's `main`). The answer is sent before the shutdown begins.
+	pub(crate) fn op_restart(&self, actor: &str) -> Result<(), ManagementError> {
+		tracing::info!(actor, "Restarting at the host operator's request");
+		let shutdown = self.shutdown.clone();
+		self.runtime.spawn(async move {
+			tokio::time::sleep(RESTART_DELAY).await;
+			// Already shutting down: that shutdown wins.
+			let _ = shutdown.trigger_shutdown(ShutdownReason::Restart);
+		});
+		Ok(())
 	}
 
 	pub(crate) fn op_pairing(&self) -> PairingSnapshot {
@@ -225,6 +243,27 @@ impl Management {
 
 	pub(crate) fn op_library(&self) -> LibrarySnapshot {
 		self.library_snapshot()
+	}
+
+	/// The box art of the library entry `key` as clients get it (PNG,
+	/// rendered and cached like `/appasset`), including entries clients are
+	/// not offered.
+	pub(crate) async fn op_library_artwork(&self, key: &str) -> Result<Vec<u8>, ManagementError> {
+		let key = bounded(key, "application key", 1024)?;
+		let candidates = {
+			let catalog = self.library.catalog();
+			let entry = catalog
+				.find_key(key)
+				.ok_or_else(|| ManagementError::NotFound("No such application.".into()))?;
+			entry.artwork.clone()
+		};
+		if candidates.is_empty() {
+			return Err(ManagementError::NotFound("This application has no artwork.".into()));
+		}
+		self.library
+			.render_artwork(candidates)
+			.await
+			.map_err(|reason| ManagementError::NotFound(format!("No usable artwork: {reason}")))
 	}
 
 	/// Queue a scan of every source; library events follow its progress.

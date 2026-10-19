@@ -145,3 +145,13 @@ describe("library page", () => {
     expect(renderToStaticMarkup(<LibraryPage navigate={() => {}} />)).toContain("offered to clients");
   });
 });
+
+describe("artwork", () => {
+  it("shows each entry's box art and a placeholder without one", () => {
+    const html = render(snapshot());
+    expect(html).toContain('src="/api/v1/library/artwork?key=steam%3A620&amp;v=3"');
+    expect(html).toContain('loading="lazy"');
+    expect(html).toContain("No box art: clients show a placeholder");
+    expect(html).not.toContain("key=desktop%3Aportal.desktop");
+  });
+});

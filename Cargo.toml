@@ -23,6 +23,8 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 # async-io, like zbus: enabling zbus's tokio feature would change the
 # server's D-Bus executor.
 ksni = { git = "https://github.com/iovxw/ksni", rev = "547cc42b9e24ed58c20e7643644184bc2264c9b0", default-features = false, features = ["async-io"] }
+# Operator restarts: descriptors are marked close-on-exec before the new start.
+libc = "0.2.190"
 moonshine-core = { path = "moonshine-core" }
 moonshine-management = { path = "moonshine-management" }
 serde = "1.0.229"

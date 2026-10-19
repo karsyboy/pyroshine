@@ -63,6 +63,8 @@ export interface Backend {
 
   overview(): Promise<Overview>;
   endSession(): Promise<void>;
+  /// Shut down normally and start again; ends a running session.
+  restart(): Promise<void>;
   approvePairing(clientId: string, request: string, pin: string, label: string): Promise<void>;
   rejectPairing(clientId: string, request: string): Promise<void>;
   renameClient(fingerprint: string, label: string): Promise<void>;

@@ -23,7 +23,7 @@ struct Server {
 	address: SocketAddr,
 	management: Arc<Management>,
 	clients: ClientManager,
-	_shutdown: async_shutdown::ShutdownManager<crate::ShutdownReason>,
+	shutdown: async_shutdown::ShutdownManager<crate::ShutdownReason>,
 	_directory: tempfile::TempDir,
 }
 
@@ -57,6 +57,7 @@ async fn start() -> Server {
 		clients.clone(),
 		Arc::new(Auth::open(directory.path().join("management.json"))),
 		Some(format!("http://{address}/")),
+		shutdown.clone(),
 	));
 	let server = WebServer {
 		listener,
@@ -80,7 +81,7 @@ async fn start() -> Server {
 		address,
 		management,
 		clients,
-		_shutdown: shutdown,
+		shutdown,
 		_directory: directory,
 	}
 }
@@ -233,6 +234,7 @@ async fn the_api_requires_a_session_even_from_loopback() {
 		"/api/v1/diagnostics/report",
 		"/api/v1/stream",
 		"/api/v1/auth/sessions",
+		"/api/v1/library/artwork?key=manual:0",
 	] {
 		let reply = browser.get(path).await;
 		assert_eq!(
@@ -243,6 +245,7 @@ async fn the_api_requires_a_session_even_from_loopback() {
 	}
 	for (path, body) in [
 		("/api/v1/session/end", json!({})),
+		("/api/v1/server/restart", json!({})),
 		("/api/v1/clients/revoke", json!({ "fingerprint": "00".repeat(32) })),
 		(
 			"/api/v1/pairing/approve",
@@ -639,6 +642,39 @@ async fn the_support_bundle_downloads_as_an_attachment() {
 		disposition.starts_with("attachment; filename=\"pyroshine-diag-"),
 		"{disposition}"
 	);
+}
+
+#[tokio::test]
+async fn a_restart_is_a_protected_change_that_shuts_down_to_start_again() {
+	let server = start().await;
+	let mut browser = Browser::new(&server);
+	browser.sign_in(&server).await;
+	let headers = vec![("Origin", format!("http://{}", browser.host()))];
+	let reply = browser
+		.send("POST", "/api/v1/server/restart", &headers, Some("{}"))
+		.await;
+	assert_eq!(reply.status, 403, "a restart needs the CSRF token");
+	assert!(!server.shutdown.is_shutdown_triggered());
+	let reply = browser.post("/api/v1/server/restart", json!({})).await;
+	assert_eq!(reply.status, 204, "{}", reply.body);
+	let reason = tokio::time::timeout(Duration::from_secs(2), server.shutdown.wait_shutdown_triggered())
+		.await
+		.expect("the restart begins after the answer");
+	assert_eq!(reason, crate::ShutdownReason::Restart);
+}
+
+#[tokio::test]
+async fn artwork_of_unknown_applications_is_not_found() {
+	let server = start().await;
+	let mut browser = Browser::new(&server);
+	browser.sign_in(&server).await;
+	for path in [
+		"/api/v1/library/artwork?key=steam:404",
+		"/api/v1/library/artwork?key=../../etc/passwd",
+	] {
+		assert_eq!(browser.get(path).await.status, 404, "{path}");
+	}
+	assert_eq!(browser.get("/api/v1/library/artwork").await.status, 422);
 }
 
 #[tokio::test]

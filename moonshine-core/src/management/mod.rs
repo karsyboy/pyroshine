@@ -123,6 +123,8 @@ pub(crate) struct Management {
 	/// Recent statistics windows, oldest first. Kept after the stream ends,
 	/// so a bundle collected afterwards still shows it.
 	stats_history: Mutex<VecDeque<StreamStats>>,
+	/// Shuts the server down for an operator restart.
+	shutdown: ShutdownManager<ShutdownReason>,
 	/// The server's Tokio runtime. zbus serves methods on its own executor,
 	/// so work that needs Tokio (session teardown, blocking file I/O) is
 	/// handed to this runtime.
@@ -173,6 +175,7 @@ impl ManagementService {
 			clients,
 			auth,
 			web_url.clone(),
+			shutdown.clone(),
 		));
 		let mut tasks = vec![tokio::spawn({
 			let management = management.clone();
@@ -223,6 +226,7 @@ fn management_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
 }
 
 impl Management {
+	#[allow(clippy::too_many_arguments)]
 	fn new(
 		facts: ServerFacts,
 		config: &Config,
@@ -231,6 +235,7 @@ impl Management {
 		clients: ClientManager,
 		auth: Arc<auth::Auth>,
 		web_url: Option<String>,
+		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Self {
 		let hub = Arc::new(Hub::default());
 		let state_path = clients.persistent_state().path().to_path_buf();
@@ -260,6 +265,7 @@ impl Management {
 			.0,
 			stats: watch::channel(None).0,
 			stats_history: Mutex::new(VecDeque::with_capacity(STATS_HISTORY)),
+			shutdown,
 			runtime: tokio::runtime::Handle::current(),
 			library,
 			sessions,

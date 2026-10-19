@@ -12,6 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod diag;
 mod pair;
+mod restart;
 mod tray;
 mod web;
 
@@ -158,6 +159,8 @@ async fn main() -> Result<(), ()> {
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let config = Config::load_or_create(&config_path)?;
+	// Before anything can replace the executable (an upgrade).
+	let invocation = restart::Invocation::current();
 
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {
@@ -286,6 +289,16 @@ async fn main() -> Result<(), ()> {
 
 	let exit_code = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
+	if exit_code == ShutdownReason::Restart {
+		match &invocation {
+			Some(invocation) => {
+				tracing::info!("Starting Pyroshine again");
+				let error = invocation.exec();
+				tracing::error!("Could not start Pyroshine again: {error}");
+			},
+			None => tracing::error!("Could not start Pyroshine again: its executable is unknown"),
+		}
+	}
 	std::process::exit(exit_code as i32);
 }
 

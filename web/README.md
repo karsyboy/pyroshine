@@ -94,7 +94,9 @@ desktop environment and client used.
    The session appears in **History** with its reconnect and stop.
 4. **Settings.** Edit a commented `config.toml` and save: only the edited
    settings change, invalid values are refused, an external edit before saving
-   reports a conflict, and the restart notice appears.
+   reports a conflict, and the restart notice appears. **Restart now** (confirm)
+   shows the restarting notice, the page reconnects, the notice is gone and the
+   saved setting is in effect; the process ID is unchanged and the tray returns.
 5. **Resilience.** With a stream running, close the browser, reload the page
    and open a second tab: the stream is unaffected and both tabs follow it.
    Restart the service: the page shows it is reconnecting and recovers on its

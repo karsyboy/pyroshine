@@ -9,6 +9,12 @@ import type { AuthState, UiError } from "./types";
 
 const BASE = "/api/v1/";
 
+/// The box art of library entry `key`, as clients get it. `version` (the
+/// catalog generation) renews the browser's cached copy when art changes.
+export function artworkUrl(key: string, version: number): string {
+  return `${BASE}library/artwork?key=${encodeURIComponent(key)}&v=${version}`;
+}
+
 /** The CSRF token of the current session, from the last sign-in state. */
 let csrf: string | null = null;
 /** Called when a request finds the session gone. */
@@ -165,6 +171,7 @@ export const http: Backend = {
 
   overview: () => json("overview"),
   endSession: () => request("POST", "session/end", {}),
+  restart: () => request("POST", "server/restart", {}),
   approvePairing: (clientId, requestToken, pin, label) =>
     request("POST", "pairing/approve", { client_id: clientId, request: requestToken, pin, label }),
   rejectPairing: (clientId, requestToken) => request("POST", "pairing/reject", { client_id: clientId, request: requestToken }),

@@ -118,7 +118,7 @@ impl Harness {
 		let shutdown = async_shutdown::ShutdownManager::new();
 		let sessions = SessionManager::for_test(shutdown.clone());
 		let clients = ClientManager::isolated(directory.path().join("state.toml"));
-		clients.ensure_cleanup(shutdown);
+		clients.ensure_cleanup(shutdown.clone());
 		let mut config = Config::default();
 		config.webserver.enable_pairing = true;
 		config.stream.timeout = 60;
@@ -139,6 +139,7 @@ impl Harness {
 			clients.clone(),
 			Arc::new(super::auth::Auth::open(directory.path().join("management.json"))),
 			None,
+			shutdown,
 		));
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
 		let server = tokio::spawn(async move {

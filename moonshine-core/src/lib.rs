@@ -36,4 +36,7 @@ pub enum ShutdownReason {
 	RtspShutdown = 4,
 	/// Session manager guard token (trigger_shutdown_token, not a shutdown trigger).
 	SessionManagerShutdown = 5,
+	/// The operator asked for a restart (web interface or session bus): after
+	/// the normal shutdown the process starts its executable again.
+	Restart = 6,
 }

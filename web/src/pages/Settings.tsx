@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Alert from "@mui/material/Alert";
 import AlertTitle from "@mui/material/AlertTitle";
 import Box from "@mui/material/Box";
@@ -15,20 +15,25 @@ import Typography from "@mui/material/Typography";
 import RestartAlt from "@mui/icons-material/RestartAlt";
 import { api, errorKind, errorMessage } from "../api/client";
 import type { ConfigDocument, ConfigIssue, ConfigSchema, ConfigValues, FieldSpec } from "../api/types";
-import { ConfirmDialog, CopyableCommand, PageHeader } from "../components/common";
+import { ConfirmDialog, PageHeader } from "../components/common";
+import { RestartButton } from "../components/Restart";
 import { FieldControl, FieldRow } from "../components/fields";
-import { ApplicationsEditor, ScannersEditor } from "../components/lists";
+import { ScannersEditor } from "../components/lists";
 import { changedFields, getPath, issueField, normalize, setPath } from "../config/draft";
 import { useDaemon } from "../state/daemon";
 import { setPreference, usePreferences } from "../state/preferences";
+
+/// Sections edited on another page: the static applications live on the
+/// Applications page, beside the discovered ones.
+const ELSEWHERE = new Set(["applications"]);
 
 function RestartNotice({ saved }: { saved: boolean }) {
   return (
     <Alert severity="info" icon={<RestartAlt />} sx={{ mb: 3 }}>
       <AlertTitle>{saved ? "Configuration saved. Restart Pyroshine to apply changes." : "Restart Pyroshine to apply the saved configuration."}</AlertTitle>
-      Pyroshine reads its configuration when it starts. Restarting ends any active session. For the packaged service:
-      <Box sx={{ mt: 1, maxWidth: 520 }}>
-        <CopyableCommand command='sudo systemctl restart "pyroshine@$USER"' />
+      Pyroshine reads its configuration when it starts. Restarting ends any active session.
+      <Box sx={{ mt: 1.5 }}>
+        <RestartButton variant="contained" label="Restart now" />
       </Box>
     </Alert>
   );
@@ -149,6 +154,19 @@ export function SettingsPage() {
     [schema, document, draft],
   );
 
+  // After a restart the running configuration is the saved one.
+  const startedAt = daemon.server?.started_at_ms;
+  const seenStart = useRef(startedAt);
+  useEffect(() => {
+    if (startedAt === undefined || startedAt === seenStart.current) return;
+    const restarted = seenStart.current !== undefined;
+    seenStart.current = startedAt;
+    if (restarted && changed.size === 0) {
+      setJustSaved(false);
+      void load();
+    }
+  }, [startedAt, changed.size, load]);
+
   // Another editor (or another window) saved the file while this page is open.
   useEffect(() => {
     if (!daemon.configRevision || !document || daemon.configRevision === document.revision || saving) return;
@@ -177,7 +195,8 @@ export function SettingsPage() {
 
   const readOnly = !document.writable;
   const issueFields = new Set(issues.map((issue) => issueField(issue.path)).filter((path): path is string => path !== null));
-  const current = schema.sections.find((candidate) => candidate.id === section) ?? schema.sections[0];
+  const sections = { ...schema, sections: schema.sections.filter((candidate) => !ELSEWHERE.has(candidate.id)) };
+  const current = sections.sections.find((candidate) => candidate.id === section) ?? sections.sections[0];
   const fields = schema.fields.filter((field) => field.section === current.id && (advanced || !field.advanced || changed.has(field.path) || issueFields.has(field.path)));
   const hiddenAdvanced = schema.fields.filter((field) => field.section === current.id && field.advanced).length - fields.filter((field) => field.advanced).length;
   const fieldError = (field: FieldSpec) =>
@@ -200,7 +219,7 @@ export function SettingsPage() {
         setIssues(report.issues);
         const first = report.issues.map((issue) => issueField(issue.path)).find(Boolean);
         const target = schema.fields.find((field) => field.path === first);
-        if (target) setSection(target.section);
+        if (target && !ELSEWHERE.has(target.section)) setSection(target.section);
         return;
       }
       const outcome = await api.saveConfig(values, document.revision);
@@ -216,7 +235,11 @@ export function SettingsPage() {
     }
   };
 
-  const generalIssues = issues.filter((issue) => !issueField(issue.path) || !schema.fields.some((field) => field.path === issueField(issue.path)));
+  const generalIssues = issues.filter(
+    (issue) =>
+      !issueField(issue.path) ||
+      !schema.fields.some((field) => field.path === issueField(issue.path) && !ELSEWHERE.has(field.section)),
+  );
 
   return (
     <Box sx={{ pb: changed.size > 0 ? 10 : 0 }}>
@@ -242,27 +265,14 @@ export function SettingsPage() {
       )}
 
       <Stack direction="row" sx={{ gap: 3, alignItems: "flex-start" }}>
-        <SectionNav schema={schema} section={current.id} setSection={setSection} changed={changed} issues={issueFields} />
+        <SectionNav schema={sections} section={current.id} setSection={setSection} changed={changed} issues={issueFields} />
         <Box sx={{ flex: 1, minWidth: 0 }}>
           <Typography variant="h5">{current.title}</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             {current.description}
           </Typography>
           {fields.map((field) =>
-            field.kind.type === "applications" ? (
-              <Box key={field.path} sx={{ mb: 2 }}>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-                  {field.help}
-                </Typography>
-                {fieldError(field) && <Alert severity="error" sx={{ mb: 1.5 }}>{fieldError(field)}</Alert>}
-                <ApplicationsEditor
-                  fields={field.kind.item}
-                  value={(getPath(draft, field.path) as Record<string, unknown>[]) ?? []}
-                  onChange={(value) => update(field.path, value)}
-                  disabled={readOnly}
-                />
-              </Box>
-            ) : field.kind.type === "scanners" ? (
+            field.kind.type === "scanners" ? (
               <Box key={field.path} sx={{ mb: 2 }}>
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
                   {field.help}

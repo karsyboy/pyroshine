@@ -15,6 +15,8 @@ pub trait Management {
 	/// End the current session through the daemon's canonical teardown. This
 	/// also stops the launched application.
 	fn end_session(&self) -> zbus::Result<()>;
+	/// Shut down normally and start again (ends a running session).
+	fn restart(&self) -> zbus::Result<()>;
 
 	/// [`crate::dto::PairingSnapshot`].
 	fn get_pairing(&self) -> zbus::Result<String>;

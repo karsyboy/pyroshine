@@ -14,7 +14,7 @@ If journal access is denied, prefix `journalctl` with `sudo`.
 | Steam or games missing / cannot launch | [Check default applications](#steam-or-games-are-missing). |
 | Keyboard, mouse or gamepad unavailable | [Check input access](#keyboard-mouse-or-gamepads-do-not-work). |
 | Web interface unreachable / no tray | [Web interface troubleshooting](MANAGEMENT.md#troubleshooting); `pyroshine pair` still works. |
-| New settings have no effect | Restart the service after saving; this ends an active session. |
+| New settings have no effect | Choose **Restart now** after saving (or restart the service); this ends an active session. |
 
 ## Host not found or connection fails
 

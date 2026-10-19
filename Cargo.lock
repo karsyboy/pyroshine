@@ -2378,6 +2378,7 @@ dependencies = [
  "futures-util",
  "image",
  "ksni",
+ "libc",
  "moonshine-core",
  "moonshine-management",
  "serde",

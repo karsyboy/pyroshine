@@ -91,8 +91,8 @@ For certificate details and terminal revocation, see
 
 ## Applications
 
-**Applications** lists every application clients can be offered: the manual entries
-from **Settings** and the games Pyroshine discovered through its scanners
+**Applications** lists every application clients can be offered, with the box
+art clients show: your own (manual) entries and the games Pyroshine discovered through its scanners
 (Steam, Lutris, Heroic and desktop entries). Installed, removed and renamed
 games appear here, and in clients' app lists, within seconds without a restart;
 an active stream is never interrupted, even when its game is removed or hidden.
@@ -103,8 +103,12 @@ an active stream is never interrupted, even when its game is removed or hidden.
 - The **switch** next to a discovered game shows or hides it from clients. The
   choice is kept across restarts, rescans and upgrades, and a hidden game keeps
   its ID, so clients treat it as the same game when it is shown again.
-- **Manual** entries are edited in **Settings**. A discovered game with the same
-  title as a manual entry is listed as *replaced*; the manual entry is offered.
+- **Add application** adds your own entry (a title and the command to run, plus
+  optional box art, scale, hooks and timeouts); **Edit** on a **Manual** entry
+  changes or removes it. Like other settings, these are saved to the
+  configuration file and offered to clients after a restart (**Restart now**).
+  A discovered game with the same title as a manual entry is listed as
+  *replaced*; the manual entry is offered.
 - **Duplicate** marks a desktop shortcut to a game another scanner already
   offers, or the same game found twice.
 - **Rescan** reads every launcher again, for example after changing files the
@@ -120,7 +124,8 @@ off in **Settings → Application discovery** (see [`[library]`](CONFIGURATION.m
 
 ## Settings
 
-**Settings** edits applications, scanners and server options; **Show advanced**
+**Settings** edits scanners and server options (your own applications are on
+the [Applications](#applications) page); **Show advanced**
 reveals less common fields. Fresh native/portable configurations already include
 Steam and library scanning. Installing or removing games needs no settings
 change or restart (see [Applications](#applications)). See the
@@ -129,8 +134,12 @@ change or restart (see [Applications](#applications)). See the
 Saving validates the whole file and preserves unedited settings and comments.
 Invalid values are refused with the setting highlighted; if the file changed
 since the page loaded it (another browser, an editor), saving reports a
-conflict and nothing is overwritten. Saved settings apply when the service
-restarts, which ends active streams; the page never restarts it:
+conflict and nothing is overwritten. Saved settings apply when Pyroshine
+restarts, which ends active streams: choose **Restart now** in the notice after
+saving, or **Restart Pyroshine** on **Diagnostics** or **Maintenance**, and
+confirm. Pyroshine shuts down normally and starts again by itself (it does not
+need systemd); the page shows that it is restarting and reconnects when it is
+back. From a terminal:
 
 ```sh
 sudo systemctl restart "pyroshine@$USER"
@@ -210,8 +219,8 @@ stop the reminder for it.
 ## Maintenance
 
 **Maintenance** shows the running version, configuration file and process,
-the commands to restart the service and read its log, the administrator
-password and the signed-in browsers.
+**Restart Pyroshine**, the commands to restart the service and read its log,
+the administrator password and the signed-in browsers.
 
 ## Desktop tray
 

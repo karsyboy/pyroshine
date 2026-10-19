@@ -13,6 +13,7 @@ import Logout from "@mui/icons-material/Logout";
 import { api, errorMessage } from "../api/client";
 import type { WebSession } from "../api/types";
 import { CopyableCommand, Facts, PageHeader } from "../components/common";
+import { RestartButton } from "../components/Restart";
 import { useAuth } from "../state/auth";
 import { useDaemon } from "../state/daemon";
 import { relative } from "../util/format";
@@ -177,9 +178,12 @@ export function MaintenancePage({ navigate }: { navigate: (to: string) => void }
               Saved settings take effect when the service restarts. Restarting ends a running stream; pairings, settings and
               history are kept. This page reconnects by itself afterwards.
             </Alert>
+            <Box sx={{ mb: 2 }}>
+              <RestartButton variant="contained" />
+            </Box>
             <Stack sx={{ gap: 1, maxWidth: 560 }}>
               <Typography variant="body2" color="text.secondary">
-                Restart (on the host or over SSH):
+                Restart from a terminal (on the host or over SSH):
               </Typography>
               <CopyableCommand command='sudo systemctl restart "pyroshine@$USER"' />
               <Typography variant="body2" color="text.secondary">

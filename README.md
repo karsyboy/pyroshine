@@ -165,16 +165,15 @@ If the host is missing, add its LAN or VPN IP manually in the client. Run
 Quit Steam on the host's local desktop first. In Moonlight or Pyrolight,
 select **Steam** or an installed game and sign in if needed.
 
-After installing new games or saving server settings, restart to apply changes
-and refresh the library; this ends active streams:
+Installed and removed games appear in clients' lists on their own. Add other
+applications on the web interface's **Applications** page or follow the
+[configuration guide](docs/CONFIGURATION.md#application). Saved settings and
+applications apply after a restart, which ends active streams: choose
+**Restart now** in the web interface, or run:
 
 ```sh
 sudo systemctl restart "pyroshine@$USER"
 ```
-
-Add other applications in the web interface's **Settings** or follow the
-[configuration guide](docs/CONFIGURATION.md#application). The web interface
-and tray never restart the server themselves.
 
 ## Streaming with PyroWave
 

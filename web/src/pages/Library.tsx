@@ -1,4 +1,4 @@
-import { memo, useCallback, useDeferredValue, useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useMemo, useState, type ReactNode } from "react";
 import Alert from "@mui/material/Alert";
 import AlertTitle from "@mui/material/AlertTitle";
 import Box from "@mui/material/Box";
@@ -19,12 +19,16 @@ import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import Refresh from "@mui/icons-material/Refresh";
 import Search from "@mui/icons-material/Search";
-import ImageOutlined from "@mui/icons-material/ImageOutlined";
 import HideImageOutlined from "@mui/icons-material/HideImageOutlined";
 import EditOutlined from "@mui/icons-material/EditOutlined";
-import { api, errorMessage } from "../api/client";
+import Add from "@mui/icons-material/Add";
+import RestartAlt from "@mui/icons-material/RestartAlt";
+import { api, artworkUrl, errorMessage } from "../api/client";
 import type { LibraryApplication, LibrarySnapshot, LibrarySource, SourceStatus } from "../api/types";
-import { PageHeader } from "../components/common";
+import { ConfirmDialog, PageHeader } from "../components/common";
+import { ItemDialog } from "../components/lists";
+import { RestartButton } from "../components/Restart";
+import { configIndex, useManualApplications, type Item } from "../state/applications";
 import { useDaemon, useNow } from "../state/daemon";
 import { useLibrary } from "../state/library";
 import { relative } from "../util/format";
@@ -136,26 +140,51 @@ function SourceCard({ source, now }: { source: LibrarySource; now: number }) {
   );
 }
 
+/// Box art as clients see it, scaled down; a placeholder without art.
+function Artwork({ application, version }: { application: LibraryApplication; version: number }) {
+  const [failed, setFailed] = useState(false);
+  const label = application.artwork ? artworkLabels[application.artwork] ?? "Box art" : "No box art: clients show a placeholder";
+  const frame = { width: 40, height: 53, borderRadius: 1, flexShrink: 0, bgcolor: "action.hover" } as const;
+  if (!application.artwork || failed) {
+    return (
+      <Box title={label} sx={{ ...frame, display: "flex", alignItems: "center", justifyContent: "center", color: "text.disabled" }}>
+        <HideImageOutlined fontSize="small" />
+      </Box>
+    );
+  }
+  return (
+    <Box
+      component="img"
+      src={artworkUrl(application.key, version)}
+      alt=""
+      title={label}
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailed(true)}
+      sx={{ ...frame, objectFit: "cover", display: "block" }}
+    />
+  );
+}
+
 /// One entry. Rows are memoized and use plain `title` hints rather than
 /// tooltip components: a page of them must mount quickly while typing.
 const ApplicationRow = memo(function ApplicationRow({
   application,
+  version,
   busy,
   onToggle,
   onEdit,
 }: {
   application: LibraryApplication;
+  version: number;
   busy: boolean;
   onToggle: (application: LibraryApplication) => void;
-  onEdit: () => void;
+  onEdit?: (application: LibraryApplication) => void;
 }) {
   const state = stateLabels[application.state];
-  const art = application.artwork ? artworkLabels[application.artwork] ?? "Box art" : "No box art: clients show a placeholder";
   return (
-    <Stack direction="row" sx={{ alignItems: "center", gap: 1.5, px: 2, py: 1.25 }} data-key={application.key}>
-      <Box title={art} sx={{ color: application.artwork ? "text.secondary" : "text.disabled", display: "flex" }}>
-        {application.artwork ? <ImageOutlined fontSize="small" /> : <HideImageOutlined fontSize="small" />}
-      </Box>
+    <Stack direction="row" sx={{ alignItems: "center", gap: 1.5, px: 2, py: 1 }} data-key={application.key}>
+      <Artwork application={application} version={version} />
       <Box sx={{ flexGrow: 1, minWidth: 0 }}>
         <Typography
           variant="body1"
@@ -174,7 +203,7 @@ const ApplicationRow = memo(function ApplicationRow({
       {application.manual && <Chip size="small" label="Manual" color="primary" variant="outlined" />}
       {state && <Chip size="small" label={state[0]} color={state[1]} variant="outlined" />}
       {application.manual ? (
-        <Button size="small" startIcon={<EditOutlined />} onClick={onEdit} title="Manual applications are edited in Settings">
+        <Button size="small" startIcon={<EditOutlined />} disabled={!onEdit} onClick={() => onEdit?.(application)}>
           Edit
         </Button>
       ) : application.can_hide ? (
@@ -197,6 +226,9 @@ export function LibraryContent({
   navigate,
   onRescan,
   onToggle,
+  onAdd,
+  onEdit,
+  notice,
   busyKeys = new Set(),
   rescanning = false,
 }: {
@@ -204,6 +236,11 @@ export function LibraryContent({
   navigate: (to: string) => void;
   onRescan: () => void;
   onToggle: (application: LibraryApplication) => void;
+  /// Add a static application; absent while the configuration cannot be edited.
+  onAdd?: () => void;
+  onEdit?: (application: LibraryApplication) => void;
+  /// Shown under the header (restart and read-only notices).
+  notice?: ReactNode;
   busyKeys?: Set<string>;
   rescanning?: boolean;
 }) {
@@ -224,7 +261,6 @@ export function LibraryContent({
     () => Array.from(new Map(snapshot.applications.map((a) => [a.source, a.source_label])).entries()),
     [snapshot.applications],
   );
-  const edit = useCallback(() => navigate("settings"), [navigate]);
   const scanning = snapshot.scanning || rescanning;
 
   return (
@@ -238,11 +274,17 @@ export function LibraryContent({
           </>
         }
         actions={
-          <Button variant="contained" startIcon={<Refresh />} onClick={onRescan} disabled={scanning}>
-            {scanning ? "Scanning…" : "Rescan"}
-          </Button>
+          <>
+            <Button variant="outlined" startIcon={<Add />} onClick={onAdd} disabled={!onAdd}>
+              Add application
+            </Button>
+            <Button variant="contained" startIcon={<Refresh />} onClick={onRescan} disabled={scanning}>
+              {scanning ? "Scanning…" : "Rescan"}
+            </Button>
+          </>
         }
       />
+      {notice}
       {scanning && <LinearProgress sx={{ mb: 2 }} aria-label="Scanning game libraries" />}
       {snapshot.notice && (
         <Alert severity="warning" sx={{ mb: 2 }}>
@@ -267,6 +309,11 @@ export function LibraryContent({
           <AlertTitle>No launchers are scanned</AlertTitle>
           Add Steam, Lutris, Heroic or desktop-entry scanners in Settings › Application discovery to offer installed
           games automatically.
+          <Box sx={{ mt: 1 }}>
+            <Button size="small" variant="outlined" onClick={() => navigate("settings")}>
+              Open Settings
+            </Button>
+          </Box>
         </Alert>
       )}
 
@@ -332,9 +379,10 @@ export function LibraryContent({
                 {index > 0 && <Divider />}
                 <ApplicationRow
                   application={application}
+                  version={snapshot.generation}
                   busy={busyKeys.has(application.key)}
                   onToggle={onToggle}
-                  onEdit={edit}
+                  onEdit={onEdit}
                 />
               </Box>
             ))}
@@ -358,12 +406,56 @@ export function LibraryContent({
   );
 }
 
+/// Starting values of a new static application.
+const NEW_APPLICATION: Item = { title: "", command: [""], launch_timeout_secs: 2 };
+
 export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
   const daemon = useDaemon();
   const { snapshot, error, reload } = useLibrary(daemon.connected);
   const [busyKeys, setBusyKeys] = useState<Set<string>>(new Set());
   const [rescanning, setRescanning] = useState(false);
   const { notify } = daemon;
+  const manual = useManualApplications();
+  /// The static application being edited (`index` null for a new one).
+  const [editing, setEditing] = useState<{ index: number | null; item: Item } | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const editable = manual.fields !== null && manual.writable;
+  const onAdd = useCallback(() => {
+    setSaveError(null);
+    setEditing({ index: null, item: structuredClone(NEW_APPLICATION) });
+  }, []);
+  const { items } = manual;
+  const onEdit = useCallback(
+    (application: LibraryApplication) => {
+      const index = configIndex(application, items);
+      if (index === null) {
+        notify("warning", `${application.title} is no longer in the configuration file; it was changed or removed there.`);
+        return;
+      }
+      setSaveError(null);
+      setEditing({ index, item: structuredClone(items[index]) });
+    },
+    [items, notify],
+  );
+
+  const store = async (next: Item[], done: string) => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await manual.save(next);
+      setEditing(null);
+      setRemoving(false);
+      notify("success", `${done} Restart Pyroshine to offer the change to clients.`);
+    } catch (failure) {
+      setRemoving(false);
+      setSaveError(errorMessage(failure));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const onToggle = useCallback(
     (application: LibraryApplication) => {
@@ -424,14 +516,76 @@ export function LibraryPage({ navigate }: { navigate: (to: string) => void }) {
     }
   };
 
+  const notice = (
+    <>
+      {manual.restartRequired && (
+        <Alert
+          severity="info"
+          icon={<RestartAlt />}
+          sx={{ mb: 2 }}
+          action={<RestartButton variant="text" label="Restart now" />}
+        >
+          Saved changes apply when Pyroshine restarts. Restarting ends any active session.
+        </Alert>
+      )}
+      {manual.fields !== null && !manual.writable && (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          Applications cannot be added or edited here: {manual.readOnlyReason ?? "the configuration file is read-only."}
+        </Alert>
+      )}
+    </>
+  );
+
   return (
-    <LibraryContent
-      snapshot={snapshot}
-      navigate={navigate}
-      onRescan={() => void rescan()}
-      onToggle={onToggle}
-      busyKeys={busyKeys}
-      rescanning={rescanning}
-    />
+    <>
+      <LibraryContent
+        snapshot={snapshot}
+        navigate={navigate}
+        onRescan={() => void rescan()}
+        onToggle={onToggle}
+        onAdd={editable ? onAdd : undefined}
+        onEdit={editable ? onEdit : undefined}
+        notice={notice}
+        busyKeys={busyKeys}
+        rescanning={rescanning}
+      />
+      {editing && manual.fields && (
+        <ItemDialog
+          title={editing.index === null ? "Add application" : `Edit ${String(editing.item.title || "application")}`}
+          fields={manual.fields}
+          initial={editing.item}
+          busy={saving}
+          error={saveError}
+          saveLabel="Save"
+          onClose={() => setEditing(null)}
+          onRemove={editing.index === null ? undefined : () => setRemoving(true)}
+          onSave={(item) =>
+            void store(
+              editing.index === null
+                ? [...manual.items, item]
+                : manual.items.map((existing, index) => (index === editing.index ? item : existing)),
+              editing.index === null ? "Application added." : "Application saved.",
+            )
+          }
+        />
+      )}
+      <ConfirmDialog
+        open={removing && editing !== null}
+        title={`Remove ${String(editing?.item.title || "this application")}?`}
+        confirm="Remove"
+        destructive
+        busy={saving}
+        onClose={() => setRemoving(false)}
+        onConfirm={() =>
+          editing?.index != null &&
+          void store(
+            manual.items.filter((_, index) => index !== editing.index),
+            "Application removed.",
+          )
+        }
+      >
+        It is removed from the configuration file; clients stop seeing it after Pyroshine restarts.
+      </ConfirmDialog>
+    </>
   );
 }

@@ -26,6 +26,7 @@ import Warning from "@mui/icons-material/Warning";
 import { api, download, errorKind, errorMessage } from "../api/client";
 import type { HealthCheck, HealthReport, ServerEvent } from "../api/types";
 import { Facts, Hint, PageHeader } from "../components/common";
+import { RestartButton } from "../components/Restart";
 import { useDaemon, useNow } from "../state/daemon";
 import { duration, relative } from "../util/format";
 
@@ -241,6 +242,7 @@ export function DiagnosticsPage() {
             <Button variant="outlined" startIcon={<Archive />} disabled={saving} onClick={() => void saveBundle()}>
               {saving ? "Collecting…" : "Save support bundle"}
             </Button>
+            <RestartButton />
             <Button variant="contained" startIcon={<Refresh />} disabled={running} onClick={() => void runChecks()}>
               {running ? "Checking…" : "Run checks"}
             </Button>
