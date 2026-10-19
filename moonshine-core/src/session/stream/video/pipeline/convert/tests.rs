@@ -395,6 +395,18 @@ fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
 	gpu::static_recovery_decode();
 }
 
+/// Each codec's 8-bit 4:2:0 profile on this GPU: an encoder is created at
+/// exactly the profile's maximum bitrate, one above it is rejected before the
+/// driver sees it, and a profile without constant-bitrate rate control
+/// cannot create the stream's CBR encoder (Pixelforge patch 0010).
+/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encoder_rate_control_limits -- --ignored --nocapture`
+#[test]
+#[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
+fn encoder_rate_control_limits_on_gpu() {
+	gpu::require();
+	gpu::rate_control_limits();
+}
+
 /// Informational: GPU and wall time per conversion for aligned and
 /// unaligned extents (`MOONSHINE_TEST_GPU=1 ... converter_timing -- --ignored --nocapture`).
 #[test]
@@ -427,6 +439,48 @@ mod gpu {
 				.wrapping_add(1442695040888963407);
 			(self.0 >> 33) as u32
 		}
+	}
+
+	pub(super) fn rate_control_limits() {
+		use crate::session::stream::video::pipeline::encode_caps::cbr_target;
+		let context = context();
+		let mut checked = 0;
+		for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+			if !context.supports_encode(codec) {
+				continue;
+			}
+			let base = match codec {
+				Codec::H264 => EncodeConfig::h264(1920, 1080),
+				Codec::H265 => EncodeConfig::h265(1920, 1080),
+				Codec::AV1 => EncodeConfig::av1(1920, 1080),
+			}
+			.with_rate_control(RateControlMode::Cbr);
+			let caps = EncoderCapabilities::query(&context, &base).unwrap();
+			let cbr = caps
+				.rate_control_modes
+				.contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR);
+			eprintln!(
+				"{codec:?}: rate control {:?}, max {} bps",
+				caps.rate_control_modes, caps.max_bitrate
+			);
+			if !cbr {
+				assert!(cbr_target(&caps, codec, 10_000_000).is_err());
+				assert!(Encoder::new(context.clone(), base.with_target_bitrate(10_000_000)).is_err());
+				checked += 1;
+				continue;
+			}
+			let max = cbr_target(&caps, codec, u64::MAX).unwrap();
+			assert_eq!(u64::from(max), caps.max_bitrate.min(u64::from(u32::MAX)));
+			drop(Encoder::new(context.clone(), base.clone().with_target_bitrate(max)).expect("maximum bitrate"));
+			if let Some(above) = max.checked_add(1).filter(|_| caps.max_bitrate < u64::from(u32::MAX)) {
+				let error = Encoder::new(context.clone(), base.with_target_bitrate(above))
+					.err()
+					.expect("a bitrate above the maximum must be rejected");
+				assert!(error.to_string().contains("at most"), "{error}");
+			}
+			checked += 1;
+		}
+		assert!(checked > 0, "no Vulkan Video codec on this GPU");
 	}
 
 	/// Use the opened capture GPU, exactly as production setup does.

@@ -21,7 +21,7 @@ mod pipeline;
 pub(crate) mod pyrowave;
 mod rtp_clock;
 pub use pipeline::ConversionQueueMode;
-pub(crate) use pipeline::convert;
+pub(crate) use pipeline::{convert, encode_caps};
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
 // The UDP bandwidth calibration probe (`crate::calibration`) reuses the

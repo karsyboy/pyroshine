@@ -67,6 +67,22 @@ impl DeviceSelector {
     }
 }
 
+/// Why a device's encode queue is unusable: it needs a `VIDEO_ENCODE` queue
+/// family and the extensions the encoder enables on it.
+fn encode_queue_unavailable(
+    encode_queue: Option<u32>,
+    has_encode_extensions: bool,
+) -> Option<&'static str> {
+    match (encode_queue, has_encode_extensions) {
+        (None, _) => Some("no queue family supports Vulkan Video encode"),
+        (Some(_), false) => Some(
+            "a queue family reports video encode, but the driver does not expose \
+             VK_KHR_video_queue and VK_KHR_video_encode_queue",
+        ),
+        (Some(_), true) => None,
+    }
+}
+
 /// Destroy the instance if context initialization fails before ownership transfers.
 struct InstanceGuard<'a> {
     instance: &'a ash::Instance,
@@ -92,6 +108,7 @@ pub struct VideoContextBuilder {
     enable_validation: bool,
     required_encode_codecs: Vec<Codec>,
     device_selector: Option<DeviceSelector>,
+    allow_without_encode: bool,
 }
 
 impl Default for VideoContextBuilder {
@@ -109,6 +126,7 @@ impl VideoContextBuilder {
             enable_validation: false,
             required_encode_codecs: Vec::new(),
             device_selector: None,
+            allow_without_encode: false,
         }
     }
 
@@ -145,6 +163,19 @@ impl VideoContextBuilder {
         self
     }
 
+    /// Accept the selected device even when it cannot encode any codec with
+    /// Vulkan Video.
+    ///
+    /// The context then provides only compute and transfer queues (for
+    /// conversion and external-memory interop); [`VideoContext::supports_encode`]
+    /// is false for every codec and [`VideoContext::encode_unsupported_reason`]
+    /// says why. Applies only together with a [`DeviceSelector`] and no
+    /// required codecs, so it never widens selection to another GPU.
+    pub fn allow_without_encode(mut self, allow: bool) -> Self {
+        self.allow_without_encode = allow;
+        self
+    }
+
     /// Build the VideoContext.
     pub fn build(self) -> Result<VideoContext> {
         VideoContext::new(self)
@@ -167,6 +198,7 @@ struct VideoContextInner {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     device_properties: vk::PhysicalDeviceProperties,
     supported_encode_codecs: Vec<Codec>,
+    encode_unsupported: Vec<(Codec, String)>,
     has_descriptor_buffer: bool,
 }
 
@@ -348,6 +380,7 @@ impl VideoContext {
         let mut transfer_queue_family = u32::MAX;
         let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
+        let mut encode_unsupported = Vec::new();
         let mut has_descriptor_buffer_ext = false;
 
         let has_extension =
@@ -420,31 +453,46 @@ impl VideoContext {
                 continue;
             }
 
+            // A queue family flag alone is not encode support: the driver must
+            // also expose the video queue extensions the encoder enables. ANV on
+            // Xe2 and newer reports VIDEO_ENCODE queues (with
+            // ANV_DEBUG=video-encode) without exposing VK_KHR_video_encode_queue,
+            // and device creation with that extension then fails.
+            let encode_extensions =
+                has_extension(&available_extensions, ash::khr::video_queue::NAME)
+                    && has_extension(&available_extensions, ash::khr::video_encode_queue::NAME);
+            let mut device_unsupported = Vec::new();
+            let queue_reason = encode_queue_unavailable(encode_queue, encode_extensions);
+            if queue_reason.is_some() {
+                encode_queue = None;
+            }
+
+            // Check if descriptor buffer extension is available.
+            has_descriptor_buffer_ext =
+                has_extension(&available_extensions, ash::ext::descriptor_buffer::NAME);
+
             // Check codec support for encoding.
             let mut encode_codecs = Vec::new();
-            if let Some(eq) = encode_queue {
-                // Check if descriptor buffer extension is available.
-                has_descriptor_buffer_ext =
-                    has_extension(&available_extensions, ash::ext::descriptor_buffer::NAME);
-
-                // Only check codec support if the extension exists
-                if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
-                    && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
-                {
-                    encode_codecs.push(Codec::H264);
-                    debug!("Device {} supports H.264 encode", device_name);
-                }
-                if has_extension(&available_extensions, ash::khr::video_encode_h265::NAME)
-                    && Self::check_h265_encode_support(&entry, &instance, physical_device, eq)
-                {
-                    encode_codecs.push(Codec::H265);
-                    debug!("Device {} supports H.265 encode", device_name);
-                }
-                if has_extension(&available_extensions, ash::khr::video_encode_av1::NAME)
-                    && Self::check_av1_encode_support(&entry, &instance, physical_device, eq)
-                {
-                    encode_codecs.push(Codec::AV1);
-                    debug!("Device {} supports AV1 encode", device_name);
+            let checks: [(Codec, &CStr); 3] = [
+                (Codec::H264, ash::khr::video_encode_h264::NAME),
+                (Codec::H265, ash::khr::video_encode_h265::NAME),
+                (Codec::AV1, ash::khr::video_encode_av1::NAME),
+            ];
+            for (codec, extension) in checks {
+                let result = match queue_reason {
+                    Some(reason) => Err(reason.to_string()),
+                    None if !has_extension(&available_extensions, extension) => Err(format!(
+                        "the driver does not expose {}",
+                        extension.to_string_lossy()
+                    )),
+                    None => Self::check_encode_support(&entry, &instance, physical_device, codec),
+                };
+                match result {
+                    Ok(()) => {
+                        encode_codecs.push(codec);
+                        debug!("Device {} supports {:?} encode", device_name, codec);
+                    }
+                    Err(reason) => device_unsupported.push((codec, reason)),
                 }
             }
 
@@ -454,11 +502,25 @@ impl VideoContext {
                 .iter()
                 .all(|codec| encode_codecs.contains(codec));
 
-            // We need encode support and compute support.
-            let has_video_support = encode_queue.is_some();
+            // We need encode support and compute support, or only compute
+            // support on an explicitly selected device that may lack encode.
+            let has_video_support = encode_queue.is_some() && !encode_codecs.is_empty();
             let has_compute_support = compute_q != u32::MAX;
+            let accept_without_encode = builder.allow_without_encode
+                && builder.device_selector.is_some()
+                && builder.required_encode_codecs.is_empty();
 
-            if has_video_support && encode_supported && has_compute_support {
+            if (has_video_support || accept_without_encode)
+                && encode_supported
+                && has_compute_support
+            {
+                if !has_video_support {
+                    encode_queue = None;
+                    info!(
+                        "Selected device {} has no usable Vulkan Video encode; creating a compute-only context",
+                        device_name
+                    );
+                }
                 selected_device = Some(physical_device);
                 selected_device_exts = Some(available_extensions);
                 video_encode_queue_family = encode_queue;
@@ -470,6 +532,7 @@ impl VideoContext {
                 };
                 compute_queue_family = compute_q;
                 supported_encode_codecs = encode_codecs;
+                encode_unsupported = device_unsupported;
                 info!("Selected device: {}", device_name);
                 break;
             } else {
@@ -477,8 +540,8 @@ impl VideoContext {
                     "Device {} skipped: video_support={}, encode_supported={}, compute_support={}",
                     device_name, has_video_support, encode_supported, has_compute_support
                 );
-                if !has_video_support {
-                    warn!("  - No queue with VIDEO_ENCODE_KHR flag found");
+                for (codec, reason) in &device_unsupported {
+                    warn!("  - {:?} encode unavailable: {}", codec, reason);
                 }
                 if !encode_supported {
                     warn!(
@@ -530,11 +593,12 @@ impl VideoContext {
             })
             .collect();
 
-        // Required device extensions for video encoding.
-        let mut extension_names = vec![
-            ash::khr::video_queue::NAME.as_ptr(),
-            ash::khr::synchronization2::NAME.as_ptr(),
-        ];
+        // Required device extensions; the video queue extension only with an
+        // encode queue (a compute-only context must not require it).
+        let mut extension_names = vec![ash::khr::synchronization2::NAME.as_ptr()];
+        if video_encode_queue_family.is_some() {
+            extension_names.push(ash::khr::video_queue::NAME.as_ptr());
+        }
 
         // External memory extensions for DMA-BUF support (optional, enabled with "dmabuf" feature).
         #[cfg(feature = "dmabuf")]
@@ -718,158 +782,61 @@ impl VideoContext {
                 memory_properties,
                 device_properties,
                 supported_encode_codecs,
+                encode_unsupported,
                 has_descriptor_buffer,
             }),
         })
     }
 
-    fn check_h264_encode_support(
+    /// Query the codec's 8-bit 4:2:0 Main profile, the baseline every encoder
+    /// configuration of that codec builds on. Returns why it is unusable.
+    fn check_encode_support(
         entry: &ash::Entry,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
-        _queue_family: u32,
-    ) -> bool {
-        // Create video queue instance extension.
+        codec: Codec,
+    ) -> std::result::Result<(), String> {
         let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
-
-        // Create H.264 encode profile info (must stay alive during the call)
         let mut h264_profile = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(
             ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
         );
-
-        // Create video profile info for H.264 encode with typical 8-bit 4:2:0.
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push(&mut h264_profile);
-
-        // Create capabilities structures.
-        let mut h264_capabilities = vk::VideoEncodeH264CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
-            .push(&mut h264_capabilities)
-            .push(&mut encode_capabilities);
-
-        // Query capabilities.
-        let result = unsafe {
-            (video_queue.fp().get_physical_device_video_capabilities_khr)(
-                physical_device,
-                &profile_info,
-                &mut capabilities,
-            )
-        };
-
-        match result {
-            vk::Result::SUCCESS => {
-                debug!(
-                    "H.264 encode supported: max {}x{}, {} DPB slots",
-                    capabilities.max_coded_extent.width,
-                    capabilities.max_coded_extent.height,
-                    capabilities.max_dpb_slots
-                );
-                true
-            }
-            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
-                debug!("H.264 encode not supported on this device");
-                false
-            }
-            err => {
-                warn!("Failed to query H.264 encode capabilities: {:?}", err);
-                false
-            }
-        }
-    }
-
-    fn check_h265_encode_support(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        _queue_family: u32,
-    ) -> bool {
-        // Create video queue instance extension.
-        let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
-
-        // Create H.265 encode profile info (must stay alive during the call)
         let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
             ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
         );
-
-        // Create video profile info for H.265 encode with typical 8-bit 4:2:0.
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push(&mut h265_profile);
-
-        // Create capabilities structures.
-        let mut h265_capabilities = vk::VideoEncodeH265CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
-            .push(&mut h265_capabilities)
-            .push(&mut encode_capabilities);
-
-        // Query capabilities.
-        let result = unsafe {
-            (video_queue.fp().get_physical_device_video_capabilities_khr)(
-                physical_device,
-                &profile_info,
-                &mut capabilities,
-            )
-        };
-
-        match result {
-            vk::Result::SUCCESS => {
-                debug!(
-                    "H.265 encode supported: max {}x{}, {} DPB slots",
-                    capabilities.max_coded_extent.width,
-                    capabilities.max_coded_extent.height,
-                    capabilities.max_dpb_slots
-                );
-                true
-            }
-            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
-                debug!("H.265 encode not supported on this device");
-                false
-            }
-            err => {
-                warn!("Failed to query H.265 encode capabilities: {:?}", err);
-                false
-            }
-        }
-    }
-
-    fn check_av1_encode_support(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        _queue_family: u32,
-    ) -> bool {
-        // Create video queue instance extension.
-        let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
-
-        // Create AV1 encode profile info (must stay alive during the call)
         let mut av1_profile = vk::VideoEncodeAV1ProfileInfoKHR::default()
             .std_profile(ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN);
-
-        // Create video profile info for AV1 encode with typical 8-bit 4:2:0.
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push(&mut av1_profile);
-
-        // Create capabilities structures.
+        let mut h264_capabilities = vk::VideoEncodeH264CapabilitiesKHR::default();
+        let mut h265_capabilities = vk::VideoEncodeH265CapabilitiesKHR::default();
         let mut av1_capabilities = vk::VideoEncodeAV1CapabilitiesKHR::default();
         let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
-            .push(&mut av1_capabilities)
-            .push(&mut encode_capabilities);
 
-        // Query capabilities.
+        let profile_info = vk::VideoProfileInfoKHR::default()
+            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+        let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut encode_capabilities);
+        let (profile_info, mut capabilities) = match codec {
+            Codec::H264 => (
+                profile_info
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                    .push(&mut h264_profile),
+                capabilities.push(&mut h264_capabilities),
+            ),
+            Codec::H265 => (
+                profile_info
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                    .push(&mut h265_profile),
+                capabilities.push(&mut h265_capabilities),
+            ),
+            Codec::AV1 => (
+                profile_info
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
+                    .push(&mut av1_profile),
+                capabilities.push(&mut av1_capabilities),
+            ),
+        };
+
+        // SAFETY: the profile and output chains are valid and live for the call.
         let result = unsafe {
             (video_queue.fp().get_physical_device_video_capabilities_khr)(
                 physical_device,
@@ -877,31 +844,47 @@ impl VideoContext {
                 &mut capabilities,
             )
         };
-
         match result {
             vk::Result::SUCCESS => {
                 debug!(
-                    "AV1 encode supported: max {}x{}, {} DPB slots",
+                    "{:?} encode supported: max {}x{}, {} DPB slots",
+                    codec,
                     capabilities.max_coded_extent.width,
                     capabilities.max_coded_extent.height,
                     capabilities.max_dpb_slots
                 );
-                true
+                Ok(())
             }
-            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
-                debug!("AV1 encode not supported on this device");
-                false
-            }
-            err => {
-                warn!("Failed to query AV1 encode capabilities: {:?}", err);
-                false
-            }
+            err => Err(format!(
+                "the 8-bit 4:2:0 Main profile is not supported ({err:?})"
+            )),
         }
     }
 
     /// Check if a codec is supported for encoding.
     pub fn supports_encode(&self, codec: Codec) -> bool {
         self.inner.supported_encode_codecs.contains(&codec)
+    }
+
+    /// Why `codec` cannot be encoded on this device, or `None` when it can.
+    ///
+    /// Describes the first missing requirement found during device selection:
+    /// no encode queue, missing driver extensions, or an unsupported Main
+    /// profile. Profile-specific limits (chroma, bit depth, rate control) are
+    /// reported by encoder creation instead.
+    pub fn encode_unsupported_reason(&self, codec: Codec) -> Option<&str> {
+        if self.supports_encode(codec) {
+            return None;
+        }
+        Some(
+            self.inner
+                .encode_unsupported
+                .iter()
+                .find(|(c, _)| *c == codec)
+                .map_or("Vulkan Video encode is unavailable", |(_, reason)| {
+                    reason.as_str()
+                }),
+        )
     }
 
     /// Get the Vulkan entry point.
@@ -945,6 +928,21 @@ mod selection_tests {
                 ..selector
             }
             .matches(None, None)
+        );
+    }
+
+    #[test]
+    fn encode_queue_flag_without_extensions_is_not_encode_support() {
+        assert_eq!(encode_queue_unavailable(Some(2), true), None);
+        assert!(
+            encode_queue_unavailable(Some(2), false)
+                .unwrap()
+                .contains("VK_KHR_video_encode_queue")
+        );
+        assert!(
+            encode_queue_unavailable(None, true)
+                .unwrap()
+                .contains("no queue family")
         );
     }
 

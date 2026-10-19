@@ -38,6 +38,7 @@ the guide for the area being changed:
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
 | Test tiers, CI gates, hardware tests and baselines | [Testing](TESTING.md) |
 | What each codec, format, GPU and lifecycle feature does and how it is tested | [Capability inventory](CAPABILITIES.md) |
+| Supported GPUs and drivers, encoder requirements and device limits | [GPU compatibility](GPU_COMPATIBILITY.md) |
 | Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |
 | Mode changes, epochs and teardown | [Reconnect validation](reconnect-validation.md) |
 | Coding-agent rules and upstream policy | [AGENTS.md](../AGENTS.md) |

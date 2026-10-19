@@ -5,7 +5,7 @@
 
 pub(crate) mod convert;
 pub(super) mod dmabuf;
-mod encode_caps;
+pub(crate) mod encode_caps;
 pub(super) mod failure;
 mod hdr_sei;
 mod padding;
@@ -1190,6 +1190,11 @@ impl VideoPipelineInner {
 		let context = self.capture_context.clone();
 
 		let codec = pixelforge_codec(ctx.format.codec)?;
+		// A compute-only capture context (no Vulkan Video encode) never
+		// advertises conventional profiles; refuse before any video call.
+		if let Some(reason) = context.encode_unsupported_reason(codec) {
+			return Err(format!("{codec:?} cannot be encoded on this GPU: {reason}"));
+		}
 
 		// Convert pixel format.
 		let pixel_format = match ctx.format.chroma {
@@ -1205,9 +1210,8 @@ impl VideoPipelineInner {
 
 		let color_description = color_description_for(ctx.format)?;
 
-		// Create encode configuration.
-		let target_bitrate = u32::try_from(ctx.bitrate)
-			.map_err(|_| format!("Configured bitrate {} bps exceeds the encoder API range", ctx.bitrate))?;
+		// Create encode configuration. The bitrate is set once the profile's
+		// limits are known.
 		let config = match codec {
 			Codec::H264 => EncodeConfig::h264(ctx.width, ctx.height),
 			Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
@@ -1218,7 +1222,6 @@ impl VideoPipelineInner {
 		.with_bit_depth(bit_depth)
 		.with_color_description(color_description)
 		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(target_bitrate)
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
@@ -1232,6 +1235,16 @@ impl VideoPipelineInner {
 		let caps = pixelforge::EncoderCapabilities::query(&context, &config)
 			.map_err(|e| format!("Failed to query encoder capabilities: {e}"))?;
 		encode_caps::check_frame(&caps, codec, ctx.width, ctx.height)?;
+		let requested_bitrate = ctx.bitrate as u64;
+		let target_bitrate = encode_caps::cbr_target(&caps, codec, requested_bitrate)?;
+		if u64::from(target_bitrate) < requested_bitrate {
+			tracing::info!(
+				requested_bps = ctx.bitrate,
+				encoder_bps = target_bitrate,
+				"Encoding at this GPU's maximum {codec:?} bitrate, below the requested bitrate"
+			);
+		}
+		let config = config.with_target_bitrate(target_bitrate);
 		if let Some(alignment) = caps.av1_coded_picture_alignment
 			&& (!ctx.width.is_multiple_of(alignment.width.max(1))
 				|| !ctx.height.is_multiple_of(alignment.height.max(1)))

@@ -690,11 +690,24 @@ mod tests {
 		let mut second_allocator = allocator();
 		drop(first);
 		let second = export(&mut second_allocator);
-		let second_planes = planes(&second);
-		assert_eq!(
-			second_planes[0].fd, reused_number,
-			"test setup: the new buffer should reuse the freed descriptor number"
-		);
+		let mut second_planes = planes(&second);
+		// How many descriptors an export opens and closes differs by driver
+		// (on Intel's xe the frame lands one number higher), so place a
+		// duplicate of the new buffer on the freed number when needed.
+		let _duplicate = (second_planes[0].fd != reused_number).then(|| {
+			// SAFETY: F_GETFD only probes the number; dup2 targets it only
+			// when it is free, and the OwnedFd takes ownership of the result.
+			unsafe {
+				assert_eq!(
+					libc::fcntl(reused_number, libc::F_GETFD),
+					-1,
+					"test setup: the freed descriptor number was taken"
+				);
+				assert_eq!(libc::dup2(second_planes[0].fd, reused_number), reused_number);
+				<std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(reused_number)
+			}
+		});
+		second_planes[0].fd = reused_number;
 		let (second_import, created) = importer
 			.import_or_reuse(second_planes[0].fd, SIZE, SIZE, format, &second_planes)
 			.unwrap();

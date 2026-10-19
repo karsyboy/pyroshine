@@ -54,6 +54,12 @@ fn parse_pci(address: &str) -> Option<(u32, u32, u32, u32)> {
 
 /// Build and verify against the *opened* DRM node used for GBM/EGL. All
 /// encoder/import contexts in a session clone this verified context.
+///
+/// The context does not require Vulkan Video encode: a capture GPU without it
+/// (Intel Xe2 and newer, where ANV exposes no encode, or any driver without
+/// the extensions) still captures, converts and runs PyroWave, which encodes
+/// with compute. Conventional profiles are then absent from the probe, so
+/// they are never advertised; [`encode_status`] says why.
 pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 	let capture = CaptureIdentity::from_file(file)?;
 	let context = VideoContextBuilder::new()
@@ -62,6 +68,7 @@ pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 			drm_render_node: capture.render,
 			pci_bus: capture.pci,
 		})
+		.allow_without_encode(true)
 		.build()
 		.map_err(|e| {
 			format!(
@@ -107,8 +114,45 @@ pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 		));
 	}
 	tracing::info!(capture_drm = ?capture.render, pci = ?capture.pci, device_uuid = ?ids.device_uuid, gpu = %name,
+		vulkan_video_encode = %encode_status(&context),
 		"Verified capture/encode/import GPU identity (same device)");
 	Ok(context)
+}
+
+const ENCODE_CODECS: [(pixelforge::Codec, &str); 3] = [
+	(pixelforge::Codec::H264, "H.264"),
+	(pixelforge::Codec::H265, "HEVC"),
+	(pixelforge::Codec::AV1, "AV1"),
+];
+
+/// One line on the context's Vulkan Video encode support: the codecs it can
+/// encode, or why none (identical reasons are reported once).
+pub(crate) fn encode_status(context: &VideoContext) -> String {
+	let supported: Vec<_> = ENCODE_CODECS
+		.iter()
+		.filter(|(codec, _)| context.supports_encode(*codec))
+		.map(|(_, label)| *label)
+		.collect();
+	let mut unavailable: Vec<(String, Vec<&str>)> = Vec::new();
+	for (codec, label) in ENCODE_CODECS {
+		let Some(reason) = context.encode_unsupported_reason(codec) else {
+			continue;
+		};
+		match unavailable.iter_mut().find(|(r, _)| r == reason) {
+			Some((_, labels)) => labels.push(label),
+			None => unavailable.push((reason.to_string(), vec![label])),
+		}
+	}
+	let unavailable = unavailable
+		.iter()
+		.map(|(reason, labels)| format!("{}: {reason}", labels.join(", ")))
+		.collect::<Vec<_>>()
+		.join("; ");
+	match (supported.is_empty(), unavailable.is_empty()) {
+		(true, _) => format!("unavailable ({unavailable})"),
+		(false, true) => supported.join(", "),
+		(false, false) => format!("{} (not {unavailable})", supported.join(", ")),
+	}
 }
 
 /// Vulkan format that samples a single-plane DRM fourcc with its channels in
@@ -281,6 +325,14 @@ mod tests {
 			panic!("the requested non-encoding GPU must not fall back to another adapter");
 		};
 		assert!(message.contains("no other GPU is eligible"));
+		// The capture context accepts it compute-only: verified as the same
+		// device (capture_context checks DRM/PCI identity), encoding nothing.
+		let context = capture_context(&file).expect("compute-only capture context");
+		for (codec, _) in ENCODE_CODECS {
+			assert!(!context.supports_encode(codec));
+			assert!(context.encode_unsupported_reason(codec).is_some());
+		}
+		assert!(encode_status(&context).starts_with("unavailable ("));
 	}
 
 	#[test]

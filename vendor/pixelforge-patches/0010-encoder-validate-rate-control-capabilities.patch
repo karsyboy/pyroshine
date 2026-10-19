@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 19 Oct 2026 16:13:48 -0400
+Subject: [PATCH] Validate rate control mode and bitrate against encoder
+ capabilities
+
+EncoderCapabilities now carries the profile's rate control modes and
+maximum bitrate, and check_rate_control() rejects an unsupported mode or a
+bitrate above the maximum before encoder creation. Both are valid-usage
+requirements that drivers do not report: ANV's Gen12 encoder offers only
+disabled rate control, and NVIDIA limits H.264/HEVC to 120 Mbps on an
+RTX 3080.
+---
+ src/encoder/capabilities.rs | 84 ++++++++++++++++++++++++++++++++++++-
+ src/encoder/codec.rs        |  5 +++
+ 2 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/src/encoder/capabilities.rs b/src/encoder/capabilities.rs
+index 2558749..f560904 100644
+--- a/src/encoder/capabilities.rs
++++ b/src/encoder/capabilities.rs
+@@ -4,7 +4,7 @@ use ash::vk::TaggedStructure;
+ 
+ use super::codec::{DeviceVideoCaps, input_image_width, query_video_caps};
+ use super::resources::gcd;
+-use super::{BitDepth, Codec, EncodeConfig, PixelFormat};
++use super::{BitDepth, Codec, EncodeConfig, PixelFormat, RateControlMode};
+ use crate::VideoContext;
+ use crate::error::{PixelForgeError, Result};
+ 
+@@ -28,6 +28,10 @@ pub struct EncoderCapabilities {
+     pub picture_access_granularity: vk::Extent2D,
+     /// AV1's picture grid. Other codecs crop directly to the requested frame.
+     pub av1_coded_picture_alignment: Option<vk::Extent2D>,
++    /// Rate control modes the profile supports.
++    pub rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
++    /// Highest average or peak bitrate a rate-controlled stream may request, in bits per second.
++    pub max_bitrate: u64,
+ }
+ 
+ impl EncoderCapabilities {
+@@ -45,9 +49,46 @@ impl EncoderCapabilities {
+             max_coded_extent: caps.max_coded_extent,
+             picture_access_granularity: caps.picture_access_granularity,
+             av1_coded_picture_alignment: caps.av1_coded_picture_alignment,
++            rate_control_modes: caps.rate_control_modes,
++            max_bitrate: caps.max_bitrate,
+         }
+     }
+ 
++    /// Reject a rate control mode the profile does not support, or a bitrate
++    /// above its maximum, instead of passing them to the driver.
++    ///
++    /// Both are valid-usage requirements of `vkCmdControlVideoCodingKHR`.
++    /// ANV's Gen12 encoder (with `ANV_DEBUG=video-encode`) offers only
++    /// disabled rate control, and NVIDIA limits H.264 and HEVC to 120 Mbps on
++    /// an RTX 3080; drivers do not report a violation, so it must be caught here.
++    pub fn check_rate_control(&self, config: &EncodeConfig) -> Result<()> {
++        let mode = match config.rate_control_mode {
++            RateControlMode::Disabled | RateControlMode::Cqp => {
++                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
++            }
++            RateControlMode::Cbr => vk::VideoEncodeRateControlModeFlagsKHR::CBR,
++            RateControlMode::Vbr => vk::VideoEncodeRateControlModeFlagsKHR::VBR,
++        };
++        if !self.rate_control_modes.contains(mode) {
++            return Err(PixelForgeError::InvalidInput(format!(
++                "{:?} on this GPU does not support {:?} rate control (supported: {:?})",
++                config.codec, config.rate_control_mode, self.rate_control_modes
++            )));
++        }
++        let peak = match config.rate_control_mode {
++            RateControlMode::Cbr => config.target_bitrate,
++            RateControlMode::Vbr => config.target_bitrate.max(config.max_bitrate),
++            RateControlMode::Disabled | RateControlMode::Cqp => return Ok(()),
++        };
++        if u64::from(peak) > self.max_bitrate {
++            return Err(PixelForgeError::InvalidInput(format!(
++                "{:?} on this GPU encodes at most {} bps; {peak} bps requested",
++                config.codec, self.max_bitrate
++            )));
++        }
++        Ok(())
++    }
++
+     /// Align to both codec blocks and device granularity, clamp to the minimum
+     /// and re-align. Reject zero dimensions, overflow and extents above the max.
+     pub fn coded_extent(&self, codec: Codec, width: u32, height: u32) -> Result<vk::Extent2D> {
+@@ -215,9 +256,50 @@ mod tests {
+                 height: granularity.1,
+             },
+             av1_coded_picture_alignment: None,
++            rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
++                | vk::VideoEncodeRateControlModeFlagsKHR::CBR
++                | vk::VideoEncodeRateControlModeFlagsKHR::VBR,
++            max_bitrate: 120_000_000,
+         }
+     }
+ 
++    #[test]
++    fn unsupported_rate_control_and_excess_bitrate_are_rejected() {
++        let cbr = |bitrate| {
++            EncodeConfig::h264(1920, 1080)
++                .with_rate_control(RateControlMode::Cbr)
++                .with_target_bitrate(bitrate)
++        };
++        let limits = caps((1, 1), (1, 1), 8192);
++        assert!(limits.check_rate_control(&cbr(120_000_000)).is_ok());
++        let error = limits.check_rate_control(&cbr(150_000_000)).unwrap_err();
++        assert!(
++            error.to_string().contains("at most 120000000 bps"),
++            "{error}"
++        );
++        let vbr = cbr(50_000_000)
++            .with_rate_control(RateControlMode::Vbr)
++            .with_max_bitrate(130_000_000);
++        assert!(limits.check_rate_control(&vbr).is_err());
++        // Constant QP ignores the bitrate.
++        let cqp = cbr(500_000_000).with_rate_control(RateControlMode::Cqp);
++        assert!(limits.check_rate_control(&cqp).is_ok());
++
++        let disabled_only = EncoderCapabilities {
++            rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
++            max_bitrate: 0,
++            ..limits
++        };
++        let error = disabled_only
++            .check_rate_control(&cbr(10_000_000))
++            .unwrap_err();
++        assert!(
++            error.to_string().contains("does not support Cbr"),
++            "{error}"
++        );
++        assert!(disabled_only.check_rate_control(&cqp).is_ok());
++    }
++
+     #[test]
+     fn coded_and_allocated_extents_are_distinct() {
+         let limits = caps((1, 1), (1, 1), 8192);
+diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
+index a3e751a..1be94c4 100644
+--- a/src/encoder/codec.rs
++++ b/src/encoder/codec.rs
+@@ -450,6 +450,8 @@ pub(crate) struct DeviceVideoCaps {
+     pub flags: vk::VideoCapabilityFlagsKHR,
+     pub std_header_version: vk::ExtensionProperties,
+     pub av1_coded_picture_alignment: Option<vk::Extent2D>,
++    pub rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
++    pub max_bitrate: u64,
+ }
+ 
+ /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
+@@ -505,6 +507,8 @@ pub(crate) fn query_video_caps(
+         av1_coded_picture_alignment: (profile_info.video_codec_operation
+             == vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
+             .then_some(av1.coded_picture_alignment),
++        rate_control_modes: encode.rate_control_modes,
++        max_bitrate: encode.max_bitrate,
+     })
+ }
+ 
+@@ -553,6 +557,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+     let capabilities = req.caps;
+ 
+     let public_caps = super::EncoderCapabilities::from_caps(capabilities);
++    public_caps.check_rate_control(config)?;
+     let coded_extent = public_caps.coded_extent(config.codec, width, height)?;
+     let input_image_extent = public_caps.input_image_extent(config.codec, width, height)?;
+     let aligned_width = coded_extent.width;
+-- 
+2.56.0
+

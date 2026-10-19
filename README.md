@@ -35,8 +35,10 @@ standard codecs.
   **x86_64 and glibc 2.39 or later**; see
   [platform compatibility](docs/INSTALLATION.md#platform-compatibility).
 - A GPU and driver with EGL/GBM capture and Vulkan DMA-BUF import on the same
-  GPU. H.264, HEVC, and AV1 also need usable Vulkan Video encode profiles.
-  Run the healthcheck below to verify your setup.
+  GPU. H.264, HEVC, and AV1 also need usable Vulkan Video encode profiles; a
+  GPU without them (Intel GPUs under Mesa today) streams PyroWave to Pyrolight
+  only. Run the healthcheck below to verify your setup, and see
+  [GPU compatibility](docs/GPU_COMPATIBILITY.md).
 - Native Steam at `/usr/bin/steam` for the default applications. Install Steam
   and your games separately; other launchers and Flatpak Steam need
   [configuration](docs/TIPS.md#steam-or-games-are-missing).

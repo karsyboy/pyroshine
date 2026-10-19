@@ -1032,6 +1032,7 @@ mod health_report_tests {
 			hdr_supported: false,
 			dma_buf_supported: false,
 			gpu_name: String::new(),
+			gpu: Default::default(),
 			duration: Duration::ZERO,
 		}
 	}

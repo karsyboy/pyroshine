@@ -103,6 +103,7 @@ Other workspace and integration areas:
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
 | Performance measurements | `docs/BENCHMARKING.md`; lifetime/soak diagnostics in `docs/LONG_SESSION_PERFORMANCE.md` |
 | Test tiers, hardware tests, baselines and regression gates | `docs/TESTING.md`; feature status and coverage in `docs/CAPABILITIES.md` |
+| GPU/driver support, encoder requirements, capture-device probing | `docs/GPU_COMPATIBILITY.md`, `gpu.rs`, `healthcheck.rs` `check_codecs` |
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |

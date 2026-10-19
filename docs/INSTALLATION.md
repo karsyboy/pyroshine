@@ -16,6 +16,8 @@ All setups need systemd, the streaming user's systemd manager/session bus,
 GPU render access, EGL/GBM capture and Vulkan DMA-BUF import on the **same GPU**.
 H.264/HEVC/AV1 require usable Vulkan Video encode profiles. The healthcheck
 verifies the actual driver and profiles; hardware family alone is insufficient.
+A GPU without Vulkan Video encode still starts and offers only PyroWave; see
+[GPU compatibility](GPU_COMPATIBILITY.md) for verified GPUs and drivers.
 The kernel must allow `kcmp(2)`; restrictive sandboxes may block it.
 A monitor or active desktop compositor is unnecessary.
 

@@ -450,6 +450,8 @@ pub(crate) struct DeviceVideoCaps {
     pub flags: vk::VideoCapabilityFlagsKHR,
     pub std_header_version: vk::ExtensionProperties,
     pub av1_coded_picture_alignment: Option<vk::Extent2D>,
+    pub rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
+    pub max_bitrate: u64,
 }
 
 /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
@@ -505,6 +507,8 @@ pub(crate) fn query_video_caps(
         av1_coded_picture_alignment: (profile_info.video_codec_operation
             == vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
             .then_some(av1.coded_picture_alignment),
+        rate_control_modes: encode.rate_control_modes,
+        max_bitrate: encode.max_bitrate,
     })
 }
 
@@ -553,6 +557,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let capabilities = req.caps;
 
     let public_caps = super::EncoderCapabilities::from_caps(capabilities);
+    public_caps.check_rate_control(config)?;
     let coded_extent = public_caps.coded_extent(config.codec, width, height)?;
     let input_image_extent = public_caps.input_image_extent(config.codec, width, height)?;
     let aligned_width = coded_extent.width;

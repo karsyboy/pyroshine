@@ -137,12 +137,19 @@ a library or extension name:
   used for capture (`VK_EXT_physical_device_drm`, with the complete PCI address
   as a fallback). An unresolvable or mismatched identity advertises no codec,
   HDR or DMA-BUF capability and prevents launch. No cross-device
-  capture-to-encode path exists.
+  capture-to-encode path exists. The context does not require Vulkan Video
+  encode: a GPU without it (Intel Xe2 and newer under Mesa, or any driver that
+  lacks the encode extensions) gets a compute-only context on the same device,
+  so capture, import and PyroWave work and no conventional profile is
+  advertised. Encode support counts only when the driver exposes
+  `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` with a video encode
+  queue, and the probe records why each missing codec is unavailable.
 - The compositor publishes the verified, shared `VideoContext` before it reports
   ready. Conventional encoding, DMA-BUF import and PyroWave device matching use
   that context for the whole session, including reconnects.
 - A conventional codec bit is set only after creating its exact Pixelforge
-  profile and after the stream converter's known-answer self-check passes for
+  profile with constant-bitrate rate control (a profile without CBR, such as
+  ANV's Gen12 encoder, is not usable), and after the stream converter's known-answer self-check passes for
   the output format that profile encodes from (NV12, P010, YUV444 or
   YUV444P10), on the configured conversion queue. A GPU that converts with
   wrong colors keeps those profiles unadvertised and reports a **Color
@@ -152,6 +159,13 @@ a library or extension name:
   the pinned C API, matching the Vulkan device and creating each SDR/HDR
   encoder. A missing or incompatible PyroWave library leaves the conventional
   codecs available.
+- Every probed profile keeps its result: the health check lists the profiles
+  not offered with their reasons, and `moonshine-bench --capabilities` reports
+  the driver, Vulkan Video encode support and each profile's reason.
+- A stream's encoder bitrate is the negotiated bitrate limited to the
+  profile's maximum (`maxBitrate`; 120 Mbps for H.264/HEVC on an RTX 3080),
+  logged when it applies; Pixelforge rejects a rate-control mode or bitrate
+  the profile does not support instead of passing it to the driver.
 
 The server then constructs, in order, TLS identity, `SessionManager`,
 `ClientManager`, the management service, the RTSP server, the webserver and

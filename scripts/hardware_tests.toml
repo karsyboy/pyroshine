@@ -140,6 +140,11 @@ requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
 env = { MOONSHINE_TEST_GPU = "1" }
 
 [[test]]
+name = "session::stream::video::pipeline::convert::tests::encoder_rate_control_limits_on_gpu"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
 name = "session::stream::video::pipeline::convert::tests::encoder_input_slots_rotate_on_gpu"
 requires = ["render-node", "vulkan-video-encode"]
 env = { MOONSHINE_TEST_GPU = "1" }
