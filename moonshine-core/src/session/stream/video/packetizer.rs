@@ -51,14 +51,14 @@ const VIDEO_FRAME_HEADER_SIZE: usize = 8;
 
 /// Smallest negotiable `packetSize`: the NV packet header plus the video
 /// frame header, so a frame's first shard carries its complete frame header.
-pub(super) const MIN_VIDEO_PACKET_SIZE: usize = NV_VIDEO_PACKET_SIZE + VIDEO_FRAME_HEADER_SIZE;
+pub(crate) const MIN_VIDEO_PACKET_SIZE: usize = NV_VIDEO_PACKET_SIZE + VIDEO_FRAME_HEADER_SIZE;
 
 /// UDP payload bytes of one shard for a negotiated `packetSize`.
 ///
 /// The client's `packetSize` covers the NV header and payload; the packetizer
 /// adds the RTP header and padding, and the encryption prefix when encrypting
 /// (Moonlight already subtracts that prefix from an encrypted stream's size).
-pub(super) fn wire_shard_size(packet_size: usize, encrypted: bool) -> Option<usize> {
+pub(crate) fn wire_shard_size(packet_size: usize, encrypted: bool) -> Option<usize> {
 	let prefix = if encrypted { ENC_PREFIX_SIZE } else { 0 };
 	packet_size
 		.checked_add(RTP_HEADER_SIZE + PADDING_SIZE)?

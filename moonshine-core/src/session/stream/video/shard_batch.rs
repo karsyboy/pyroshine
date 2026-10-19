@@ -174,6 +174,12 @@ impl ShardBatch {
 		&self.data
 	}
 
+	/// Mutable contiguous buffer, for a sender that rewrites shard headers in
+	/// place between sends (the calibration probe reuses one batch per step).
+	pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+		&mut self.data
+	}
+
 	/// Size of each individual shard.
 	pub fn shard_size(&self) -> usize {
 		self.shard_size

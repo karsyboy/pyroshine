@@ -279,12 +279,26 @@ impl UdpGsoSocket {
 		self.socket.local_addr()
 	}
 
+	/// Datagrams [`Self::send_batch`] submits (and paces) together for a shard size.
+	pub fn segments_per_send(&self, shard_size: usize) -> usize {
+		if !self.disable_gso && self.udp_state.max_gso_segments() > 1 {
+			gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size)
+		} else {
+			pacing_segments_per_send(shard_size)
+		}
+	}
+
 	pub fn set_tos_v4(&self, tos: u32) -> std::io::Result<()> {
 		self.socket.set_tos_v4(tos)
 	}
 
 	pub async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
 		self.socket.recv_from(buf).await
+	}
+
+	/// Non-blocking receive; `WouldBlock` when no datagram is queued.
+	pub fn try_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+		self.socket.try_recv_from(buf)
 	}
 
 	/// `pacing` is set for the intra-only PyroWave path. Conventional

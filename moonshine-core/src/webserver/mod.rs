@@ -39,6 +39,7 @@ use self::pairing::handle_pair_request;
 use super::session::stream::audio::AudioChannels;
 
 mod bandwidth;
+pub(crate) use bandwidth::routed_link_mbps;
 #[cfg(test)]
 mod bandwidth_tests;
 mod pairing;
@@ -408,6 +409,47 @@ impl Webserver {
 					};
 					return Ok(bandwidth::response(permit));
 				},
+				// UDP bandwidth calibration (see `crate::calibration`). Like the HTTPS
+				// probe it is refused during a session; a session start preempts it.
+				(&Method::GET, "/pyroshine-udp-probe") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					if !matches!(self.session_manager.get_session_context().await, Ok(None)) {
+						return Ok(
+							xml_error(409, "End the stream before bandwidth calibration").map(BodyExt::boxed_unsync)
+						);
+					}
+					let link = crate::calibration::host_link_mbps(local_address, peer_address.ip());
+					match self
+						.session_manager
+						.calibration()
+						.start(
+							&params,
+							peer_cert_fingerprint.as_deref().unwrap_or_default(),
+							peer_address,
+							link,
+						)
+						.await
+					{
+						Ok(reply) => xml_response(reply.to_xml()),
+						Err(error) => xml_error(error.status, &error.message),
+					}
+				},
+				(&Method::GET, "/pyroshine-udp-probe-result") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					match self
+						.session_manager
+						.calibration()
+						.result(&params, peer_cert_fingerprint.as_deref().unwrap_or_default())
+						.await
+					{
+						Ok(xml) => xml_response(xml),
+						Err(error) => xml_error(error.status, &error.message),
+					}
+				},
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
@@ -648,12 +690,20 @@ impl Webserver {
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
 		);
-		if https
+		let paired_peer = https
 			&& peer_cert_fingerprint.is_some_and(|fp| {
 				self.verify_paired_client(&Some(fp.clone()), peer_address.ip())
 					.is_none()
-			}) && self.supported_codecs & 0x01800000 != 0
-		{
+			});
+		if paired_peer {
+			// UDP calibration works for every codec; clients without it ignore these.
+			response += &format!(
+				"<PyroshineUdpProbeVersion>{}</PyroshineUdpProbeVersion><PyroshineUdpProbeMaxKbps>{}</PyroshineUdpProbeMaxKbps>",
+				crate::calibration::plan::PROTOCOL_VERSION,
+				crate::calibration::plan::MAX_RATE_KBPS
+			);
+		}
+		if paired_peer && self.supported_codecs & 0x01800000 != 0 {
 			let speed = local_address
 				.map(|a| bandwidth::routed_link_mbps(a.ip(), peer_address.ip()))
 				.unwrap_or(0);
@@ -1182,6 +1232,17 @@ fn request_keys(params: &mut HashMap<String, String>, request: &str) -> Result<S
 		.map_err(|error| format!("Invalid key parameters in {request} request: {error}."))
 }
 
+fn xml_response(xml: String) -> Response<Full<Bytes>> {
+	let mut response = Response::new(Full::new(Bytes::from(xml)));
+	response
+		.headers_mut()
+		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+	response
+		.headers_mut()
+		.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+	response
+}
+
 fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {
 	// Always return HTTP 200 so that Moonlight (Qt) reads the response body.
 	// Qt treats HTTP 4xx/5xx as network errors and never reads the body,
@@ -1243,7 +1304,7 @@ fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
 	Ok(None)
 }
 
-fn escape_xml(input: impl AsRef<str>) -> String {
+pub(crate) fn escape_xml(input: impl AsRef<str>) -> String {
 	input
 		.as_ref()
 		.replace("&", "&amp;")

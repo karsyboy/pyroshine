@@ -1567,6 +1567,8 @@ pub struct SessionManager {
 	presence_tx: Arc<watch::Sender<ClientPresence>>,
 	/// Failures reported to the operator (see [`Problem`]).
 	problems_tx: broadcast::Sender<Problem>,
+	/// UDP bandwidth calibration, which yields the video port to sessions.
+	calibration: crate::calibration::Calibration,
 }
 
 impl SessionManager {
@@ -1583,6 +1585,14 @@ impl SessionManager {
 	) -> Result<Self, ()> {
 		let stats_tx = broadcast::channel(256).0;
 		let presence_tx = Arc::new(watch::channel(ClientPresence::default()).0);
+		let video_port = crate::calibration::VideoPortArbiter::default();
+		let calibration = crate::calibration::Calibration::new(
+			crate::calibration::StreamSettings {
+				address: address.clone(),
+				video: video_config.clone(),
+			},
+			video_port.clone(),
+		);
 		let backend = SystemSession {
 			compositor_config,
 			video_config,
@@ -1593,13 +1603,20 @@ impl SessionManager {
 			inhibit_sleep,
 			stats_tx: stats_tx.clone(),
 			presence_tx: presence_tx.clone(),
+			video_port,
 		};
 		Ok(Self {
 			core: SessionCore::new(backend, shutdown)?,
 			stats_tx,
 			presence_tx,
 			problems_tx: broadcast::channel(32).0,
+			calibration,
 		})
+	}
+
+	/// The UDP bandwidth calibration service.
+	pub(crate) fn calibration(&self) -> &crate::calibration::Calibration {
+		&self.calibration
 	}
 
 	/// Report a failure the operator should see: a rejected launch or

@@ -24,15 +24,20 @@ pub use pipeline::ConversionQueueMode;
 pub(crate) use pipeline::convert;
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
+// The UDP bandwidth calibration probe (`crate::calibration`) reuses the
+// production sender so its datagrams leave with the stream's GSO cadence and pacing.
 pub use fec::FecMode;
 use fec::FrameFecStatus;
 pub use format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 	VideoChromaSampling, VideoCodec, VideoDynamicRange, VideoFormat,
 };
-use gso_socket::{FramePacing, UdpGsoSocket, duration_micros_u64};
+use gso_socket::duration_micros_u64;
+pub(crate) use gso_socket::{FramePacing, UdpGsoSocket};
+pub(crate) use pacing_timer::PacingTimer;
+pub(crate) use packetizer::wire_shard_size;
 use pipeline::VideoPipeline;
-use shard_batch::ShardBatch;
+pub(crate) use shard_batch::{ShardBatch, ShardBuf};
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]

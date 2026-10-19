@@ -74,6 +74,7 @@ flowchart LR
 | `discovery.rs` | Advertise `_nvstream._tcp` over mDNS | — |
 | `tls.rs`, `clients.rs`, `state.rs`, `durable.rs` | Server identity, paired-client trust, durable `state.toml` | Session authorization |
 | `webserver/` | GameStream HTTP/HTTPS API: server info, app list, pairing, launch/resume/cancel, PyroWave bandwidth probe | Stream properties |
+| `calibration/` | UDP bandwidth calibration runs on the idle video port through the production sender; yields the port to sessions | Calibration runs |
 | `rtsp.rs` | RTSP OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY; parse and validate negotiated stream contexts | Encoders or sockets |
 | `ingress.rs` | Bounded, cancellable tasks for accepted HTTP, HTTPS and RTSP connections | Protocol semantics |
 | `session/manager.rs` | The single session's lifecycle, transitions, authorization generations, keys and teardown | Resource creation details |
@@ -973,6 +974,7 @@ Changes must preserve these properties unless a task explicitly redesigns them:
 | Capture admission, encoder queues and transport accounting | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC, pacing and GPU matrix | [PyroWave](PYROWAVE.md) |
 | PyroWave dialects and authenticated bandwidth calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
+| UDP bandwidth calibration | [Bandwidth calibration](BANDWIDTH_CALIBRATION.md) |
 | Native color descriptions and Wine/Proton setup | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity and report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
 | Measurements, diagnostics and reconnect acceptance | [Benchmarking](BENCHMARKING.md), [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md), [Reconnect validation](reconnect-validation.md) |

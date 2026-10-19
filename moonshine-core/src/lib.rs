@@ -2,6 +2,7 @@
 #![allow(clippy::result_unit_err)]
 
 pub mod app_scanner;
+pub mod calibration;
 pub mod clients;
 pub mod config;
 pub(crate) mod crypto;

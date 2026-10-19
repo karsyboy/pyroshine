@@ -49,6 +49,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `app_scanner/` | Application catalog: Steam, Lutris, Heroic and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
 | `webserver/` (`mod.rs`, `pairing.rs`, `bandwidth.rs`) | GameStream HTTP/HTTPS API, operator pairing, PyroWave bandwidth probe |
+| `calibration/` | Authenticated UDP bandwidth calibration: plan, wire format, run sender, recommendation, reference receiver; video-port arbitration with sessions |
 | `rtsp.rs`, `ingress.rs`, `discovery.rs` | RTSP negotiation; bounded connection supervision; mDNS |
 | `session/manager.rs`, `session/mod.rs`, `session/lifecycle.rs` | Session states, transitions, teardown ownership, worker guards and start latches |
 | `session/application.rs`, `session/inhibit.rs` | Application systemd unit and environment; logind sleep inhibition |
@@ -67,7 +68,8 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 Other workspace and integration areas:
 
 - `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark and
-  `moonshine-library` (scan launchers with isolated state, report timing and follow changes).
+  `moonshine-library` (scan launchers with isolated state, report timing and follow changes), and
+  `moonshine-udp-probe` (UDP bandwidth calibration client for real-network measurements).
 - `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
   error names, proxies) shared by the daemon, the web interface, the tray and the CLI.
 - `web/`: the web management interface (React/Material UI, npm only), built into

@@ -79,6 +79,11 @@ metadata is rejected. Native metadata is never rewritten.
 
 ## Authenticated calibration
 
+This section describes the HTTPS download probe that PyroWave clients use when
+the host lacks UDP calibration. Current Pyroshine hosts also offer frame-shaped
+[UDP bandwidth calibration](BANDWIDTH_CALIBRATION.md) for every codec, which
+measures loss, bursts and queueing that a TCP download cannot.
+
 Paired HTTPS `/serverinfo` advertises `PyroWaveBandwidthProbeBytes=33554432` and
 `PyroWaveHostLinkMbps`. HTTP and unpaired clients do not receive probe discovery.
 `GET /pyrowave-bandwidth-probe` checks the normal paired certificate fingerprint,

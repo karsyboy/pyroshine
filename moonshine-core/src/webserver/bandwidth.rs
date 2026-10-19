@@ -39,7 +39,7 @@ pub(super) fn response(permit: OwnedSemaphorePermit) -> Response<ResponseBody> {
 
 /// Identify the interface owning the selected route's source, then require a
 /// physical, active, full-duplex Ethernet device. Bridges/VPNs stay unknown.
-pub(super) fn routed_link_mbps(local: IpAddr, peer: IpAddr) -> u64 {
+pub(crate) fn routed_link_mbps(local: IpAddr, peer: IpAddr) -> u64 {
 	use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 	let Ok(socket) = std::net::UdpSocket::bind((if local.is_ipv4() { "0.0.0.0" } else { "::" }, 0)) else {
 		return 0;

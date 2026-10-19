@@ -172,6 +172,8 @@ pub(crate) struct SystemSession {
 	pub(crate) inhibit_sleep: bool,
 	pub(crate) stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	pub(crate) presence_tx: std::sync::Arc<watch::Sender<status::ClientPresence>>,
+	/// Shares the video UDP port with bandwidth calibration runs.
+	pub(crate) video_port: crate::calibration::VideoPortArbiter,
 }
 
 impl SessionBackend for SystemSession {
@@ -186,6 +188,8 @@ impl SessionBackend for SystemSession {
 		cause: StopCauseSlot,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> Result<InitializedSession, SessionFailure> {
+		// A calibration run may hold the video port; a session always wins.
+		let _claim = self.video_port.release_for_session().await;
 		InitializedSession::new(
 			self.compositor_config.clone(),
 			self.video_config.clone(),
