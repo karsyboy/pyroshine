@@ -12,6 +12,7 @@
 //! `pyroshine open [page]` (the application launcher) opens a page of the web
 //! interface, through the running tray when there is one.
 
+mod appearance;
 mod attach;
 mod browser;
 mod icons;
@@ -145,6 +146,7 @@ pub async fn run(attached: bool) -> Result<(), String> {
 	let notifier = notifications::Notifier::new(service.clone()).await;
 	let hide = Arc::new(Notify::new());
 	let tray = item::spawn(service.clone(), notifier.clone(), hide.clone()).await;
+	let appearance = tokio::spawn(appearance::follow(connection.clone(), tray.clone()));
 	let following = service.start(tray, notifier.clone());
 
 	let opener = {
@@ -188,6 +190,7 @@ pub async fn run(attached: bool) -> Result<(), String> {
 		_ = following => tracing::info!("The session bus closed; the tray exits"),
 	}
 	opener.abort();
+	appearance.abort();
 	Ok(())
 }
 

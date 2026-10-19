@@ -15,7 +15,7 @@ use moonshine_management::dto::{PairingSnapshot, SessionDetails, SessionPhase, S
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
-use super::icons::{self, Badge};
+use super::icons::{self, Badge, MenuIcon, Style};
 use super::notifications::Notifier;
 use super::service::Service;
 
@@ -110,11 +110,18 @@ pub struct PyroTray {
 	hide: Arc<Notify>,
 	view: View,
 	icons: HashMap<Badge, Vec<Icon>>,
+	menu_icons: HashMap<(MenuIcon, Style), Vec<u8>>,
+	/// The desktop's light or dark style, for the menu icons.
+	style: Style,
 	/// Token the tray host provided for the click being handled.
 	activation_token: Option<String>,
 }
 
 impl PyroTray {
+	fn icon(&self, icon: MenuIcon) -> Vec<u8> {
+		self.menu_icons[&(icon, self.style)].clone()
+	}
+
 	fn open(&mut self, page: &str) {
 		let service = self.service.clone();
 		let notifier = self.notifier.clone();
@@ -238,7 +245,7 @@ impl Tray for PyroTray {
 		items.push(
 			StandardItem {
 				label: "_Open Pyroshine".into(),
-				icon_name: "internet-web-browser".into(),
+				icon_data: self.icon(MenuIcon::Dashboard),
 				activate: Box::new(|tray: &mut Self| tray.open("dashboard")),
 				..Default::default()
 			}
@@ -249,14 +256,14 @@ impl Tray for PyroTray {
 				let page = format!("clients?request={request}");
 				StandardItem {
 					label: format!("{}…", pairing_label(self.view.requests.len())),
-					icon_name: "dialog-password".into(),
+					icon_data: self.icon(MenuIcon::Pairing),
 					activate: Box::new(move |tray: &mut Self| tray.open(&page)),
 					..Default::default()
 				}
 			},
 			None => StandardItem {
 				label: "_Pair a Client…".into(),
-				icon_name: "list-add".into(),
+				icon_data: self.icon(MenuIcon::Pair),
 				activate: Box::new(|tray: &mut Self| tray.open("clients")),
 				..Default::default()
 			},
@@ -273,7 +280,7 @@ impl Tray for PyroTray {
 			items.push(
 				StandardItem {
 					label: format!("_End Session (closes {application})"),
-					icon_name: "media-playback-stop".into(),
+					icon_data: self.icon(MenuIcon::EndSession),
 					activate: Box::new(|tray: &mut Self| {
 						let service = tray.service.clone();
 						let notifier = tray.notifier.clone();
@@ -296,7 +303,7 @@ impl Tray for PyroTray {
 		items.push(
 			StandardItem {
 				label: "Session _History".into(),
-				icon_name: "document-open-recent".into(),
+				icon_data: self.icon(MenuIcon::History),
 				activate: Box::new(|tray: &mut Self| tray.open("history")),
 				..Default::default()
 			}
@@ -305,7 +312,7 @@ impl Tray for PyroTray {
 		items.push(
 			StandardItem {
 				label: "_Updates".into(),
-				icon_name: "system-software-update".into(),
+				icon_data: self.icon(MenuIcon::Updates),
 				activate: Box::new(|tray: &mut Self| tray.open("updates")),
 				..Default::default()
 			}
@@ -314,7 +321,7 @@ impl Tray for PyroTray {
 		items.push(
 			StandardItem {
 				label: "Set Up _Web Access…".into(),
-				icon_name: "dialog-password".into(),
+				icon_data: self.icon(MenuIcon::WebAccess),
 				enabled: self.view.connected,
 				activate: Box::new(|tray: &mut Self| tray.setup_web_access()),
 				..Default::default()
@@ -328,7 +335,7 @@ impl Tray for PyroTray {
 				// start: the server, its web interface and any stream keep
 				// running.
 				label: "_Hide Tray Icon".into(),
-				icon_name: "view-hidden".into(),
+				icon_data: self.icon(MenuIcon::Hide),
 				activate: Box::new(|tray: &mut Self| tray.hide.notify_one()),
 				..Default::default()
 			}
@@ -385,6 +392,12 @@ impl TrayHandle {
 	pub async fn disconnected(&self) {
 		self.change(|view| *view = View::default()).await;
 	}
+
+	pub async fn style(&self, style: Style) {
+		if let Some(handle) = &self.0 {
+			handle.update(|tray| tray.style = style).await;
+		}
+	}
 }
 
 /// Request tokens waiting for the operator, newest last.
@@ -418,6 +431,8 @@ pub async fn spawn(service: Arc<Service>, notifier: Notifier, hide: Arc<Notify>)
 		hide,
 		view: View::default(),
 		icons,
+		menu_icons: icons::menu_icons(),
+		style: Style::default(),
 		activation_token: None,
 	};
 	// The panel may start after the tray, so a missing

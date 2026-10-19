@@ -1,5 +1,5 @@
 //! Tray icons: the Pyroshine logo with a status badge, rendered once at
-//! startup in the sizes panels ask for.
+//! startup in the sizes panels ask for, and the menu's Material icons.
 
 use std::sync::LazyLock;
 
@@ -162,6 +162,90 @@ fn keypad(x: f32, y: f32) -> bool {
 		.any(|(cx, cy)| (x - cx).powi(2) + (y - cy).powi(2) <= 0.15f32.powi(2))
 }
 
+/// Menu entries' icons: the Material icons the web interface uses for the
+/// same pages (`menu-icons/`, made by `web/scripts/generate-icons.py`). Theme
+/// icon names would mix styles from whatever icon theme is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MenuIcon {
+	Dashboard,
+	Pair,
+	Pairing,
+	EndSession,
+	History,
+	Updates,
+	WebAccess,
+	Hide,
+}
+
+impl MenuIcon {
+	const ALL: [MenuIcon; 8] = [
+		MenuIcon::Dashboard,
+		MenuIcon::Pair,
+		MenuIcon::Pairing,
+		MenuIcon::EndSession,
+		MenuIcon::History,
+		MenuIcon::Updates,
+		MenuIcon::WebAccess,
+		MenuIcon::Hide,
+	];
+
+	/// White alpha mask.
+	fn mask(self) -> &'static [u8] {
+		match self {
+			MenuIcon::Dashboard => include_bytes!("menu-icons/dashboard.png"),
+			MenuIcon::Pair => include_bytes!("menu-icons/pair.png"),
+			MenuIcon::Pairing => include_bytes!("menu-icons/pairing.png"),
+			MenuIcon::EndSession => include_bytes!("menu-icons/end-session.png"),
+			MenuIcon::History => include_bytes!("menu-icons/history.png"),
+			MenuIcon::Updates => include_bytes!("menu-icons/updates.png"),
+			MenuIcon::WebAccess => include_bytes!("menu-icons/web-access.png"),
+			MenuIcon::Hide => include_bytes!("menu-icons/hide.png"),
+		}
+	}
+}
+
+/// Whether the desktop draws menus light or dark (the desktop portal's
+/// `color-scheme`); menu icons take the matching text color.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Style {
+	#[default]
+	Light,
+	Dark,
+}
+
+impl Style {
+	fn color(self) -> [u8; 3] {
+		match self {
+			// Breeze's text colors, close to other desktops' too.
+			Style::Light => [0x23, 0x26, 0x29],
+			Style::Dark => [0xfc, 0xfc, 0xfc],
+		}
+	}
+}
+
+/// PNG menu icons for both styles.
+pub fn menu_icons() -> std::collections::HashMap<(MenuIcon, Style), Vec<u8>> {
+	let mut icons = std::collections::HashMap::new();
+	for icon in MenuIcon::ALL {
+		let mask = image::load_from_memory_with_format(icon.mask(), image::ImageFormat::Png)
+			.expect("embedded menu icon decodes")
+			.into_rgba8();
+		for style in [Style::Light, Style::Dark] {
+			let [red, green, blue] = style.color();
+			let mut tinted = mask.clone();
+			for pixel in tinted.pixels_mut() {
+				*pixel = Rgba([red, green, blue, pixel[3]]);
+			}
+			let mut png = Vec::new();
+			tinted
+				.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+				.expect("an in-memory PNG encodes");
+			icons.insert((icon, style), png);
+		}
+	}
+	icons
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -190,5 +274,18 @@ mod tests {
 		let corner = streaming.get_pixel(52, 46).0;
 		assert_ne!(plain.get_pixel(52, 46).0, corner);
 		assert!(corner[1] > corner[0] || corner == [255, 255, 255, 255], "{corner:?}");
+	}
+
+	#[test]
+	fn menu_icons_take_the_style_color() {
+		let icons = menu_icons();
+		assert_eq!(icons.len(), MenuIcon::ALL.len() * 2);
+		for style in [Style::Light, Style::Dark] {
+			let png = &icons[&(MenuIcon::History, style)];
+			let image = image::load_from_memory(png).unwrap().into_rgba8();
+			let opaque = image.pixels().find(|pixel| pixel[3] == 255).expect("an opaque pixel");
+			assert_eq!(opaque.0[..3], style.color());
+			assert!(image.pixels().any(|pixel| pixel[3] == 0), "transparent background");
+		}
 	}
 }
