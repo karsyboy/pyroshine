@@ -50,6 +50,11 @@ pub struct ApplicationConfig {
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Overrides of `[frame_limit]` (`frame_limit_mode`, `frame_limit_fps`,
+	/// `frame_limit_method`).
+	#[serde(flatten)]
+	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
 }
 
 impl Default for ApplicationConfig {
@@ -64,6 +69,7 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			frame_limit: Default::default(),
 		}
 	}
 }
@@ -140,6 +146,8 @@ pub(crate) struct ApplicationContext {
 	pub hdr: bool,
 	/// Environment variables to pass on.
 	pub extra_env: HashMap<String, String>,
+	/// Frame limit for this launch (`None`: the application launches unchanged).
+	pub frame_limit: Option<crate::session::frame_limit::FrameLimit>,
 }
 
 /// A launched application unit and its exit monitor.
@@ -171,7 +179,6 @@ impl Application {
 			.with_hint("Set its command in the Pyroshine configuration."));
 		};
 		let args = &config.command[1..];
-		let envs = make_envs(&context)?;
 
 		tracing::info!(program, ?args, "Launching application.");
 
@@ -183,6 +190,12 @@ impl Application {
 		subscribe_to_systemd_signals(&conn)
 			.await
 			.map_err(|()| session_bus_failure("subscribing to systemd signals failed"))?;
+
+		let limit_env = match context.frame_limit {
+			Some(limit) => frame_limit_environment(&conn, &config.title, limit).await,
+			None => Vec::new(),
+		};
+		let envs = make_envs(&context, &limit_env)?;
 
 		// Stop any leftover unit from a previous session. A unit whose processes
 		// cannot be shown gone, or that is still loaded, cannot be replaced
@@ -297,8 +310,53 @@ pub(crate) async fn stop_application_unit(unit_name: &str) -> Result<(), ()> {
 	stop_unit_owned(unit_name.to_string()).await
 }
 
+/// Environment that applies `limit` to the application unit (see
+/// `session::frame_limit`). Only runs when a limit is configured.
+async fn frame_limit_environment(
+	conn: &Connection,
+	title: &str,
+	limit: crate::session::frame_limit::FrameLimit,
+) -> Vec<(String, String)> {
+	use crate::session::frame_limit;
+	// The unit inherits the user manager's environment; a limit the user set
+	// there is theirs to keep.
+	let inherited: std::collections::HashSet<String> =
+		match Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER).await {
+			Ok(proxy) => proxy
+				.get_property::<Vec<String>>("Environment")
+				.await
+				.unwrap_or_else(|error| {
+					tracing::debug!(%error, "Cannot read the user manager environment");
+					Vec::new()
+				})
+				.into_iter()
+				.filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
+				.collect(),
+			Err(_) => Default::default(),
+		};
+	let mangohud = limit.method == frame_limit::FrameLimitMethod::Mangohud
+		&& tokio::task::spawn_blocking(frame_limit::mangohud_layer_installed)
+			.await
+			.unwrap_or(false);
+	let applied = frame_limit::environment(limit, &inherited, mangohud);
+	for note in &applied.notes {
+		tracing::warn!(application = title, "Frame limit: {note}");
+	}
+	match applied.method {
+		Some(method) => tracing::info!(
+			application = title,
+			fps = limit.fps,
+			?method,
+			variables = ?applied.variables,
+			"Frame limit applied to the application unit"
+		),
+		None => tracing::info!(application = title, "Frame limit left to the user environment"),
+	}
+	applied.variables
+}
+
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, SessionFailure> {
+fn make_envs(context: &ApplicationContext, frame_limit: &[(String, String)]) -> Result<Vec<String>, SessionFailure> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -349,6 +407,9 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, SessionFailure
 		}
 		envs.push(format!("{key}={value}"));
 	}
+
+	// Unit-scoped: only this application and its children see these.
+	envs.extend(frame_limit.iter().map(|(key, value)| format!("{key}={value}")));
 
 	Ok(envs)
 }
@@ -1858,8 +1919,17 @@ mod tests {
 			wayland_display: "wayland-pyroshine-test".into(),
 			hdr: true,
 			extra_env: Default::default(),
+			frame_limit: None,
 		};
-		let env = super::make_envs(&context).unwrap();
+		let env = super::make_envs(&context, &[]).unwrap();
+		// Disabled limiting adds nothing.
+		assert!(
+			!env.iter()
+				.any(|e| e.starts_with("DXVK_FRAME_RATE") || e.starts_with("MANGOHUD"))
+		);
+		let limited = super::make_envs(&context, &[("DXVK_FRAME_RATE".into(), "60".into())]).unwrap();
+		assert_eq!(limited.len(), env.len() + 1);
+		assert_eq!(limited.last().unwrap(), "DXVK_FRAME_RATE=60");
 		assert!(env.contains(&"DISPLAY=:5".into()));
 		assert!(env.contains(&"WAYLAND_DISPLAY=wayland-pyroshine-test".into()));
 		assert!(env.iter().all(|e| !super::obsolete_presentation_environment(
@@ -1868,7 +1938,7 @@ mod tests {
 		)));
 		let mut obsolete = context;
 		obsolete.extra_env.insert("ENABLE_MOONSHINE_WSI".into(), "1".into());
-		assert!(super::make_envs(&obsolete).is_err());
+		assert!(super::make_envs(&obsolete, &[]).is_err());
 		assert!(super::obsolete_presentation_environment(
 			"MOONSHINE_WSI_DISABLE_BYPASS",
 			"1"

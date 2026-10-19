@@ -37,6 +37,12 @@ struct Args {
 	/// H.264/HEVC/AV1 conversion queue; auto prefers a dedicated compute family.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	conversion_queue: String,
+	/// Application frame limit (`[frame_limit]`): off, stream, or a frame rate.
+	#[arg(long, default_value = "off")]
+	frame_limit: String,
+	/// Limiter for `--frame-limit`.
+	#[arg(long, default_value = "proton", value_parser = ["proton", "mangohud"])]
+	frame_limit_method: String,
 	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
@@ -1104,6 +1110,7 @@ async fn run_benchmark(
 		"127.0.0.1".to_string(),
 		STREAM_TIMEOUT_SECS,
 		false,
+		frame_limit(args)?,
 		shutdown.clone(),
 	)
 	.map_err(|_| boxed_error("Failed to create session manager"))?;
@@ -1731,4 +1738,28 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 
 fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 	Box::new(std::io::Error::other(message.into()))
+}
+
+/// `[frame_limit]` from `--frame-limit` and `--frame-limit-method`.
+pub(crate) fn frame_limit(
+	args: &Args,
+) -> Result<moonshine_core::session::frame_limit::FrameLimitConfig, Box<dyn std::error::Error>> {
+	use moonshine_core::session::frame_limit::{FrameLimitConfig, FrameLimitMethod, FrameLimitMode};
+	let method = if args.frame_limit_method == "mangohud" {
+		FrameLimitMethod::Mangohud
+	} else {
+		FrameLimitMethod::Proton
+	};
+	let (mode, fps) = match args.frame_limit.as_str() {
+		"off" => (FrameLimitMode::Off, 60),
+		"stream" => (FrameLimitMode::Stream, 60),
+		rate => (
+			FrameLimitMode::Custom,
+			rate.parse()
+				.map_err(|_| boxed_error("--frame-limit must be off, stream or a frame rate"))?,
+		),
+	};
+	let config = FrameLimitConfig { mode, fps, method };
+	config.validate().map_err(boxed_error)?;
+	Ok(config)
 }

@@ -9,6 +9,7 @@ pub use crate::management::history::HistoryConfig;
 pub use crate::management::web::ManagementConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
+pub use crate::session::frame_limit::FrameLimitConfig;
 use crate::session::stream::StreamConfig;
 pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::webserver::WebserverConfig;
@@ -50,6 +51,9 @@ pub struct Config {
 
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
+
+	/// Optional frame limiting of launched applications (off by default).
+	pub frame_limit: FrameLimitConfig,
 
 	/// Inhibit system sleep (suspend) while a session is active.
 	///
@@ -158,6 +162,17 @@ impl Config {
 				self.library.poll_interval_secs
 			));
 		}
+		self.frame_limit.validate()?;
+		for application in &self.applications {
+			application
+				.frame_limit
+				.validate(&format!("application '{}'", application.title))?;
+		}
+		for scanner in &self.application_scanners {
+			scanner
+				.frame_limit()
+				.validate(&format!("the {} scanner", scanner.kind().id()))?;
+		}
 		if !STREAM_TIMEOUT_SECS.contains(&self.stream.timeout) {
 			return Err(format!(
 				"stream.timeout must be between {} and {} seconds, not {}",
@@ -219,9 +234,11 @@ impl Default for Config {
 				stdout: None,
 				stderr: None,
 				launch_timeout_secs: 2,
+				frame_limit: Default::default(),
 			})],
 			library: LibraryConfig::default(),
 			compositor: CompositorConfig::default(),
+			frame_limit: FrameLimitConfig::default(),
 			inhibit_sleep: true,
 		}
 	}
@@ -234,6 +251,36 @@ mod tests {
 	#[test]
 	fn default_configuration_is_valid() {
 		assert_eq!(Config::default().validate(), Ok(()));
+	}
+
+	#[test]
+	fn frame_limits_are_off_by_default_validated_and_omitted_when_unset() {
+		let config = Config::default();
+		assert_eq!(
+			config.frame_limit.mode,
+			crate::session::frame_limit::FrameLimitMode::Off
+		);
+		// Existing configurations serialize without any frame limit override.
+		let application = toml::to_string(&config.applications[0]).unwrap();
+		assert!(!application.contains("frame_limit"), "{application}");
+		let parse = |toml: &str| toml::from_str::<Config>(toml).unwrap().validate();
+		assert!(
+			parse("[frame_limit]\nmode = \"custom\"\nfps = 5")
+				.unwrap_err()
+				.contains("frame_limit.fps")
+		);
+		let application = "[[application]]\ntitle = \"Game\"\ncommand = [\"game\"]\nframe_limit_mode = \"custom\"\nframe_limit_fps = 2000";
+		assert!(parse(application).unwrap_err().contains("application 'Game'"));
+		let scanner =
+			"[[application_scanner]]\ntype = \"steam\"\nlibrary = \"/tmp\"\ncommand = [\"steam\"]\nframe_limit_fps = 1";
+		assert!(parse(scanner).unwrap_err().contains("steam scanner"));
+		let valid = "[frame_limit]\nmode = \"stream\"\nmethod = \"mangohud\"\n\n[[application]]\ntitle = \"Game\"\ncommand = [\"game\"]\nframe_limit_mode = \"off\"";
+		let config: Config = toml::from_str(valid).unwrap();
+		assert_eq!(config.validate(), Ok(()));
+		assert_eq!(
+			config.applications[0].frame_limit.frame_limit_mode,
+			Some(crate::session::frame_limit::FrameLimitMode::Off)
+		);
 	}
 
 	/// Review 2026-10-05 CFG-001: a hand-written file is held to the same

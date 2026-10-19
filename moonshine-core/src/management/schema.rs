@@ -11,6 +11,7 @@ use moonshine_management::dto::{ChoiceOption, ConfigSchema, FieldKind, FieldSpec
 use serde::Serialize;
 
 use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy, VrrCapture};
+use crate::session::frame_limit::{FrameLimitMethod, FrameLimitMode};
 use crate::session::stream::audio::AudioQuality;
 use crate::session::stream::control::input::gamepad::{GamepadEmulation, HomeTrigger};
 use crate::session::stream::video::{ConversionQueueMode, FecMode, PyroWaveQueueMode};
@@ -213,6 +214,46 @@ fn connector_strategy(strategy: VirtualConnectorStrategy) -> (&'static str, &'st
 	}
 }
 
+fn frame_limit_mode(mode: FrameLimitMode) -> (&'static str, &'static str) {
+	match mode {
+		FrameLimitMode::Off => ("Off", "Launch applications unchanged."),
+		FrameLimitMode::Stream => (
+			"Match stream FPS",
+			"Limit to the frame rate of the stream that launches the application.",
+		),
+		FrameLimitMode::Custom => ("Custom FPS", "Limit to the frame rate set below."),
+	}
+}
+
+fn frame_limit_method(method: FrameLimitMethod) -> (&'static str, &'static str) {
+	match method {
+		FrameLimitMethod::Proton => (
+			"Proton (DXVK, vkd3d-proton)",
+			"Direct3D games under Proton or Wine. Native Linux games are not limited.",
+		),
+		FrameLimitMethod::Mangohud => (
+			"MangoHud",
+			"Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+		),
+	}
+}
+
+fn optional(kind: FieldKind, unset: &str) -> FieldKind {
+	match kind {
+		FieldKind::Choice { options, .. } => FieldKind::Choice {
+			options,
+			unset_label: Some(unset.into()),
+		},
+		FieldKind::Integer { min, max, unit, .. } => FieldKind::Integer {
+			min,
+			max,
+			unit,
+			optional: true,
+		},
+		kind => kind,
+	}
+}
+
 const OUTPUT_SUGGESTIONS: &[&str] = &["null", "journal", "inherit", "file:/path/to/log", "append:/path/to/log"];
 
 /// Settings shared by applications and every scanner type.
@@ -267,6 +308,42 @@ fn launch_fields(section: &str, scanner: bool) -> Vec<FieldSpec> {
 			"Launch timeout",
 			"Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
 			integer(0.0, 3600.0, Some("s")),
+		)
+		.advanced()
+		.0,
+		Field::new(
+			"frame_limit_mode",
+			section,
+			"Frame limit",
+			&format!("Frame limiting for {of}. Unset uses the global frame limit setting. Takes effect at the next launch."),
+			optional(
+				choices(
+					&[FrameLimitMode::Off, FrameLimitMode::Stream, FrameLimitMode::Custom],
+					frame_limit_mode,
+				),
+				"Global setting",
+			),
+		)
+		.advanced()
+		.0,
+		Field::new(
+			"frame_limit_fps",
+			section,
+			"Frame limit FPS",
+			"Frame rate for a custom frame limit. Unset uses the global value.",
+			optional(integer(10.0, 1000.0, Some("FPS")), ""),
+		)
+		.advanced()
+		.0,
+		Field::new(
+			"frame_limit_method",
+			section,
+			"Frame limiter",
+			"Limiter used for this application. Unset uses the global limiter.",
+			optional(
+				choices(&[FrameLimitMethod::Proton, FrameLimitMethod::Mangohud], frame_limit_method),
+				"Global setting",
+			),
 		)
 		.advanced()
 		.0,
@@ -475,6 +552,11 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"history",
 			"Session history",
 			"How long finished sessions are kept and what is recorded about them.",
+		),
+		section(
+			"frame_limit",
+			"Frame limiting",
+			"Optional limits that stop launched games rendering frames the stream cannot send.",
 		),
 		section("diagnostics", "Diagnostics", "Logging for performance investigation."),
 	];
@@ -860,6 +942,30 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		.advanced()
 		.caution("Always compositing costs GPU time; use it to diagnose capture problems."),
 		Field::new(
+			"frame_limit.mode",
+			"frame_limit",
+			"Frame limit",
+			"Ask launched games to render at most this many frames per second. Capture pacing is unchanged; this saves GPU time games spend on frames the stream drops. Applies only to applications Pyroshine launches, at their next launch. Applications can override it.",
+			choices(
+				&[FrameLimitMode::Off, FrameLimitMode::Stream, FrameLimitMode::Custom],
+				frame_limit_mode,
+			),
+		),
+		Field::new(
+			"frame_limit.fps",
+			"frame_limit",
+			"Custom FPS",
+			"Frame rate for the custom frame limit.",
+			integer(10.0, 1000.0, Some("FPS")),
+		),
+		Field::new(
+			"frame_limit.method",
+			"frame_limit",
+			"Limiter",
+			"How the limit is enforced. Values set in your user environment (DXVK_FRAME_RATE, VKD3D_FRAME_RATE, MangoHud configuration) and game launch options take precedence. See the health check for what is available.",
+			choices(&[FrameLimitMethod::Proton, FrameLimitMethod::Mangohud], frame_limit_method),
+		),
+		Field::new(
 			"compositor.vrr_capture",
 			"display",
 			"VRR capture",
@@ -981,6 +1087,9 @@ pub(crate) mod tests {
 			"stdout": "journal",
 			"stderr": "journal",
 			"launch_timeout_secs": 5,
+			"frame_limit_mode": "custom",
+			"frame_limit_fps": 90,
+			"frame_limit_method": "mangohud",
 		});
 		let mut application = json!({
 			"title": "Game",

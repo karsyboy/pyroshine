@@ -34,6 +34,10 @@ pub struct SteamApplicationScannerConfig {
 	/// Seconds to wait for each scanned application to reach an active state after launch.
 	#[serde(default = "crate::session::application::default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Overrides of `[frame_limit]` for each discovered application.
+	#[serde(flatten)]
+	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
 }
 
 /// Steam tools that are installed like games but cannot be played.
@@ -126,6 +130,7 @@ pub(crate) fn scan(config: &SteamApplicationScannerConfig) -> SourceScan {
 					stdout: config.stdout.clone(),
 					stderr: config.stderr.clone(),
 					launch_timeout_secs: config.launch_timeout_secs,
+					frame_limit: config.frame_limit.clone(),
 				};
 				let (candidates, origin) = art.find(app.app_id);
 				if candidates.is_empty() {
@@ -295,6 +300,7 @@ pub(crate) mod tests {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: 2,
+			frame_limit: Default::default(),
 		}
 	}
 

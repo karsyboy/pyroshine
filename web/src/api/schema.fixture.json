@@ -38,6 +38,11 @@
       "virtual_connector_strategy": "single_application",
       "vrr_capture": "auto"
     },
+    "frame_limit": {
+      "fps": 60,
+      "method": "proton",
+      "mode": "off"
+    },
     "history": {
       "enabled": true,
       "max_sessions": 1000,
@@ -883,6 +888,77 @@
         "section": "display"
       },
       {
+        "advanced": false,
+        "caution": null,
+        "help": "Ask launched games to render at most this many frames per second. Capture pacing is unchanged; this saves GPU time games spend on frames the stream drops. Applies only to applications Pyroshine launches, at their next launch. Applications can override it.",
+        "kind": {
+          "options": [
+            {
+              "description": "Launch applications unchanged.",
+              "label": "Off",
+              "value": "off"
+            },
+            {
+              "description": "Limit to the frame rate of the stream that launches the application.",
+              "label": "Match stream FPS",
+              "value": "stream"
+            },
+            {
+              "description": "Limit to the frame rate set below.",
+              "label": "Custom FPS",
+              "value": "custom"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Frame limit",
+        "path": "frame_limit.mode",
+        "required": false,
+        "section": "frame_limit"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Frame rate for the custom frame limit.",
+        "kind": {
+          "max": 1000.0,
+          "min": 10.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "FPS"
+        },
+        "label": "Custom FPS",
+        "path": "frame_limit.fps",
+        "required": false,
+        "section": "frame_limit"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "How the limit is enforced. Values set in your user environment (DXVK_FRAME_RATE, VKD3D_FRAME_RATE, MangoHud configuration) and game launch options take precedence. See the health check for what is available.",
+        "kind": {
+          "options": [
+            {
+              "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+              "label": "Proton (DXVK, vkd3d-proton)",
+              "value": "proton"
+            },
+            {
+              "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+              "label": "MangoHud",
+              "value": "mangohud"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "Limiter",
+        "path": "frame_limit.method",
+        "required": false,
+        "section": "frame_limit"
+      },
+      {
         "advanced": true,
         "caution": null,
         "help": "Presentation-driven capture for clients that request VRR presentation, such as Pyrolight.",
@@ -1125,6 +1201,77 @@
               "path": "launch_timeout_secs",
               "required": false,
               "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "Frame limiting for the application. Unset uses the global frame limit setting. Takes effect at the next launch.",
+              "kind": {
+                "options": [
+                  {
+                    "description": "Launch applications unchanged.",
+                    "label": "Off",
+                    "value": "off"
+                  },
+                  {
+                    "description": "Limit to the frame rate of the stream that launches the application.",
+                    "label": "Match stream FPS",
+                    "value": "stream"
+                  },
+                  {
+                    "description": "Limit to the frame rate set below.",
+                    "label": "Custom FPS",
+                    "value": "custom"
+                  }
+                ],
+                "type": "choice",
+                "unset_label": "Global setting"
+              },
+              "label": "Frame limit",
+              "path": "frame_limit_mode",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "Frame rate for a custom frame limit. Unset uses the global value.",
+              "kind": {
+                "max": 1000.0,
+                "min": 10.0,
+                "optional": true,
+                "type": "integer",
+                "unit": "FPS"
+              },
+              "label": "Frame limit FPS",
+              "path": "frame_limit_fps",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
+              "help": "Limiter used for this application. Unset uses the global limiter.",
+              "kind": {
+                "options": [
+                  {
+                    "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+                    "label": "Proton (DXVK, vkd3d-proton)",
+                    "value": "proton"
+                  },
+                  {
+                    "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+                    "label": "MangoHud",
+                    "value": "mangohud"
+                  }
+                ],
+                "type": "choice",
+                "unset_label": "Global setting"
+              },
+              "label": "Frame limiter",
+              "path": "frame_limit_method",
+              "required": false,
+              "section": "applications"
             }
           ],
           "type": "applications"
@@ -1255,6 +1402,77 @@
                   "path": "launch_timeout_secs",
                   "required": false,
                   "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame limiting for each discovered application. Unset uses the global frame limit setting. Takes effect at the next launch.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Launch applications unchanged.",
+                        "label": "Off",
+                        "value": "off"
+                      },
+                      {
+                        "description": "Limit to the frame rate of the stream that launches the application.",
+                        "label": "Match stream FPS",
+                        "value": "stream"
+                      },
+                      {
+                        "description": "Limit to the frame rate set below.",
+                        "label": "Custom FPS",
+                        "value": "custom"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limit",
+                  "path": "frame_limit_mode",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame rate for a custom frame limit. Unset uses the global value.",
+                  "kind": {
+                    "max": 1000.0,
+                    "min": 10.0,
+                    "optional": true,
+                    "type": "integer",
+                    "unit": "FPS"
+                  },
+                  "label": "Frame limit FPS",
+                  "path": "frame_limit_fps",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Limiter used for this application. Unset uses the global limiter.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+                        "label": "Proton (DXVK, vkd3d-proton)",
+                        "value": "proton"
+                      },
+                      {
+                        "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+                        "label": "MangoHud",
+                        "value": "mangohud"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limiter",
+                  "path": "frame_limit_method",
+                  "required": false,
+                  "section": "scanners"
                 }
               ],
               "id": "steam",
@@ -1372,6 +1590,77 @@
                   },
                   "label": "Launch timeout",
                   "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame limiting for each discovered application. Unset uses the global frame limit setting. Takes effect at the next launch.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Launch applications unchanged.",
+                        "label": "Off",
+                        "value": "off"
+                      },
+                      {
+                        "description": "Limit to the frame rate of the stream that launches the application.",
+                        "label": "Match stream FPS",
+                        "value": "stream"
+                      },
+                      {
+                        "description": "Limit to the frame rate set below.",
+                        "label": "Custom FPS",
+                        "value": "custom"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limit",
+                  "path": "frame_limit_mode",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame rate for a custom frame limit. Unset uses the global value.",
+                  "kind": {
+                    "max": 1000.0,
+                    "min": 10.0,
+                    "optional": true,
+                    "type": "integer",
+                    "unit": "FPS"
+                  },
+                  "label": "Frame limit FPS",
+                  "path": "frame_limit_fps",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Limiter used for this application. Unset uses the global limiter.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+                        "label": "Proton (DXVK, vkd3d-proton)",
+                        "value": "proton"
+                      },
+                      {
+                        "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+                        "label": "MangoHud",
+                        "value": "mangohud"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limiter",
+                  "path": "frame_limit_method",
                   "required": false,
                   "section": "scanners"
                 }
@@ -1492,6 +1781,77 @@
                   },
                   "label": "Launch timeout",
                   "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame limiting for each discovered application. Unset uses the global frame limit setting. Takes effect at the next launch.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Launch applications unchanged.",
+                        "label": "Off",
+                        "value": "off"
+                      },
+                      {
+                        "description": "Limit to the frame rate of the stream that launches the application.",
+                        "label": "Match stream FPS",
+                        "value": "stream"
+                      },
+                      {
+                        "description": "Limit to the frame rate set below.",
+                        "label": "Custom FPS",
+                        "value": "custom"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limit",
+                  "path": "frame_limit_mode",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame rate for a custom frame limit. Unset uses the global value.",
+                  "kind": {
+                    "max": 1000.0,
+                    "min": 10.0,
+                    "optional": true,
+                    "type": "integer",
+                    "unit": "FPS"
+                  },
+                  "label": "Frame limit FPS",
+                  "path": "frame_limit_fps",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Limiter used for this application. Unset uses the global limiter.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+                        "label": "Proton (DXVK, vkd3d-proton)",
+                        "value": "proton"
+                      },
+                      {
+                        "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+                        "label": "MangoHud",
+                        "value": "mangohud"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limiter",
+                  "path": "frame_limit_method",
                   "required": false,
                   "section": "scanners"
                 }
@@ -1620,6 +1980,77 @@
                   "path": "launch_timeout_secs",
                   "required": false,
                   "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame limiting for each discovered application. Unset uses the global frame limit setting. Takes effect at the next launch.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Launch applications unchanged.",
+                        "label": "Off",
+                        "value": "off"
+                      },
+                      {
+                        "description": "Limit to the frame rate of the stream that launches the application.",
+                        "label": "Match stream FPS",
+                        "value": "stream"
+                      },
+                      {
+                        "description": "Limit to the frame rate set below.",
+                        "label": "Custom FPS",
+                        "value": "custom"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limit",
+                  "path": "frame_limit_mode",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame rate for a custom frame limit. Unset uses the global value.",
+                  "kind": {
+                    "max": 1000.0,
+                    "min": 10.0,
+                    "optional": true,
+                    "type": "integer",
+                    "unit": "FPS"
+                  },
+                  "label": "Frame limit FPS",
+                  "path": "frame_limit_fps",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Limiter used for this application. Unset uses the global limiter.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+                        "label": "Proton (DXVK, vkd3d-proton)",
+                        "value": "proton"
+                      },
+                      {
+                        "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+                        "label": "MangoHud",
+                        "value": "mangohud"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limiter",
+                  "path": "frame_limit_method",
+                  "required": false,
+                  "section": "scanners"
                 }
               ],
               "id": "desktop",
@@ -1745,6 +2176,11 @@
         "description": "How long finished sessions are kept and what is recorded about them.",
         "id": "history",
         "title": "Session history"
+      },
+      {
+        "description": "Optional limits that stop launched games rendering frames the stream cannot send.",
+        "id": "frame_limit",
+        "title": "Frame limiting"
       },
       {
         "description": "Logging for performance investigation.",

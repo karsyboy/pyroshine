@@ -94,6 +94,7 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 | `webserver` | table | HTTP/HTTPS ports, pairing, and TLS files. |
 | `stream` | table | RTSP, timeout, video, audio, and control settings. |
 | `compositor` | table | GPU, capture, HDR, window focus, and keyboard settings. |
+| `frame_limit` | table, off | Optional frame limiting of launched games; see [`[frame_limit]`](#frame_limit). |
 
 ## `[webserver]`
 
@@ -380,6 +381,9 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 | `stdout` | optional string, effective `"null"` | systemd `StandardOutput` destination, e.g. `journal`, `file:/path`, or `append:/path`. |
 | `stderr` | optional string, effective `"null"` | systemd `StandardError` destination. Set `journal` to capture errors. |
 | `launch_timeout_secs` | nonnegative integer, `2` | Time allowed for the application to reach an active state after launch; separate from the wait for pre-commands. Increase for slow launchers. |
+| `frame_limit_mode` | optional `"off"`, `"stream"` or `"custom"`; unset uses [`[frame_limit]`](#frame_limit) | Frame limiting for this application. `"off"` opts out of a global limit. |
+| `frame_limit_fps` | optional integer `10`–`1000` | Frame rate for `"custom"`; unset uses `frame_limit.fps`. |
+| `frame_limit_method` | optional `"proton"` or `"mangohud"` | Limiter for this application; unset uses `frame_limit.method`. |
 
 Commands are argument arrays rather than shell scripts. For shell syntax,
 variable expansion, pipes, or redirection, explicitly run a shell, for example
@@ -412,8 +416,9 @@ removed and renamed games reach clients without a restart (see
 [`[library]`](#library)). Adding, removing or editing a scanner still requires
 a restart. Each entry requires `type`.
 
-All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`, and
-`launch_timeout_secs`, with the same defaults and behavior as applications.
+All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`,
+`launch_timeout_secs` and the `frame_limit_*` overrides, with the same defaults
+and behavior as applications.
 Those values are copied to each discovered application. Scanners do not accept
 `output_scale`, `title`, or `boxart` overrides.
 
@@ -506,6 +511,54 @@ shows the error and what to do about it.
 auto_refresh = true
 poll_interval_secs = 300
 ```
+
+## `[frame_limit]`
+
+[Source](../moonshine-core/src/session/frame_limit.rs). Asks launched games to
+render no more frames than the stream can send. It is off by default and changes
+nothing when off. Pyroshine already paces games that wait for the display
+(vsync); a game with vsync off renders as fast as the GPU allows and the
+surplus frames are dropped at capture, using GPU time the encoder competes for.
+Capture timing and VRR capture are unchanged either way.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `mode` | `"off"`, `"stream"` or `"custom"`; `"off"` | `"stream"` limits to the frame rate of the stream that launches the application; `"custom"` to `fps`. |
+| `fps` | integer `10`–`1000`, `60` | Frame rate for `"custom"`. |
+| `method` | `"proton"` or `"mangohud"`; `"proton"` | `"proton"` sets `DXVK_FRAME_RATE` and `VKD3D_FRAME_RATE`, the limiters built into Proton/Wine's Direct3D translation: Direct3D 8–12 games. Native Linux games are not limited. `"mangohud"` sets `MANGOHUD=1` and `MANGOHUD_CONFIG=no_display,fps_limit=N`: every Vulkan game, including Proton's, with MangoHud's overlay hidden. It needs MangoHud installed (and its 32-bit layer for 32-bit games); when its Vulkan layer is missing, launches use `"proton"` instead. OpenGL games are not limited by either. |
+
+Applications and scanners override these with `frame_limit_mode`,
+`frame_limit_fps` and `frame_limit_method`.
+
+```toml
+[frame_limit]
+mode = "stream"
+method = "proton"
+
+[[application]]
+title = "Desktop"
+command = ["/usr/bin/startplasma-wayland"]
+frame_limit_mode = "off"
+```
+
+- The limit applies only to the application Pyroshine launches and its
+  children (including games started by a Steam client Pyroshine launched). It
+  is set on that application's systemd unit: your desktop Steam, Steam's own
+  settings and games you start locally are never affected, and no helper
+  process runs.
+- It is fixed when the application starts. A reconnect at another frame rate
+  keeps the running game's limit; restart the game to change it.
+- Your own settings win: a `DXVK_FRAME_RATE`, `VKD3D_FRAME_RATE` or MangoHud
+  configuration (`MANGOHUD_CONFIG`, `MANGOHUD_CONFIGFILE`, `DISABLE_MANGOHUD`)
+  in the user manager's environment is kept, and a game's own launch options
+  (Steam's `… %command%`, `env` in the command) apply after Pyroshine's.
+- With `"mangohud"`, MangoHud's own configuration file is not read for these
+  games, so its overlay stays hidden even with `mangohud %command%`. Use
+  `"proton"` for games where you want your MangoHud setup.
+- Gamescope inside a game's launch options has its own limiter (`-r`); set
+  `frame_limit_mode = "off"` for such games, or the two limits may disagree.
+- Settings change at the next launch of a game; `pyroshine healthcheck` and the
+  **Diagnostics** page report what the configured limiter covers on this host.
 
 ## Diagnostics outside config.toml
 

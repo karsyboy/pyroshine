@@ -399,6 +399,7 @@ pub fn recheck_in_server(config: &Config, previous: Option<&HealthReport>, sessi
 	check_uhid(&mut report);
 	check_input_group(&mut report);
 	check_dirs(&mut report, config);
+	check_frame_limit(&mut report, config);
 	report.duration = started.elapsed();
 	report
 }
@@ -441,6 +442,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	if let Some(config) = config {
 		check_dirs(&mut report, config);
+		check_frame_limit(&mut report, config);
 	}
 
 	report.duration = started.elapsed();
@@ -1584,6 +1586,39 @@ pub(crate) fn find_render_node(gpu_config: &Option<String>) -> Result<PathBuf, S
 	}
 
 	Ok(best_node.unwrap_or_else(|| entries[0].path()))
+}
+
+/// Frame limiting status: what the configured limiter covers, and whether a
+/// configured MangoHud limiter is available. Never fatal.
+fn check_frame_limit(report: &mut HealthReport, config: &Config) {
+	use crate::session::frame_limit::{FrameLimitMethod, mangohud_layer_installed, support_summary};
+	let start = Instant::now();
+	let wants_mangohud = config.frame_limit.method == FrameLimitMethod::Mangohud
+		|| config
+			.applications
+			.iter()
+			.any(|a| a.frame_limit.frame_limit_method == Some(FrameLimitMethod::Mangohud))
+		|| config
+			.application_scanners
+			.iter()
+			.any(|s| s.frame_limit().frame_limit_method == Some(FrameLimitMethod::Mangohud));
+	let mangohud = mangohud_layer_installed();
+	let (supported, message) = support_summary(&config.frame_limit, mangohud);
+	let elapsed = start.elapsed().as_millis() as u64;
+	if supported && !(wants_mangohud && !mangohud) {
+		report.add_passed("Frame limiter", message, elapsed);
+	} else if supported {
+		report.add_warn(
+			"Frame limiter",
+			format!(
+				"  {message}\n  An application or scanner selects the MangoHud limiter, which is not installed; \
+				 those launches use the Proton limiters."
+			),
+			elapsed,
+		);
+	} else {
+		report.add_warn("Frame limiter", format!("  {message}"), elapsed);
+	}
 }
 
 #[cfg(test)]

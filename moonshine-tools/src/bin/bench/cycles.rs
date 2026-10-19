@@ -425,6 +425,7 @@ fn session_manager(args: &Args, shutdown: &ShutdownManager<ShutdownReason>) -> R
 		Ipv4Addr::LOCALHOST.to_string(),
 		STREAM_TIMEOUT_SECS,
 		false,
+		super::frame_limit(args)?,
 		shutdown.clone(),
 	)
 	.map_err(|()| boxed_error("Failed to create session manager"))

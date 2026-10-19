@@ -55,6 +55,8 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 | `--detach-seconds <N>` | `0` | After the run, measure N s attached, then N s with both media epochs paused by a reconnecting client's ANNOUNCE (no PLAY), then PLAY and time the first frame; reports frames, process CPU and per-engine GPU time of the benchmark process |
 | `--runtime-probe` | off | Run a 1 ms timer task on the session runtime and report its lateness percentiles (scheduling delay caused by packetization and transport) |
+| `--frame-limit <off\|stream\|N>` | `off` | Apply [`[frame_limit]`](CONFIGURATION.md#frame_limit) to the benchmark application: the stream's frame rate or a fixed rate. Also applies to `--cycles` and `--reconnect-cycles` |
+| `--frame-limit-method <method>` | `proton` | Limiter for `--frame-limit`: `proton` or `mangohud` |
 | `--vrr` | off | Act as a client that requested VRR presentation, so the compositor uses presentation-driven capture. With `--reconnect-cycles`, the request alternates per cycle |
 | `--rtp-trace <path>` | none | Write `frame_index,rtp_timestamp,arrival_us` for every received video frame (unencrypted video only), to compare RTP and arrival intervals |
 | `--json <path>` | none | Write a machine-readable result document for the run or matrix; see [machine-readable results](#machine-readable-results) |
@@ -338,6 +340,21 @@ of direct export.
 The benchmark has no Moonlight client: there is no ENet control, audio endpoint
 or client decode. Cycles establish backend ownership and streaming continuity;
 client compatibility still needs the [reconnect matrix](reconnect-validation.md).
+
+### Frame limiting
+
+Compare `--frame-limit off` with `--frame-limit stream` on a game that does not
+wait for the display. Pyroshine's compositor offers FIFO and MAILBOX, so use
+MAILBOX for an unthrottled source (`vkcube --wsi wayland --present_mode 1`; the
+compositor does not offer IMMEDIATE). A native Vulkan source needs
+`--frame-limit-method mangohud`; `proton` covers only DXVK/vkd3d-proton titles.
+Judge the effect by the application, not the stream FPS, which the capture
+pacer holds at the target either way: the `Video capture cadence` log's
+`game_surface_commits` per capture (frames the game rendered per frame sent),
+the application process's GPU engine time and CPU time (`/proc/<pid>/fdinfo`,
+`/proc/<pid>/stat`), whole-device `resources.device_busy`, and the host latency
+and arrival-interval distributions in the JSON result. Run the pair at least
+three times, interleaved.
 
 ## Game interference harness
 

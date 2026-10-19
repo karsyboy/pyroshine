@@ -1581,6 +1581,7 @@ impl SessionManager {
 		address: String,
 		stream_timeout: u64,
 		inhibit_sleep: bool,
+		frame_limit: crate::session::frame_limit::FrameLimitConfig,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let stats_tx = broadcast::channel(256).0;
@@ -1604,6 +1605,7 @@ impl SessionManager {
 			stats_tx: stats_tx.clone(),
 			presence_tx: presence_tx.clone(),
 			video_port,
+			frame_limit,
 		};
 		Ok(Self {
 			core: SessionCore::new(backend, shutdown)?,
@@ -1770,6 +1772,7 @@ impl SessionManager {
 			"127.0.0.1".into(),
 			30,
 			false,
+			Default::default(),
 			shutdown,
 		)
 		.unwrap()
