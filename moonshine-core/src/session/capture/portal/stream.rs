@@ -96,16 +96,31 @@ pub(crate) struct DeclaredColor {
 impl DeclaredColor {
 	/// The frame color space this declaration describes, or `None` when the
 	/// source declares an encoding the pipeline cannot read correctly.
+	///
+	/// Desktops declare SDR differently: KWin leaves both fields unset,
+	/// Mutter declares gamma 2.2 with BT.709 primaries. Every gamma-encoded
+	/// SDR transfer with BT.709 (or unstated) primaries is the encoding the
+	/// pipeline streams as SDR; only PQ with BT.2020 primaries is HDR10.
 	pub(crate) fn color_space(self) -> Option<FrameColorSpace> {
-		match (self.transfer, self.primaries) {
-			(
-				0 | spa_sys::SPA_VIDEO_TRANSFER_SRGB | spa_sys::SPA_VIDEO_TRANSFER_BT709,
-				0 | spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT709,
-			) => Some(FrameColorSpace::Srgb),
-			(spa_sys::SPA_VIDEO_TRANSFER_SMPTE2084, spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020) => {
-				Some(FrameColorSpace::Bt2020Pq)
-			},
-			_ => None,
+		const SDR_TRANSFERS: [u32; 5] = [
+			spa_sys::SPA_VIDEO_TRANSFER_UNKNOWN,
+			spa_sys::SPA_VIDEO_TRANSFER_GAMMA22,
+			spa_sys::SPA_VIDEO_TRANSFER_BT709,
+			spa_sys::SPA_VIDEO_TRANSFER_SRGB,
+			spa_sys::SPA_VIDEO_TRANSFER_BT601,
+		];
+		let bt709 = matches!(
+			self.primaries,
+			spa_sys::SPA_VIDEO_COLOR_PRIMARIES_UNKNOWN | spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT709
+		);
+		if SDR_TRANSFERS.contains(&self.transfer) && bt709 {
+			Some(FrameColorSpace::Srgb)
+		} else if self.transfer == spa_sys::SPA_VIDEO_TRANSFER_SMPTE2084
+			&& self.primaries == spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020
+		{
+			Some(FrameColorSpace::Bt2020Pq)
+		} else {
+			None
 		}
 	}
 }

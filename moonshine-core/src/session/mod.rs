@@ -284,6 +284,10 @@ impl SessionBackend for SystemSession {
 	async fn stop_application(&self, unit_name: &str) -> Result<(), ()> {
 		application::stop_application_unit(unit_name).await
 	}
+
+	fn capture_details(launched: &LaunchedSession) -> Option<moonshine_management::dto::CaptureDetails> {
+		Some(launched.capture.details())
+	}
 }
 
 /// A stream socket could not be created. The common cause is another process

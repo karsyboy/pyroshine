@@ -564,6 +564,32 @@ function AudioCard({ session }: { session: SessionDetails }) {
   );
 }
 
+const inputLabels: Record<string, string> = {
+  libei: "Keyboard and pointer (libei)",
+  portal: "Keyboard and pointer (portal)",
+  none: "View-only",
+};
+
+/** Mode and, in Desktop Mode, what of the desktop is captured and controlled. */
+function captureRows(capture: SessionDetails["capture"]): [string, string][] {
+  if (!capture) {
+    return [];
+  }
+  const rows: [string, string][] = [["Mode", capture.mode_label]];
+  if (capture.mode === "desktop") {
+    if (capture.output) {
+      const refresh = capture.output.refresh_millihertz ? ` @ ${(capture.output.refresh_millihertz / 1000).toFixed(0)} Hz` : "";
+      rows.push(["Captured output", `${capture.output.width} × ${capture.output.height}${refresh}`]);
+    }
+    rows.push(["Desktop", capture.current_desktop || capture.desktop || "—"]);
+    rows.push(["Remote input", inputLabels[capture.input ?? "none"] ?? capture.input ?? "—"]);
+    rows.push(["Permission", capture.consent === "restored" ? "Remembered by the desktop" : "Granted on the desktop"]);
+  }
+  rows.push(["Captured content", capture.dynamic_range]);
+  rows.push(["Capture backend", `${capture.backend === "desktop" ? "XDG Desktop Portal" : "Isolated compositor"} on ${capture.render_node}`]);
+  return rows;
+}
+
 function StreamDetails({ session }: { session: SessionDetails }) {
   const video = session.video;
   return (
@@ -603,6 +629,7 @@ function StreamDetails({ session }: { session: SessionDetails }) {
           </Typography>
           <Facts
             rows={[
+              ...captureRows(session.capture),
               ["Foreground application", session.foreground_application?.title ?? "—"],
               ["Moonlight application", session.application.title],
               ["Application ID", String(session.application.id)],

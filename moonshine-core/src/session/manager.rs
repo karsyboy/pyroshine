@@ -209,6 +209,11 @@ pub(crate) trait SessionBackend: Send + Sync + 'static {
 	/// idempotent; `Ok` for an absent unit. `Err` keeps the session from being
 	/// reported idle.
 	fn stop_application(&self, unit_name: &str) -> impl Future<Output = Result<(), ()>> + Send;
+
+	/// What the launched session captures, for status reporting.
+	fn capture_details(_launched: &Self::Launched) -> Option<moonshine_management::dto::CaptureDetails> {
+		None
+	}
 }
 
 enum SessionState<B: SessionBackend> {
@@ -282,6 +287,8 @@ struct SessionRecord {
 	first_generation: Option<u64>,
 	/// Why the session ended, recorded by whatever ended it.
 	cause: StopCauseSlot,
+	/// The running capture backend, once launched.
+	capture: Option<moonshine_management::dto::CaptureDetails>,
 }
 
 struct LiveSession<B: SessionBackend> {
@@ -351,6 +358,7 @@ pub(crate) struct SessionView {
 	/// Current authorized launch/resume client, or the launch client while initializing.
 	pub client_ip: IpAddr,
 	pub streams: Option<(VideoStreamContext, AudioStreamContext)>,
+	pub capture: Option<moonshine_management::dto::CaptureDetails>,
 }
 
 struct SessionManagerInner<B: SessionBackend> {
@@ -676,6 +684,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				// Initialization publishes the record before creating its first grant.
 				client_ip: client_ip.unwrap_or(context.client_ip),
 				streams: live.record.streams.clone(),
+				capture: live.record.capture.clone(),
 			}
 		})
 	}
@@ -991,6 +1000,7 @@ impl<B: SessionBackend> SessionCore<B> {
 					started_at: SystemTime::now(),
 					first_generation: None,
 					cause: cause.clone(),
+					capture: None,
 				},
 				state: None,
 				transition: None,
@@ -1101,9 +1111,11 @@ impl<B: SessionBackend> SessionCore<B> {
 			let mut guard = core.lock().await;
 			let outcome = match result {
 				Ok(Ok(launched)) => {
+					let capture = B::capture_details(&launched);
 					let state = SessionState::Launched(launched);
 					match guard.committable(&ticket) {
 						Some(live) => {
+							live.record.capture = capture;
 							live.state = Some(state);
 							live.transition = None;
 							guard.progress_at = Instant::now();
@@ -1811,6 +1823,7 @@ impl SessionManager {
 				started_at: SystemTime::now(),
 				first_generation: None,
 				cause: StopCauseSlot::default(),
+				capture: None,
 			},
 			state: None,
 			transition: None,

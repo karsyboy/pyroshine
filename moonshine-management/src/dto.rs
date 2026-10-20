@@ -70,6 +70,50 @@ pub struct SessionDetails {
 	pub video: Option<VideoDetails>,
 	/// Negotiated audio stream, once RTSP PLAY committed one.
 	pub audio: Option<AudioDetails>,
+	/// What the session streams and how, once capture is running.
+	#[serde(default)]
+	pub capture: Option<CaptureDetails>,
+}
+
+/// The capture backend of a running session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaptureDetails {
+	/// `game` (the isolated compositor) or `desktop` (the running desktop).
+	pub mode: String,
+	/// `Game Mode` or `Desktop Mode`.
+	pub mode_label: String,
+	/// `isolated` or `desktop` (XDG Desktop Portal).
+	pub backend: String,
+	/// DRM render node frames are captured and encoded on.
+	pub render_node: String,
+	/// `SDR` or `HDR`: what the captured content delivers.
+	pub dynamic_range: String,
+	/// Desktop Mode: the captured desktop output.
+	#[serde(default)]
+	pub output: Option<CapturedOutputDetails>,
+	/// Desktop Mode: `kde`, `gnome` or `other`, and `XDG_CURRENT_DESKTOP`.
+	#[serde(default)]
+	pub desktop: Option<String>,
+	#[serde(default)]
+	pub current_desktop: Option<String>,
+	/// Desktop Mode: how remote input reaches the desktop: `libei`, `portal`
+	/// or `none` (view-only).
+	#[serde(default)]
+	pub input: Option<String>,
+	/// Desktop Mode: `restored` (no prompt) or `requested` (the desktop asked
+	/// or granted it by policy).
+	#[serde(default)]
+	pub consent: Option<String>,
+}
+
+/// A captured desktop output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedOutputDetails {
+	pub width: u32,
+	pub height: u32,
+	/// Declared refresh in millihertz, when the desktop declared one.
+	#[serde(default)]
+	pub refresh_millihertz: Option<u32>,
 }
 
 /// Which encoder backend produces the video stream and on which GPU.

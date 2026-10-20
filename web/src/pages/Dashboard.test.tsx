@@ -427,3 +427,54 @@ describe("last stop", () => {
     expect(html).toMatch(/<code[^>]*>journalctl --user -u moonshine-session.service -e<\/code>/);
   });
 });
+
+describe("capture mode display", () => {
+  const snapshot: SessionSnapshot = { ...fixture, phase: "streaming" };
+
+  it("names Desktop Mode, the captured output and how input reaches the desktop", () => {
+    const html = render({
+      ...snapshot,
+      session: {
+        ...snapshot.session!,
+        capture: {
+          mode: "desktop",
+          mode_label: "Desktop Mode",
+          backend: "desktop",
+          render_node: "/dev/dri/renderD128",
+          dynamic_range: "SDR",
+          output: { width: 2560, height: 1440, refresh_millihertz: 144000 },
+          desktop: "gnome",
+          current_desktop: "ubuntu:GNOME",
+          input: "none",
+          consent: "restored",
+        },
+      },
+    });
+    expect(html).toContain("Desktop Mode");
+    expect(html).toContain("2560 × 1440 @ 144 Hz");
+    expect(html).toContain("ubuntu:GNOME");
+    expect(html).toContain("View-only");
+    expect(html).toContain("Remembered by the desktop");
+    expect(html).toContain("XDG Desktop Portal");
+  });
+
+  it("shows Game Mode without desktop rows, and nothing for older daemons", () => {
+    const game = render({
+      ...snapshot,
+      session: {
+        ...snapshot.session!,
+        capture: {
+          mode: "game",
+          mode_label: "Game Mode",
+          backend: "isolated",
+          render_node: "/dev/dri/renderD128",
+          dynamic_range: "HDR",
+        },
+      },
+    });
+    expect(game).toContain("Game Mode");
+    expect(game).not.toContain("Captured output");
+    expect(game).toContain("Isolated compositor");
+    expect(render(snapshot)).not.toContain("Capture backend");
+  });
+});

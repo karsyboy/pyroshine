@@ -779,6 +779,7 @@ fn session_details(view: SessionView, gpu: &str, video_config: &VideoStreamConfi
 			title: view.application_title,
 		},
 		foreground_application: view.foreground_application,
+		capture: view.capture,
 		client_address: display_address(view.client_ip),
 		started_at_ms: unix_millis(view.started_at),
 		requested: RequestedMode {

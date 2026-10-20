@@ -130,6 +130,8 @@ struct Eis {
 struct PortalMethods {
 	connection: zbus::blocking::Connection,
 	session: OwnedObjectPath,
+	/// Methods whose first call was checked for a refusal.
+	verified: std::cell::RefCell<BTreeSet<&'static str>>,
 }
 
 /// The desktop input sink of a Desktop Mode session.
@@ -305,6 +307,7 @@ impl DesktopInput {
 		let methods = PortalMethods {
 			connection: connection.into(),
 			session: session.into(),
+			verified: Default::default(),
 		};
 		Self::with(InputTransport::Portal, None, Some(methods), output)
 	}
@@ -368,14 +371,28 @@ impl DesktopInput {
 		}
 	}
 
-	fn portal_call(&self, method: &str, body: &(impl serde::Serialize + zbus::zvariant::DynamicType)) {
+	fn portal_call(&self, method: &'static str, body: &(impl serde::Serialize + zbus::zvariant::DynamicType)) {
+		const PORTAL: &str = "org.freedesktop.portal.Desktop";
+		const PATH: &str = "/org/freedesktop/portal/desktop";
+		const INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 		let Some(portal) = &self.portal else {
 			return;
 		};
-		// Fire and forget: input must never wait for a D-Bus round trip.
-		let message = zbus::message::Message::method_call("/org/freedesktop/portal/desktop", method)
-			.and_then(|builder| builder.destination("org.freedesktop.portal.Desktop"))
-			.and_then(|builder| builder.interface("org.freedesktop.portal.RemoteDesktop"))
+		// The first call of each method waits for the portal's answer, so a
+		// refusal is logged once; later calls are fire and forget: input must
+		// never wait for a D-Bus round trip.
+		if portal.verified.borrow_mut().insert(method) {
+			if let Err(error) = portal
+				.connection
+				.call_method(Some(PORTAL), PATH, Some(INTERFACE), method, body)
+			{
+				tracing::warn!(%error, method, "The portal refused remote input");
+			}
+			return;
+		}
+		let message = zbus::message::Message::method_call(PATH, method)
+			.and_then(|builder| builder.destination(PORTAL))
+			.and_then(|builder| builder.interface(INTERFACE))
 			.and_then(|builder| builder.with_flags(zbus::message::Flags::NoReplyExpected))
 			.and_then(|builder| builder.build(body));
 		match message {

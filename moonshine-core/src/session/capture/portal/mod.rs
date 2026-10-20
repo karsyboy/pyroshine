@@ -380,7 +380,11 @@ async fn setup(
 		.await
 		.map_err(|error| portal_failure(&error, Some(desktop.kind)))?;
 	let input_allowed = session.devices & (dbus::DEVICE_KEYBOARD | dbus::DEVICE_POINTER) != 0;
-	let eis = if session.remote_desktop && input_allowed && session.versions.eis() {
+	// Diagnostic: `MOONSHINE_DESKTOP_INPUT=portal` uses the portal's input
+	// methods even where libei is offered, to exercise the RemoteDesktop 1
+	// path (Ubuntu 22.04's GNOME 42) on a current desktop.
+	let force_portal_input = std::env::var("MOONSHINE_DESKTOP_INPUT").is_ok_and(|value| value == "portal");
+	let eis = if session.remote_desktop && input_allowed && session.versions.eis() && !force_portal_input {
 		match session.connect_to_eis().await {
 			Ok(fd) => Some(fd),
 			Err(error) => {

@@ -239,6 +239,44 @@ impl LiveCapture {
 		}
 	}
 
+	/// What the management interface shows about this capture.
+	pub(crate) fn details(&self) -> moonshine_management::dto::CaptureDetails {
+		let capabilities = self.capabilities();
+		let mut details = moonshine_management::dto::CaptureDetails {
+			mode: "game".into(),
+			mode_label: "Game Mode".into(),
+			backend: capabilities.backend.as_str().into(),
+			render_node: capabilities.render_node.display().to_string(),
+			dynamic_range: if capabilities.hdr() { "HDR" } else { "SDR" }.into(),
+			output: None,
+			desktop: None,
+			current_desktop: None,
+			input: None,
+			consent: None,
+		};
+		if let Self::Desktop(desktop) = self {
+			let ready = desktop.ready();
+			details.mode = "desktop".into();
+			details.mode_label = "Desktop Mode".into();
+			details.output = Some(moonshine_management::dto::CapturedOutputDetails {
+				width: ready.output.width,
+				height: ready.output.height,
+				refresh_millihertz: ready.output.refresh_millihertz,
+			});
+			details.desktop = Some(ready.desktop.kind.as_str().into());
+			details.current_desktop = Some(ready.desktop.current_desktop.clone());
+			details.input = Some(ready.input.as_str().into());
+			details.consent = Some(
+				match ready.consent {
+					portal::Consent::Restored => "restored",
+					portal::Consent::Requested => "requested",
+				}
+				.into(),
+			);
+		}
+		details
+	}
+
 	/// Where a launched application presents: the isolated backend's own
 	/// displays. Desktop Mode launches no application.
 	pub(crate) fn application_display(&self) -> Option<&ApplicationDisplay> {

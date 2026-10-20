@@ -889,6 +889,7 @@ mod tests {
 				title: "Steam".into(),
 			},
 			foreground_application: None,
+			capture: None,
 			client_address: "192.168.1.50".into(),
 			started_at_ms: 1_000,
 			requested: RequestedMode {
