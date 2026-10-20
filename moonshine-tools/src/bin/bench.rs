@@ -19,7 +19,7 @@ use moonshine_core::session::stream::control::ControlStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
 use moonshine_core::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
-use moonshine_core::session::stream::video::{ConversionQueueMode, FrameStats, PyroWaveQueueMode};
+use moonshine_core::session::stream::video::{ConversionQueueMode, EncoderPreference, FrameStats, PyroWaveQueueMode};
 use moonshine_core::session::{RemoteInputKey, RemoteInputKeyId};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,6 +37,10 @@ struct Args {
 	/// H.264/HEVC/AV1 conversion queue; auto prefers a dedicated compute family.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	conversion_queue: String,
+	/// H.264/HEVC/AV1 encoder backends (`stream.video.encoder`): auto prefers
+	/// Vulkan Video and falls back to VA-API, then NVENC, per profile.
+	#[arg(long, default_value = "auto", value_parser = ["auto", "vulkan", "vaapi", "nvenc"])]
+	encoder: String,
 	/// Application frame limit (`[frame_limit]`): off, stream, or a frame rate.
 	#[arg(long, default_value = "off")]
 	frame_limit: String,
@@ -779,12 +783,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Probe the capture GPU exactly as the server does at startup. Blocking GPU
 /// work, so it runs off the async runtime.
-async fn probe_capabilities() -> Result<Capabilities, Box<dyn std::error::Error>> {
-	Ok(tokio::task::spawn_blocking(|| healthcheck::probe_capabilities(None)).await?)
+fn encoder_preference(args: &Args) -> EncoderPreference {
+	match args.encoder.as_str() {
+		"vulkan" => EncoderPreference::Vulkan,
+		"vaapi" => EncoderPreference::Vaapi,
+		"nvenc" => EncoderPreference::Nvenc,
+		_ => EncoderPreference::Auto,
+	}
+}
+
+async fn probe_capabilities(args: &Args) -> Result<Capabilities, Box<dyn std::error::Error>> {
+	let mut config = moonshine_core::config::Config::default();
+	config.stream.video.encoder = encoder_preference(args);
+	Ok(tokio::task::spawn_blocking(move || healthcheck::probe_capabilities(Some(&config))).await?)
 }
 
 async fn run_capabilities(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	let capabilities = probe_capabilities().await?;
+	let capabilities = probe_capabilities(args).await?;
 	let document = report::document(Some(&capabilities), Vec::new(), unix_now());
 	println!("{}", serde_json::to_string_pretty(&document)?);
 	if let Some(path) = &args.json {
@@ -798,7 +813,7 @@ async fn gating_capabilities(args: &Args) -> Result<Option<Capabilities>, Box<dy
 	if !args.skip_unsupported {
 		return Ok(None);
 	}
-	let capabilities = probe_capabilities().await?;
+	let capabilities = probe_capabilities(args).await?;
 	tracing::info!(
 		gpu = capabilities.gpu_name,
 		profiles = ?healthcheck::codec_profile_labels(capabilities.supported_codecs),
@@ -870,7 +885,7 @@ fn workload(
 		"bit_depth": format.map(|format| format.bit_depth.bits()),
 		"range": format.map(|format| format!("{:?}", format.range).to_lowercase()),
 		"hdr": args.hdr,
-		"encoder": if codec == "pyrowave" { "pyrowave" } else { "pixelforge-vulkan-video" },
+		"encoder": if codec == "pyrowave" { "pyrowave".to_string() } else { args.encoder.clone() },
 		"capture_mode": if args.composited { "composited" } else { "auto" },
 		"vrr": args.vrr,
 		"cursor": args.cursor,
@@ -1097,6 +1112,11 @@ async fn run_benchmark(
 				"compute" => PyroWaveQueueMode::Compute,
 				_ => PyroWaveQueueMode::Auto,
 			},
+			encoder: encoder_preference(args),
+			// The probed backend per profile, as the server uses it.
+			encoder_table: capabilities
+				.map(|capabilities| capabilities.gpu.encoder_table())
+				.unwrap_or_default(),
 			..VideoStreamConfig::default()
 		},
 		AudioStreamConfig {

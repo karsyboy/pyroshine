@@ -188,7 +188,8 @@ async fn main() -> Result<(), ()> {
 
 	// Run health checks unless the user explicitly disabled them.
 	// If health checks are disabled, we still probe the GPU for supported codecs and HDR support.
-	let (supported_codecs, hdr_supported, dma_buf_supported, gpu_name, health) = if args.no_health_check {
+	let (supported_codecs, hdr_supported, dma_buf_supported, gpu_name, encoder_table, health) = if args.no_health_check
+	{
 		tracing::info!("Health checks disabled (--no-health-check); probing GPU capabilities only.");
 		let capabilities = tokio::task::spawn_blocking({
 			let cfg = config.clone();
@@ -202,6 +203,7 @@ async fn main() -> Result<(), ()> {
 			capabilities.hdr_supported,
 			capabilities.dma_buf_supported,
 			capabilities.gpu_name,
+			capabilities.gpu.encoder_table(),
 			None,
 		)
 	} else {
@@ -223,9 +225,13 @@ async fn main() -> Result<(), ()> {
 			report.hdr_supported,
 			report.dma_buf_supported,
 			report.gpu_name.clone(),
+			report.gpu.encoder_table(),
 			Some(report),
 		)
 	};
+	// Streams use the backend the probe verified for their profile.
+	let mut config = config;
+	config.stream.video.encoder_table = encoder_table;
 
 	if !dma_buf_supported {
 		tracing::error!(

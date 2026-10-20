@@ -21,7 +21,8 @@ mod pipeline;
 pub(crate) mod pyrowave;
 mod rtp_clock;
 pub use pipeline::ConversionQueueMode;
-pub(crate) use pipeline::{convert, encode_caps};
+pub use pipeline::{EncoderBackend, EncoderPreference, EncoderTable};
+pub(crate) use pipeline::{convert, encode_caps, nvenc, vaapi};
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
 // The UDP bandwidth calibration probe (`crate::calibration`) reuses the
@@ -76,6 +77,14 @@ pub struct VideoStreamConfig {
 	/// Queue for H.264/HEVC/AV1 RGB-to-YCbCr conversion; auto prefers a
 	/// dedicated compute family so a GPU-bound game cannot delay it.
 	pub conversion_queue: pipeline::ConversionQueueMode,
+	/// Which encoder implementations encode H.264/HEVC/AV1: `auto` uses Vulkan
+	/// Video wherever it encodes a profile and VA-API or NVENC for the profiles
+	/// it cannot; `vulkan`, `vaapi` or `nvenc` use only that one.
+	pub encoder: pipeline::EncoderPreference,
+	/// The backend the startup probe chose for each advertised profile; set by
+	/// the server, not configurable.
+	#[serde(skip)]
+	pub encoder_table: pipeline::EncoderTable,
 
 	/// Upper bound for the client-requested video packet size, in bytes.
 	///
@@ -141,6 +150,8 @@ impl Default for VideoStreamConfig {
 			log_stats: true,
 			pyrowave_queue: pyrowave::PyroWaveQueueMode::Auto,
 			conversion_queue: pipeline::ConversionQueueMode::Auto,
+			encoder: pipeline::EncoderPreference::Auto,
+			encoder_table: pipeline::EncoderTable::default(),
 			max_packet_size: 0,
 		}
 	}

@@ -119,6 +119,38 @@ pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 	Ok(context)
 }
 
+/// The DRM render node of `context`'s physical device, for APIs that open
+/// the GPU by node (VA-API). `None` when the driver does not report DRM
+/// identity (`VK_EXT_physical_device_drm`).
+pub(crate) fn render_node(context: &VideoContext) -> Option<std::path::PathBuf> {
+	let has_drm = unsafe {
+		context
+			.instance()
+			.enumerate_device_extension_properties(context.physical_device())
+	}
+	.ok()?
+	.iter()
+	.any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == ash::ext::physical_device_drm::NAME);
+	if !has_drm {
+		return None;
+	}
+	let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+	let mut props = vk::PhysicalDeviceProperties2::default().push(&mut drm);
+	// SAFETY: the extension is supported and the structures live for the call.
+	unsafe {
+		context
+			.instance()
+			.get_physical_device_properties2(context.physical_device(), &mut props);
+	}
+	if drm.has_render == 0 {
+		return None;
+	}
+	// Resolve the node by device number, not by assuming /dev/dri naming.
+	let dir = format!("/sys/dev/char/{}:{}", drm.render_major, drm.render_minor);
+	let name = std::fs::read_link(dir).ok()?.file_name()?.to_owned();
+	Some(std::path::Path::new("/dev/dri").join(name))
+}
+
 const ENCODE_CODECS: [(pixelforge::Codec, &str); 3] = [
 	(pixelforge::Codec::H264, "H.264"),
 	(pixelforge::Codec::H265, "HEVC"),

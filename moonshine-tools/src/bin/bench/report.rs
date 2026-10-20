@@ -127,6 +127,7 @@ pub(super) fn capabilities(capabilities: &Capabilities) -> Value {
 				json!({
 					"profile": id,
 					"available": probe.unavailable.is_none(),
+					"backend": probe.backend.map(|backend| format!("{backend:?}").to_lowercase()),
 					"reason": probe.unavailable,
 				})
 			})

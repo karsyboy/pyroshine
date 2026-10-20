@@ -1,11 +1,12 @@
 #version 450
-// RGB -> encoder-input YCbCr conversion for the conventional (Vulkan Video)
-// codecs, optionally compositing up to two premultiplied-alpha layers (a Steam
+// RGB -> encoder-input YCbCr conversion for the conventional (Vulkan Video,
+// VA-API, NVENC) codecs, optionally compositing up to two premultiplied-alpha layers (a Steam
 // notification, then the cursor) while sampling the source.
 //
 // Output is a buffer holding one plane after the other; each plane row starts
-// on a 32-bit word and rows are `*_pitch` words apart. The buffer is copied
-// into the encoder's input image afterwards (see `convert.rs`, `Layout`).
+// on a 32-bit word and rows are `*_pitch` words apart. Packed 4:4:4 formats
+// have a single plane of one word per pixel. The buffer is copied into the
+// encoder's input afterwards (see `convert.rs`, `Layout`).
 //
 // Each invocation owns a 4x2 pixel block and therefore whole 32-bit output
 // words (four 8-bit or two 16-bit luma samples per row, plus the chroma
@@ -29,7 +30,7 @@ layout(push_constant) uniform PushConstants {
     // Largest source texel coordinate that holds image content.
     uint source_max_x;
     uint source_max_y;
-    uint output_format;  // 0=NV12, 2=YUV444, 3=P010, 4=YUV444P10
+    uint output_format;  // 0=NV12, 2=YUV444, 3=P010, 4=YUV444P10, 5=XYUV, 6=Y410
     uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB->BT.2020+PQ, 3=scRGB linear->BT.2020+PQ
     uint full_range;
     float sdr_white_nits;
@@ -202,6 +203,16 @@ uint pack_c10(vec2 c) {
     return q10_c(c.x) | (q10_c(c.y) << 16u);
 }
 
+// Packed 4:4:4, one word per pixel. XYUV: Cr, Cb, Y, 0xFF from the lowest
+// byte. Y410: Cb bits 0-9, Y 10-19, Cr 20-29, alpha 3 in bits 30-31.
+uint pack_xyuv(vec3 p) {
+    return q8_c(p.z) | (q8_c(p.y) << 8u) | (q8_y(p.x) << 16u) | (0xffu << 24u);
+}
+
+uint pack_y410(vec3 p) {
+    return (q10_c(p.y) >> 6u) | ((q10_y(p.x) >> 6u) << 10u) | ((q10_c(p.z) >> 6u) << 20u) | (3u << 30u);
+}
+
 void main() {
     uint bx = gl_GlobalInvocationID.x;
     uint by = gl_GlobalInvocationID.y;
@@ -247,6 +258,24 @@ void main() {
         output_data[ca + 1u] = pack_c8(a2.yz, a3.yz);
         output_data[cb] = pack_c8(b0.yz, b1.yz);
         output_data[cb + 1u] = pack_c8(b2.yz, b3.yz);
+    } else if (params.output_format == 5u) {
+        output_data[row_a + 4u * bx] = pack_xyuv(a0);
+        output_data[row_a + 4u * bx + 1u] = pack_xyuv(a1);
+        output_data[row_a + 4u * bx + 2u] = pack_xyuv(a2);
+        output_data[row_a + 4u * bx + 3u] = pack_xyuv(a3);
+        output_data[row_b + 4u * bx] = pack_xyuv(b0);
+        output_data[row_b + 4u * bx + 1u] = pack_xyuv(b1);
+        output_data[row_b + 4u * bx + 2u] = pack_xyuv(b2);
+        output_data[row_b + 4u * bx + 3u] = pack_xyuv(b3);
+    } else if (params.output_format == 6u) {
+        output_data[row_a + 4u * bx] = pack_y410(a0);
+        output_data[row_a + 4u * bx + 1u] = pack_y410(a1);
+        output_data[row_a + 4u * bx + 2u] = pack_y410(a2);
+        output_data[row_a + 4u * bx + 3u] = pack_y410(a3);
+        output_data[row_b + 4u * bx] = pack_y410(b0);
+        output_data[row_b + 4u * bx + 1u] = pack_y410(b1);
+        output_data[row_b + 4u * bx + 2u] = pack_y410(b2);
+        output_data[row_b + 4u * bx + 3u] = pack_y410(b3);
     } else {
         // YUV444P10: 16-bit luma; one UV word per pixel.
         output_data[row_a + 2u * bx] = pack_y10(a0, a1);

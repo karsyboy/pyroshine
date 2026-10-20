@@ -160,6 +160,16 @@ requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
 env = { MOONSHINE_TEST_GPU = "1" }
 
 [[test]]
+name = "session::stream::video::pipeline::convert::tests::vaapi_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "vaapi-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::nvenc_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "nvenc", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
 name = "session::stream::video::pipeline::dmabuf::tests::gpu_import_after_source_owner_teardown_and_fd_reuse"
 requires = ["render-node"]
 env = { MOONSHINE_TEST_GPU = "1" }

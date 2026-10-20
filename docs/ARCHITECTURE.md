@@ -21,8 +21,9 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
 (Vulkan Video encoding, vendored at its upstream release plus the patches in
-`vendor/pixelforge-patches/`), the optional PyroWave shared library (loaded at
-runtime), the vendored Inputtino native backend (virtual input devices), and
+`vendor/pixelforge-patches/`), the optional PyroWave shared library, libva and
+the NVIDIA driver's CUDA and NVENC libraries (all loaded at runtime only when
+used), the vendored Inputtino native backend (virtual input devices), and
 systemd/logind over D-Bus. Internal crate names, paths, environment variables
 and protocol identifiers keep the upstream `moonshine` spelling.
 
@@ -140,18 +141,22 @@ a library or extension name:
   capture-to-encode path exists. The context does not require Vulkan Video
   encode: a GPU without it (Intel Xe2 and newer under Mesa, or any driver that
   lacks the encode extensions) gets a compute-only context on the same device,
-  so capture, import and PyroWave work and no conventional profile is
-  advertised. Encode support counts only when the driver exposes
+  so capture, import, PyroWave and the VA-API/NVENC encoders work and no
+  Vulkan Video profile is advertised. Encode support counts only when the driver exposes
   `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` with a video encode
   queue, and the probe records why each missing codec is unavailable.
 - The compositor publishes the verified, shared `VideoContext` before it reports
   ready. Conventional encoding, DMA-BUF import and PyroWave device matching use
   that context for the whole session, including reconnects.
-- A conventional codec bit is set only after creating its exact Pixelforge
-  profile with constant-bitrate rate control (a profile without CBR, such as
-  ANV's Gen12 encoder, is not usable), and after the stream converter's known-answer self-check passes for
-  the output format that profile encodes from (NV12, P010, YUV444 or
-  YUV444P10), on the configured conversion queue. A GPU that converts with
+- A conventional codec bit is set only after creating its exact profile with
+  constant-bitrate rate control on one of the encoders `stream.video.encoder`
+  allows, tried in the order Vulkan Video (Pixelforge), VA-API, NVENC (a
+  profile without CBR, such as ANV's Gen12 encoder, is not usable; VA-API and
+  NVENC also encode one frame), and after the stream converter's known-answer
+  self-check passes for the input format that encoder takes (NV12, P010,
+  YUV444, YUV444P10, or packed XYUV/Y410 for VA-API and NVENC 4:4:4), on the
+  configured conversion queue. The chosen encoder of each profile is recorded
+  (`EncoderTable`) and used by every stream of that profile until restart. A GPU that converts with
   wrong colors keeps those profiles unadvertised and reports a **Color
   conversion** warning, or a failure when no profile remains. Stream setup runs
   the same self-check and stops the stream with a color-conversion cause
@@ -470,8 +475,18 @@ transfer, primaries, matrix, range and HDR as independent negotiated properties.
 
 | Backend | Formats | Path |
 | --- | --- | --- |
-| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → rate-control padding removed (`pipeline/padding.rs`) → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
+| Conventional (`pipeline/mod.rs`, `pipeline/convert.rs`, `pipeline/backend.rs`) | H.264, HEVC, AV1 via Vulkan Video (Pixelforge), VA-API (`pipeline/vaapi/`) or NVENC (`pipeline/nvenc/`) | DMA-BUF import → compute conversion (with optional cursor/notification layers) into the encoder's input (a Vulkan image, an imported VA surface or a CUDA-imported Vulkan buffer) → asynchronous encode with bounded in-flight frames → rate-control padding removed (`pipeline/padding.rs`) → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
 | PyroWave (`pyrowave.rs`, `pyrowave_protocol.rs`) | Intra-only wavelet codec, 4:2:0/4:4:4, SDR/HDR10 | DMA-BUF import into a PyroWave-owned Vulkan device on the same GPU → GPU scale, color transform and encode → one frame at a time through send completion |
+
+The three conventional encoders sit behind `ConventionalEncoder`
+(`pipeline/backend.rs`): the loop asks it for the next input target, converts
+into it and submits; everything after the encoded packet is shared. VA-API
+writes its own SPS/PPS/VPS, slice headers and AV1 OBUs (`vaapi/h264.rs`,
+`hevc.rs`, `av1.rs`) so the VUI and color description match the stream, and
+reads coded buffers on a readback thread; NVENC maps the CUDA-imported buffer
+and recovers from loss with reference invalidation. A stream's encoder is the
+one its profile was probed with; it never changes during a stream, and a
+failure is reported like any other encoder failure.
 
 PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a
 conventional codec and has no CPU or alternate-codec fallback. `pyrowave.rs`
@@ -490,7 +505,7 @@ bitrate-derived window anchored to capture time (`pacing_timer.rs`); a frame
 whose window elapsed during encode is sent before the next capture slot, and
 the schedule rebases after backpressure rather than bursting.
 
-**Failures.** Both encoder backends report frame failures through
+**Failures.** All encoder backends report frame failures through
 `pipeline/failure.rs` with the failed stage, a recovery (`DropFrame`,
 `RequestIdr` or `Terminal`) and whether the source's GPU reads are not
 submitted, completed or unknown. Only the first two release the source for

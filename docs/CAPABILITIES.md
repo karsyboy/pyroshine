@@ -23,11 +23,14 @@ failing mid-stream.
 ## Codecs and formats
 
 Conventional codecs are encoded with Vulkan Video through the vendored
-Pixelforge (`session/stream/video/pipeline/`); the startup probe
-(`healthcheck.rs` `check_codecs`, `pipeline/encode_caps.rs`) creates each
-profile's encoder with the stream's constant-bitrate configuration and
-advertises only those that succeed and pass the converter self-check; every
-other profile keeps its reason. `healthcheck::supports_video_format` is the single
+Pixelforge, or with VA-API or NVENC for profiles Vulkan Video cannot encode
+(or when `stream.video.encoder` selects them); `session/stream/video/pipeline/`
+`backend.rs` is the shared interface. The startup probe (`healthcheck.rs`
+`check_codecs`, `pipeline/encode_caps.rs`, `vaapi::probe`, `nvenc::probe`)
+creates each profile's encoder with the stream's constant-bitrate
+configuration and advertises only those that succeed and pass the converter
+self-check, recording which encoder will encode it; every other profile keeps
+its reason. `healthcheck::supports_video_format` is the single
 negotiation gate (`CODEC_PROFILES`). Supported GPUs and drivers are listed in
 [GPU compatibility](GPU_COMPATIBILITY.md).
 
@@ -47,6 +50,9 @@ negotiation gate (`CODEC_PROFILES`). Supported GPUs and drivers are listed in
 | HDR10 (BT.2020/PQ) | Implemented; only native color descriptions declare HDR | `compositor/color_management.rs`, `pipeline/hdr_sei.rs`, `format.rs` `validate` | `color_management`, `hdr_sei`, `format` | `hw:native_color_draw_preserves_pq_and_scales_linear_light`, `hw:invalid_native_color_constructors_…`, `bench` (`*-hdr10`); client display of HDR is unverified |
 | Full and limited range | Implemented (PyroWave always full) | `format.rs`, `pipeline/convert.rs` | `convert/tests.rs` | `hw:converter_matches_reference_on_gpu` |
 | Odd and unaligned extents | Implemented where the codec can crop | `pipeline/convert.rs`, Pixelforge patches 0001, 0003, 0006 | `video::tests::unaligned_extents_validate_…` | `hw:encode_decode_matches_reference_on_gpu` |
+| Encoder selection (`stream.video.encoder`) | Implemented: per-profile choice fixed at startup, explicit choices never fall back | `pipeline/backend.rs`, `healthcheck.rs` `check_codecs`, `pipeline/mod.rs` `select_backend` | `backend::tests`, `healthcheck::tests`, `pipeline` | `bench --capabilities --encoder …` on RX 9070 XT, RTX 3080, UHD 730, Arc B390 |
+| VA-API encoding (H.264; HEVC Main, Main10, 4:4:4 8/10-bit; AV1 Main 8/10-bit) | Implemented where the driver encodes the profile | `pipeline/vaapi/` (packed headers in `h264.rs`, `hevc.rs`, `av1.rs`; DMA-BUF surface import), packed 4:4:4 conversion in `convert.rs` | `vaapi` (bit writer, headers, AV1 offsets, profile map), `padding` (iHD zero padding) | `hw:vaapi_encode_decode_matches_reference_on_gpu` on Arc B390 (7 profiles), UHD 730 (5), RX 9070 XT (5) |
+| NVENC encoding (H.264 incl. 4:4:4; HEVC Main, Main10, 4:4:4 8-bit; AV1 Main 8/10-bit) | Implemented; HEVC 4:4:4 10-bit not implemented | `pipeline/nvenc/` (CUDA import of Vulkan buffers, reference invalidation) | `backend::tests` | `hw:nvenc_encode_decode_matches_reference_on_gpu` on RTX 3080 (5 profiles; AV1 needs Ada or newer) |
 
 ## GPU vendors and device selection
 
@@ -58,9 +64,9 @@ they occur. The verified hardware is listed in [GPU compatibility](GPU_COMPATIBI
 | --- | --- | --- | --- | --- |
 | AMD (RADV) | Implemented | probe as above; CBR filler removal `pipeline/padding.rs`; AV1 grid patch 0007 | `padding` | all `hw:` GPU tests, `bench`, `cycles` |
 | NVIDIA (proprietary) | Implemented | 64-texel input/DPB widths (patches 0001, 0006); NVML telemetry `gpu_sensors/nvml.rs` | `gpu_sensors::nvml::tests` | all `hw:` GPU tests, `hw:reads_an_nvidia_gpu`, `bench` (encoder utilization via `nvidia-smi`), `cycles` |
-| Intel (ANV) | Partial: PyroWave only | compute-only capture context (`gpu.rs`, Pixelforge patch 0009) | Pixelforge `encode_queue_flag_without_extensions_is_not_encode_support` | ANV exposes no Vulkan Video encode on Xe2/Xe3 and only with `ANV_DEBUG=video-encode` (without CBR) on Gen12, so no conventional profile is advertised. UHD 730 and Arc B390: `hw:pyrowave_imports_compositor_dmabufs_on_gpu`, PyroWave's own round-trip tests, `bench` PyroWave workloads; no real client checked |
+| Intel (ANV, iHD) | Implemented: conventional codecs through VA-API (needs `intel-media-driver`), PyroWave through Vulkan compute | compute-only capture context (`gpu.rs`, Pixelforge patch 0009); `pipeline/vaapi/` | Pixelforge `encode_queue_flag_without_extensions_is_not_encode_support`, `vaapi` | ANV exposes no Vulkan Video encode on Xe2/Xe3 and only with `ANV_DEBUG=video-encode` (without CBR) on Gen12. UHD 730 and Arc B390: `hw:vaapi_encode_decode_matches_reference_on_gpu`, `hw:pyrowave_imports_compositor_dmabufs_on_gpu`, PyroWave's own round-trip tests, `bench`; no real client checked |
 | Capture GPU by DRM/PCI identity, no fallback | Implemented | `gpu.rs`, Pixelforge patch 0005 | `gpu::tests` | `hw:capture_device_selection_on_gpu`, `hw:capture_device_without_encode_support_never_falls_back_on_gpu` |
-| Capture GPU without Vulkan Video encode | Implemented: compute-only context on the same device, PyroWave only | `gpu.rs` `capture_context`, `encode_status`; Pixelforge patch 0009 | `gpu::tests`, `healthcheck::tests` | `hw:capture_device_without_encode_support_never_falls_back_on_gpu` (UHD 730 beside an RTX 3080; Arc B390 alone) |
+| Capture GPU without Vulkan Video encode | Implemented: compute-only context on the same device; PyroWave, and VA-API/NVENC where available | `gpu.rs` `capture_context`, `encode_status`; Pixelforge patch 0009 | `gpu::tests`, `healthcheck::tests` | `hw:capture_device_without_encode_support_never_falls_back_on_gpu` (UHD 730 beside an RTX 3080; Arc B390 alone) |
 | GPU telemetry (busy, engines, power) | Implemented; NVIDIA via NVML only (no DRM fdinfo) | `gpu_sensors/` | `gpu_sensors` | `hw:reads_this_hosts_gpus` |
 
 ## Capture and pacing
@@ -121,7 +127,8 @@ they occur. The verified hardware is listed in [GPU compatibility](GPU_COMPATIBI
   [reconnect validation matrix](reconnect-validation.md) with a real client.
 - GPU device loss and encoder failures are covered by classification and
   teardown tests, not by inducing a real device loss.
-- Intel hosts stream PyroWave only: Mesa's ANV offers no usable Vulkan Video
-  encoder. VA-API, which Intel's media driver supports, is not used; see
-  [GPU compatibility](GPU_COMPATIBILITY.md). A real client has not streamed
-  from an Intel host.
+- Intel hosts encode H.264/HEVC/AV1 through VA-API (Mesa's ANV offers no
+  usable Vulkan Video encoder; see [GPU compatibility](GPU_COMPATIBILITY.md)).
+  The VA-API and NVENC encoders are covered by GPU encode/decode round trips
+  and benchmarks; a real client has not streamed from them, nor from an
+  Intel host.

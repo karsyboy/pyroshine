@@ -14,7 +14,8 @@ use pixelforge::{
 use crate::config::Config;
 use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
 use crate::session::stream::video::{
-	BitDepth, ChromaFormat, ConversionQueueMode, NegotiatedVideoFormat, VideoCodec, convert,
+	BitDepth, ChromaFormat, ConversionQueueMode, EncoderBackend, EncoderPreference, EncoderTable,
+	NegotiatedVideoFormat, VideoCodec, convert,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,21 @@ pub struct ProfileProbe {
 	pub bit: u32,
 	/// Why the profile is not advertised, or `None` when it is.
 	pub unavailable: Option<String>,
+	/// The backend that encodes an advertised conventional profile.
+	pub backend: Option<EncoderBackend>,
+}
+
+impl GpuDetails {
+	/// Each advertised conventional profile's backend, for stream setup.
+	pub fn encoder_table(&self) -> EncoderTable {
+		let mut table = EncoderTable::default();
+		for probe in self.profiles.iter().filter(|probe| probe.unavailable.is_none()) {
+			if let Some(backend) = probe.backend {
+				table.insert(probe.bit, backend);
+			}
+		}
+		table
+	}
 }
 
 /// GPU capability results produced by [`probe_capabilities`].
@@ -143,7 +159,13 @@ pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -
 		return chroma_supported && dynamic_range_supported;
 	}
 
-	let bit = match (format.codec, format.chroma, format.bit_depth) {
+	profile_bit(format).is_some_and(|bit| capabilities & bit != 0)
+}
+
+/// The [`CODEC_PROFILES`] bit of a conventional format, or `None` for
+/// PyroWave and unsupported combinations (H.264 10-bit).
+pub fn profile_bit(format: NegotiatedVideoFormat) -> Option<u32> {
+	Some(match (format.codec, format.chroma, format.bit_depth) {
 		(VideoCodec::H264, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_H264,
 		(VideoCodec::H264, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_H264_HIGH_8444,
 		(VideoCodec::Hevc, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_HEVC,
@@ -154,9 +176,8 @@ pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -
 		(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_AV1_MAIN10,
 		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_AV1_HIGH_8444,
 		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_AV1_HIGH_10444,
-		_ => return false,
-	};
-	capabilities & bit != 0
+		_ => return None,
+	})
 }
 
 impl HealthReport {
@@ -177,8 +198,25 @@ impl HealthReport {
 	/// (a withdrawal) replaces the earlier one.
 	fn record_profile(&mut self, bit: u32, unavailable: Option<String>) {
 		match self.gpu.profiles.iter_mut().find(|probe| probe.bit == bit) {
-			Some(probe) => probe.unavailable = unavailable,
-			None => self.gpu.profiles.push(ProfileProbe { bit, unavailable }),
+			Some(probe) => {
+				if unavailable.is_some() {
+					probe.backend = None;
+				}
+				probe.unavailable = unavailable;
+			},
+			None => self.gpu.profiles.push(ProfileProbe {
+				bit,
+				unavailable,
+				backend: None,
+			}),
+		}
+	}
+
+	/// Record an advertised conventional profile and its backend.
+	fn record_profile_backend(&mut self, bit: u32, backend: EncoderBackend) {
+		self.record_profile(bit, None);
+		if let Some(probe) = self.gpu.profiles.iter_mut().find(|probe| probe.bit == bit) {
+			probe.backend = Some(backend);
 		}
 	}
 
@@ -326,7 +364,7 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 
 	let mut report = HealthReport::empty();
 
-	run_gpu_checks(&mut report, &gpu_config, conversion_queue);
+	run_gpu_checks(&mut report, &gpu_config, conversion_queue, encoder_preference(config));
 	// --no-health-check discards the report, but identity/selection failures
 	// and profiles withdrawn for wrong colors must still reach the
 	// administrator before the generic startup gate.
@@ -347,6 +385,10 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 	}
 }
 
+fn encoder_preference(config: Option<&Config>) -> EncoderPreference {
+	config.map(|config| config.stream.video.encoder).unwrap_or_default()
+}
+
 fn conversion_queue(config: Option<&Config>) -> ConversionQueueMode {
 	config
 		.map(|config| config.stream.video.conversion_queue)
@@ -354,14 +396,19 @@ fn conversion_queue(config: Option<&Config>) -> ConversionQueueMode {
 }
 
 /// Run the GPU/codec/HDR probes and record their results into `report`.
-fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>, conversion_queue: ConversionQueueMode) {
+fn run_gpu_checks(
+	report: &mut HealthReport,
+	gpu_config: &Option<String>,
+	conversion_queue: ConversionQueueMode,
+	preference: EncoderPreference,
+) {
 	check_render_nodes(report, gpu_config);
 	let render_node_open = check_render_node_open(report, gpu_config);
 	// Prefer the configured/accessible node over the first discovered one, so
 	// the EGL probe (HDR detection) runs on the GPU the compositor will use.
 	let egl_result = check_egl(report, render_node_open.as_ref());
 	let vk_context = check_vulkan(report, render_node_open.as_ref().filter(|_| egl_result.is_some()));
-	check_codecs(report, vk_context.as_ref());
+	check_codecs(report, vk_context.as_ref(), preference);
 	check_color_conversion(report, vk_context.as_ref(), conversion_queue);
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
 
@@ -421,7 +468,12 @@ pub fn recheck_in_server(config: &Config, previous: Option<&HealthReport>, sessi
 			report.gpu_name = previous.gpu_name.clone();
 			report.gpu = previous.gpu.clone();
 		},
-		None => run_gpu_checks(&mut report, &config.compositor.gpu, conversion_queue(Some(config))),
+		None => run_gpu_checks(
+			&mut report,
+			&config.compositor.gpu,
+			conversion_queue(Some(config)),
+			encoder_preference(Some(config)),
+		),
 	}
 	check_xwayland(&mut report);
 	check_xdg_runtime(&mut report);
@@ -446,7 +498,12 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	// --- GPU checks ---
 
-	run_gpu_checks(&mut report, &gpu_config, conversion_queue(config));
+	run_gpu_checks(
+		&mut report,
+		&gpu_config,
+		conversion_queue(config),
+		encoder_preference(config),
+	);
 
 	// --- External dependencies ---
 
@@ -748,7 +805,7 @@ fn check_vulkan(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<Vid
 	}
 }
 
-fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
+fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>, preference: EncoderPreference) {
 	let start = Instant::now();
 	let ctx = match context {
 		Some(c) => c,
@@ -765,90 +822,36 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	let mut supported = 0u32;
 	let mut names = Vec::new();
 
-	let candidates = [
-		(
-			Codec::H264,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Eight,
-			CODEC_H264,
-			"H.264 4:2:0 8-bit",
-		),
-		(
-			Codec::H264,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Eight,
-			CODEC_H264_HIGH_8444,
-			"H.264 4:4:4 8-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Eight,
-			CODEC_HEVC,
-			"HEVC 4:2:0 8-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Ten,
-			CODEC_HEVC_MAIN10,
-			"HEVC 4:2:0 10-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Eight,
-			CODEC_HEVC_REXT_8444,
-			"HEVC 4:4:4 8-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Ten,
-			CODEC_HEVC_REXT_10444,
-			"HEVC 4:4:4 10-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Eight,
-			CODEC_AV1_MAIN8,
-			"AV1 4:2:0 8-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Ten,
-			CODEC_AV1_MAIN10,
-			"AV1 4:2:0 10-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Eight,
-			CODEC_AV1_HIGH_8444,
-			"AV1 4:4:4 8-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Ten,
-			CODEC_AV1_HIGH_10444,
-			"AV1 4:4:4 10-bit",
-		),
-	];
-
-	for (codec, chroma, depth, bit, label) in candidates {
-		match probe_profile(ctx, codec, chroma, depth) {
-			Ok(()) => {
+	for &(codec, chroma, depth, bit, label) in CONVENTIONAL_PROFILES {
+		let mut reasons = Vec::new();
+		let mut chosen = None;
+		for &backend in preference.candidates() {
+			match probe_backend(ctx, backend, codec, chroma, depth) {
+				Ok(()) => {
+					chosen = Some(backend);
+					break;
+				},
+				Err(error) => {
+					tracing::debug!(label, backend = backend.label(), %error, "Video profile is not supported");
+					reasons.push(if preference.candidates().len() > 1 {
+						format!("{}: {error}", backend.label())
+					} else {
+						error
+					});
+				},
+			}
+		}
+		match chosen {
+			Some(backend) => {
 				supported |= bit;
-				names.push(label);
-				report.record_profile(bit, None);
+				names.push(if backend == EncoderBackend::Vulkan {
+					label.to_string()
+				} else {
+					format!("{label} ({})", backend.label())
+				});
+				report.record_profile_backend(bit, backend);
 			},
-			Err(error) => {
-				tracing::debug!(label, %error, "Video profile is not supported");
-				report.record_profile(bit, Some(error));
-			},
+			None => report.record_profile(bit, Some(reasons.join("; "))),
 		}
 	}
 
@@ -874,7 +877,7 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 					(ChromaFormat::Yuv444, BitDepth::Eight) => pyrowave_444_8 = true,
 					(ChromaFormat::Yuv444, BitDepth::Ten) => pyrowave_444_10 = true,
 				}
-				names.push(label);
+				names.push(label.to_string());
 			},
 			Err(error) => {
 				tracing::debug!(%error, %chroma, bit_depth = depth.bits(), "PyroWave profile is unavailable");
@@ -946,7 +949,7 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 		report.add_failed(
 			"Codecs",
 			format!(
-				"  No usable video encode profile: no Vulkan Video encoder and no PyroWave.\n  Vulkan Video encode: {}\n  Not offered:\n{not_offered}",
+				"  No usable video encode profile: no H.264/HEVC/AV1 encoder and no PyroWave.\n  Vulkan Video encode: {}\n  Not offered:\n{not_offered}",
 				report.gpu.vulkan_video_encode
 			),
 			elapsed,
@@ -957,7 +960,7 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 		report.add_warn(
 			"Codecs",
 			format!(
-				"  Only PyroWave can stream from this GPU: {}\n  No H.264, HEVC or AV1 for Moonlight clients without PyroWave.\n  Vulkan Video encode: {}",
+				"  Only PyroWave can stream from this GPU: {}\n  No H.264, HEVC or AV1 for Moonlight clients without PyroWave.\n  Vulkan Video encode: {}\n  Not offered:\n{not_offered}",
 				names.join(", "),
 				report.gpu.vulkan_video_encode
 			),
@@ -974,7 +977,7 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	}
 }
 
-/// Every conventional profile bit (Vulkan Video codecs).
+/// Every conventional profile bit (H.264/HEVC/AV1 on any encoder).
 const CODEC_CONVENTIONAL_MASK: u32 = CODEC_H264
 	| CODEC_H264_HIGH_8444
 	| CODEC_HEVC
@@ -986,27 +989,151 @@ const CODEC_CONVENTIONAL_MASK: u32 = CODEC_H264
 	| CODEC_AV1_HIGH_8444
 	| CODEC_AV1_HIGH_10444;
 
-/// Probe a conventional profile exactly as a stream would use it: the codec
-/// on this device, the profile's capabilities, constant-bitrate rate control
-/// and an encoder instance. Returns the first reason it cannot be used.
-fn probe_profile(ctx: &VideoContext, codec: Codec, chroma: PixelFormat, depth: EncodeBitDepth) -> Result<(), String> {
-	/// Well below every encoder's maximum: probes test support, not limits.
-	const PROBE_BITRATE: u32 = 10_000_000;
+/// Conventional profiles in probe order: codec, chroma, bit depth, capability
+/// bit, label.
+const CONVENTIONAL_PROFILES: &[(VideoCodec, ChromaFormat, BitDepth, u32, &str)] = &[
+	(
+		VideoCodec::H264,
+		ChromaFormat::Yuv420,
+		BitDepth::Eight,
+		CODEC_H264,
+		"H.264 4:2:0 8-bit",
+	),
+	(
+		VideoCodec::H264,
+		ChromaFormat::Yuv444,
+		BitDepth::Eight,
+		CODEC_H264_HIGH_8444,
+		"H.264 4:4:4 8-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv420,
+		BitDepth::Eight,
+		CODEC_HEVC,
+		"HEVC 4:2:0 8-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv420,
+		BitDepth::Ten,
+		CODEC_HEVC_MAIN10,
+		"HEVC 4:2:0 10-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv444,
+		BitDepth::Eight,
+		CODEC_HEVC_REXT_8444,
+		"HEVC 4:4:4 8-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv444,
+		BitDepth::Ten,
+		CODEC_HEVC_REXT_10444,
+		"HEVC 4:4:4 10-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv420,
+		BitDepth::Eight,
+		CODEC_AV1_MAIN8,
+		"AV1 4:2:0 8-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv420,
+		BitDepth::Ten,
+		CODEC_AV1_MAIN10,
+		"AV1 4:2:0 10-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv444,
+		BitDepth::Eight,
+		CODEC_AV1_HIGH_8444,
+		"AV1 4:4:4 8-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv444,
+		BitDepth::Ten,
+		CODEC_AV1_HIGH_10444,
+		"AV1 4:4:4 10-bit",
+	),
+];
+
+/// Probe a conventional profile on one backend exactly as a stream would use
+/// it (an encoder instance with constant-bitrate rate control); returns the
+/// first reason it cannot be used.
+fn probe_backend(
+	ctx: &VideoContext,
+	backend: EncoderBackend,
+	codec: VideoCodec,
+	chroma: ChromaFormat,
+	depth: BitDepth,
+) -> Result<(), String> {
+	use crate::session::stream::video::{nvenc, vaapi};
+	match backend {
+		EncoderBackend::Vulkan => probe_vulkan(ctx, codec, chroma, depth),
+		EncoderBackend::Vaapi => vaapi::probe(ctx, codec, chroma, depth),
+		EncoderBackend::Nvenc => nvenc::probe(ctx, codec, chroma, depth),
+	}
+}
+
+/// Well below every encoder's maximum: probes test support, not limits.
+const PROBE_BITRATE: u32 = 10_000_000;
+
+fn vulkan_probe_config(
+	codec: VideoCodec,
+	chroma: ChromaFormat,
+	depth: BitDepth,
+) -> Result<(Codec, EncodeConfig), String> {
+	let (codec, base) = match codec {
+		VideoCodec::H264 => (Codec::H264, EncodeConfig::h264(128, 128)),
+		VideoCodec::Hevc => (Codec::H265, EncodeConfig::h265(128, 128)),
+		VideoCodec::Av1 => (Codec::AV1, EncodeConfig::av1(128, 128)),
+		VideoCodec::PyroWave => return Err("PyroWave is not a Vulkan Video codec".into()),
+	};
+	let config = base
+		.with_pixel_format(match chroma {
+			ChromaFormat::Yuv420 => PixelFormat::Yuv420,
+			ChromaFormat::Yuv444 => PixelFormat::Yuv444,
+		})
+		.with_bit_depth(match depth {
+			BitDepth::Eight => EncodeBitDepth::Eight,
+			BitDepth::Ten => EncodeBitDepth::Ten,
+		})
+		.with_rate_control(RateControlMode::Cbr)
+		.with_target_bitrate(PROBE_BITRATE);
+	Ok((codec, config))
+}
+
+/// Whether Vulkan Video can encode the profile with constant-bitrate rate
+/// control, from capabilities alone (no encoder instance).
+pub(crate) fn probe_vulkan_capabilities(
+	ctx: &VideoContext,
+	codec: Codec,
+	chroma: ChromaFormat,
+	depth: BitDepth,
+) -> Result<(), String> {
 	if let Some(reason) = ctx.encode_unsupported_reason(codec) {
 		return Err(reason.to_string());
 	}
-	let base = match codec {
-		Codec::H264 => EncodeConfig::h264(128, 128),
-		Codec::H265 => EncodeConfig::h265(128, 128),
-		Codec::AV1 => EncodeConfig::av1(128, 128),
+	let video_codec = match codec {
+		Codec::H264 => VideoCodec::H264,
+		Codec::H265 => VideoCodec::Hevc,
+		Codec::AV1 => VideoCodec::Av1,
 	};
-	let config = base
-		.with_pixel_format(chroma)
-		.with_bit_depth(depth)
-		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(PROBE_BITRATE);
+	let (codec, config) = vulkan_probe_config(video_codec, chroma, depth)?;
 	let caps = EncoderCapabilities::query(ctx, &config).map_err(|error| error.to_string())?;
-	crate::session::stream::video::encode_caps::cbr_target(&caps, codec, u64::from(PROBE_BITRATE))?;
+	crate::session::stream::video::encode_caps::cbr_target(&caps, codec, u64::from(PROBE_BITRATE)).map(drop)
+}
+
+fn probe_vulkan(ctx: &VideoContext, codec: VideoCodec, chroma: ChromaFormat, depth: BitDepth) -> Result<(), String> {
+	let (pixelforge_codec, config) = vulkan_probe_config(codec, chroma, depth)?;
+	probe_vulkan_capabilities(ctx, pixelforge_codec, chroma, depth)?;
 	Encoder::new(ctx.clone(), config)
 		.map(drop)
 		.map_err(|error| error.to_string())
@@ -1059,21 +1186,32 @@ fn vulkan_driver(ctx: &VideoContext) -> String {
 const COLOR_CONVERSION: &str = "Color conversion";
 
 /// The converter output format each conventional profile encodes from.
-const CONVERSION_PROFILES: [(pixelforge::OutputFormat, u32); 4] = [
-	(
-		pixelforge::OutputFormat::NV12,
-		CODEC_H264 | CODEC_HEVC | CODEC_AV1_MAIN8,
-	),
-	(pixelforge::OutputFormat::P010, CODEC_HEVC_MAIN10 | CODEC_AV1_MAIN10),
-	(
-		pixelforge::OutputFormat::YUV444,
-		CODEC_H264_HIGH_8444 | CODEC_HEVC_REXT_8444 | CODEC_AV1_HIGH_8444,
-	),
-	(
-		pixelforge::OutputFormat::YUV444P10,
-		CODEC_HEVC_REXT_10444 | CODEC_AV1_HIGH_10444,
-	),
-];
+/// The converter output each advertised conventional profile encodes from,
+/// which depends on the backend that will encode it, with the profiles that
+/// need each format.
+fn conversion_formats(report: &HealthReport) -> Vec<(convert::ConvertFormat, u32)> {
+	let mut formats: Vec<(convert::ConvertFormat, u32)> = Vec::new();
+	for probe in &report.gpu.profiles {
+		let Some(backend) = probe.backend else {
+			continue;
+		};
+		if report.supported_codecs & probe.bit == 0 {
+			continue;
+		}
+		let Some(&(_, chroma, depth, _, _)) = CONVENTIONAL_PROFILES.iter().find(|profile| profile.3 == probe.bit)
+		else {
+			continue;
+		};
+		let Ok(format) = backend.convert_format(chroma, depth) else {
+			continue;
+		};
+		match formats.iter_mut().find(|(known, _)| *known == format) {
+			Some((_, profiles)) => *profiles |= probe.bit,
+			None => formats.push((format, probe.bit)),
+		}
+	}
+	formats
+}
 
 /// Run the stream converter's known-answer self-check for every output format
 /// a verified profile needs, on the configured conversion queue.
@@ -1097,16 +1235,13 @@ fn check_color_conversion(report: &mut HealthReport, context: Option<&VideoConte
 /// [`check_color_conversion`] with the self-check supplied by the caller.
 fn record_color_conversion(
 	report: &mut HealthReport,
-	mut self_check: impl FnMut(pixelforge::OutputFormat) -> Result<(), String>,
+	mut self_check: impl FnMut(convert::ConvertFormat) -> Result<(), String>,
 ) {
 	let start = Instant::now();
 	let mut passed = Vec::new();
 	let mut failures = Vec::new();
 	let mut withdrawn = 0;
-	for (format, profiles) in CONVERSION_PROFILES {
-		if report.supported_codecs & profiles == 0 {
-			continue;
-		}
+	for (format, profiles) in conversion_formats(report) {
 		match self_check(format) {
 			Ok(()) => passed.push(convert::format_label(format)),
 			Err(detail) => {
@@ -1784,7 +1919,7 @@ mod tests {
 		let mut report = HealthReport::empty();
 		let context = check_vulkan(&mut report, None);
 		assert!(context.is_none());
-		check_codecs(&mut report, context.as_ref());
+		check_codecs(&mut report, context.as_ref(), EncoderPreference::Auto);
 		assert!(!check_dmabuf(&mut report, context.as_ref()));
 		assert_eq!(report.supported_codecs, 0);
 		assert!(!report.hdr_supported);
@@ -1868,11 +2003,18 @@ mod tests {
 	}
 
 	fn conversion_report(supported_codecs: u32) -> HealthReport {
-		HealthReport {
+		let mut report = HealthReport {
 			supported_codecs,
 			dma_buf_supported: true,
 			..HealthReport::empty()
+		};
+		for &(_, _, _, bit, _) in CONVENTIONAL_PROFILES
+			.iter()
+			.filter(|profile| supported_codecs & profile.3 != 0)
+		{
+			report.record_profile_backend(bit, EncoderBackend::Vulkan);
 		}
+		report
 	}
 
 	/// Issue #11: a GPU whose conversion loses chroma samples encodes every
@@ -1880,19 +2022,22 @@ mod tests {
 	/// profiles that convert through the failing format and keeps the rest.
 	#[test]
 	fn wrong_colors_withdraw_the_affected_profiles() {
-		use pixelforge::OutputFormat;
+		use convert::ConvertFormat;
 		let all = CODEC_H264 | CODEC_HEVC | CODEC_HEVC_MAIN10 | CODEC_HEVC_REXT_8444 | CODEC_AV1_MAIN8 | CODEC_PYROWAVE;
 		let mut report = conversion_report(all);
 		let mut checked = Vec::new();
 		record_color_conversion(&mut report, |format| {
 			checked.push(format);
 			match format {
-				OutputFormat::NV12 => Err("Cb 0/4 by column within a 4x2 block".into()),
+				ConvertFormat::Nv12 => Err("Cb 0/4 by column within a 4x2 block".into()),
 				_ => Ok(()),
 			}
 		});
 		// AV1/HEVC 4:4:4 10-bit are not supported: their format is not checked.
-		assert_eq!(checked, [OutputFormat::NV12, OutputFormat::P010, OutputFormat::YUV444]);
+		assert_eq!(
+			checked,
+			[ConvertFormat::Nv12, ConvertFormat::P010, ConvertFormat::Yuv444]
+		);
 		assert_eq!(
 			report.supported_codecs,
 			CODEC_HEVC_MAIN10 | CODEC_HEVC_REXT_8444 | CODEC_PYROWAVE

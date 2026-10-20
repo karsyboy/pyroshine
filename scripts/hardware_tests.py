@@ -41,6 +41,8 @@ REQUIREMENTS = (
     "systemd-user",
     "input-devices",
     "nvidia-gpu",
+    "vaapi-encode",
+    "nvenc",
     "pyrowave-library",
     "unsupported-render-node",
 )
@@ -106,6 +108,56 @@ def pci_address(node):
         return None
 
 
+def vaapi_encode(node):
+    """Whether libva initializes on `node` and offers an H.264/HEVC encoder."""
+    import ctypes
+
+    try:
+        va = ctypes.CDLL("libva.so.2")
+        drm = ctypes.CDLL("libva-drm.so.2")
+    except OSError as error:
+        return False, str(error)
+    drm.vaGetDisplayDRM.restype = ctypes.c_void_p
+    for name in ("vaInitialize", "vaTerminate", "vaMaxNumEntrypoints", "vaQueryConfigEntrypoints"):
+        getattr(va, name).argtypes = None
+    try:
+        fd = os.open(node, os.O_RDWR)
+    except OSError as error:
+        return False, f"{node}: {error}"
+    try:
+        display = ctypes.c_void_p(drm.vaGetDisplayDRM(fd))
+        major, minor = ctypes.c_int(), ctypes.c_int()
+        if not display.value or va.vaInitialize(display, ctypes.byref(major), ctypes.byref(minor)) != 0:
+            return False, f"no VA-API driver for {node}"
+        try:
+            # VAProfileH264High (7), VAProfileHEVCMain (17); EncSlice (6), EncSliceLP (8).
+            entrypoints = (ctypes.c_int * max(va.vaMaxNumEntrypoints(display), 1))()
+            for profile in (7, 17):
+                count = ctypes.c_int()
+                if va.vaQueryConfigEntrypoints(display, profile, entrypoints, ctypes.byref(count)) == 0 and any(
+                    entrypoints[i] in (6, 8) for i in range(count.value)
+                ):
+                    return True, f"VA-API encoder on {node}"
+            return False, f"no VA-API H.264/HEVC encoder on {node}"
+        finally:
+            va.vaTerminate(display)
+    finally:
+        os.close(fd)
+
+
+def nvenc_available(nodes):
+    import ctypes
+
+    if not any(drm_driver(node) == "nvidia" for node in nodes):
+        return False, "no NVIDIA render node"
+    try:
+        ctypes.CDLL("libcuda.so.1")
+        ctypes.CDLL("libnvidia-encode.so.1")
+    except OSError as error:
+        return False, str(error)
+    return True, "libcuda.so.1 and libnvidia-encode.so.1"
+
+
 def probe(args):
     """Each requirement: (available, detail). Probing never runs a test."""
     nodes = sorted(glob.glob("/dev/dri/renderD*"))
@@ -132,6 +184,9 @@ def probe(args):
         (pci_address(node) for node in nodes if drm_driver(node) == "nvidia"), None
     )
     found["nvidia-gpu"] = (bool(nvidia), f"NVML device {nvidia}" if nvidia else "no NVIDIA render node")
+    test_node = os.environ.get("MOONSHINE_TEST_RENDER_NODE") or (usable[0] if usable else None)
+    found["vaapi-encode"] = vaapi_encode(test_node) if test_node else (False, "no accessible render node")
+    found["nvenc"] = nvenc_available(nodes)
     library = args.pyrowave_library or os.environ.get("MOONSHINE_PYROWAVE_LIBRARY")
     found["pyrowave-library"] = (
         bool(library and os.path.exists(library)),
