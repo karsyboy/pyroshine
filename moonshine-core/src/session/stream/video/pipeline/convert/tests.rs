@@ -105,6 +105,12 @@ fn tight_extent(format: ConvertFormat, (w, h): (u32, u32)) -> (u32, u32) {
 }
 
 #[test]
+fn captured_dmabufs_are_acquired_from_a_foreign_producer_when_supported() {
+	assert_eq!(dmabuf_producer_family(true), vk::QUEUE_FAMILY_FOREIGN_EXT);
+	assert_eq!(dmabuf_producer_family(false), vk::QUEUE_FAMILY_EXTERNAL);
+}
+
+#[test]
 fn external_buffers_are_handed_over_through_queue_family_ownership() {
 	use ash::vk::Handle as _;
 	let buffer = vk::Buffer::from_raw(0x1234);

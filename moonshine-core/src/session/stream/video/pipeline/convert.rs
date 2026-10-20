@@ -788,6 +788,19 @@ fn color_range() -> vk::ImageSubresourceRange {
 	}
 }
 
+/// The queue family a captured DMA-BUF is acquired from. Its producer (a
+/// game's GL or Vulkan driver, XWayland, the compositor's EGL) is generally
+/// not this Vulkan driver, which `QUEUE_FAMILY_FOREIGN_EXT` describes;
+/// `QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity
+/// and remains the fallback on a driver without `VK_EXT_queue_family_foreign`.
+fn dmabuf_producer_family(has_queue_family_foreign: bool) -> u32 {
+	if has_queue_family_foreign {
+		vk::QUEUE_FAMILY_FOREIGN_EXT
+	} else {
+		vk::QUEUE_FAMILY_EXTERNAL
+	}
+}
+
 /// The barriers around a copy into `buffer`, which a reader of the same
 /// driver outside Vulkan (CUDA, for NVENC) consumes in place: ownership is
 /// acquired from `QUEUE_FAMILY_EXTERNAL` before the copy (discarding the
@@ -924,6 +937,9 @@ pub(crate) struct InputConverter {
 	context: VideoContext,
 	queue: vk::Queue,
 	queue_family: u32,
+	/// The queue family captured DMA-BUFs are acquired from (see
+	/// [`dmabuf_producer_family`]).
+	producer_family: u32,
 	/// Whether conversion runs on a dedicated compute family.
 	pub(crate) async_compute: bool,
 	/// Frame (logical) extent.
@@ -1066,6 +1082,7 @@ impl InputConverter {
 		let mut converter = Self {
 			queue,
 			queue_family,
+			producer_family: dmabuf_producer_family(context.has_queue_family_foreign()),
 			async_compute: use_dedicated,
 			width,
 			height,
@@ -1661,9 +1678,9 @@ impl InputConverter {
 			}
 
 			// The first use of an imported (EXCLUSIVE) DMA-BUF acquires it from
-			// the external owner; later uses start from the GENERAL layout left
-			// below. Imported layers are client DMA-BUFs and follow the same
-			// protocol.
+			// its producer (`producer_family`); later uses start from the
+			// GENERAL layout left below. Imported layers are client DMA-BUFs and
+			// follow the same protocol.
 			let acquire = |image: vk::Image, first_use: bool| {
 				vk::ImageMemoryBarrier::default()
 					.old_layout(if first_use {
@@ -1673,7 +1690,7 @@ impl InputConverter {
 					})
 					.new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
 					.src_queue_family_index(if first_use {
-						vk::QUEUE_FAMILY_EXTERNAL
+						self.producer_family
 					} else {
 						vk::QUEUE_FAMILY_IGNORED
 					})

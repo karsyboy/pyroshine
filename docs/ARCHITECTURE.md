@@ -494,7 +494,10 @@ explicit. The NVENC input buffer is released by the converter queue to
 `VK_QUEUE_FAMILY_EXTERNAL` (CUDA belongs to the same driver) before the
 conversion fence. VA surfaces come from another driver and are handed over
 through `VK_QUEUE_FAMILY_FOREIGN_EXT`, so VA-API needs
-`VK_EXT_queue_family_foreign`. An input slot is reused only after the
+`VK_EXT_queue_family_foreign`. Captured DMA-BUFs (game buffers, overlay
+layers) are written by other drivers too and are acquired on first use from
+the foreign queue family where the driver has the extension, else from
+`VK_QUEUE_FAMILY_EXTERNAL`. An input slot is reused only after the
 encoder's work on it completed: a VA submission that failed after the driver
 may have accepted it is synced first, and if completion cannot be established
 the stream ends and the VA objects are left to the driver rather than
