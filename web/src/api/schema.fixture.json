@@ -84,6 +84,7 @@
       "timeout": 60,
       "video": {
         "conversion_queue": "auto",
+        "encoder": "auto",
         "encrypt": false,
         "fec_max_percentage": 25,
         "fec_min_percentage": 0,
@@ -626,6 +627,41 @@
         },
         "label": "PyroWave GPU queue",
         "path": "stream.video.pyrowave_queue",
+        "required": false,
+        "section": "video"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Which encoder implementations encode the conventional codecs. Takes effect after a restart: the startup check decides each codec profile's encoder.",
+        "kind": {
+          "options": [
+            {
+              "description": "Vulkan Video where the GPU supports a profile, otherwise VA-API or NVENC (recommended).",
+              "label": "Automatic",
+              "value": "auto"
+            },
+            {
+              "description": "Only Vulkan Video.",
+              "label": "Vulkan Video",
+              "value": "vulkan"
+            },
+            {
+              "description": "Only VA-API (Intel, AMD).",
+              "label": "VA-API",
+              "value": "vaapi"
+            },
+            {
+              "description": "Only NVENC (NVIDIA).",
+              "label": "NVENC",
+              "value": "nvenc"
+            }
+          ],
+          "type": "choice",
+          "unset_label": null
+        },
+        "label": "H.264/HEVC/AV1 encoder",
+        "path": "stream.video.encoder",
         "required": false,
         "section": "video"
       },

@@ -100,10 +100,13 @@ overrides:
       - libvulkan1
       - libwayland-client0
       - xwayland
-    # The tray opens the browser through the desktop portal or xdg-open.
+    # The tray opens the browser through the desktop portal or xdg-open;
+    # libva is loaded at runtime for VA-API encoding (Intel GPUs).
     recommends:
       - xdg-desktop-portal
       - xdg-utils
+      - libva2
+      - libva-drm2
   rpm:
     depends:
       - glibc
@@ -119,6 +122,7 @@ overrides:
     recommends:
       - xdg-desktop-portal
       - xdg-utils
+      - libva
   archlinux:
     depends:
       - glibc

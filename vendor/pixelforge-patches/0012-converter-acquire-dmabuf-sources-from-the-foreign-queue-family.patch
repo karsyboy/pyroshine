@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Tue, 20 Oct 2026 11:21:17 -0400
+Subject: [PATCH] converter: acquire DMA-BUF sources from the foreign queue
+ family
+
+A converter source imported from a DMA-BUF is normally written by another
+driver (a GL or Vulkan client, a compositor). Acquire it on first use from
+VK_QUEUE_FAMILY_FOREIGN_EXT when the context enabled
+VK_EXT_queue_family_foreign; VK_QUEUE_FAMILY_EXTERNAL only covers producers
+with the same device and driver identity and remains the fallback.
+---
+ src/converter/mod.rs | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/src/converter/mod.rs b/src/converter/mod.rs
+index 6264463..3a22832 100644
+--- a/src/converter/mod.rs
++++ b/src/converter/mod.rs
+@@ -585,15 +585,23 @@ impl ColorConverter {
+             // --- Phase 1: Transition source image for shader read ---
+ 
+             // For external memory (DMA-BUF) imports with EXCLUSIVE sharing,
+-            // the first use must include a queue family acquire operation.
+-            // Set srcQueueFamilyIndex to EXTERNAL (ownership is foreign)
+-            // and dstQueueFamilyIndex to the encoder's compute queue family.
++            // the first use must include a queue family acquire operation
++            // to the encoder's compute queue family. The producer is usually
++            // another driver (a GL or Vulkan client, a compositor), which
++            // QUEUE_FAMILY_FOREIGN_EXT describes; QUEUE_FAMILY_EXTERNAL only
++            // covers the same driver and is the fallback without
++            // VK_EXT_queue_family_foreign.
+             let needs_acquire = src_layout == vk::ImageLayout::UNDEFINED;
++            let producer_family = if self.context.has_queue_family_foreign() {
++                vk::QUEUE_FAMILY_FOREIGN_EXT
++            } else {
++                vk::QUEUE_FAMILY_EXTERNAL
++            };
+             let src_barrier = vk::ImageMemoryBarrier::default()
+                 .old_layout(src_layout)
+                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                 .src_queue_family_index(if needs_acquire {
+-                    vk::QUEUE_FAMILY_EXTERNAL
++                    producer_family
+                 } else {
+                     vk::QUEUE_FAMILY_IGNORED
+                 })
+-- 
+2.56.0
+

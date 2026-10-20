@@ -14,7 +14,7 @@ use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy, VrrCaptu
 use crate::session::frame_limit::{FrameLimitMethod, FrameLimitMode};
 use crate::session::stream::audio::AudioQuality;
 use crate::session::stream::control::input::gamepad::{GamepadEmulation, HomeTrigger};
-use crate::session::stream::video::{ConversionQueueMode, FecMode, PyroWaveQueueMode};
+use crate::session::stream::video::{ConversionQueueMode, EncoderPreference, FecMode, PyroWaveQueueMode};
 
 /// Paths of the list settings edited as structured entries.
 pub(crate) const APPLICATIONS: &str = "application";
@@ -125,6 +125,18 @@ fn queue_mode(mode: PyroWaveQueueMode) -> (&'static str, &'static str) {
 			"Compute",
 			"Request a compute queue; the library falls back to graphics.",
 		),
+	}
+}
+
+fn encoder_preference(preference: EncoderPreference) -> (&'static str, &'static str) {
+	match preference {
+		EncoderPreference::Auto => (
+			"Automatic",
+			"Vulkan Video where the GPU supports a profile, otherwise VA-API or NVENC (recommended).",
+		),
+		EncoderPreference::Vulkan => ("Vulkan Video", "Only Vulkan Video."),
+		EncoderPreference::Vaapi => ("VA-API", "Only VA-API (Intel, AMD)."),
+		EncoderPreference::Nvenc => ("NVENC", "Only NVENC (NVIDIA)."),
 	}
 }
 
@@ -811,6 +823,22 @@ pub(crate) fn config_schema() -> ConfigSchema {
 					PyroWaveQueueMode::Compute,
 				],
 				queue_mode,
+			),
+		)
+		.advanced(),
+		Field::new(
+			"stream.video.encoder",
+			"video",
+			"H.264/HEVC/AV1 encoder",
+			"Which encoder implementations encode the conventional codecs. Takes effect after a restart: the startup check decides each codec profile's encoder.",
+			choices(
+				&[
+					EncoderPreference::Auto,
+					EncoderPreference::Vulkan,
+					EncoderPreference::Vaapi,
+					EncoderPreference::Nvenc,
+				],
+				encoder_preference,
 			),
 		)
 		.advanced(),

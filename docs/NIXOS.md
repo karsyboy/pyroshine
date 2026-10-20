@@ -59,8 +59,10 @@ itself while its user is signed in to a desktop, as on other distributions.
 
    Set up your GPU driver through your NixOS hardware configuration. The module
    enables `hardware.graphics`, but it does not select/configure a proprietary
-   NVIDIA driver for you. The built package includes the PyroWave library and
-   host driver search paths.
+   NVIDIA driver for you. The built package includes the PyroWave library,
+   libva and host driver search paths. Intel GPUs encode H.264/HEVC/AV1
+   through VA-API: add Intel's media driver with
+   `hardware.graphics.extraPackages = [ pkgs.intel-media-driver ];`.
 3. Apply the configuration:
 
    ```sh

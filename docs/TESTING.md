@@ -70,7 +70,13 @@ pinned PyroWave library with `scripts/build-pyrowave.sh WORKDIR PREFIX`.
 Point `MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE` at a GPU without Vulkan Video
 encode (for example ANV without `ANV_DEBUG=video-encode`) to run the
 no-fallback device-selection test. Select a Vulkan driver with
-`VK_DRIVER_FILES` on multi-GPU hosts.
+`VK_DRIVER_FILES` on multi-GPU hosts. The VA-API and NVENC round trips
+(`vaapi_encode_decode_matches_reference_on_gpu`,
+`nvenc_encode_decode_matches_reference_on_gpu`) need the `vaapi-encode`
+requirement (libva initializes on the test render node and offers an H.264 or
+HEVC encoder) or `nvenc` (an NVIDIA render node, `libcuda.so.1` and
+`libnvidia-encode.so.1`), plus `ffmpeg`; `MOONSHINE_TEST_E2E_FILTER` and
+`MOONSHINE_TEST_E2E_FRAMES` narrow them as for the Vulkan Video round trip.
 
 Run the compositor and XWayland tests from a release build on NVIDIA. They are
 the regression tests for the compositor-thread teardown order (see

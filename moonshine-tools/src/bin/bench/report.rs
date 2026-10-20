@@ -112,6 +112,26 @@ pub(super) fn capabilities(capabilities: &Capabilities) -> Value {
 			.collect::<Vec<_>>(),
 		"hdr_supported": capabilities.hdr_supported,
 		"dma_buf_supported": capabilities.dma_buf_supported,
+		"driver": capabilities.gpu.driver,
+		"vulkan_video_encode": capabilities.gpu.vulkan_video_encode,
+		// Every probed profile, with the reason it is not advertised.
+		"profile_probes": capabilities
+			.gpu
+			.profiles
+			.iter()
+			.map(|probe| {
+				let id = healthcheck::CODEC_PROFILES
+					.iter()
+					.find(|(bit, _, _)| *bit == probe.bit)
+					.map_or("unknown", |(_, id, _)| *id);
+				json!({
+					"profile": id,
+					"available": probe.unavailable.is_none(),
+					"backend": probe.backend.map(|backend| format!("{backend:?}").to_lowercase()),
+					"reason": probe.unavailable,
+				})
+			})
+			.collect::<Vec<_>>(),
 	})
 }
 
@@ -475,6 +495,7 @@ mod tests {
 			hdr_supported: false,
 			dma_buf_supported: true,
 			gpu_name: "test".into(),
+			gpu: Default::default(),
 		};
 		let h264 = NegotiatedVideoFormat::sdr(
 			VideoCodec::H264,

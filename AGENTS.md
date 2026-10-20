@@ -58,7 +58,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `session/stream/audio/` | Embedded PulseAudio-compatible server, Opus encoding, audio FEC/encryption, UDP |
 | `session/stream/control/` | ENet control protocol, peer authorization (`peers.rs`), input decoding/routing, Inputtino devices, ownership and feedback |
 | `session/stream/video/` | Negotiated formats, stream epochs, packetization, FEC, GSO/pacing, diagnostics |
-| `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), Pixelforge encoding, HDR metadata, failure classification |
+| `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), conventional encoders behind `backend.rs` (Pixelforge/Vulkan Video, `vaapi/`, `nvenc/`, runtime-loaded with generated `sys.rs` bindings), HDR metadata, padding removal, failure classification |
 | `session/stream/video/pyrowave.rs`, `pyrowave_protocol.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership; dialect/profile negotiation |
 | `session/status.rs` | Public session phase from manager status and control-stream peer ownership |
 | `management/` | Management of the running server: shared operations (`ops.rs`), event hub (`hub.rs`), web interface (`web/`: HTTP API, SSE, static files) with administrator auth (`auth.rs`), session-bus adapter (`dbus.rs`), config store (`config_store.rs`), editor schema (`schema.rs`), telemetry, session history (`history.rs`), release checks (`updates.rs`) |
@@ -79,7 +79,8 @@ Other workspace and integration areas:
   (`launcher.rs`). The web interface and the tray are clients of the management
   interface only; `moonshine-core` and `moonshine-management` must never depend on them.
 - `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
-  (`build-shaders.sh`), changelog tooling/tests, measurement harnesses, the
+  (`build-shaders.sh`), VA-API/NVENC binding regeneration
+  (`generate-encoder-ffi.sh`), changelog tooling/tests, measurement harnesses, the
   baseline recorder and result comparison (`record_baseline.py`,
   `bench_results.py`) and the hardware-test registry/runner
   (`hardware_tests.toml`, `hardware_tests.py`).
@@ -103,6 +104,7 @@ Other workspace and integration areas:
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
 | Performance measurements | `docs/BENCHMARKING.md`; lifetime/soak diagnostics in `docs/LONG_SESSION_PERFORMANCE.md` |
 | Test tiers, hardware tests, baselines and regression gates | `docs/TESTING.md`; feature status and coverage in `docs/CAPABILITIES.md` |
+| GPU/driver support, encoder requirements, capture-device probing | `docs/GPU_COMPATIBILITY.md`, `gpu.rs`, `healthcheck.rs` `check_codecs` |
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |

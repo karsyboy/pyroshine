@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use ash::vk;
-use pixelforge::{Codec, ColorSpace, OutputFormat, VideoContext};
+use pixelforge::{Codec, ColorSpace, VideoContext};
 
 use super::dmabuf::CachedImport;
 use crate::session::compositor::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
@@ -122,12 +122,28 @@ pub(crate) struct Layer<'a> {
 /// Layers bottom to top (notification, cursor).
 pub(crate) type Layers<'a> = [Option<Layer<'a>>; MAX_OVERLAYS];
 
-/// The image receiving the converted planes and the layout it is in before
-/// the conversion and must be left in afterwards.
+/// Where the converted planes are copied, for each encoder backend.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Target {
-	pub image: vk::Image,
-	pub layout: vk::ImageLayout,
+pub(crate) enum Target {
+	/// A multi-planar image addressed by plane aspects, and the layout it is
+	/// in before the conversion and must be left in afterwards.
+	Image { image: vk::Image, layout: vk::ImageLayout },
+	/// One single-plane image per output plane, imported from memory another
+	/// driver owns (the DMA-BUF layers of a VA-API surface). Their content is
+	/// replaced: each is acquired from `QUEUE_FAMILY_FOREIGN_EXT` without
+	/// preserving it and released back in `GENERAL` after the copy. The VA
+	/// driver is not the Vulkan driver, so `QUEUE_FAMILY_EXTERNAL` (same
+	/// device and driver identity) would not cover the hand-off; the context
+	/// must have `VK_EXT_queue_family_foreign` enabled.
+	ExternalPlanes { images: [vk::Image; 2], count: usize },
+	/// A buffer with exactly this converter's [`Layout`] that another API of
+	/// the same driver reads in place (an NVENC input buffer that CUDA
+	/// imported from an opaque FD). It receives a buffer copy between an
+	/// acquire from and a release to `QUEUE_FAMILY_EXTERNAL`: the external
+	/// reader observes the copy only through that release (and the host's
+	/// fence wait). The acquire does not preserve the previous content, which
+	/// the copy replaces entirely.
+	Buffer { buffer: vk::Buffer },
 }
 
 impl Target {
@@ -135,40 +151,85 @@ impl Target {
 	/// creation and leaves it in `VIDEO_ENCODE_SRC_KHR`, and every conversion
 	/// returns it there.
 	pub(crate) fn encoder_input(image: vk::Image) -> Self {
-		Self {
+		Self::Image {
 			image,
 			layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
 		}
 	}
 }
 
-/// Per-format sample sizes of the 2-plane (Y + interleaved CbCr) layouts.
+/// Output sample layout of a conversion.
+///
+/// The 2-plane layouts match Vulkan Video's input formats; the packed 4:4:4
+/// layouts are what VA-API (and NVENC for 8-bit) encode 4:4:4 from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ConvertFormat {
+	/// 8-bit luma plane, then interleaved CbCr at half width and height (NV12).
+	Nv12,
+	/// NV12 with 16-bit samples holding 10 bits in the high bits (P010).
+	P010,
+	/// 8-bit luma plane, then interleaved CbCr at full resolution
+	/// (`G8_B8R8_2PLANE_444_UNORM`).
+	Yuv444,
+	/// [`Self::Yuv444`] with P010-style 16-bit samples.
+	Yuv444P10,
+	/// One little-endian 32-bit word per pixel: Cr, Cb, Y and 0xFF from the
+	/// lowest byte. VA-API `XYUV`, DRM `XYUV8888` and NVENC `AYUV` share it.
+	Xyuv,
+	/// One little-endian 32-bit word per pixel: Cb in bits 0-9, Y in 10-19,
+	/// Cr in 20-29 and alpha 3 in 30-31 (VA-API and DRM `Y410`).
+	Y410,
+}
+
+impl ConvertFormat {
+	/// Bits per sample.
+	pub(crate) fn bit_depth(self) -> u32 {
+		match self {
+			Self::Nv12 | Self::Yuv444 | Self::Xyuv => 8,
+			Self::P010 | Self::Yuv444P10 | Self::Y410 => 10,
+		}
+	}
+
+	/// Whether chroma has half the luma width and height.
+	pub(crate) fn subsampled(self) -> bool {
+		matches!(self, Self::Nv12 | Self::P010)
+	}
+}
+
+/// Per-format sample sizes: the 2-plane (Y + interleaved CbCr) layouts, or a
+/// single plane of packed 4:4:4 words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FormatInfo {
-	/// Shader format code (Pixelforge's numbering).
+	/// Shader format code.
 	code: u32,
-	/// Bytes per luma sample.
+	/// Bytes per luma sample, or per pixel of a packed format.
 	luma_bytes: u32,
-	/// Bytes per CbCr pair.
+	/// Bytes per CbCr pair; 0 for packed formats (no chroma plane).
 	chroma_bytes: u32,
 	/// 4:2:0 (chroma at half width and height) rather than 4:4:4.
 	subsampled: bool,
 }
 
-fn format_info(format: OutputFormat) -> Option<FormatInfo> {
+impl FormatInfo {
+	fn packed(&self) -> bool {
+		self.chroma_bytes == 0
+	}
+}
+
+fn format_info(format: ConvertFormat) -> FormatInfo {
 	let info = |code, luma_bytes, chroma_bytes, subsampled| FormatInfo {
 		code,
 		luma_bytes,
 		chroma_bytes,
 		subsampled,
 	};
-	// I420 (3 planes) is never negotiated by Pyroshine.
 	match format {
-		OutputFormat::NV12 => Some(info(0, 1, 2, true)),
-		OutputFormat::YUV444 => Some(info(2, 1, 2, false)),
-		OutputFormat::P010 => Some(info(3, 2, 4, true)),
-		OutputFormat::YUV444P10 => Some(info(4, 2, 4, false)),
-		OutputFormat::I420 => None,
+		ConvertFormat::Nv12 => info(0, 1, 2, true),
+		ConvertFormat::Yuv444 => info(2, 1, 2, false),
+		ConvertFormat::P010 => info(3, 2, 4, true),
+		ConvertFormat::Yuv444P10 => info(4, 2, 4, false),
+		ConvertFormat::Xyuv => info(5, 4, 0, false),
+		ConvertFormat::Y410 => info(6, 4, 0, false),
 	}
 }
 
@@ -204,19 +265,25 @@ pub(crate) fn conversion_extent(codec: Codec, width: u32, height: u32) -> Result
 }
 
 /// Plane layout of the conversion buffer and of its copy into the encoder
-/// input image.
+/// input.
 ///
 /// Both planes start on a 32-bit word and every row is a whole number of
 /// words, so each word lies in one row and belongs to exactly one 4x2 block:
 /// luma rows hold `4 * blocks_x` samples, chroma rows hold the CbCr pairs of
-/// the same blocks (`2 * blocks_x` for 4:2:0, `4 * blocks_x` for 4:4:4). The
+/// the same blocks (`2 * blocks_x` for 4:2:0, `4 * blocks_x` for 4:4:4).
+/// Packed 4:4:4 formats have one plane of one word per pixel. The
 /// copy regions address the conversion extent through `bufferRowLength`, so
 /// the samples past it are never copied. Word-aligned offsets also satisfy
 /// `VkBufferImageCopy::bufferOffset` (a multiple of each plane's element
 /// size, at most four bytes) on any queue family.
+///
+/// [`Self::aligned`] pads rows to a byte alignment for a [`Target::Buffer`]
+/// read in place: there every plane shares the luma row pitch in bytes
+/// (4:2:0) and the chroma plane starts right after the last luma row, which is
+/// how NVENC addresses a registered pitched buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
-	pub format: OutputFormat,
+	pub format: ConvertFormat,
 	info: FormatInfo,
 	/// Conversion extent copied into the target image.
 	pub extent: (u32, u32),
@@ -233,8 +300,22 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-	pub(crate) fn new(format: OutputFormat, (width, height): (u32, u32)) -> Result<Self, String> {
-		let info = format_info(format).ok_or_else(|| format!("unsupported output format {format:?}"))?;
+	#[cfg(test)]
+	pub(crate) fn new(format: ConvertFormat, extent: (u32, u32)) -> Result<Self, String> {
+		Self::aligned(format, extent, 4)
+	}
+
+	/// A layout whose row pitches are multiples of `row_alignment` bytes (a
+	/// multiple of four).
+	pub(crate) fn aligned(
+		format: ConvertFormat,
+		(width, height): (u32, u32),
+		row_alignment: u32,
+	) -> Result<Self, String> {
+		let info = format_info(format);
+		if row_alignment == 0 || !row_alignment.is_multiple_of(4) {
+			return Err(format!("row alignment {row_alignment} is not a multiple of four bytes"));
+		}
 		if width == 0 || height == 0 {
 			return Err(format!("empty conversion extent {width}x{height}"));
 		}
@@ -245,11 +326,24 @@ impl Layout {
 		}
 		let blocks_x = u64::from(width.div_ceil(BLOCK_WIDTH));
 		let blocks_y = u64::from(height.div_ceil(BLOCK_HEIGHT));
-		let luma_pitch = blocks_x * u64::from(info.luma_bytes);
-		let (chroma_pitch, chroma_rows) = if info.subsampled {
-			(blocks_x * 2 * u64::from(info.chroma_bytes) / 4, blocks_y)
+		let alignment_words = u64::from(row_alignment / 4);
+		// Words per row before alignment, then the chroma rows' share of it:
+		// equal for 4:2:0 (half as many pairs of twice the size), twice the
+		// luma width for 2-plane 4:4:4, none for packed formats.
+		let luma_words = blocks_x * u64::from(info.luma_bytes);
+		let luma_pitch = luma_words.next_multiple_of(alignment_words);
+		let (chroma_pitch, chroma_rows) = if info.packed() {
+			(0, 0)
+		} else if info.subsampled {
+			(
+				luma_pitch * 2 * u64::from(info.chroma_bytes) / 4 / u64::from(info.luma_bytes),
+				blocks_y,
+			)
 		} else {
-			(blocks_x * u64::from(info.chroma_bytes), blocks_y * 2)
+			(
+				luma_pitch * u64::from(info.chroma_bytes) / u64::from(info.luma_bytes),
+				blocks_y * 2,
+			)
 		};
 		let chroma_offset = luma_pitch * blocks_y * 2;
 		let words = chroma_offset + chroma_pitch * chroma_rows;
@@ -279,8 +373,34 @@ impl Layout {
 		}
 	}
 
-	/// Luma and chroma `VkBufferImageCopy` regions.
+	/// Number of output planes (2, or 1 for packed formats).
+	pub(crate) fn plane_count(&self) -> usize {
+		if self.info.packed() { 1 } else { 2 }
+	}
+
+	/// Row pitch of the luma (or packed) plane in bytes.
+	pub(crate) fn row_pitch_bytes(&self) -> u32 {
+		self.luma_pitch * 4
+	}
+
+	/// Rows of the luma plane in the buffer: the conversion height rounded up
+	/// to the 4x2 block grid. The chroma plane follows them.
+	pub(crate) fn luma_rows(&self) -> u32 {
+		self.blocks.1 * BLOCK_HEIGHT
+	}
+
+	/// Plane regions for a multi-planar target ([`Target::Image`]); only the
+	/// first [`Self::plane_count`] are used.
 	pub(crate) fn copy_regions(&self) -> [vk::BufferImageCopy; 2] {
+		self.plane_regions([vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1])
+	}
+
+	/// The same regions for per-plane images ([`Target::ExternalPlanes`]).
+	pub(crate) fn plane_image_regions(&self) -> [vk::BufferImageCopy; 2] {
+		self.plane_regions([vk::ImageAspectFlags::COLOR; 2])
+	}
+
+	fn plane_regions(&self, aspects: [vk::ImageAspectFlags; 2]) -> [vk::BufferImageCopy; 2] {
 		let region = |offset, row_length, aspect, (width, height)| vk::BufferImageCopy {
 			buffer_offset: offset,
 			buffer_row_length: row_length,
@@ -298,19 +418,20 @@ impl Layout {
 				depth: 1,
 			},
 		};
-		[
-			region(
-				0,
-				self.luma_pitch * 4 / self.info.luma_bytes,
-				vk::ImageAspectFlags::PLANE_0,
-				self.extent,
-			),
+		let chroma = if self.info.packed() {
+			// Unused: packed formats have one plane.
+			region(0, 0, aspects[1], (0, 0))
+		} else {
 			region(
 				u64::from(self.chroma_offset) * 4,
 				self.chroma_pitch * 4 / self.info.chroma_bytes,
-				vk::ImageAspectFlags::PLANE_1,
+				aspects[1],
 				self.chroma_extent(),
-			),
+			)
+		};
+		[
+			region(0, self.luma_pitch * 4 / self.info.luma_bytes, aspects[0], self.extent),
+			chroma,
 		]
 	}
 
@@ -319,6 +440,9 @@ impl Layout {
 	pub(crate) fn read_planes(&self, bytes: &[u8]) -> Result<reference::Planes, String> {
 		if (bytes.len() as u64) < self.size {
 			return Err(format!("buffer holds {} of {} bytes", bytes.len(), self.size));
+		}
+		if self.info.packed() {
+			return self.read_packed(bytes);
 		}
 		let ten_bit = self.info.luma_bytes == 2;
 		let sample = |offset: usize| -> Result<u16, String> {
@@ -350,6 +474,40 @@ impl Layout {
 		}
 		Ok(planes)
 	}
+
+	/// [`Self::read_planes`] for the packed 4:4:4 formats.
+	fn read_packed(&self, bytes: &[u8]) -> Result<reference::Planes, String> {
+		let (width, height) = self.extent;
+		let mut planes = reference::Planes::new(self.extent, self.extent);
+		for y in 0..height as usize {
+			for x in 0..width as usize {
+				let offset = y * self.luma_pitch as usize * 4 + x * 4;
+				let word = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+				let index = y * width as usize + x;
+				let (luma, cb, cr) = match self.format {
+					ConvertFormat::Xyuv => {
+						if word >> 24 != 0xff {
+							return Err(format!(
+								"XYUV word 0x{word:08x} at byte {offset} has alpha other than 0xff"
+							));
+						}
+						((word >> 16) & 0xff, (word >> 8) & 0xff, word & 0xff)
+					},
+					_ => {
+						if word >> 30 != 3 {
+							return Err(format!(
+								"Y410 word 0x{word:08x} at byte {offset} has alpha other than 3"
+							));
+						}
+						((word >> 10) & 0x3ff, word & 0x3ff, (word >> 20) & 0x3ff)
+					},
+				};
+				planes.luma[index] = luma as u16;
+				planes.chroma[index] = [cb as u16, cr as u16];
+			}
+		}
+		Ok(planes)
+	}
 }
 
 /// Independent CPU definition of the conversion, used by the creation-time
@@ -364,7 +522,8 @@ impl Layout {
 /// replicate its nearest edge pixel. Arithmetic is in f64, so the GPU (f32)
 /// may differ by one code where a value lies on a rounding boundary.
 pub(crate) mod reference {
-	use pixelforge::{ColorSpace, OutputFormat};
+	use super::ConvertFormat;
+	use pixelforge::ColorSpace;
 
 	/// Color conversion parameters of one frame.
 	#[derive(Clone, Copy, Debug)]
@@ -479,19 +638,14 @@ pub(crate) mod reference {
 	/// are left zero (and skipped by [`compare`]); chroma rows follow their
 	/// first luma row.
 	pub(crate) fn convert(
-		format: OutputFormat,
+		format: ConvertFormat,
 		color: Color,
 		frame: (u32, u32),
 		extent: (u32, u32),
 		rgb: &dyn Fn(u32, u32) -> [f32; 3],
 		row: &dyn Fn(u32) -> bool,
 	) -> Planes {
-		let (bits, subsampled) = match format {
-			OutputFormat::NV12 => (8, true),
-			OutputFormat::P010 => (10, true),
-			OutputFormat::YUV444 | OutputFormat::I420 => (8, false),
-			OutputFormat::YUV444P10 => (10, false),
-		};
+		let (bits, subsampled) = (format.bit_depth(), format.subsampled());
 		let chroma_extent = if subsampled {
 			(extent.0.div_ceil(2), extent.1.div_ceil(2))
 		} else {
@@ -634,6 +788,40 @@ fn color_range() -> vk::ImageSubresourceRange {
 	}
 }
 
+/// The queue family a captured DMA-BUF is acquired from. Its producer (a
+/// game's GL or Vulkan driver, XWayland, the compositor's EGL) is generally
+/// not this Vulkan driver, which `QUEUE_FAMILY_FOREIGN_EXT` describes;
+/// `QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity
+/// and remains the fallback on a driver without `VK_EXT_queue_family_foreign`.
+fn dmabuf_producer_family(has_queue_family_foreign: bool) -> u32 {
+	if has_queue_family_foreign {
+		vk::QUEUE_FAMILY_FOREIGN_EXT
+	} else {
+		vk::QUEUE_FAMILY_EXTERNAL
+	}
+}
+
+/// The barriers around a copy into `buffer`, which a reader of the same
+/// driver outside Vulkan (CUDA, for NVENC) consumes in place: ownership is
+/// acquired from `QUEUE_FAMILY_EXTERNAL` before the copy (discarding the
+/// content, which the copy replaces) and released back to it afterwards, which
+/// makes the write available to the external reader.
+fn external_buffer_handoff(buffer: vk::Buffer, queue_family: u32) -> [vk::BufferMemoryBarrier<'static>; 2] {
+	let barrier = vk::BufferMemoryBarrier::default().buffer(buffer).size(vk::WHOLE_SIZE);
+	[
+		barrier
+			.src_access_mask(vk::AccessFlags::empty())
+			.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+			.src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+			.dst_queue_family_index(queue_family),
+		barrier
+			.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+			.dst_access_mask(vk::AccessFlags::empty())
+			.src_queue_family_index(queue_family)
+			.dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL),
+	]
+}
+
 fn find_memory_type(context: &VideoContext, type_bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32, String> {
 	// SAFETY: plain physical-device property query.
 	let properties = unsafe {
@@ -749,6 +937,9 @@ pub(crate) struct InputConverter {
 	context: VideoContext,
 	queue: vk::Queue,
 	queue_family: u32,
+	/// The queue family captured DMA-BUFs are acquired from (see
+	/// [`dmabuf_producer_family`]).
+	producer_family: u32,
 	/// Whether conversion runs on a dedicated compute family.
 	pub(crate) async_compute: bool,
 	/// Frame (logical) extent.
@@ -793,12 +984,14 @@ impl InputConverter {
 	/// and its output is compared with [`reference`]; a mismatch is returned
 	/// as an error that locates the defect, since every frame would be
 	/// corrupted the same way.
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		context: VideoContext,
 		mode: ConversionQueueMode,
 		frame: (u32, u32),
 		extent: (u32, u32),
-		output_format: OutputFormat,
+		output_format: ConvertFormat,
+		row_alignment: u32,
 		color_space: ColorSpace,
 		full_range: bool,
 	) -> Result<Self, ConverterError> {
@@ -808,6 +1001,7 @@ impl InputConverter {
 			frame,
 			extent,
 			output_format,
+			row_alignment,
 			color_space,
 			full_range,
 			false,
@@ -823,7 +1017,8 @@ impl InputConverter {
 		mode: ConversionQueueMode,
 		(width, height): (u32, u32),
 		extent: (u32, u32),
-		output_format: OutputFormat,
+		output_format: ConvertFormat,
+		row_alignment: u32,
 		color_space: ColorSpace,
 		full_range: bool,
 		readback: bool,
@@ -834,7 +1029,7 @@ impl InputConverter {
 				extent.0, extent.1
 			));
 		}
-		let layout = Layout::new(output_format, extent)?;
+		let layout = Layout::aligned(output_format, extent, row_alignment)?;
 		let limits = context.device_properties().limits;
 		if layout.size > u64::from(limits.max_storage_buffer_range) {
 			return Err(format!(
@@ -887,6 +1082,7 @@ impl InputConverter {
 		let mut converter = Self {
 			queue,
 			queue_family,
+			producer_family: dmabuf_producer_family(context.has_queue_family_foreign()),
 			async_compute: use_dedicated,
 			width,
 			height,
@@ -1482,9 +1678,9 @@ impl InputConverter {
 			}
 
 			// The first use of an imported (EXCLUSIVE) DMA-BUF acquires it from
-			// the external owner; later uses start from the GENERAL layout left
-			// below. Imported layers are client DMA-BUFs and follow the same
-			// protocol.
+			// its producer (`producer_family`); later uses start from the
+			// GENERAL layout left below. Imported layers are client DMA-BUFs and
+			// follow the same protocol.
 			let acquire = |image: vk::Image, first_use: bool| {
 				vk::ImageMemoryBarrier::default()
 					.old_layout(if first_use {
@@ -1494,7 +1690,7 @@ impl InputConverter {
 					})
 					.new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
 					.src_queue_family_index(if first_use {
-						vk::QUEUE_FAMILY_EXTERNAL
+						self.producer_family
 					} else {
 						vk::QUEUE_FAMILY_IGNORED
 					})
@@ -1724,19 +1920,23 @@ impl InputConverter {
 
 	/// Record the copy of the output buffer into `target` after `writer`
 	/// (the dispatch in this command buffer, or a completed earlier one)
-	/// wrote the buffer, leaving `target` in its layout.
+	/// wrote the buffer, leaving `target` ready for its encoder.
+	///
+	/// The encode that reads the target is submitted after the host observed
+	/// this submission's fence, so no barrier orders the copy against it; the
+	/// target's previous reader (an encode) completed before its encoder handed
+	/// the target out again.
 	///
 	/// # Safety
 	///
-	/// `cmd` is recording on this converter's queue family.
+	/// `cmd` is recording on this converter's queue family, and every target
+	/// handle belongs to this converter's device.
 	unsafe fn record_copy(&self, cmd: vk::CommandBuffer, writer: BufferWriter, target: Target) {
 		let (src_stage, src_access) = match writer {
 			BufferWriter::Dispatch => (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE),
 			BufferWriter::Completed => (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_WRITE),
 		};
 		let device = self.context.device();
-		// Buffer writes -> copy; target -> TRANSFER_DST. The target's previous
-		// reader (an encode) completed before Pixelforge returned the slot.
 		let buffer_barrier = [vk::BufferMemoryBarrier::default()
 			.src_access_mask(src_access)
 			.dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1744,56 +1944,151 @@ impl InputConverter {
 			.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
 			.buffer(self.output_buffer)
 			.size(vk::WHOLE_SIZE)];
-		let image_barrier = |old, new, src, dst| {
-			[vk::ImageMemoryBarrier::default()
+		let image_barrier = |image, old, new, src, dst, (src_family, dst_family)| {
+			vk::ImageMemoryBarrier::default()
 				.src_access_mask(src)
 				.dst_access_mask(dst)
 				.old_layout(old)
 				.new_layout(new)
-				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.image(target.image)
-				.subresource_range(color_range())]
+				.src_queue_family_index(src_family)
+				.dst_queue_family_index(dst_family)
+				.image(image)
+				.subresource_range(color_range())
 		};
+		let ignored = (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED);
 		// SAFETY: guaranteed by the caller.
 		unsafe {
-			device.cmd_pipeline_barrier(
-				cmd,
-				src_stage,
-				vk::PipelineStageFlags::TRANSFER,
-				vk::DependencyFlags::empty(),
-				&[],
-				&buffer_barrier,
-				&image_barrier(
-					target.layout,
-					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-					vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-					vk::AccessFlags::TRANSFER_WRITE,
-				),
-			);
-			device.cmd_copy_buffer_to_image(
-				cmd,
-				self.output_buffer,
-				target.image,
-				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-				&self.layout.copy_regions(),
-			);
-			// The encode that reads the target is submitted after the host
-			// observed this submission's fence.
-			device.cmd_pipeline_barrier(
-				cmd,
-				vk::PipelineStageFlags::TRANSFER,
-				vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-				vk::DependencyFlags::empty(),
-				&[],
-				&[],
-				&image_barrier(
-					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-					target.layout,
-					vk::AccessFlags::TRANSFER_WRITE,
-					vk::AccessFlags::empty(),
-				),
-			);
+			match target {
+				Target::Image { image, layout } => {
+					device.cmd_pipeline_barrier(
+						cmd,
+						src_stage,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&buffer_barrier,
+						&[image_barrier(
+							image,
+							layout,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+							vk::AccessFlags::TRANSFER_WRITE,
+							ignored,
+						)],
+					);
+					let regions = self.layout.copy_regions();
+					device.cmd_copy_buffer_to_image(
+						cmd,
+						self.output_buffer,
+						image,
+						vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+						&regions[..self.layout.plane_count()],
+					);
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&[image_barrier(
+							image,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							layout,
+							vk::AccessFlags::TRANSFER_WRITE,
+							vk::AccessFlags::empty(),
+							ignored,
+						)],
+					);
+				},
+				Target::ExternalPlanes { images, count } => {
+					let count = count.min(self.layout.plane_count());
+					// Acquire without preserving: the copy replaces every texel
+					// the encoder reads (the surface measures the conversion extent).
+					let acquire: Vec<_> = images[..count]
+						.iter()
+						.map(|&image| {
+							image_barrier(
+								image,
+								vk::ImageLayout::UNDEFINED,
+								vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+								vk::AccessFlags::empty(),
+								vk::AccessFlags::TRANSFER_WRITE,
+								(vk::QUEUE_FAMILY_FOREIGN_EXT, self.queue_family),
+							)
+						})
+						.collect();
+					device.cmd_pipeline_barrier(
+						cmd,
+						src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&buffer_barrier,
+						&acquire,
+					);
+					let regions = self.layout.plane_image_regions();
+					for (image, region) in images[..count].iter().zip(regions.iter()) {
+						device.cmd_copy_buffer_to_image(
+							cmd,
+							self.output_buffer,
+							*image,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							std::slice::from_ref(region),
+						);
+					}
+					let release: Vec<_> = images[..count]
+						.iter()
+						.map(|&image| {
+							image_barrier(
+								image,
+								vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+								vk::ImageLayout::GENERAL,
+								vk::AccessFlags::TRANSFER_WRITE,
+								vk::AccessFlags::empty(),
+								(self.queue_family, vk::QUEUE_FAMILY_FOREIGN_EXT),
+							)
+						})
+						.collect();
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&release,
+					);
+				},
+				Target::Buffer { buffer } => {
+					let [acquire, release] = external_buffer_handoff(buffer, self.queue_family);
+					device.cmd_pipeline_barrier(
+						cmd,
+						src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[buffer_barrier[0], acquire],
+						&[],
+					);
+					device.cmd_copy_buffer(
+						cmd,
+						self.output_buffer,
+						buffer,
+						&[vk::BufferCopy::default().size(self.layout.size)],
+					);
+					// Release the copy to the external reader before the fence.
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[release],
+						&[],
+					);
+				},
+			}
 		}
 	}
 
@@ -1825,7 +2120,7 @@ impl InputConverter {
 	/// Static-scene recovery needs this: the encoder rotates its input slots,
 	/// so the current slot never holds the latest frame (review 2026-10-05
 	/// BUG-002).
-	pub(crate) fn copy_last_output(&self, target: vk::Image) -> Result<bool, vk::Result> {
+	pub(crate) fn copy_last_output(&self, target: Target) -> Result<bool, vk::Result> {
 		if !self.output_valid {
 			return Ok(false);
 		}
@@ -1839,7 +2134,7 @@ impl InputConverter {
 				cmd,
 				&vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
 			)?;
-			self.record_copy(cmd, BufferWriter::Completed, Target::encoder_input(target));
+			self.record_copy(cmd, BufferWriter::Completed, target);
 			device.end_command_buffer(cmd)?;
 			if let Err(e) = self.submit_and_wait(cmd) {
 				// A failed wait leaves the submission state unknown; idle the
@@ -1918,7 +2213,7 @@ impl From<SelfCheckFailure> for ConverterError {
 /// A self-check that ran and produced wrong output (or could not run).
 #[derive(Debug)]
 pub(crate) struct SelfCheckFailure {
-	pub format: OutputFormat,
+	pub format: ConvertFormat,
 	/// Where the output differs (plane and block column), or why the check
 	/// could not run.
 	pub detail: String,
@@ -1935,13 +2230,14 @@ impl std::fmt::Display for SelfCheckFailure {
 }
 
 /// Operator name of a converter output format and its stream profile.
-pub(crate) fn format_label(format: OutputFormat) -> &'static str {
+pub(crate) fn format_label(format: ConvertFormat) -> &'static str {
 	match format {
-		OutputFormat::NV12 => "4:2:0 8-bit (NV12)",
-		OutputFormat::P010 => "4:2:0 10-bit (P010)",
-		OutputFormat::YUV444 => "4:4:4 8-bit",
-		OutputFormat::YUV444P10 => "4:4:4 10-bit",
-		OutputFormat::I420 => "4:2:0 8-bit (I420)",
+		ConvertFormat::Nv12 => "4:2:0 8-bit (NV12)",
+		ConvertFormat::P010 => "4:2:0 10-bit (P010)",
+		ConvertFormat::Yuv444 => "4:4:4 8-bit",
+		ConvertFormat::Yuv444P10 => "4:4:4 10-bit",
+		ConvertFormat::Xyuv => "4:4:4 8-bit (packed XYUV)",
+		ConvertFormat::Y410 => "4:4:4 10-bit (packed Y410)",
 	}
 }
 
@@ -1952,14 +2248,14 @@ pub(crate) fn format_label(format: OutputFormat) -> &'static str {
 pub(crate) fn self_check(
 	context: &VideoContext,
 	mode: ConversionQueueMode,
-	format: OutputFormat,
+	format: ConvertFormat,
 ) -> Result<(), SelfCheckFailure> {
 	self_check_inner(context, mode, format).map_err(|detail| SelfCheckFailure { format, detail })
 }
 
-fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: OutputFormat) -> Result<(), String> {
+fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: ConvertFormat) -> Result<(), String> {
 	let frame = SELF_CHECK_FRAME;
-	let subsampled = format_info(format).is_some_and(|info| info.subsampled);
+	let subsampled = format.subsampled();
 	let extent = if subsampled {
 		(frame.0.next_multiple_of(2), frame.1.next_multiple_of(2))
 	} else {
@@ -1971,6 +2267,7 @@ fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: O
 		frame,
 		extent,
 		format,
+		4,
 		ColorSpace::Bt709,
 		false,
 		true,

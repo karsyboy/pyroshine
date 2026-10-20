@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Tue, 20 Oct 2026 11:01:26 -0400
+Subject: [PATCH] Enable VK_EXT_queue_family_foreign when available
+
+Media APIs such as VA-API export DMA-BUF surfaces from a different driver
+than the Vulkan device that writes them. Ownership transfers of such
+resources use VK_QUEUE_FAMILY_FOREIGN_EXT, which requires this extension.
+Enable it when the device offers it and report it through
+VideoContext::has_queue_family_foreign; it stays optional for every other
+context.
+---
+ src/vulkan.rs | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/vulkan.rs b/src/vulkan.rs
+index 54ff0ce..10ba8e4 100644
+--- a/src/vulkan.rs
++++ b/src/vulkan.rs
+@@ -200,6 +200,7 @@ struct VideoContextInner {
+     supported_encode_codecs: Vec<Codec>,
+     encode_unsupported: Vec<(Codec, String)>,
+     has_descriptor_buffer: bool,
++    has_queue_family_foreign: bool,
+ }
+ 
+ impl Drop for VideoContextInner {
+@@ -289,6 +290,13 @@ impl VideoContext {
+     pub fn has_descriptor_buffer(&self) -> bool {
+         self.inner.has_descriptor_buffer
+     }
++
++    /// Returns true if `VK_EXT_queue_family_foreign` is enabled, so resources
++    /// shared with another driver (for example a media API's DMA-BUF
++    /// surfaces) can be transferred to and from `VK_QUEUE_FAMILY_FOREIGN_EXT`.
++    pub fn has_queue_family_foreign(&self) -> bool {
++        self.inner.has_queue_family_foreign
++    }
+ }
+ 
+ impl VideoContext {
+@@ -382,6 +390,7 @@ impl VideoContext {
+         let mut supported_encode_codecs = Vec::new();
+         let mut encode_unsupported = Vec::new();
+         let mut has_descriptor_buffer_ext = false;
++        let mut has_queue_family_foreign_ext = false;
+ 
+         let has_extension =
+             |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
+@@ -470,6 +479,8 @@ impl VideoContext {
+             // Check if descriptor buffer extension is available.
+             has_descriptor_buffer_ext =
+                 has_extension(&available_extensions, ash::ext::descriptor_buffer::NAME);
++            has_queue_family_foreign_ext =
++                has_extension(&available_extensions, ash::ext::queue_family_foreign::NAME);
+ 
+             // Check codec support for encoding.
+             let mut encode_codecs = Vec::new();
+@@ -628,6 +639,11 @@ impl VideoContext {
+             }
+         }
+ 
++        // Optional: ownership transfers with other drivers' external memory.
++        if has_queue_family_foreign_ext {
++            push_ext(ash::ext::queue_family_foreign::NAME.as_ptr());
++        }
++
+         // Enable VK_EXT_descriptor_buffer extension (required for descriptor buffer API).
+         if has_descriptor_buffer_ext {
+             push_ext(ash::ext::descriptor_buffer::NAME.as_ptr());
+@@ -784,6 +800,7 @@ impl VideoContext {
+                 supported_encode_codecs,
+                 encode_unsupported,
+                 has_descriptor_buffer,
++                has_queue_family_foreign: has_queue_family_foreign_ext,
+             }),
+         })
+     }
+-- 
+2.56.0
+

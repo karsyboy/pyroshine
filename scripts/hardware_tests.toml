@@ -140,6 +140,11 @@ requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
 env = { MOONSHINE_TEST_GPU = "1" }
 
 [[test]]
+name = "session::stream::video::pipeline::convert::tests::encoder_rate_control_limits_on_gpu"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
 name = "session::stream::video::pipeline::convert::tests::encoder_input_slots_rotate_on_gpu"
 requires = ["render-node", "vulkan-video-encode"]
 env = { MOONSHINE_TEST_GPU = "1" }
@@ -152,6 +157,16 @@ env = { MOONSHINE_TEST_GPU = "1" }
 [[test]]
 name = "session::stream::video::pipeline::convert::tests::stream_encode_decode_matches_reference_on_gpu"
 requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::vaapi_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "vaapi-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::nvenc_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "nvenc", "ffmpeg"]
 env = { MOONSHINE_TEST_GPU = "1" }
 
 [[test]]

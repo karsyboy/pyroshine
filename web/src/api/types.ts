@@ -57,7 +57,7 @@ export interface VideoDetails {
 }
 
 export interface EncoderDetails {
-  /** `vulkan_video` or `pyrowave`. */
+  /** `vulkan_video`, `vaapi`, `nvenc` or `pyrowave`. */
   backend: string;
   backend_label: string;
   gpu: string;

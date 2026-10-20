@@ -585,15 +585,23 @@ impl ColorConverter {
             // --- Phase 1: Transition source image for shader read ---
 
             // For external memory (DMA-BUF) imports with EXCLUSIVE sharing,
-            // the first use must include a queue family acquire operation.
-            // Set srcQueueFamilyIndex to EXTERNAL (ownership is foreign)
-            // and dstQueueFamilyIndex to the encoder's compute queue family.
+            // the first use must include a queue family acquire operation
+            // to the encoder's compute queue family. The producer is usually
+            // another driver (a GL or Vulkan client, a compositor), which
+            // QUEUE_FAMILY_FOREIGN_EXT describes; QUEUE_FAMILY_EXTERNAL only
+            // covers the same driver and is the fallback without
+            // VK_EXT_queue_family_foreign.
             let needs_acquire = src_layout == vk::ImageLayout::UNDEFINED;
+            let producer_family = if self.context.has_queue_family_foreign() {
+                vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                vk::QUEUE_FAMILY_EXTERNAL
+            };
             let src_barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(src_layout)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_queue_family_index(if needs_acquire {
-                    vk::QUEUE_FAMILY_EXTERNAL
+                    producer_family
                 } else {
                     vk::QUEUE_FAMILY_IGNORED
                 })

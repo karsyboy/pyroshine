@@ -13,6 +13,7 @@
   vulkan-loader,
   wayland,
   libglvnd,
+  libva,
   callPackage,
   pyrowave ? callPackage ./pyrowave.nix { },
   pyroshine-web ? callPackage ./web.nix { },
@@ -120,13 +121,17 @@ rustPlatform.buildRustPackage {
     # NVIDIA (and GPU generally): pixelforge opens libvulkan.so.1 with
     # dlopen (ash's "loaded" feature) and smithay's GL renderer does the
     # same for libEGL, so neither lands in DT_NEEDED and the automatic
-    # buildInputs RUNPATH doesn't cover them. Add the Vulkan loader + glvnd
-    # dispatch explicitly, and /run/opengl-driver/lib (addDriverRunpath) so
-    # the NVIDIA userspace driver and its Vulkan ICD resolve at runtime.
+    # buildInputs RUNPATH doesn't cover them. The VA-API encoder opens
+    # libva.so.2 the same way. Add the Vulkan loader, glvnd dispatch and
+    # libva explicitly, and /run/opengl-driver/lib (addDriverRunpath) so the
+    # NVIDIA userspace driver (its Vulkan ICD, libcuda, libnvidia-encode)
+    # resolves at runtime; libva finds VA drivers (hardware.graphics.
+    # extraPackages, e.g. intel-media-driver) under /run/opengl-driver.
     patchelf --add-rpath ${
       lib.makeLibraryPath [
         vulkan-loader
         libglvnd
+        libva
         pyrowave
       ]
     } $out/bin/moonshine
