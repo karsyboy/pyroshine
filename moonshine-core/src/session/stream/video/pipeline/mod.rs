@@ -2224,7 +2224,14 @@ impl VideoPipelineInner {
 				};
 				let slot_wait = t_slot.elapsed();
 				let converted = input_converter
-					.convert(&source_import, import_vk_format, needs_transition, &layers, target)
+					.convert(
+						&source_import,
+						import_vk_format,
+						needs_transition,
+						frame.scale_to_stream,
+						&layers,
+						target,
+					)
 					.map(|outcome| {
 						convert_window.record(outcome.gpu_ns, frame.has_overlays());
 					})

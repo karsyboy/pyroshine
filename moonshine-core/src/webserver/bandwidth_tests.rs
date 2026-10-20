@@ -95,6 +95,7 @@ async fn authenticated_probe_discovery_exact_payload_and_admission() {
 		Default::default(),
 		Default::default(),
 		Default::default(),
+		Default::default(),
 		"127.0.0.1".into(),
 		30,
 		false,
@@ -206,6 +207,7 @@ impl Fixture {
 			.with_no_client_auth();
 		let shutdown = ShutdownManager::new();
 		let session_manager = SessionManager::new(
+			Default::default(),
 			Default::default(),
 			crate::session::stream::video::VideoStreamConfig {
 				port: video_port,

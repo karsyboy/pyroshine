@@ -176,7 +176,7 @@ async fn main() -> Result<(), ()> {
 	// The library scans on its own thread while the host checks run, and
 	// keeps the catalog current afterwards (see `app_scanner::service`).
 	let library = app_scanner::Library::start(
-		config.applications.clone(),
+		config.offered_applications(),
 		config.application_scanners.clone(),
 		config.library.clone(),
 		app_scanner::service::LibraryPaths::standard(),
@@ -372,6 +372,7 @@ impl Moonshine {
 
 		let session_manager = SessionManager::new(
 			config.compositor.clone(),
+			config.desktop.clone(),
 			config.stream.video.clone(),
 			config.stream.audio.clone(),
 			config.stream.control.clone(),

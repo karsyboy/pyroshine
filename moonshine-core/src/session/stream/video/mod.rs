@@ -1317,9 +1317,14 @@ mod tests {
 			..Default::default()
 		};
 		assert!(
-			crate::session::stream::audio::AudioStream::new(audio, "127.0.0.1".into(), ShutdownManager::new())
-				.await
-				.is_err()
+			crate::session::stream::audio::AudioStream::new(
+				audio,
+				"127.0.0.1".into(),
+				crate::session::stream::audio::AudioSource::Pulse,
+				ShutdownManager::new(),
+			)
+			.await
+			.is_err()
 		);
 	}
 

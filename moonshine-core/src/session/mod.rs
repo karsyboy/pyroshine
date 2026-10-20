@@ -5,8 +5,8 @@ use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
 use tokio::sync::watch;
 
-use crate::session::compositor::CompositorConfig;
 use crate::session::stream::audio::AudioChannels;
+use crate::session::stream::audio::AudioSource;
 use crate::session::stream::audio::AudioStream;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
@@ -19,8 +19,9 @@ use crate::session::stream::video::VideoStreamHandle;
 use self::application::Application;
 use self::application::ApplicationConfig;
 use self::application::ApplicationContext;
+use self::application::SessionMode;
 use self::capture::frame::HdrModeState;
-use self::capture::{CaptureBackend, CapturePacing, CaptureSource, LiveCapture};
+use self::capture::{CaptureBackend, CapturePacing, CaptureSettings, CaptureSource, LiveCapture};
 use self::failure::{SessionFailure, StopCauseSlot};
 use self::inhibit::SleepInhibitor;
 use self::lifecycle::StartLatch;
@@ -81,6 +82,7 @@ fn valid_application_unit_name(name: &str) -> bool {
 	})
 }
 
+pub use self::capture::portal::probe as desktop_probe;
 pub use self::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
 pub(crate) type SessionKeysReceiver = watch::Receiver<keys::ActiveKeys>;
@@ -164,7 +166,7 @@ pub(crate) struct ResumeRequest {
 /// resource-creating work for each transition while the manager owns state,
 /// generations, cancellation and teardown ordering.
 pub(crate) struct SystemSession {
-	pub(crate) compositor_config: CompositorConfig,
+	pub(crate) capture_settings: CaptureSettings,
 	pub(crate) video_config: VideoStreamConfig,
 	pub(crate) audio_config: AudioStreamConfig,
 	pub(crate) control_config: ControlStreamConfig,
@@ -194,7 +196,7 @@ impl SessionBackend for SystemSession {
 		// A calibration run may hold the video port; a session always wins.
 		let _claim = self.video_port.release_for_session().await;
 		InitializedSession::new(
-			self.compositor_config.clone(),
+			self.capture_settings.clone(),
 			self.video_config.clone(),
 			self.audio_config.clone(),
 			self.control_config.clone(),
@@ -313,7 +315,7 @@ pub(crate) struct InitializedSession {
 impl InitializedSession {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn new(
-		compositor_config: CompositorConfig,
+		capture_settings: CaptureSettings,
 		video_config: VideoStreamConfig,
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
@@ -328,17 +330,27 @@ impl InitializedSession {
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
 		// Create the capture source, audio stream, video stream, and control stream.
-		// Every session runs isolated Game Mode.
+		// The entry's mode selects the backend: Game Mode is the default.
+		let backend = match context.application.mode {
+			SessionMode::Game => CaptureBackend::Isolated,
+			SessionMode::Desktop => CaptureBackend::Desktop,
+		};
+		let desktop_audio = capture_settings.desktop.audio;
 		let (capture, endpoints) = CaptureSource::new(
-			CaptureBackend::Isolated,
-			compositor_config,
+			backend,
+			capture_settings,
 			&context,
 			video_config.log_stats,
 			stop.clone(),
+			cause.clone(),
 			foreground_tx,
 		);
 		let (audio_port, video_port, control_port) = (audio_config.port, video_config.port, control_config.port);
-		let audio = AudioStream::new(audio_config, address.clone(), stop.clone())
+		let audio_source = match backend {
+			CaptureBackend::Isolated => AudioSource::Pulse,
+			CaptureBackend::Desktop => AudioSource::Desktop { capture: desktop_audio },
+		};
+		let audio = AudioStream::new(audio_config, address.clone(), audio_source, stop.clone())
 			.await
 			.map_err(|()| stream_setup_failure("audio", audio_port))?;
 		let video_stream = VideoStream::new(
@@ -392,19 +404,9 @@ impl InitializedSession {
 		let capture = tokio::task::spawn_blocking(move || capture.launch())
 			.await
 			.map_err(|e| {
-				tracing::error!("Compositor launch task failed: {e}");
-				SessionFailure::see_log("compositor_start_failed", "The streaming compositor failed to start.")
-			})?
-			.map_err(|error| {
-				SessionFailure::new(
-					"compositor_start_failed",
-					format!("The streaming compositor could not start: {error}."),
-				)
-				.with_hint(
-					"Check the GPU selection (gpu in the configuration) and the startup checks on the \
-					 Diagnostics page or with pyroshine healthcheck.",
-				)
-			})?;
+				tracing::error!("Capture launch task failed: {e}");
+				SessionFailure::see_log("capture_start_failed", "The capture backend failed to start.")
+			})??;
 		let capabilities = capture.capabilities();
 		tracing::info!(
 			backend = capabilities.backend.as_str(),
@@ -414,7 +416,18 @@ impl InitializedSession {
 			presentation_pacing = capabilities.presentation_pacing,
 			"Capture ready"
 		);
-		let display = capture.application_display();
+		// Desktop Mode streams what already runs: no application is launched.
+		let Some(display) = capture.application_display() else {
+			return Ok(LaunchedSession {
+				context,
+				application: None,
+				video_stream,
+				capture,
+				audio,
+				control_stream,
+				hdr_metadata_rx,
+			});
+		};
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
 		let application = Application::spawn(
@@ -447,7 +460,7 @@ impl InitializedSession {
 
 		Ok(LaunchedSession {
 			context,
-			application,
+			application: Some(application),
 			video_stream,
 			capture,
 			audio,
@@ -460,7 +473,8 @@ impl InitializedSession {
 /// Launched session state — capture and app running, waiting for RTSP negotiation.
 pub(crate) struct LaunchedSession {
 	context: SessionContext,
-	application: Application,
+	/// The launched application; `None` in Desktop Mode.
+	application: Option<Application>,
 	video_stream: VideoStream,
 	capture: LiveCapture,
 	audio: AudioStream,
@@ -580,7 +594,7 @@ impl LaunchedSession {
 /// The authoritative session context (as reported to HTTP/RTSP) lives in the
 /// manager's session record; this keeps only what reconfiguration consumes.
 pub(crate) struct ActiveSession {
-	_application: Application,
+	_application: Option<Application>,
 	capture: LiveCapture,
 	video_handle: VideoStreamHandle,
 	audio_handle: stream::audio::AudioStartHandle,

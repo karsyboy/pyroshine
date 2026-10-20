@@ -27,6 +27,7 @@ use crate::{
 	ingress::Ingress,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
+		application::SessionMode,
 		failure::{Problem, SessionFailure},
 		manager::SessionManager,
 		negotiation::{self, DisplayMode},
@@ -570,7 +571,9 @@ impl Webserver {
 		for entry in catalog.offered() {
 			response += "<App>";
 
-			let hdr_supported = u8::from(self.hdr_supported);
+			// Desktop Mode streams what the desktop shares, which is SDR on
+			// the desktops tested; Moonlight then does not ask for HDR.
+			let hdr_supported = u8::from(self.hdr_supported && entry.application.mode.is_game());
 			response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
 			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();
 			response += format!("<ID>{}</ID>", entry.id).as_ref();
@@ -874,6 +877,15 @@ impl Webserver {
 				return xml_error(400, &message);
 			},
 		};
+
+		if application.mode == SessionMode::Desktop && hdr {
+			let failure = SessionFailure::new(
+				"desktop_hdr_unsupported",
+				"Desktop Mode streams the desktop in SDR; the client asked for HDR.",
+			)
+			.with_hint("Turn HDR off in the client's settings for Desktop Mode.");
+			return self.launch_failed(&application.title, &failure);
+		}
 
 		let initialize_result = self
 			.session_manager

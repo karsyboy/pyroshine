@@ -45,8 +45,8 @@ use crate::session::manager::SessionShutdownReason;
 
 use self::admission::{CaptureSender, capture_channel};
 pub(crate) use self::capture::DirectReject;
-use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
+use crate::session::capture::input::CaptureInputEvent;
 
 /// Keyboard configuration for the compositor's XKB state.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -209,7 +209,7 @@ pub(crate) struct Compositor {
 	stop: ShutdownManager<SessionShutdownReason>,
 	frame_tx: CaptureSender,
 	foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	input_rx: calloop::channel::Channel<CompositorInputEvent>,
+	input_rx: calloop::channel::Channel<CaptureInputEvent>,
 	reconfigure_tx: calloop::channel::Sender<CompositorReconfigure>,
 	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 }
@@ -365,7 +365,7 @@ fn run_compositor(
 	config: CompositorConfig,
 	context: CompositorContext,
 	outputs: CompositorOutputs,
-	input_rx: calloop::channel::Channel<CompositorInputEvent>,
+	input_rx: calloop::channel::Channel<CaptureInputEvent>,
 	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
@@ -677,7 +677,7 @@ fn run_compositor(
 					let angle = f64::from(bench_pointer_ticks) * 0.05;
 					let (x, y) = (16384.0 + 8000.0 * angle.cos(), 16384.0 + 8000.0 * angle.sin());
 					input::process_input(
-						CompositorInputEvent::MouseMoveAbsolute {
+						CaptureInputEvent::MouseMoveAbsolute {
 							x: x as i16,
 							y: y as i16,
 							screen_width: i16::MAX,

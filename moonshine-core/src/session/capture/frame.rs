@@ -10,6 +10,7 @@
 //! | Pixel format, bit depth | DRM fourcc (`format`): packed RGB(A), 8-bit, 10-bit or FP16 |
 //! | Modifier | `modifier`; always a pair in `gpu::ImportableModifiers` |
 //! | Dimensions, crop | `width` × `height` is the visible image; frames are never cropped |
+//! | Scaling | `scale_to_stream`: the whole frame fills the stream extent (Desktop Mode); otherwise it is sampled 1:1 |
 //! | Primaries, transfer, matrix | [`FrameColorSpace`], from the source's color declaration |
 //! | Range, chroma | Full-range RGB, so 4:4:4; the encoder converts to the negotiated YUV |
 //! | HDR metadata | `hdr_metadata`, static HDR10 metadata of the source |
@@ -301,6 +302,11 @@ pub(crate) struct ExportedFrame {
 	pub overlays: FrameOverlays,
 	/// How the frame was produced; diagnostics only.
 	pub origin: CaptureOrigin,
+	/// Scale the whole frame onto the negotiated stream extent when the two
+	/// differ (a desktop output streamed at another resolution). Otherwise a
+	/// frame is sampled 1:1 and one that raced an extent change is
+	/// edge-extended. Encoders with their own scaler (PyroWave) always scale.
+	pub scale_to_stream: bool,
 }
 
 /// Layout of a single DMA-BUF plane; its descriptor is owned by the frame.
@@ -359,6 +365,7 @@ impl ExportedFrame {
 			hdr_metadata,
 			overlays: Default::default(),
 			origin: CaptureOrigin::default(),
+			scale_to_stream: false,
 		}
 	}
 
@@ -419,6 +426,7 @@ impl ExportedFrame {
 			hdr_metadata: None,
 			overlays: Default::default(),
 			origin: CaptureOrigin::default(),
+			scale_to_stream: false,
 		}
 	}
 }

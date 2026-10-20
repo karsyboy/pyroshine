@@ -121,6 +121,9 @@ pub enum SessionShutdownReason {
 	InputHandlerStopped,
 	/// Compositor stopped unexpectedly.
 	CompositorStopped,
+	/// Desktop Mode capture ended (sharing stopped on the desktop, the
+	/// output or desktop went away, or the capture failed).
+	DesktopCaptureStopped,
 	/// A launch, start or reconfiguration failed after changing resources.
 	TransitionFailed,
 }
@@ -1080,8 +1083,11 @@ impl<B: SessionBackend> SessionCore<B> {
 				.begin_transition(TransitionKind::Launch)
 				.map_err(|()| SessionFailure::busy("The session could not be launched."))?;
 			let live = guard.live().expect("checked above");
-			// Recorded before anything can create the unit.
-			live.record.application_unit = Some(application_unit_name());
+			// Recorded before anything can create the unit. Desktop Mode
+			// launches no application, so its teardown stops no unit.
+			if live.record.context.application.mode.is_game() {
+				live.record.application_unit = Some(application_unit_name());
+			}
 			let Some(SessionState::Initialized(session)) = live.state.take() else {
 				unreachable!("checked above");
 			};
@@ -1575,6 +1581,7 @@ impl SessionManager {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		compositor_config: CompositorConfig,
+		desktop_config: crate::session::capture::portal::DesktopConfig,
 		video_config: VideoStreamConfig,
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
@@ -1595,7 +1602,10 @@ impl SessionManager {
 			video_port.clone(),
 		);
 		let backend = SystemSession {
-			compositor_config,
+			capture_settings: crate::session::capture::CaptureSettings {
+				compositor: compositor_config,
+				desktop: desktop_config,
+			},
 			video_config,
 			audio_config,
 			control_config,
@@ -1765,6 +1775,7 @@ impl SessionManager {
 	/// Manager with default stream configuration, for RTSP/ingress tests.
 	pub(crate) fn for_test(shutdown: ShutdownManager<ShutdownReason>) -> Self {
 		Self::new(
+			Default::default(),
 			Default::default(),
 			Default::default(),
 			Default::default(),

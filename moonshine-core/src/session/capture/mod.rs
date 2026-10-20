@@ -17,16 +17,24 @@
 //! | Failure reporting | Launch errors, then the worker's exit stopping the session |
 //! | Resource ownership | The backend's thread; the capture GPU outlives it |
 //!
-//! Only isolated Game Mode exists: [`CaptureBackend::Isolated`] runs the
-//! session's own headless Smithay compositor (`session/compositor/`), which
-//! keeps its Wayland/XWayland environment, application surfaces, output,
-//! scene, focus and input to itself. A second backend adds a variant to
-//! [`CaptureBackend`], [`CaptureSource`] and [`LiveCapture`]; the compiler
-//! then lists every operation it must provide. See `docs/ARCHITECTURE.md`
-//! ("Capture backends") for the contract a new backend must meet.
+//! Two backends exist:
+//!
+//! - [`CaptureBackend::Isolated`] (Game Mode, the default) runs the session's
+//!   own headless Smithay compositor (`session/compositor/`), which keeps its
+//!   Wayland/XWayland environment, application surfaces, output, scene, focus
+//!   and input to itself.
+//! - [`CaptureBackend::Desktop`] (Desktop Mode) streams the user's running
+//!   Wayland desktop through the XDG Desktop Portal (`portal/`): PipeWire
+//!   frames, input through the devices the portal authorized.
+//!
+//! A further backend adds a variant to [`CaptureBackend`], [`CaptureSource`]
+//! and [`LiveCapture`]; the compiler then lists every operation it must
+//! provide. See `docs/CAPTURE_BACKENDS.md` for the contract a backend meets.
 
 pub(crate) mod admission;
 pub(crate) mod frame;
+pub(crate) mod input;
+pub(crate) mod portal;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -36,8 +44,9 @@ use async_shutdown::ShutdownManager;
 use smithay::backend::allocator::Fourcc;
 
 use crate::session::SessionContext;
-use crate::session::compositor::input::CompositorInputEvent;
+use crate::session::capture::input::CaptureInputEvent;
 use crate::session::compositor::{Compositor, CompositorConfig, LaunchedCompositor};
+use crate::session::failure::{SessionFailure, StopCauseSlot};
 use crate::session::lifecycle::WorkerGuard;
 use crate::session::manager::SessionShutdownReason;
 
@@ -50,12 +59,16 @@ pub(crate) enum CaptureBackend {
 	/// the session, running only the launched application.
 	#[default]
 	Isolated,
+	/// Desktop Mode: the user's running Wayland desktop, captured and
+	/// controlled through the XDG Desktop Portal with the user's consent.
+	Desktop,
 }
 
 impl CaptureBackend {
 	pub(crate) fn as_str(self) -> &'static str {
 		match self {
 			Self::Isolated => "isolated",
+			Self::Desktop => "desktop",
 		}
 	}
 }
@@ -142,42 +155,72 @@ pub(crate) struct CaptureEndpoints {
 	/// Frames for the video pipeline, with the capture GPU context.
 	pub frames: CaptureReceiver,
 	/// Keyboard, pointer, touch and pen input for the captured scene.
-	pub input: calloop::channel::Sender<CompositorInputEvent>,
+	pub input: calloop::channel::Sender<CaptureInputEvent>,
+}
+
+/// Configuration of every backend; the session's backend uses its part.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CaptureSettings {
+	pub compositor: CompositorConfig,
+	pub desktop: portal::DesktopConfig,
 }
 
 /// A session's capture source before it runs.
 pub(crate) enum CaptureSource {
 	Isolated(Compositor),
+	Desktop(portal::PortalCapture),
 }
 
 impl CaptureSource {
 	/// Create the selected backend's channels. Nothing runs until [`Self::launch`].
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		backend: CaptureBackend,
-		config: CompositorConfig,
+		settings: CaptureSettings,
 		context: &SessionContext,
 		log_stats: bool,
 		stop: ShutdownManager<SessionShutdownReason>,
+		cause: StopCauseSlot,
 		foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> (Self, CaptureEndpoints) {
 		match backend {
 			CaptureBackend::Isolated => {
 				let (compositor, endpoints) = Compositor::new(
-					config,
+					settings.compositor,
 					crate::session::compositor::CompositorContext::from_session(context, log_stats),
 					stop,
 					foreground_tx,
 				);
 				(Self::Isolated(compositor), endpoints)
 			},
+			CaptureBackend::Desktop => {
+				let config = portal::PortalCaptureConfig {
+					desktop: settings.desktop,
+					gpu: settings.compositor.gpu,
+					restore_token: portal::token::default_path(),
+					refresh_rate: context.refresh_rate,
+				};
+				let (capture, endpoints) = portal::PortalCapture::new(config, stop, cause);
+				(Self::Desktop(capture), endpoints)
+			},
 		}
 	}
 
-	/// Start the backend and wait for its readiness. Blocks; the error says
-	/// why it could not start, for the operator.
-	pub(crate) fn launch(self) -> Result<LiveCapture, String> {
+	/// Start the backend and wait for its readiness. Blocks; the failure says
+	/// why it could not start, for the operator and the client.
+	pub(crate) fn launch(self) -> Result<LiveCapture, SessionFailure> {
 		match self {
-			Self::Isolated(compositor) => compositor.launch().map(LiveCapture::Isolated),
+			Self::Isolated(compositor) => compositor.launch().map(LiveCapture::Isolated).map_err(|error| {
+				SessionFailure::new(
+					"compositor_start_failed",
+					format!("The streaming compositor could not start: {error}."),
+				)
+				.with_hint(
+					"Check the GPU selection (gpu in the configuration) and the startup checks on the \
+					 Diagnostics page or with pyroshine healthcheck.",
+				)
+			}),
+			Self::Desktop(capture) => capture.launch().map(LiveCapture::Desktop),
 		}
 	}
 }
@@ -185,18 +228,23 @@ impl CaptureSource {
 /// A running capture backend.
 pub(crate) enum LiveCapture {
 	Isolated(LaunchedCompositor),
+	Desktop(portal::LaunchedPortal),
 }
 
 impl LiveCapture {
 	pub(crate) fn capabilities(&self) -> &CaptureCapabilities {
 		match self {
 			Self::Isolated(compositor) => &compositor.ready().capabilities,
+			Self::Desktop(desktop) => &desktop.ready().capabilities,
 		}
 	}
 
-	pub(crate) fn application_display(&self) -> &ApplicationDisplay {
+	/// Where a launched application presents: the isolated backend's own
+	/// displays. Desktop Mode launches no application.
+	pub(crate) fn application_display(&self) -> Option<&ApplicationDisplay> {
 		match self {
-			Self::Isolated(compositor) => &compositor.ready().display,
+			Self::Isolated(compositor) => Some(&compositor.ready().display),
+			Self::Desktop(_) => None,
 		}
 	}
 
@@ -205,6 +253,7 @@ impl LiveCapture {
 	pub(crate) async fn reconfigure(&mut self, mode: OutputMode) -> Result<bool, ()> {
 		match self {
 			Self::Isolated(compositor) => compositor.reconfigure(mode).await,
+			Self::Desktop(desktop) => desktop.reconfigure(mode),
 		}
 	}
 }

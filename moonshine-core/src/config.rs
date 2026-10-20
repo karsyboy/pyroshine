@@ -7,7 +7,8 @@ pub use crate::app_scanner::lutris::LutrisApplicationScannerConfig;
 pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
 pub use crate::management::history::HistoryConfig;
 pub use crate::management::web::ManagementConfig;
-pub use crate::session::application::ApplicationConfig;
+pub use crate::session::application::{ApplicationConfig, SessionMode};
+pub use crate::session::capture::portal::DesktopConfig;
 use crate::session::compositor::CompositorConfig;
 pub use crate::session::frame_limit::FrameLimitConfig;
 use crate::session::stream::StreamConfig;
@@ -51,6 +52,9 @@ pub struct Config {
 
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
+
+	/// Desktop Mode: streaming the running desktop (off by default).
+	pub desktop: DesktopConfig,
 
 	/// Optional frame limiting of launched applications (off by default).
 	pub frame_limit: FrameLimitConfig,
@@ -184,6 +188,21 @@ impl Config {
 		Ok(())
 	}
 
+	/// The configured entries clients are offered: `[[application]]`, then
+	/// the Desktop Mode entry when `[desktop]` enables it and no application
+	/// entry already streams the desktop.
+	pub fn offered_applications(&self) -> Vec<ApplicationConfig> {
+		let mut applications = self.applications.clone();
+		if self.desktop.enabled && !applications.iter().any(|a| a.mode == SessionMode::Desktop) {
+			applications.push(ApplicationConfig {
+				title: self.desktop.title.clone(),
+				mode: SessionMode::Desktop,
+				..Default::default()
+			});
+		}
+		applications
+	}
+
 	fn resolve_paths(&mut self) -> Result<(), ()> {
 		let cert_path = self.webserver.certificate.to_string_lossy().to_string();
 		let cert_path =
@@ -238,6 +257,7 @@ impl Default for Config {
 			})],
 			library: LibraryConfig::default(),
 			compositor: CompositorConfig::default(),
+			desktop: DesktopConfig::default(),
 			frame_limit: FrameLimitConfig::default(),
 			inhibit_sleep: true,
 		}

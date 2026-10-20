@@ -451,6 +451,7 @@ fn session_manager(
 			bench_pointer: super::bench_pointer(args),
 			..Default::default()
 		},
+		Default::default(),
 		VideoStreamConfig {
 			encoder: super::encoder_preference(args),
 			encoder_table: table.clone(),

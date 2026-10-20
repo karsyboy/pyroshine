@@ -41,6 +41,9 @@ layout(push_constant) uniform PushConstants {
     // Block grid (4x2 pixels per invocation).
     uint blocks_x;
     uint blocks_y;
+    // Non-zero: the whole source is scaled onto the logical frame (Desktop
+    // Mode, whose output size is not the stream's); zero samples 1:1.
+    uint scaled;
     // Layer rectangles in output pixels (x, y, width, height), bottom to top;
     // width 0 disables a layer.
     ivec4 layer_rect[2];
@@ -125,8 +128,22 @@ vec3 blend_layer1(vec3 dst, ivec2 coord) {
 // Composited RGB of frame pixel `coord` (inside the logical frame), in the
 // encoder's signal encoding.
 vec3 read_rgb(ivec2 coord) {
-    ivec2 texel = min(coord, ivec2(params.source_max_x, params.source_max_y));
-    vec3 rgb = texelFetch(inputImage, texel, 0).rgb;
+    vec3 rgb;
+    if (params.scaled != 0u) {
+        // Four bilinear taps a quarter output pixel around the center: a
+        // 2x2-supersampled bilinear filter, which also averages a 2:1 (or
+        // smaller) downscale without skipping source texels.
+        vec2 size = vec2(params.width, params.height);
+        vec2 center = (vec2(coord) + 0.5) / size;
+        vec2 quarter = 0.25 / size;
+        rgb = 0.25 * (textureLod(inputImage, center + vec2(-quarter.x, -quarter.y), 0.0).rgb
+                    + textureLod(inputImage, center + vec2( quarter.x, -quarter.y), 0.0).rgb
+                    + textureLod(inputImage, center + vec2(-quarter.x,  quarter.y), 0.0).rgb
+                    + textureLod(inputImage, center + vec2( quarter.x,  quarter.y), 0.0).rgb);
+    } else {
+        ivec2 texel = min(coord, ivec2(params.source_max_x, params.source_max_y));
+        rgb = texelFetch(inputImage, texel, 0).rgb;
+    }
     // Late composition happens in the source's encoding, exactly where the
     // GLES compositor blends these elements into its output buffer.
     rgb = blend_layer0(rgb, coord);

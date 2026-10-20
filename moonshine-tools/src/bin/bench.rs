@@ -62,6 +62,12 @@ struct Args {
 	#[arg(long, default_value_t = 1400)]
 	packet_size: usize,
 
+	/// Stream the running desktop (Desktop Mode, through the XDG Desktop
+	/// Portal) instead of launching `command` in the isolated compositor. The
+	/// resolution must match the captured output.
+	#[arg(long)]
+	desktop: bool,
+
 	/// Command to run (application to spawn).
 	command: Vec<String>,
 
@@ -765,7 +771,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		return run_capabilities(&args).await;
 	}
 
-	if args.command.is_empty() {
+	if args.command.is_empty() && !args.desktop {
 		tracing::error!("No command provided. Usage: moonshine-bench [OPTIONS] <COMMAND>");
 		std::process::exit(1);
 	}
@@ -1095,6 +1101,7 @@ async fn run_benchmark(
 			bench_pointer: bench_pointer(args),
 			..Default::default()
 		},
+		Default::default(),
 		VideoStreamConfig {
 			fec_percentage: args.fec_percentage,
 			fec_mode: match args.fec_mode.as_str() {
@@ -1139,6 +1146,11 @@ async fn run_benchmark(
 
 	let app_config = ApplicationConfig {
 		title: "bench".to_string(),
+		mode: if args.desktop {
+			moonshine_core::config::SessionMode::Desktop
+		} else {
+			moonshine_core::config::SessionMode::Game
+		},
 		command: args.command.clone(),
 		..Default::default()
 	};

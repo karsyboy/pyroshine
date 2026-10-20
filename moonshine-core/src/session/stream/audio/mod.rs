@@ -16,6 +16,7 @@ use self::encoder::AudioEncoder;
 use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
 
 mod buffer;
+mod desktop;
 mod encoder;
 mod pulse_server;
 
@@ -399,10 +400,23 @@ impl AudioStartHandle {
 	}
 }
 
+/// Where a session's audio comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AudioSource {
+	/// The launched application plays into the session's own
+	/// PulseAudio-compatible server (Game Mode).
+	Pulse,
+	/// The desktop's default output, recorded through PipeWire (Desktop
+	/// Mode); `capture: false` streams silence.
+	Desktop { capture: bool },
+}
+
 pub(crate) struct AudioStream {
-	pulse_socket: UnixListener,
+	/// The Pulse server's socket; `None` for desktop audio.
+	pulse_socket: Option<UnixListener>,
 	pub pulse_socket_path: PathBuf,
 	udp_socket: tokio::net::UdpSocket,
+	source: AudioSource,
 	stop: ShutdownManager<SessionShutdownReason>,
 }
 
@@ -410,8 +424,21 @@ impl AudioStream {
 	pub async fn new(
 		config: AudioStreamConfig,
 		address: String,
+		source: AudioSource,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
+		if let AudioSource::Desktop { .. } = source {
+			let udp_socket = UdpSocket::bind((address, config.port))
+				.await
+				.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
+			return Ok(AudioStream {
+				pulse_socket: None,
+				pulse_socket_path: PathBuf::new(),
+				udp_socket,
+				source,
+				stop,
+			});
+		}
 		let pulse_socket_dir = dirs::runtime_dir()
 			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
 			.join("moonshine/pulse");
@@ -448,9 +475,10 @@ impl AudioStream {
 		tracing::debug!("Listening for audio messages on {}", pulse_socket_path.display());
 
 		Ok(AudioStream {
-			pulse_socket,
+			pulse_socket: Some(pulse_socket),
 			pulse_socket_path,
 			udp_socket,
+			source: AudioSource::Pulse,
 			stop,
 		})
 	}
@@ -489,20 +517,37 @@ impl AudioStream {
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
 		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
 
-		// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
+		// Spawn the audio source immediately (no gating — no network impact).
 		let (pulse_reconfigure_tx, pulse_reconfigure_rx) = crossbeam_channel::unbounded();
-		PulseServer::spawn(
-			self.pulse_socket,
-			self.pulse_socket_path.clone(),
-			context.audio_config.channels as u8,
-			context.packet_duration_ms,
-			frame_tx,
-			frame_recycle_rx,
-			self.stop.clone(),
-			pulse_reconfigure_rx,
-			generation,
-		)
-		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
+		match (self.source, self.pulse_socket) {
+			(AudioSource::Pulse, Some(pulse_socket)) => PulseServer::spawn(
+				pulse_socket,
+				self.pulse_socket_path.clone(),
+				context.audio_config.channels as u8,
+				context.packet_duration_ms,
+				frame_tx,
+				frame_recycle_rx,
+				self.stop.clone(),
+				pulse_reconfigure_rx,
+				generation,
+			)
+			.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?,
+			(AudioSource::Desktop { capture }, _) => desktop::DesktopAudio::spawn(
+				capture,
+				context.audio_config.channels as u8,
+				context.packet_duration_ms,
+				frame_tx,
+				frame_recycle_rx,
+				self.stop.clone(),
+				pulse_reconfigure_rx,
+				generation,
+			)
+			.map_err(|e| tracing::error!("Failed to start desktop audio: {e}"))?,
+			(AudioSource::Pulse, None) => {
+				tracing::error!("The PulseAudio socket is missing");
+				return Err(());
+			},
+		}
 
 		// Spawn audio encoder — registered now, gated behind the latch.
 		let (encoder_reconfigure_tx, encoder_reconfigure_rx) = crossbeam_channel::unbounded();

@@ -220,6 +220,7 @@ pub(crate) fn describe_stop(reason: SessionShutdownReason) -> (&'static str, &'s
 		),
 		Reason::InputHandlerStopped => ("input_failed", "Input handling stopped unexpectedly.", true),
 		Reason::CompositorStopped => ("compositor_failed", "The compositor stopped unexpectedly.", true),
+		Reason::DesktopCaptureStopped => ("desktop_capture_ended", "The desktop capture ended.", true),
 		Reason::TransitionFailed => (
 			"transition_failed",
 			"Starting or reconfiguring the stream failed.",
@@ -387,6 +388,7 @@ mod tests {
 			Reason::ControlStreamStopped,
 			Reason::InputHandlerStopped,
 			Reason::CompositorStopped,
+			Reason::DesktopCaptureStopped,
 			Reason::TransitionFailed,
 		] {
 			let (code, message, _) = describe_stop(reason);

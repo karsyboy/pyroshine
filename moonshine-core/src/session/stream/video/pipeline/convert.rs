@@ -86,7 +86,8 @@ struct PushConstants {
 	chroma_pitch: u32,
 	blocks_x: u32,
 	blocks_y: u32,
-	_padding: [u32; 3],
+	scaled: u32,
+	_padding: [u32; 2],
 	layer_rect: [[i32; 4]; MAX_OVERLAYS],
 	layer_opacity: [f32; MAX_OVERLAYS],
 	layer_opaque: [u32; MAX_OVERLAYS],
@@ -929,6 +930,8 @@ struct SourceBinding {
 	image: vk::Image,
 	view: vk::ImageView,
 	extent: (u32, u32),
+	/// Scale the whole source onto the frame instead of sampling 1:1.
+	scaled: bool,
 	/// First use of an imported (EXCLUSIVE, external) image: acquire it.
 	first_use: bool,
 }
@@ -1194,8 +1197,10 @@ impl InputConverter {
 			self.sampler = device
 				.create_sampler(
 					&vk::SamplerCreateInfo::default()
-						.mag_filter(vk::Filter::NEAREST)
-						.min_filter(vk::Filter::NEAREST)
+						// texelFetch (1:1 sampling) ignores filtering; the
+						// scaled path samples bilinearly.
+						.mag_filter(vk::Filter::LINEAR)
+						.min_filter(vk::Filter::LINEAR)
 						.address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
 						.address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
 						.address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
@@ -1545,6 +1550,7 @@ impl InputConverter {
 		source: &Arc<CachedImport>,
 		source_format: vk::Format,
 		first_use: bool,
+		scaled: bool,
 		layers: &Layers<'_>,
 		target: Target,
 	) -> Result<ConvertOutcome, vk::Result> {
@@ -1556,6 +1562,8 @@ impl InputConverter {
 			image: source.image(),
 			view,
 			extent: source.extent(),
+			// A 1:1 source needs no filtering, whatever the frame asked.
+			scaled: scaled && source.extent() != (self.width, self.height),
 			first_use,
 		};
 		let outcome = self.dispatch(&binding, layers, Some(target))?;
@@ -1588,7 +1596,8 @@ impl InputConverter {
 			chroma_pitch: layout.chroma_pitch,
 			blocks_x: layout.blocks.0,
 			blocks_y: layout.blocks.1,
-			_padding: [0; 3],
+			scaled: u32::from(source.scaled),
+			_padding: [0; 2],
 			layer_rect: [[0; 4]; MAX_OVERLAYS],
 			layer_opacity: [0.0; MAX_OVERLAYS],
 			layer_opaque: [0; MAX_OVERLAYS],
@@ -2282,6 +2291,7 @@ fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: C
 				image: source.image,
 				view: source.view,
 				extent: frame,
+				scaled: false,
 				first_use: false,
 			},
 			&[None, None],

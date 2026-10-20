@@ -116,6 +116,7 @@ pub(crate) fn scan(config: &LutrisApplicationScannerConfig) -> SourceScan {
 
 		let application = ApplicationConfig {
 			title: name,
+			mode: crate::session::application::SessionMode::Game,
 			pre_command: config.pre_command.clone(),
 			post_command: config.post_command.clone(),
 			command: config.command.iter().map(|cmd| cmd.replace("{slug}", &slug)).collect(),

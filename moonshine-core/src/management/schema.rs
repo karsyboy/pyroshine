@@ -10,6 +10,7 @@
 use moonshine_management::dto::{ChoiceOption, ConfigSchema, FieldKind, FieldSpec, ScannerVariant, SchemaSection};
 use serde::Serialize;
 
+use crate::session::application::SessionMode;
 use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy, VrrCapture};
 use crate::session::frame_limit::{FrameLimitMethod, FrameLimitMode};
 use crate::session::stream::audio::AudioQuality;
@@ -226,6 +227,13 @@ fn connector_strategy(strategy: VirtualConnectorStrategy) -> (&'static str, &'st
 	}
 }
 
+fn session_mode(mode: SessionMode) -> (&'static str, &'static str) {
+	match mode {
+		SessionMode::Game => ("Game Mode", "Launch the command in an isolated display (default)."),
+		SessionMode::Desktop => ("Desktop Mode", "Stream the running desktop; the command is not run."),
+	}
+}
+
 fn frame_limit_mode(mode: FrameLimitMode) -> (&'static str, &'static str) {
 	match mode {
 		FrameLimitMode::Off => ("Off", "Launch applications unchanged."),
@@ -384,6 +392,14 @@ fn application_fields() -> Vec<FieldSpec> {
 			},
 		)
 		.required()
+		.0,
+		Field::new(
+			"mode",
+			section,
+			"Mode",
+			"Game Mode launches the command in Pyroshine's own isolated display; Desktop Mode streams your running desktop and launches nothing.",
+			choices(&[SessionMode::Game, SessionMode::Desktop], session_mode),
+		)
 		.0,
 		Field::new(
 			"boxart",
@@ -550,6 +566,11 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		),
 		section("keyboard", "Keyboard", "XKB layout of the streaming session."),
 		section("applications", "Applications", "Applications offered to clients."),
+		section(
+			"desktop",
+			"Desktop Mode",
+			"Stream the desktop you are logged in to, with its applications, as its own entry.",
+		),
 		section(
 			"scanners",
 			"Application discovery",
@@ -970,6 +991,34 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		.advanced()
 		.caution("Always compositing costs GPU time; use it to diagnose capture problems."),
 		Field::new(
+			"desktop.enabled",
+			"desktop",
+			"Offer Desktop Mode",
+			"List an entry that streams your running Wayland desktop (Plasma, GNOME and other desktops with the XDG Desktop Portal) instead of launching an application. The desktop asks for permission the first time.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"desktop.title",
+			"desktop",
+			"Entry title",
+			"Name of the Desktop Mode entry in Moonlight. It also derives the entry's ID.",
+			text(false, Some("Desktop Mode"), &[]),
+		),
+		Field::new(
+			"desktop.input",
+			"desktop",
+			"Remote control",
+			"Let the client use the desktop's keyboard and pointer. Off streams the desktop view-only.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"desktop.audio",
+			"desktop",
+			"Desktop audio",
+			"Stream what the desktop plays on its default output. Local playback continues.",
+			FieldKind::Bool,
+		),
+		Field::new(
 			"frame_limit.mode",
 			"frame_limit",
 			"Frame limit",
@@ -1121,6 +1170,7 @@ pub(crate) mod tests {
 		});
 		let mut application = json!({
 			"title": "Game",
+			"mode": "desktop",
 			"command": ["/usr/bin/game"],
 			"boxart": "/tmp/art.png",
 			"output_scale": 1.5,

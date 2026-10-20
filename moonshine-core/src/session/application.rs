@@ -14,11 +14,40 @@ pub fn default_launch_timeout() -> u64 {
 	2
 }
 
+/// What a session of an application entry streams.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+	/// Game Mode: the application in Pyroshine's own isolated compositor.
+	#[default]
+	Game,
+	/// Desktop Mode: the user's running desktop; no application is launched.
+	Desktop,
+}
+
+impl SessionMode {
+	pub fn is_game(&self) -> bool {
+		*self == Self::Game
+	}
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Game => "game",
+			Self::Desktop => "desktop",
+		}
+	}
+}
+
 /// Configuration for a single application that can be launched in a session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
+
+	/// `game` (default) launches `command` in the isolated compositor;
+	/// `desktop` streams the running desktop and ignores `command`.
+	#[serde(default, skip_serializing_if = "SessionMode::is_game")]
+	pub mode: SessionMode,
 
 	/// Path to a boxart image.
 	pub boxart: Option<PathBuf>,
@@ -61,6 +90,7 @@ impl Default for ApplicationConfig {
 	fn default() -> Self {
 		Self {
 			title: String::new(),
+			mode: SessionMode::Game,
 			boxart: None,
 			command: Vec::new(),
 			output_scale: None,

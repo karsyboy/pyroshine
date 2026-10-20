@@ -966,6 +966,7 @@ mod gpu {
 					image: source.image(),
 					view,
 					extent: case.source_extent,
+					scaled: false,
 					first_use: false,
 				},
 				layers.0,
@@ -1171,7 +1172,71 @@ mod gpu {
 
 		layers_at_frame_edges(&context, &mut rng, &mut failures);
 		copy_into_planar_images(&context, &mut rng, &mut failures);
+		scaled_sources(&context, &mut rng, &mut failures);
 		assert!(failures.is_empty(), "converter mismatches: {failures:#?}");
+	}
+
+	/// Desktop Mode's scaled path (`ExportedFrame::scale_to_stream`): at an
+	/// exact 2:1 downscale the four bilinear taps fall on texel centers, so
+	/// every output pixel is the box average of its 2x2 source texels, for
+	/// odd frames and every output format.
+	fn scaled_sources(context: &VideoContext, rng: &mut Rng, failures: &mut Vec<String>) {
+		let frame = (321, 181);
+		let source_extent = (frame.0 * 2, frame.1 * 2);
+		let source_format = vk::Format::B8G8R8A8_UNORM;
+		let bytes = pattern(rng, source_format, source_extent);
+		let image = source_image(context, source_extent, source_format, &bytes);
+		let texel_size = texel_bytes(source_format);
+		let texel = |x: u32, y: u32| {
+			let offset = (y as usize * source_extent.0 as usize + x as usize) * texel_size;
+			decode_texel(source_format, &bytes[offset..offset + texel_size])
+		};
+		for format in FORMATS {
+			let extent = tight_extent(format, frame);
+			let label = format!("{format:?} scaled 642x362 -> 321x181");
+			let result = (|| -> Result<reference::Agreement, String> {
+				let mut converter = InputConverter::create(
+					context.clone(),
+					ConversionQueueMode::Auto,
+					frame,
+					extent,
+					format,
+					4,
+					BT709_LIMITED.space,
+					BT709_LIMITED.full_range,
+					true,
+				)?;
+				let view = converter.source_view(&image, source_format)?;
+				converter
+					.dispatch(
+						&SourceBinding {
+							image: image.image(),
+							view,
+							extent: source_extent,
+							scaled: true,
+							first_use: false,
+						},
+						&[None, None],
+						None,
+					)
+					.map_err(|e| format!("dispatch: {e}"))?;
+				let actual = converter.layout.read_planes(converter.readback())?;
+				let rgb = |x: u32, y: u32| {
+					let (x, y) = (x.min(frame.0 - 1), y.min(frame.1 - 1));
+					let taps = [
+						texel(2 * x, 2 * y),
+						texel(2 * x + 1, 2 * y),
+						texel(2 * x, 2 * y + 1),
+						texel(2 * x + 1, 2 * y + 1),
+					];
+					std::array::from_fn(|c| taps.iter().map(|t| t[c]).sum::<f32>() / 4.0)
+				};
+				let row = rows(extent);
+				let expected = reference::convert(format, BT709_LIMITED, frame, extent, &rgb, &row);
+				reference::compare(&expected, &actual, 1, &row)
+			})();
+			assert_agreement(&label, result, failures);
+		}
 	}
 
 	/// A notification (imported BGRX, alpha ignored, 75% window opacity)
@@ -1408,6 +1473,7 @@ mod gpu {
 				.convert(
 					&source,
 					vk::Format::R8G8B8A8_UNORM,
+					false,
 					false,
 					&[None, None],
 					Target::Image {
@@ -1877,6 +1943,7 @@ mod gpu {
 							&source,
 							vk::Format::R8G8B8A8_UNORM,
 							false,
+							false,
 							&[None, None],
 							Target::encoder_input(encoder.input_image()),
 						)
@@ -2078,7 +2145,7 @@ mod gpu {
 					}
 					let packet = encoder.input_target().map_err(|e| e.to_string()).and_then(|target| {
 						converter
-							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
+							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 							.map_err(|e| format!("convert: {e:?}"))?;
 						let future = encoder.encode(target).map_err(|e| e.to_string())?;
 						block_on(future).map_err(|e| e.to_string())
@@ -2339,7 +2406,7 @@ mod gpu {
 				use super::super::super::backend::EncoderInput;
 				let target = encoder.input_target().unwrap();
 				converter
-					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
+					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 					.unwrap();
 				stream.extend(block_on(encoder.encode(target).unwrap()).unwrap().data);
 			}
@@ -2430,7 +2497,7 @@ mod gpu {
 					.unwrap();
 					for _ in 0..20 {
 						converter
-							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
+							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 							.unwrap();
 					}
 					const N: u32 = 300;
@@ -2438,7 +2505,7 @@ mod gpu {
 					for _ in 0..N {
 						let t = std::time::Instant::now();
 						gpu_ns += converter
-							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
+							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 							.unwrap()
 							.gpu_ns
 							.unwrap_or(0);

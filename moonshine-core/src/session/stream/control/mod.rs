@@ -13,7 +13,7 @@ use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
 use crate::session::capture::frame::{HdrMetadata, HdrModeState};
-use crate::session::compositor::input::CompositorInputEvent;
+use crate::session::capture::input::CaptureInputEvent;
 use crate::session::keys::ActiveKeys;
 use crate::session::lifecycle::WorkerGuard;
 use crate::session::manager::SessionShutdownReason;
@@ -376,7 +376,7 @@ impl ControlStream {
 	pub fn new(
 		config: ControlStreamConfig,
 		address: String,
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		input_tx: calloop::channel::Sender<CaptureInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone(), config.gamepad.clone())?;
@@ -1222,10 +1222,10 @@ mod tests {
 						while !stop.is_shutdown_triggered() {
 							while let Ok(event) = input_events.try_recv() {
 								match event {
-									CompositorInputEvent::KeyDown { keycode: 30 } => {
+									CaptureInputEvent::KeyDown { keycode: 30 } => {
 										presses.fetch_add(1, Ordering::SeqCst);
 									},
-									CompositorInputEvent::Reset { keys, ready, .. } => {
+									CaptureInputEvent::Reset { keys, ready, .. } => {
 										resets.lock().unwrap().push(keys);
 										ready.send(()).unwrap();
 									},
