@@ -4,7 +4,7 @@
 //! which stage failed, how the stream recovers, and whether GPU work can still
 //! read the frame's source buffer. The last answer decides whether the
 //! compositor may reuse that buffer's content (`consumed`); the frame's
-//! [`SourceLease`](crate::session::compositor::frame::SourceLease) keeps the
+//! [`SourceLease`](crate::session::capture::frame::SourceLease) keeps the
 //! descriptors valid either way.
 //!
 //! [`FailurePolicy`] applies the recovery, bounds diagnostics and escalates a

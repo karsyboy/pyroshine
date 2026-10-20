@@ -23,8 +23,8 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::admission::OverlayCaps;
-use crate::session::compositor::frame::{
+use crate::session::capture::admission::OverlayCaps;
+use crate::session::capture::frame::{
 	CaptureOrigin, FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
 };
 use crate::session::lifecycle::{StartWaiter, WorkerGuard};
@@ -110,9 +110,9 @@ fn conventional_credit_limit() -> usize {
 /// Declares whether this consumer composites frame overlays (late cursor
 /// composition) and withdraws the declaration on every exit; the next
 /// consumer of the capture channel declares its own.
-struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
+struct OverlaySupport<'a>(&'a crate::session::capture::admission::CaptureReceiver);
 impl<'a> OverlaySupport<'a> {
-	fn declare(rx: &'a crate::session::compositor::admission::CaptureReceiver, caps: OverlayCaps) -> Self {
+	fn declare(rx: &'a crate::session::capture::admission::CaptureReceiver, caps: OverlayCaps) -> Self {
 		rx.set_overlay_caps(caps);
 		Self(rx)
 	}
@@ -835,7 +835,7 @@ async fn run_packet_consumer(
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		frame_rx: crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: crate::session::capture::admission::CaptureReceiver,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
@@ -980,7 +980,7 @@ impl VideoPipelineInner {
 	fn run(
 		mut self,
 		runtime: tokio::runtime::Handle,
-		frame_rx: crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: crate::session::capture::admission::CaptureReceiver,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
@@ -1331,7 +1331,7 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run_pyrowave_encoding_loop(
 		&self,
-		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: &crate::session::capture::admission::CaptureReceiver,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
@@ -1687,7 +1687,7 @@ impl VideoPipelineInner {
 	fn run_encoding_loop(
 		&self,
 		runtime: &tokio::runtime::Handle,
-		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: &crate::session::capture::admission::CaptureReceiver,
 		context: VideoContext,
 		mut encoder: ConventionalEncoder,
 		mut input_converter: InputConverter,

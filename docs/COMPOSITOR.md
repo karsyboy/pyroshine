@@ -7,9 +7,11 @@ determine how applications receive that input.
 
 ## Ownership and frame handoff
 
-The embedded Smithay compositor owns the visible scene and input focus, not
-codec negotiation or packet transport. `frame.rs` carries the exported DMA-BUF,
-color/HDR metadata and consumption signal to the video pipeline. Capture demand
+The embedded Smithay compositor is the isolated capture backend (see
+[Capture backends](CAPTURE_BACKENDS.md)). It owns the visible scene and input
+focus, not codec negotiation or packet transport. The shared frame contract
+(`session/capture/frame.rs`) carries the exported DMA-BUF, color/HDR metadata
+and consumption signal to the video pipeline. Capture demand
 is separately generation-tagged; see [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
 Service buffer releases and input even when capture is blocked or the scene is
 clean. [Architecture](ARCHITECTURE.md) explains session and stream ownership.

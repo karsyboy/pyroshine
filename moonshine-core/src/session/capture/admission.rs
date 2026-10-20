@@ -128,6 +128,11 @@ impl CaptureSender {
 			_context: self.context.clone(),
 		}
 	}
+	/// Owners of the capture context cell: both channel ends plus every hold.
+	#[cfg(test)]
+	pub(crate) fn context_owners(&self) -> usize {
+		Arc::strong_count(&self.context)
+	}
 	pub(crate) fn take_demand_source(&mut self) -> Option<PingSource> {
 		self.demand_source.take()
 	}
@@ -352,7 +357,7 @@ mod tests {
 
 	#[test]
 	fn overlay_caps_require_every_layer_kind() {
-		use crate::session::compositor::frame::{FrameOverlay, OverlayContent, OverlayFormat, OverlayImage};
+		use crate::session::capture::frame::{FrameOverlay, OverlayContent, OverlayFormat, OverlayImage};
 		let pixels = FrameOverlay {
 			content: OverlayContent::Pixels(Arc::new(OverlayImage {
 				generation: 1,

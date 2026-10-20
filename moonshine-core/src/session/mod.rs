@@ -19,9 +19,8 @@ use crate::session::stream::video::VideoStreamHandle;
 use self::application::Application;
 use self::application::ApplicationConfig;
 use self::application::ApplicationContext;
-use self::compositor::Compositor;
-use self::compositor::LaunchedCompositor;
-use self::compositor::frame::HdrModeState;
+use self::capture::frame::HdrModeState;
+use self::capture::{CaptureBackend, CapturePacing, CaptureSource, LiveCapture};
 use self::failure::{SessionFailure, StopCauseSlot};
 use self::inhibit::SleepInhibitor;
 use self::lifecycle::StartLatch;
@@ -32,6 +31,7 @@ use self::stream::video::VideoStreamConfig;
 
 pub mod application;
 pub mod authorization;
+pub(crate) mod capture;
 pub mod compositor;
 pub mod failure;
 pub mod frame_limit;
@@ -298,10 +298,10 @@ fn stream_setup_failure(stream: &str, port: u16) -> SessionFailure {
 	))
 }
 
-/// Initialized session state — components created, compositor and app not yet started.
+/// Initialized session state — components created, capture and app not yet started.
 pub(crate) struct InitializedSession {
 	context: SessionContext,
-	compositor: Compositor,
+	capture: CaptureSource,
 	audio_stream: AudioStream,
 	video_stream: VideoStream,
 	control_stream: ControlStream,
@@ -327,10 +327,13 @@ impl InitializedSession {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
-		// Create compositor, audio stream, video stream, and control stream.
-		let (compositor, handles) = Compositor::new(
+		// Create the capture source, audio stream, video stream, and control stream.
+		// Every session runs isolated Game Mode.
+		let (capture, endpoints) = CaptureSource::new(
+			CaptureBackend::Isolated,
 			compositor_config,
-			compositor::CompositorContext::from_session(&context, video_config.log_stats),
+			&context,
+			video_config.log_stats,
 			stop.clone(),
 			foreground_tx,
 		);
@@ -341,7 +344,7 @@ impl InitializedSession {
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
-			handles.frame_rx,
+			endpoints.frames,
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
@@ -349,12 +352,12 @@ impl InitializedSession {
 		)
 		.await
 		.map_err(|()| stream_setup_failure("video", video_port))?;
-		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())
+		let control_stream = ControlStream::new(control_config, address, endpoints.input, stop.clone())
 			.map_err(|()| stream_setup_failure("control", control_port))?;
 
 		Ok(Self {
 			context,
-			compositor,
+			capture,
 			audio_stream: audio,
 			video_stream,
 			control_stream,
@@ -364,7 +367,7 @@ impl InitializedSession {
 		})
 	}
 
-	/// Launch the session — starts the compositor and application, but does not start streams.
+	/// Launch the session — starts capture and the application, but does not start streams.
 	///
 	/// The manager records the application unit before calling this, so a
 	/// cancellation after systemd accepted the unit is still cleaned up.
@@ -374,7 +377,7 @@ impl InitializedSession {
 	) -> Result<LaunchedSession, SessionFailure> {
 		let Self {
 			context,
-			compositor,
+			capture,
 			audio_stream: audio,
 			video_stream,
 			control_stream,
@@ -383,10 +386,10 @@ impl InitializedSession {
 			cause,
 		} = self;
 
-		// Waiting for the compositor's readiness blocks; keep it off the runtime
-		// workers. A cancelled launch drops the result, and the compositor thread
-		// exits on the session stop that cancelled it.
-		let launched_compositor = tokio::task::spawn_blocking(move || compositor.launch())
+		// Waiting for capture readiness blocks; keep it off the runtime workers.
+		// A cancelled launch drops the result, and the capture thread exits on
+		// the session stop that cancelled it.
+		let capture = tokio::task::spawn_blocking(move || capture.launch())
 			.await
 			.map_err(|e| {
 				tracing::error!("Compositor launch task failed: {e}");
@@ -402,7 +405,16 @@ impl InitializedSession {
 					 Diagnostics page or with pyroshine healthcheck.",
 				)
 			})?;
-		let ready = launched_compositor.ready();
+		let capabilities = capture.capabilities();
+		tracing::info!(
+			backend = capabilities.backend.as_str(),
+			render_node = %capabilities.render_node.display(),
+			sdr_format = ?capabilities.sdr_format,
+			hdr_format = ?capabilities.hdr_format,
+			presentation_pacing = capabilities.presentation_pacing,
+			"Capture ready"
+		);
+		let display = capture.application_display();
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
 		let application = Application::spawn(
@@ -410,11 +422,11 @@ impl InitializedSession {
 			ApplicationContext {
 				unit_name: application_unit_name().to_string(),
 				pulse_socket_path,
-				xdisplay: ready.xdisplay,
-				wayland_display: ready.wayland_display.clone(),
+				xdisplay: display.xdisplay,
+				wayland_display: display.wayland_display.clone(),
 				// Keep HDR-capable application paths enabled so a later reconnect can
 				// switch SDR/HDR without relaunching the application.
-				hdr: ready.hdr_capable,
+				hdr: capabilities.hdr(),
 				// Fixed for the application's lifetime: a resume at another frame
 				// rate keeps the limit the launching stream set.
 				frame_limit: frame_limit::resolve(frame_limit, &context.application.frame_limit, context.refresh_rate),
@@ -437,7 +449,7 @@ impl InitializedSession {
 			context,
 			application,
 			video_stream,
-			launched_compositor,
+			capture,
 			audio,
 			control_stream,
 			hdr_metadata_rx,
@@ -445,29 +457,26 @@ impl InitializedSession {
 	}
 }
 
-/// Launched session state — compositor and app running, waiting for RTSP negotiation.
+/// Launched session state — capture and app running, waiting for RTSP negotiation.
 pub(crate) struct LaunchedSession {
 	context: SessionContext,
 	application: Application,
 	video_stream: VideoStream,
-	launched_compositor: LaunchedCompositor,
+	capture: LiveCapture,
 	audio: AudioStream,
 	control_stream: ControlStream,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
 }
 
 impl LaunchedSession {
-	/// Apply the negotiated output mode to the running compositor (a no-op when
-	/// it matches the launch mode) and verify the effective HDR state.
+	/// Apply the negotiated output mode to the running capture backend (a
+	/// no-op when it matches the launch mode) and verify the effective HDR state.
 	pub(crate) async fn apply_output_mode(
 		&mut self,
 		video: &VideoStreamContext,
-		capture_pacing: compositor::CapturePacing,
+		capture_pacing: CapturePacing,
 	) -> Result<(), ()> {
-		let effective_hdr = self
-			.launched_compositor
-			.reconfigure(video.output_mode(capture_pacing))
-			.await?;
+		let effective_hdr = self.capture.reconfigure(video.output_mode(capture_pacing)).await?;
 		if effective_hdr != video.format.hdr {
 			tracing::warn!(
 				requested_hdr = video.format.hdr,
@@ -494,7 +503,7 @@ impl LaunchedSession {
 	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
 		let Self {
 			context,
-			launched_compositor,
+			capture,
 			application,
 			audio,
 			video_stream,
@@ -554,7 +563,7 @@ impl LaunchedSession {
 		Ok((
 			ActiveSession {
 				_application: application,
-				compositor: launched_compositor,
+				capture,
 				video_handle: video_handle_for_resume,
 				audio_handle: audio_handle_for_resume,
 				video_context: video_ctx,
@@ -572,7 +581,7 @@ impl LaunchedSession {
 /// manager's session record; this keeps only what reconfiguration consumes.
 pub(crate) struct ActiveSession {
 	_application: Application,
-	compositor: LaunchedCompositor,
+	capture: LiveCapture,
 	video_handle: VideoStreamHandle,
 	audio_handle: stream::audio::AudioStartHandle,
 	video_context: VideoStreamContext,
@@ -589,8 +598,8 @@ impl ActiveSession {
 	}
 
 	/// Apply a resuming client's capture pacing to the unchanged output.
-	pub(crate) async fn apply_capture_pacing(&mut self, capture_pacing: compositor::CapturePacing) -> Result<(), ()> {
-		self.compositor
+	pub(crate) async fn apply_capture_pacing(&mut self, capture_pacing: CapturePacing) -> Result<(), ()> {
+		self.capture
 			.reconfigure(self.video_context.output_mode(capture_pacing))
 			.await
 			.map(|_| ())
@@ -599,10 +608,10 @@ impl ActiveSession {
 	pub(crate) async fn reconfigure_video(
 		&mut self,
 		context: VideoStreamContext,
-		capture_pacing: compositor::CapturePacing,
+		capture_pacing: CapturePacing,
 		generation: u64,
 	) -> Result<(), ()> {
-		let effective_hdr = self.compositor.reconfigure(context.output_mode(capture_pacing)).await?;
+		let effective_hdr = self.capture.reconfigure(context.output_mode(capture_pacing)).await?;
 		if effective_hdr != context.format.hdr {
 			tracing::warn!(
 				requested_hdr = context.format.hdr,

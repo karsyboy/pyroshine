@@ -1,24 +1,56 @@
-//! Frame export types for the compositor-to-encoder pipeline.
+//! The frame contract between a capture backend and the video pipeline.
 //!
-//! `ExportedFrame` is the single frame-exchange type between the compositor
-//! and the video pipeline. It replaces the PipeWire-based `CapturedFrame`.
+//! `ExportedFrame` is the single frame-exchange type: every backend produces
+//! it and every encoder (conventional and PyroWave) consumes it the same way.
+//!
+//! | Property | Carried as |
+//! | --- | --- |
+//! | GPU identity | Implicit: the frame is on the capture GPU, whose verified Vulkan context the channel carries (`CaptureReceiver::context`) |
+//! | Frame source | DMA-BUF planes (`planes()`), owned by a [`SourceLease`] |
+//! | Pixel format, bit depth | DRM fourcc (`format`): packed RGB(A), 8-bit, 10-bit or FP16 |
+//! | Modifier | `modifier`; always a pair in `gpu::ImportableModifiers` |
+//! | Dimensions, crop | `width` × `height` is the visible image; frames are never cropped |
+//! | Primaries, transfer, matrix | [`FrameColorSpace`], from the source's color declaration |
+//! | Range, chroma | Full-range RGB, so 4:4:4; the encoder converts to the negotiated YUV |
+//! | HDR metadata | `hdr_metadata`, static HDR10 metadata of the source |
+//! | Timestamps | `source_time` (content time, drives RTP), `created_at` (export completion) |
+//! | Damage | None: every frame is encoded whole |
+//! | Producer sync | Complete before the frame is sent (see below) |
+//! | Consumer sync | `consumed` (content reuse) and the capture credit (demand), separately |
+//!
+//! A source that cannot meet a row (YUV or cropped buffers, an unsampleable
+//! format, buffers on another GPU) must compose or convert it itself, or fail
+//! to start; the pipeline never receives what it cannot read correctly.
+//!
+//! # Producer synchronization
+//!
+//! A frame is sent only once every producer write to its buffer has
+//! completed: the backend waited on the producer's fence, or latched a client
+//! commit only after its DMA-BUF finished rendering. Consumers therefore read
+//! without waiting for the producer. A backend whose source signals
+//! completion differently (for example a DRM syncobj timeline point) waits
+//! for it before sending; carrying an unsignaled fence to the consumer would
+//! need an extension of this type, not a different reading of it.
 //!
 //! # Source-buffer ownership
 //!
 //! Every frame owns a [`SourceLease`]: a strong reference to the Smithay
-//! `Dmabuf` it was exported from (a compositor pool slot or a client's
-//! direct-scanout buffer). The lease owns the plane descriptors, so they stay
-//! open — and their numbers cannot be reused for another object — for as long
-//! as the frame (or a clone of its lease) exists, regardless of when the
-//! compositor drops its pool, retires a resolution's pool or exits. Plane fds
-//! are only handed out as `BorrowedFd`s tied to the frame's lifetime.
+//! `Dmabuf` it was exported from (for the isolated compositor, a pool slot or
+//! a client's direct-scanout buffer). The lease owns the plane descriptors, so
+//! they stay open — and their numbers cannot be reused for another object —
+//! for as long as the frame (or a clone of its lease) exists, regardless of
+//! when the backend drops its pool, retires a resolution's pool or exits.
+//! Plane fds are only handed out as `BorrowedFd`s tied to the frame's lifetime.
 //!
 //! The lease guarantees descriptor and memory validity. *Content* reuse is a
-//! separate contract: `consumed` tells the compositor it may render into, or
+//! separate contract: `consumed` tells the backend it may render into, or
 //! release to its client, that buffer again, and is set only once no GPU work
 //! can still read it (after a completed read, or a failure that provably never
-//! submitted one). The capture credit is a third, independent signal that
-//! bounds capture demand through transport.
+//! submitted one). The pipeline sets it after its read; the channel sets it
+//! for frames it discards (stale epoch, full, disconnected). A failure whose
+//! GPU access is unknown never sets it, so that buffer stays held rather than
+//! risk reuse under a pending read. The capture credit is a third, independent
+//! signal that bounds capture demand through transport.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
@@ -28,7 +60,7 @@ use std::time::Instant;
 use smithay::backend::allocator::Buffer;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 
-/// Color space of the compositor output frame.
+/// Color encoding of a captured frame, as its source declared it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum FrameColorSpace {
 	/// sRGB (BT.709 primaries, sRGB EOTF, BT.709 matrix).
@@ -219,10 +251,11 @@ pub(crate) enum CapturePath {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CaptureOrigin {
 	pub path: CapturePath,
-	pub composition_reason: Option<super::DirectReject>,
+	/// Isolated-compositor diagnostics; other backends report `None`.
+	pub composition_reason: Option<crate::session::compositor::DirectReject>,
 }
 
-/// A compositor frame exported for encoding.
+/// A captured frame handed to the video pipeline for encoding.
 #[derive(Debug)]
 pub(crate) struct ExportedFrame {
 	/// Owns the plane descriptors below; see the module documentation.
@@ -240,7 +273,8 @@ pub(crate) struct ExportedFrame {
 	pub width: u32,
 	/// Frame height in pixels.
 	pub height: u32,
-	/// Timestamp when the frame was produced by the compositor.
+	/// When the backend finished producing the frame (render completion for
+	/// composed frames, export for direct ones).
 	pub created_at: Instant,
 	/// When the frame's content became current: the sampled refresh deadline
 	/// under fixed pacing, or the latch time of the newest content under VRR
@@ -252,10 +286,11 @@ pub(crate) struct ExportedFrame {
 	/// GLES preparation/submission start, retained across the fence wait.
 	/// Direct exports have no compositor render and use `created_at` for pacing.
 	pub composition_started_at: Option<Instant>,
-	/// Index of the pre-allocated GBM buffer in the compositor's pool.
+	/// The backend's index of the source buffer (pool slot or client
+	/// buffer); diagnostics only.
 	pub buffer_index: usize,
 	/// Shared flag set to `true` once no GPU work can still read the source,
-	/// signalling the compositor that this buffer's content may be reused.
+	/// signalling the backend that this buffer's content may be reused.
 	pub consumed: Arc<AtomicBool>,
 	/// Color space of the rendered frame.
 	pub color_space: FrameColorSpace,

@@ -28,6 +28,7 @@ the guide for the area being changed:
 | Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
 | Inputtino and Pixelforge patch maintenance | [Vendored dependencies](../vendor/README.md) |
 | Web management interface, tray and management API | [Architecture](ARCHITECTURE.md#management), [web interface](../web/README.md) |
+| Capture backends, the frame contract and future capture modes | [Capture backends](CAPTURE_BACKENDS.md) |
 | Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |

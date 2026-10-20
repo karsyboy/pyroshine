@@ -12,10 +12,8 @@ use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
-use crate::session::compositor::{
-	frame::{HdrMetadata, HdrModeState},
-	input::CompositorInputEvent,
-};
+use crate::session::capture::frame::{HdrMetadata, HdrModeState};
+use crate::session::compositor::input::CompositorInputEvent;
 use crate::session::keys::ActiveKeys;
 use crate::session::lifecycle::WorkerGuard;
 use crate::session::manager::SessionShutdownReason;

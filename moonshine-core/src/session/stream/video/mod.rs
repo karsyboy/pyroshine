@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::authorization::MediaStream;
-use crate::session::compositor::frame::HdrModeState;
+use crate::session::capture::frame::HdrModeState;
 use crate::session::lifecycle::{StartLatch, StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::MediaDemand;
@@ -212,14 +212,14 @@ pub struct FrameStats {
 	/// Captured with VRR (presentation-driven) pacing.
 	pub vrr_capture: bool,
 	/// How the source frame was produced (direct export or composition).
-	pub(crate) capture_origin: crate::session::compositor::frame::CaptureOrigin,
+	pub(crate) capture_origin: crate::session::capture::frame::CaptureOrigin,
 }
 
 impl FrameStats {
 	/// How the source frame was captured: `direct`, `direct_late` (direct
 	/// export with late-composited layers) or `composited`.
 	pub fn capture_path(&self) -> &'static str {
-		use crate::session::compositor::frame::CapturePath;
+		use crate::session::capture::frame::CapturePath;
 		match self.capture_origin.path {
 			CapturePath::Direct => "direct",
 			CapturePath::DirectLate => "direct_late",
@@ -336,9 +336,9 @@ impl VideoStreamContext {
 	/// The virtual-output properties this stream requires from the compositor.
 	pub(crate) fn output_mode(
 		&self,
-		capture_pacing: crate::session::compositor::CapturePacing,
-	) -> crate::session::compositor::OutputMode {
-		crate::session::compositor::OutputMode {
+		capture_pacing: crate::session::capture::CapturePacing,
+	) -> crate::session::capture::OutputMode {
+		crate::session::capture::OutputMode {
 			width: self.width,
 			height: self.height,
 			refresh_rate: self.fps,
@@ -562,7 +562,7 @@ impl VideoStreamHandle {
 
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
-	frame_rx: crate::session::compositor::admission::CaptureReceiver,
+	frame_rx: crate::session::capture::admission::CaptureReceiver,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	/// Receives the encoder's failure if it ends the session.
@@ -573,7 +573,7 @@ impl VideoStream {
 	pub async fn new(
 		config: VideoStreamConfig,
 		address: String,
-		frame_rx: crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: crate::session::capture::admission::CaptureReceiver,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -944,7 +944,7 @@ fn deliverable(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::session::compositor::CapturePacing;
+	use crate::session::capture::CapturePacing;
 	use crate::session::stream::test_support::SocketId;
 
 	#[tokio::test]
@@ -1294,7 +1294,7 @@ mod tests {
 	async fn busy_udp_port_fails_stream_construction() {
 		let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let port = occupied.local_addr().unwrap().port();
-		let (_capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+		let (_capture_tx, capture_rx) = crate::session::capture::admission::capture_channel();
 		let config = VideoStreamConfig {
 			port,
 			..Default::default()
@@ -1342,7 +1342,7 @@ mod tests {
 			// Each attempt gets its own capture channel; keep the senders open.
 			let mut capture_senders = Vec::new();
 			let stream = construct_on_fixed_port(port, async || {
-				let (capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+				let (capture_tx, capture_rx) = crate::session::capture::admission::capture_channel();
 				capture_senders.push(capture_tx);
 				VideoStream::new(
 					config.clone(),

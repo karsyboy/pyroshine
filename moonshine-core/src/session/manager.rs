@@ -37,7 +37,7 @@ use crate::session::SessionKeysSender;
 use crate::session::SystemSession;
 use crate::session::application_unit_name;
 use crate::session::authorization::StreamAuthorization;
-use crate::session::compositor::CapturePacing;
+use crate::session::capture::CapturePacing;
 use crate::session::compositor::CompositorConfig;
 use crate::session::failure::{Problem, SessionFailure, StopCauseSlot};
 use crate::session::keys::KeyLedger;

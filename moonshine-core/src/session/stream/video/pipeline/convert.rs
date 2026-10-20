@@ -42,7 +42,7 @@ use ash::vk;
 use pixelforge::{Codec, ColorSpace, VideoContext};
 
 use super::dmabuf::CachedImport;
-use crate::session::compositor::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
+use crate::session::capture::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
 
 /// Precompiled from `shaders/convert.comp` by `scripts/build-shaders.sh`.
 const CONVERT_SPIRV: &[u8] = include_bytes!("shaders/convert.spv");

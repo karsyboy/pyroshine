@@ -5,7 +5,7 @@ For the system context see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Capture admission and presentation
 
-`compositor/admission.rs` provides receiver-driven demand, one owned credit and
+`capture/admission.rs` provides receiver-driven demand, one owned credit and
 one handoff slot. The receiver requests a capture only when useful; the compositor
 claims the credit before direct export, fd duplication, scene-element construction
 or GLES rendering. Without demand it retains dirty state and skips capture work.

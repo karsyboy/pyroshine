@@ -17,7 +17,7 @@ use smithay::reexports::wayland_protocols::wp::color_representation::v1::server:
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata};
+use crate::session::capture::frame::{FrameColorSpace, HdrMetadata};
 use crate::session::compositor::state::MoonshineCompositor;
 
 fn send_ready(resource: &wp_image_description_v1::WpImageDescriptionV1) {
@@ -1315,7 +1315,7 @@ mod tests {
 		);
 		let launched = compositor.launch().unwrap();
 		let socket_path = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
-			.join(&launched.ready().wayland_display);
+			.join(&launched.ready().display.wayland_display);
 		for case in 0..4 {
 			let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
 			let mut queue = connection.new_event_queue::<Peer>();
