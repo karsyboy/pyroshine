@@ -13,6 +13,11 @@
 //! The benchmark has no Moonlight client: there is no ENet control stream,
 //! client decode or audio endpoint. These cycles establish backend ownership
 //! and streaming continuity, not client compatibility.
+//!
+//! The capture GPU is probed as the server probes it at startup, so
+//! `--encoder` stays strict: each cycle records the conventional backend the
+//! probe chose for its profile, and a profile the requested backend cannot
+//! encode fails to start instead of falling back to another backend.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -24,14 +29,15 @@ use std::time::{Duration, Instant};
 use async_shutdown::ShutdownManager;
 use moonshine_core::ShutdownReason;
 use moonshine_core::config::ApplicationConfig;
+use moonshine_core::healthcheck;
 use moonshine_core::session::compositor::{CaptureMode, CompositorConfig};
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::session::stream::audio::{AudioChannels, AudioConfig, AudioStreamConfig, AudioStreamContext};
 use moonshine_core::session::stream::control::ControlStreamConfig;
 use moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect;
 use moonshine_core::session::stream::video::{
-	BitDepth, ChromaFormat, ColorRange, FrameStats, NegotiatedVideoFormat, VideoCodec, VideoStreamConfig,
-	VideoStreamContext,
+	BitDepth, ChromaFormat, ColorRange, EncoderBackend, EncoderTable, FrameStats, NegotiatedVideoFormat, VideoCodec,
+	VideoStreamConfig, VideoStreamContext,
 };
 use moonshine_core::session::{RemoteInputKey, RemoteInputKeyId, SessionContext, SessionKeyData, SessionKeys};
 use tokio::sync::broadcast;
@@ -310,9 +316,9 @@ fn port_is_free(port: u16) -> bool {
 	std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
-fn describe(video: &VideoStreamContext, audio: &AudioStreamContext) -> String {
+fn describe(table: &EncoderTable, video: &VideoStreamContext, audio: &AudioStreamContext) -> String {
 	format!(
-		"{}x{}@{} {} {} {}-bit {} {} Mbps enc={} audio={:?}/{}ms/{}",
+		"{}x{}@{} {} {} {}-bit {} {} Mbps encoder={} enc={} audio={:?}/{}ms/{}",
 		video.width,
 		video.height,
 		video.fps,
@@ -321,6 +327,7 @@ fn describe(video: &VideoStreamContext, audio: &AudioStreamContext) -> String {
 		video.format.bit_depth.bits(),
 		if video.format.hdr { "HDR10" } else { "SDR" },
 		video.bitrate / 1_000_000,
+		encoder_label(table, video),
 		video.encrypt_video,
 		audio.audio_config.channels,
 		audio.packet_duration_ms,
@@ -330,6 +337,21 @@ fn describe(video: &VideoStreamContext, audio: &AudioStreamContext) -> String {
 			"normal"
 		},
 	)
+}
+
+/// The encoder the pipeline uses for this stream: PyroWave, or the probed
+/// backend for a conventional profile ("none" when the requested backend
+/// cannot encode it, so the cycle must fail to start).
+fn encoder_label(table: &EncoderTable, video: &VideoStreamContext) -> &'static str {
+	if video.format.codec == VideoCodec::PyroWave {
+		return "pyrowave";
+	}
+	match healthcheck::profile_bit(video.format).and_then(|bit| table.get(bit)) {
+		Some(EncoderBackend::Vulkan) => "vulkan",
+		Some(EncoderBackend::Vaapi) => "vaapi",
+		Some(EncoderBackend::Nvenc) => "nvenc",
+		None => "none",
+	}
 }
 
 struct CycleLog {
@@ -402,7 +424,23 @@ impl CycleLog {
 	}
 }
 
-fn session_manager(args: &Args, shutdown: &ShutdownManager<ShutdownReason>) -> Result<SessionManager, BoxError> {
+/// The probed encoder table, as the server installs it at startup.
+async fn encoder_table(args: &Args) -> Result<EncoderTable, BoxError> {
+	let capabilities = super::probe_capabilities(args).await?;
+	tracing::info!(
+		gpu = capabilities.gpu_name,
+		encoder = args.encoder,
+		profiles = ?healthcheck::codec_profile_labels(capabilities.supported_codecs),
+		"Probed capture GPU for cycles"
+	);
+	Ok(capabilities.gpu.encoder_table())
+}
+
+fn session_manager(
+	args: &Args,
+	table: &EncoderTable,
+	shutdown: &ShutdownManager<ShutdownReason>,
+) -> Result<SessionManager, BoxError> {
 	SessionManager::new(
 		CompositorConfig {
 			capture_mode: if args.composited {
@@ -413,7 +451,11 @@ fn session_manager(args: &Args, shutdown: &ShutdownManager<ShutdownReason>) -> R
 			bench_pointer: super::bench_pointer(args),
 			..Default::default()
 		},
-		VideoStreamConfig::default(),
+		VideoStreamConfig {
+			encoder: super::encoder_preference(args),
+			encoder_table: table.clone(),
+			..Default::default()
+		},
 		AudioStreamConfig {
 			port: 0,
 			..Default::default()
@@ -484,7 +526,8 @@ pub(super) async fn run_full_cycles(args: &Args) -> Result<(), BoxError> {
 	let codecs = codecs(args);
 	let video_port = VideoStreamConfig::default().port;
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
-	let manager = session_manager(args, &shutdown)?;
+	let table = encoder_table(args).await?;
+	let manager = session_manager(args, &table, &shutdown)?;
 	let mut stats = manager.bench_stats_receiver();
 	let receiver = Receiver::bind().await?;
 	let mut log = CycleLog::new(args)?;
@@ -496,7 +539,7 @@ pub(super) async fn run_full_cycles(args: &Args) -> Result<(), BoxError> {
 		settings = settings.step(step, codecs.len());
 		let video = settings.video(&codecs, args.packet_size);
 		let audio = settings.audio();
-		let description = describe(&video, &audio);
+		let description = describe(&table, &video, &audio);
 		let started = Instant::now();
 		let mut checks = Vec::new();
 		let mut window = None;
@@ -556,7 +599,8 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 	let codecs = codecs(args);
 	let video_port = VideoStreamConfig::default().port;
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
-	let manager = session_manager(args, &shutdown)?;
+	let table = encoder_table(args).await?;
+	let manager = session_manager(args, &table, &shutdown)?;
 	let mut stats = manager.bench_stats_receiver();
 	let receiver = Receiver::bind().await?;
 	let mut log = CycleLog::new(args)?;
@@ -631,7 +675,7 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 		settings = settings.step(step, codecs.len());
 		let video = settings.video(&codecs, args.packet_size);
 		let audio = settings.audio();
-		let description = describe(&video, &audio);
+		let description = describe(&table, &video, &audio);
 		let started = Instant::now();
 		let mut checks = Vec::new();
 		let mut window = None;
@@ -660,7 +704,7 @@ pub(super) async fn run_reconnect_cycles(args: &Args) -> Result<(), BoxError> {
 			tracing::error!(
 				cycle,
 				stage,
-				from = describe(&previous.video(&codecs, args.packet_size), &previous.audio()),
+				from = describe(&table, &previous.video(&codecs, args.packet_size), &previous.audio()),
 				to = description,
 				"Reconnect failed"
 			);
@@ -710,4 +754,39 @@ fn finish(log: CycleLog, cycles: u32, baseline: Resources) -> Result<(), BoxErro
 		return Err(boxed_error(format!("{} of {cycles} cycle(s) failed", log.failures)));
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use clap::Parser as _;
+	use moonshine_core::session::stream::video::EncoderPreference;
+
+	use super::*;
+
+	#[test]
+	fn cycles_keep_the_requested_encoder() {
+		for (name, preference) in [
+			("auto", EncoderPreference::Auto),
+			("vulkan", EncoderPreference::Vulkan),
+			("vaapi", EncoderPreference::Vaapi),
+			("nvenc", EncoderPreference::Nvenc),
+		] {
+			let args = Args::try_parse_from(["moonshine-bench", "--cycles", "1", "--encoder", name, "true"]).unwrap();
+			assert_eq!(super::super::encoder_preference(&args), preference, "{name}");
+		}
+	}
+
+	#[test]
+	fn cycles_record_the_probed_backend() {
+		let mut table = EncoderTable::default();
+		table.insert(healthcheck::CODEC_H264, EncoderBackend::Vaapi);
+		let video = |codec| VideoStreamContext {
+			format: NegotiatedVideoFormat::sdr(codec, ChromaFormat::Yuv420, BitDepth::Eight, ColorRange::Limited),
+			..Settings::default().video(&[codec], 1024)
+		};
+		assert_eq!(encoder_label(&table, &video(VideoCodec::H264)), "vaapi");
+		// A profile the requested backend cannot encode has no fallback.
+		assert_eq!(encoder_label(&table, &video(VideoCodec::Hevc)), "none");
+		assert_eq!(encoder_label(&table, &video(VideoCodec::PyroWave)), "pyrowave");
+	}
 }

@@ -53,36 +53,49 @@ const MAX_TILE_ROWS: u32 = 64;
 const OBU_SIZE_BYTES: usize = 4;
 
 /// Level limits (Annex A.3): seq_level_idx, MaxPicSize, MaxHSize, MaxVSize,
-/// MaxDisplayRate. Bitrate limits are not applied (streams exceed them, like
-/// other low-latency encoders).
-const LEVELS: [(u8, u64, u32, u32, u64); 14] = [
-	(0, 147_456, 2048, 1152, 4_423_680),
-	(1, 278_784, 2816, 1584, 8_363_520),
-	(4, 665_856, 4352, 2448, 19_975_680),
-	(5, 1_065_024, 5504, 3096, 31_950_720),
-	(8, 2_359_296, 6144, 3456, 70_778_880),
-	(9, 2_359_296, 6144, 3456, 141_557_760),
-	(12, 8_912_896, 8192, 4352, 267_386_880),
-	(13, 8_912_896, 8192, 4352, 534_773_760),
-	(14, 8_912_896, 8192, 4352, 1_069_547_520),
-	(15, 8_912_896, 8192, 4352, 1_069_547_520),
-	(16, 35_651_584, 16384, 8704, 1_069_547_520),
-	(17, 35_651_584, 16384, 8704, 2_139_095_040),
-	(18, 35_651_584, 16384, 8704, 4_278_190_080),
-	(19, 35_651_584, 16384, 8704, 4_278_190_080),
+/// MaxDisplayRate, and MainMbps and HighMbps in kbit/s (0: no High tier
+/// below level 4.0). Main profile's BitrateProfileFactor is 1.
+const LEVELS: [(u8, u64, u32, u32, u64, u64, u64); 14] = [
+	(0, 147_456, 2048, 1152, 4_423_680, 1_500, 0),
+	(1, 278_784, 2816, 1584, 8_363_520, 3_000, 0),
+	(4, 665_856, 4352, 2448, 19_975_680, 6_000, 0),
+	(5, 1_065_024, 5504, 3096, 31_950_720, 10_000, 0),
+	(8, 2_359_296, 6144, 3456, 70_778_880, 12_000, 30_000),
+	(9, 2_359_296, 6144, 3456, 141_557_760, 20_000, 50_000),
+	(12, 8_912_896, 8192, 4352, 267_386_880, 30_000, 100_000),
+	(13, 8_912_896, 8192, 4352, 534_773_760, 40_000, 160_000),
+	(14, 8_912_896, 8192, 4352, 1_069_547_520, 60_000, 240_000),
+	(15, 8_912_896, 8192, 4352, 1_069_547_520, 60_000, 240_000),
+	(16, 35_651_584, 16384, 8704, 1_069_547_520, 60_000, 240_000),
+	(17, 35_651_584, 16384, 8704, 2_139_095_040, 100_000, 480_000),
+	(18, 35_651_584, 16384, 8704, 4_278_190_080, 160_000, 800_000),
+	(19, 35_651_584, 16384, 8704, 4_278_190_080, 160_000, 800_000),
 ];
 
-/// The lowest level whose picture size and sample rate fit; 31 (no level
-/// constraints) beyond the table.
-pub(super) fn seq_level_idx(width: u32, height: u32, fps: u32) -> u8 {
+/// The level and tier (`true`: High) of a stream: the lowest Main tier level
+/// whose picture size, sample rate and bitrate (the stream's constant target)
+/// fit, else the lowest High tier level that fits; 31 (no level constraints)
+/// beyond the table.
+pub(super) fn seq_level_tier(width: u32, height: u32, fps: u32, bitrate: u32) -> (u8, bool) {
 	let picture = u64::from(width) * u64::from(height);
 	let rate = picture * u64::from(fps);
+	let kbps = u64::from(bitrate).div_ceil(1000);
+	let fits = |&&(_, max_picture, max_width, max_height, max_rate, ..): &&(u8, u64, u32, u32, u64, u64, u64)| {
+		picture <= max_picture && width <= max_width && height <= max_height && rate <= max_rate
+	};
 	LEVELS
 		.iter()
-		.find(|(_, max_picture, max_width, max_height, max_rate)| {
-			picture <= *max_picture && width <= *max_width && height <= *max_height && rate <= *max_rate
+		.filter(fits)
+		.find(|&&(.., main_kbps, _)| kbps <= main_kbps)
+		.map(|&(level, ..)| (level, false))
+		.or_else(|| {
+			LEVELS
+				.iter()
+				.filter(fits)
+				.find(|&&(.., high_kbps)| kbps <= high_kbps)
+				.map(|&(level, ..)| (level, true))
 		})
-		.map_or(31, |(level, ..)| *level)
+		.unwrap_or((31, false))
 }
 
 /// Smallest `k` with `block << k >= target` (spec `tile_log2`).
@@ -175,6 +188,7 @@ pub(super) struct FrameHeader {
 pub(super) struct Av1 {
 	tools: Tools,
 	level: u8,
+	high_tier: bool,
 	sb_cols: u32,
 	sb_rows: u32,
 	max_log2_tile_cols: u32,
@@ -200,9 +214,11 @@ impl Av1 {
 				setup.width, setup.height
 			));
 		}
+		let (level, high_tier) = seq_level_tier(setup.width, setup.height, setup.fps, setup.bitrate);
 		Ok(Self {
 			tools,
-			level: seq_level_idx(setup.width, setup.height, setup.fps),
+			level,
+			high_tier,
 			sb_cols,
 			sb_rows,
 			max_log2_tile_cols: tile_log2(1, sb_cols.min(MAX_TILE_COLS)),
@@ -223,7 +239,7 @@ impl Av1 {
 		w.u(12, 0); // operating_point_idc[0]
 		w.u(5, u32::from(self.level)); // seq_level_idx[0]
 		if self.level > 7 {
-			w.flag(false); // seq_tier[0]: Main
+			w.flag(self.high_tier); // seq_tier[0]
 		}
 		let width_bits = 32 - (setup.width - 1).max(1).leading_zeros();
 		let height_bits = 32 - (setup.height - 1).max(1).leading_zeros();
@@ -272,7 +288,7 @@ impl Av1 {
 		let mut seq = VAEncSequenceParameterBufferAV1 {
 			seq_profile: 0,
 			seq_level_idx: self.level,
-			seq_tier: 0,
+			seq_tier: u8::from(self.high_tier),
 			hierarchical_flag: 0,
 			// Infinite GOP: key frames only when requested.
 			intra_period: 0,
@@ -547,12 +563,25 @@ mod tests {
 
 	#[test]
 	fn level_follows_picture_size_and_rate() {
-		assert_eq!(seq_level_idx(1920, 1080, 30), 8); // 4.0
-		assert_eq!(seq_level_idx(1920, 1080, 60), 9); // 4.1
-		assert_eq!(seq_level_idx(1920, 1080, 120), 12); // 5.0
-		assert_eq!(seq_level_idx(2560, 1440, 120), 13); // 5.1
-		assert_eq!(seq_level_idx(3840, 2160, 120), 14); // 5.2
-		assert_eq!(seq_level_idx(16384, 16384, 60), 31);
+		let level = |width, height, fps| seq_level_tier(width, height, fps, 10_000_000);
+		assert_eq!(level(1920, 1080, 30), (8, false)); // 4.0
+		assert_eq!(level(1920, 1080, 60), (9, false)); // 4.1
+		assert_eq!(level(1920, 1080, 120), (12, false)); // 5.0
+		assert_eq!(level(2560, 1440, 120), (13, false)); // 5.1
+		assert_eq!(level(3840, 2160, 120), (14, false)); // 5.2
+		assert_eq!(level(16384, 16384, 60), (31, false));
+	}
+
+	#[test]
+	fn level_and_tier_bound_the_bitrate() {
+		// 1080p60 is 4.1 by size; Main tier 4.1 carries 20 Mbit/s, 5.2 60.
+		assert_eq!(seq_level_tier(1920, 1080, 60, 20_000_000), (9, false));
+		assert_eq!(seq_level_tier(1920, 1080, 60, 50_000_000), (14, false));
+		assert_eq!(seq_level_tier(1920, 1080, 60, 100_000_000), (17, false));
+		// Beyond Main tier 6.3 (160 Mbit/s): the lowest High tier level.
+		assert_eq!(seq_level_tier(1920, 1080, 60, 200_000_000), (14, true));
+		// Beyond every level: no level constraints.
+		assert_eq!(seq_level_tier(1920, 1080, 60, 900_000_000), (31, false));
 	}
 
 	#[test]
@@ -621,8 +650,9 @@ mod tests {
 		assert_eq!(obu[1] as usize, obu.len() - 2);
 		let payload = &obu[2..];
 		// seq_profile..operating_point_idc: 3+1+1+1+1+5+12 bits, then the
-		// level (4.0), a tier bit (levels above 7) and the frame size.
-		assert_eq!(bits(payload, 24, 5), 8);
+		// level (4.1 for 20 Mbit/s), a tier bit (levels above 7) and the
+		// frame size.
+		assert_eq!(bits(payload, 24, 5), 9);
 		assert_eq!(bits(payload, 29, 1), 0);
 		// frame_width_bits_minus_1: 1365 needs 11 bits; 767 needs 10.
 		assert_eq!(bits(payload, 30, 4), 10);

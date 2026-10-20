@@ -1,4 +1,5 @@
-//! VA-API H.264, HEVC and AV1 encoding on the capture GPU, zero-copy.
+//! VA-API H.264, HEVC and AV1 encoding on the capture GPU. Raw frames stay
+//! on the GPU: the converter's output is copied into the encoder's surfaces.
 //!
 //! libva is loaded at runtime (`libva.so.2`, `libva-drm.so.2`), so hosts
 //! without it are unaffected. The display is opened on the capture GPU's own
@@ -7,10 +8,15 @@
 //! Input surfaces are allocated by the driver in the layout its encoder reads
 //! (tiled, possibly a packed 4:4:4 format), exported as DMA-BUF and imported
 //! into the capture Vulkan device, one single-plane image per layer: the color
-//! converter copies each frame straight into them ([`Target::ExternalPlanes`]).
-//! The converter waits for its fence before [`VaapiEncoder::encode`] submits
-//! the surface, which orders the write before the encoder's read; a surface is
-//! handed out again only after its encode was read back.
+//! converter copies each frame into them ([`Target::ExternalPlanes`]), handing
+//! them over through `VK_QUEUE_FAMILY_FOREIGN_EXT` because the VA driver is not
+//! the Vulkan driver. The converter waits for its fence before
+//! [`VaapiEncoder::encode`] submits the surface, which orders the write before
+//! the encoder's read; a surface is handed out again only after its encode was
+//! read back, or, when a submission failed after the driver may have accepted
+//! it, after the surface was synced. When completion cannot be established
+//! the encoder fails closed: the stream ends and the VA objects are never
+//! destroyed under the driver.
 //!
 //! Frames: an IDR (AV1 key frame) on start and on request, otherwise P
 //! frames (low-delay B frames where the driver needs them; AV1 inter frames)
@@ -26,7 +32,8 @@ pub(crate) mod sys;
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -423,12 +430,25 @@ struct Slot {
 
 /// State shared with the readback thread.
 struct Shared {
-	display: Display,
+	display: Arc<Display>,
 	/// Serializes submissions with coded-buffer mapping.
 	lock: Mutex<()>,
 	/// Per input slot: submitted and not yet read back.
 	busy: Mutex<Vec<bool>>,
 	freed: Condvar,
+	/// The completion of a submitted frame could not be established: its
+	/// slot stays busy, the encoder fails every later frame and its VA
+	/// objects are never destroyed. Set while holding `busy`.
+	lost: AtomicBool,
+}
+
+impl Shared {
+	/// Record that a slot's completion is unknown (see [`Self::lost`]).
+	fn mark_lost(&self) {
+		let _busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+		self.lost.store(true, Ordering::Release);
+		self.freed.notify_all();
+	}
 }
 
 struct Job {
@@ -439,13 +459,32 @@ struct Job {
 	/// Bytes the packet starts with before the coded data: the AV1 temporal
 	/// delimiter, which no driver is asked to write.
 	prefix: &'static [u8],
-	reply: tokio::sync::oneshot::Sender<Result<Packet, EncodeError>>,
+	/// `None` for a failed submission the driver may have accepted: the
+	/// readback thread only establishes its completion before freeing the slot.
+	reply: Option<tokio::sync::oneshot::Sender<Result<Packet, EncodeError>>>,
+}
+
+/// A failed submission. `accepted`: `vaBeginPicture` succeeded, so the driver
+/// may have taken work that still reads the input surface and writes its
+/// coded buffer; the slot is freed only once that work is known to be done.
+struct SubmitError {
+	error: EncodeError,
+	accepted: bool,
+}
+
+impl From<EncodeError> for SubmitError {
+	fn from(error: EncodeError) -> Self {
+		Self { error, accepted: false }
+	}
 }
 
 /// A VA-API encoder of one stream epoch.
 pub(crate) struct VaapiEncoder {
 	shared: Arc<Shared>,
 	vulkan: VideoContext,
+	node: PathBuf,
+	profile: VAProfile,
+	entrypoint: VAEntrypoint,
 	config: VAConfigID,
 	context: VAContextID,
 	slots: Vec<Slot>,
@@ -469,16 +508,65 @@ pub(crate) struct VaapiEncoder {
 unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
-	/// Create the encoder on `vulkan`'s GPU for `format`.
+	/// Create the encoder on `vulkan`'s GPU for `format`, with the first
+	/// entry point that initializes (see [`entrypoint_order`]).
 	pub(crate) fn new(vulkan: &VideoContext, format: NativeFormat) -> Result<Self, String> {
+		Self::create(vulkan, format, |_| Ok(()))
+	}
+
+	/// Create the encoder with each usable entry point in order until one
+	/// initializes and passes `verify`.
+	fn create(
+		vulkan: &VideoContext,
+		format: NativeFormat,
+		verify: impl Fn(&mut Self) -> Result<(), String>,
+	) -> Result<Self, String> {
 		let profile = profile(format.codec, format.chroma, format.bit_depth)?;
+		if !vulkan.has_queue_family_foreign() {
+			return Err("the capture GPU's Vulkan driver lacks VK_EXT_queue_family_foreign, \
+			            which hands VA-API surfaces between the two drivers"
+				.into());
+		}
 		let node = crate::gpu::render_node(vulkan)
 			.ok_or("the capture GPU's Vulkan driver reports no DRM render node for VA-API")?;
-		let display = Display::open(&node)?;
+		let display = Arc::new(Display::open(&node)?);
+		let order = entrypoint_order(
+			&listed_entrypoints(&display, profile.profile),
+			verified_entrypoint(&node, profile.profile),
+		);
+		if order.is_empty() {
+			return Err(format!("{} has no VA-API {} encoder", display.vendor, profile.label));
+		}
+		let mut reasons = Vec::new();
+		for entrypoint in order {
+			let attempt = Self::with_entrypoint(vulkan, format, &profile, display.clone(), &node, entrypoint)
+				.and_then(|mut encoder| verify(&mut encoder).map(|()| encoder));
+			match attempt {
+				Ok(encoder) => return Ok(encoder),
+				Err(reason) => {
+					tracing::debug!(
+						profile = profile.label,
+						entrypoint = entrypoint_label(entrypoint),
+						reason,
+						"VA-API entry point unusable"
+					);
+					reasons.push(format!("{} entry point: {reason}", entrypoint_label(entrypoint)));
+				},
+			}
+		}
+		Err(reasons.join("; "))
+	}
+
+	fn with_entrypoint(
+		vulkan: &VideoContext,
+		format: NativeFormat,
+		profile: &Profile,
+		display: Arc<Display>,
+		node: &Path,
+		entrypoint: VAEntrypoint,
+	) -> Result<Self, String> {
 		let va = display.va;
 		let raw = display.raw;
-		let entrypoint = entrypoint(&display, profile.profile)
-			.ok_or_else(|| format!("{} has no VA-API {} encoder", display.vendor, profile.label))?;
 
 		let mut attributes = [
 			VAConfigAttrib {
@@ -629,10 +717,14 @@ impl VaapiEncoder {
 			lock: Mutex::new(()),
 			busy: Mutex::new(vec![false; INPUT_SURFACES]),
 			freed: Condvar::new(),
+			lost: AtomicBool::new(false),
 		});
 		let mut encoder = Self {
 			shared,
 			vulkan: vulkan.clone(),
+			node: node.to_path_buf(),
+			profile: profile.profile,
+			entrypoint,
 			config,
 			context: VA_INVALID_ID,
 			slots: Vec::new(),
@@ -651,7 +743,7 @@ impl VaapiEncoder {
 			readback: None,
 		};
 		// Drop releases whatever was created if a later step fails.
-		encoder.create_resources(&profile)?;
+		encoder.create_resources(profile)?;
 		let (jobs, receiver) = std::sync::mpsc::channel();
 		let shared = encoder.shared.clone();
 		encoder.readback = Some(
@@ -664,7 +756,7 @@ impl VaapiEncoder {
 		tracing::info!(
 			driver = %encoder.shared.display.vendor,
 			profile = profile.label,
-			entrypoint = if entrypoint == VAEntrypointEncSliceLP { "low-power" } else { "slice" },
+			entrypoint = entrypoint_label(entrypoint),
 			coded_width,
 			coded_height,
 			"Created VA-API encoder"
@@ -831,11 +923,19 @@ impl VaapiEncoder {
 	/// Wait until slot `index` was read back.
 	fn wait_free(&self, wanted: impl Fn(&[bool]) -> bool) -> Result<(), EncodeError> {
 		let busy = self.shared.busy.lock().unwrap_or_else(|e| e.into_inner());
+		let lost = || self.shared.lost.load(Ordering::Acquire);
 		let (_busy, timeout) = self
 			.shared
 			.freed
-			.wait_timeout_while(busy, SLOT_TIMEOUT, |busy| !wanted(busy))
+			.wait_timeout_while(busy, SLOT_TIMEOUT, |busy| !lost() && !wanted(busy))
 			.unwrap_or_else(|e| e.into_inner());
+		if lost() {
+			// Terminal: an input surface may still be in use by the driver.
+			return Err(EncodeError::Native {
+				message: "VA-API could not establish that a submitted frame completed".into(),
+				device_lost: true,
+			});
+		}
 		if timeout.timed_out() {
 			return Err(EncodeError::native("VA-API encoder did not finish a frame within 5 s"));
 		}
@@ -877,11 +977,32 @@ impl VaapiEncoder {
 		};
 		let (surface, coded) = (slot.surface, slot.coded);
 		self.shared.busy.lock().unwrap_or_else(|e| e.into_inner())[index] = true;
-		if let Err(error) = self.submit(&frame, surface, coded) {
-			self.shared.busy.lock().unwrap_or_else(|e| e.into_inner())[index] = false;
+		if let Err(SubmitError { error, accepted }) = self.submit(&frame, surface, coded) {
 			// The reference chain is unknown after a failed submission.
 			self.idr_pending = true;
 			self.last_recon = None;
+			if !accepted {
+				self.shared.busy.lock().unwrap_or_else(|e| e.into_inner())[index] = false;
+				return Err(error);
+			}
+			// The slot stays busy until the readback thread, after every
+			// earlier frame, has synced the surface. It stays current, so the
+			// next frame waits for that.
+			let drain = Job {
+				slot: index,
+				surface,
+				coded,
+				key_frame: false,
+				prefix: &[],
+				reply: None,
+			};
+			if self.jobs.as_ref().is_none_or(|jobs| jobs.send(drain).is_err()) {
+				self.shared.mark_lost();
+				return Err(EncodeError::Native {
+					message: format!("{error}; VA-API readback thread stopped before the frame was synced"),
+					device_lost: true,
+				});
+			}
 			return Err(error);
 		}
 		let (reply, receiver) = tokio::sync::oneshot::channel();
@@ -895,7 +1016,7 @@ impl VaapiEncoder {
 			} else {
 				&[]
 			},
-			reply,
+			reply: Some(reply),
 		};
 		if self.jobs.as_ref().is_none_or(|jobs| jobs.send(job).is_err()) {
 			return Err(EncodeError::native("VA-API readback thread stopped"));
@@ -911,7 +1032,7 @@ impl VaapiEncoder {
 		Ok(PacketFuture::Native(receiver))
 	}
 
-	fn submit(&self, frame: &Frame, surface: VASurfaceID, coded: VABufferID) -> Result<(), EncodeError> {
+	fn submit(&self, frame: &Frame, surface: VASurfaceID, coded: VABufferID) -> Result<(), SubmitError> {
 		let display = &self.shared.display;
 		let mut buffers = Buffers {
 			display,
@@ -936,10 +1057,11 @@ impl VaapiEncoder {
 				buffers.ids.len() as c_int,
 			);
 			let ended = (va.end_picture)(display.raw, self.context);
-			display.check(rendered, "render picture")?;
-			display.check(ended, "end picture")?;
+			display
+				.check(rendered, "render picture")
+				.and_then(|()| display.check(ended, "end picture"))
+				.map_err(|error| SubmitError { error, accepted: true })
 		}
-		Ok(())
 	}
 
 	/// Parameter buffers and packed headers of an H.264/HEVC frame.
@@ -1028,7 +1150,8 @@ impl Drop for VaapiEncoder {
 		let device = self.vulkan.device();
 		for slot in &self.slots {
 			// SAFETY: conversions into these images completed (each was
-			// fenced) and no encode reads them any more.
+			// fenced). The imports only reference the surfaces' DMA-BUFs, so
+			// they are released even if the VA driver may still use them.
 			unsafe {
 				for &image in &slot.images[..slot.planes] {
 					device.destroy_image(image, None);
@@ -1038,9 +1161,17 @@ impl Drop for VaapiEncoder {
 				}
 			}
 		}
+		if self.shared.lost.load(Ordering::Acquire) {
+			// Fail closed: never destroy surfaces, buffers or the context the
+			// driver may still use, nor terminate their display.
+			tracing::error!("Keeping VA-API encoder objects: a submitted frame's completion is unknown");
+			std::mem::forget(self.shared.clone());
+			return;
+		}
 		let display = &self.shared.display;
 		let va = display.va;
-		// SAFETY: every frame was read back; IDs are destroyed child-first.
+		// SAFETY: every frame was read back or synced; IDs are destroyed
+		// child-first.
 		unsafe {
 			for slot in &self.slots {
 				if slot.coded != VA_INVALID_ID {
@@ -1174,34 +1305,83 @@ impl Drop for Buffers<'_> {
 /// Wait for each submitted frame, copy its bitstream out and free its slot.
 fn readback(shared: Arc<Shared>, jobs: std::sync::mpsc::Receiver<Job>) {
 	let display = &shared.display;
-	let va = display.va;
 	for job in jobs {
-		// SAFETY: valid display and IDs; the encoder keeps them alive until
-		// this thread exits.
-		let result = unsafe {
-			let synced = match va.sync_buffer {
-				Some(sync_buffer) => {
-					let status = sync_buffer(display.raw, job.coded, VA_TIMEOUT_INFINITE as u64);
-					if status as u32 == VA_STATUS_ERROR_UNIMPLEMENTED {
-						(va.sync_surface)(display.raw, job.surface)
-					} else {
-						status
-					}
-				},
-				None => (va.sync_surface)(display.raw, job.surface),
-			};
-			display.check(synced, "sync").and_then(|()| {
-				let _mapping = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
-				read_coded(display, job.coded, job.prefix).map(|data| Packet {
-					data,
-					is_key_frame: job.key_frame,
-				})
-			})
+		let completed = match job.reply {
+			// SAFETY: valid display and surface; the encoder keeps it alive
+			// until this thread exits.
+			None => unsafe { sync_surface(display, job.surface) },
+			Some(reply) => {
+				// SAFETY: as above, for the frame's surface and coded buffer.
+				let (result, completed) =
+					unsafe { read_back(&shared, job.surface, job.coded, job.key_frame, job.prefix) };
+				let _ = reply.send(result);
+				completed
+			},
 		};
-		let _ = job.reply.send(result);
-		shared.busy.lock().unwrap_or_else(|e| e.into_inner())[job.slot] = false;
-		shared.freed.notify_all();
+		if completed {
+			shared.busy.lock().unwrap_or_else(|e| e.into_inner())[job.slot] = false;
+			shared.freed.notify_all();
+		} else {
+			tracing::error!(slot = job.slot, "VA-API could not sync a submitted frame");
+			shared.mark_lost();
+		}
 	}
+}
+
+/// Whether every operation on `surface` completed.
+///
+/// # Safety
+///
+/// `surface` is a valid surface of `display`.
+unsafe fn sync_surface(display: &Display, surface: VASurfaceID) -> bool {
+	// SAFETY: guaranteed by the caller.
+	unsafe { (display.va.sync_surface)(display.raw, surface) as u32 == VA_STATUS_SUCCESS }
+}
+
+/// Wait for a submitted frame and copy its bitstream; also whether its
+/// completion was established, so its slot can be reused.
+///
+/// # Safety
+///
+/// The surface and coded buffer are valid and were submitted together.
+unsafe fn read_back(
+	shared: &Shared,
+	surface: VASurfaceID,
+	coded: VABufferID,
+	key_frame: bool,
+	prefix: &[u8],
+) -> (Result<Packet, EncodeError>, bool) {
+	let display = &shared.display;
+	let va = display.va;
+	// SAFETY: guaranteed by the caller.
+	let synced = unsafe {
+		match va.sync_buffer {
+			Some(sync_buffer) => {
+				let status = sync_buffer(display.raw, coded, VA_TIMEOUT_INFINITE as u64);
+				if status as u32 == VA_STATUS_ERROR_UNIMPLEMENTED {
+					(va.sync_surface)(display.raw, surface)
+				} else {
+					status
+				}
+			},
+			None => (va.sync_surface)(display.raw, surface),
+		}
+	};
+	if let Err(error) = display.check(synced, "sync") {
+		// The frame failed; its slot is reusable only once the surface is idle.
+		// SAFETY: guaranteed by the caller.
+		return (Err(error), unsafe { sync_surface(display, surface) });
+	}
+	let _mapping = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
+	// SAFETY: the encode completed.
+	let data = unsafe { read_coded(display, coded, prefix) };
+	(
+		data.map(|data| Packet {
+			data,
+			is_key_frame: key_frame,
+		}),
+		true,
+	)
 }
 
 /// Copy a finished coded buffer's segments.
@@ -1216,24 +1396,43 @@ unsafe fn read_coded(display: &Display, coded: VABufferID, prefix: &[u8]) -> Res
 		unsafe { (display.va.map_buffer)(display.raw, coded, &mut mapped) },
 		"map coded buffer",
 	)?;
+	// SAFETY: the mapped list is valid until vaUnmapBuffer.
+	let data = unsafe { coded_segments(mapped.cast(), prefix) };
+	// SAFETY: mapped above.
+	unsafe { (display.va.unmap_buffer)(display.raw, coded) };
+	data
+}
+
+/// `prefix` followed by every segment of a coded buffer's list.
+///
+/// A segment the driver marks as corrupt (`VA_CODED_BUF_STATUS_BAD_BITSTREAM`)
+/// or overflowing fails the frame, so it is never sent and the pipeline's
+/// recovery re-anchors the stream; the other status bits (QP, frame-size
+/// hints) are informational.
+///
+/// # Safety
+///
+/// `segment` is null or the head of a valid `VACodedBufferSegment` list whose
+/// buffers hold `size` bytes each.
+unsafe fn coded_segments(mut segment: *const VACodedBufferSegment, prefix: &[u8]) -> Result<Vec<u8>, EncodeError> {
 	let mut data = prefix.to_vec();
-	let mut overflow = false;
-	let mut segment = mapped.cast::<VACodedBufferSegment>();
+	let mut status = 0;
 	while !segment.is_null() {
-		// SAFETY: the mapped list is valid until vaUnmapBuffer.
+		// SAFETY: guaranteed by the caller.
 		let current = unsafe { &*segment };
-		overflow |= current.status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK != 0;
+		status |= current.status;
 		if !current.buf.is_null() && current.size > 0 {
-			// SAFETY: `size` bytes at `buf` belong to the mapped segment.
+			// SAFETY: `size` bytes at `buf` belong to the segment.
 			data.extend_from_slice(unsafe {
 				std::slice::from_raw_parts(current.buf.cast::<u8>(), current.size as usize)
 			});
 		}
 		segment = current.next.cast();
 	}
-	// SAFETY: mapped above.
-	unsafe { (display.va.unmap_buffer)(display.raw, coded) };
-	if overflow {
+	if status & VA_CODED_BUF_STATUS_BAD_BITSTREAM != 0 {
+		return Err(EncodeError::native("VA-API marked the coded frame as corrupt"));
+	}
+	if status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK != 0 {
 		return Err(EncodeError::native("VA-API coded buffer overflowed"));
 	}
 	if data.len() == prefix.len() {
@@ -1242,9 +1441,8 @@ unsafe fn read_coded(display: &Display, coded: VABufferID, prefix: &[u8]) -> Res
 	Ok(data)
 }
 
-/// The encode entry point for `profile`: low-power (fixed-function) when the
-/// driver offers it, which keeps encoding off the 3D engine on Intel Gen12.
-fn entrypoint(display: &Display, profile: VAProfile) -> Option<VAEntrypoint> {
+/// The encode entry points the driver lists for `profile`.
+fn listed_entrypoints(display: &Display, profile: VAProfile) -> Vec<VAEntrypoint> {
 	let va = display.va;
 	// SAFETY: valid display.
 	let max = unsafe { (va.max_num_entrypoints)(display.raw) }.max(0) as usize;
@@ -1253,12 +1451,55 @@ fn entrypoint(display: &Display, profile: VAProfile) -> Option<VAEntrypoint> {
 	// SAFETY: the array holds `max` entries.
 	let status = unsafe { (va.query_config_entrypoints)(display.raw, profile, entrypoints.as_mut_ptr(), &mut count) };
 	if status as u32 != VA_STATUS_SUCCESS {
-		return None;
+		return Vec::new();
 	}
 	entrypoints.truncate(count.max(0) as usize);
-	[VAEntrypointEncSliceLP, VAEntrypointEncSlice]
+	entrypoints
+}
+
+/// The encode entry points to try, in order: low-power (fixed-function)
+/// first, which keeps encoding off the 3D engine on Intel Gen12, then the
+/// slice encoder. Intel GPUs before Meteor Lake list both, and low-power rate
+/// control needs HuC firmware a host may lack, so an unusable low-power
+/// encoder must not hide a working slice encoder. An entry point the startup
+/// probe verified by encoding a frame goes first.
+fn entrypoint_order(listed: &[VAEntrypoint], verified: Option<VAEntrypoint>) -> Vec<VAEntrypoint> {
+	let mut order: Vec<VAEntrypoint> = [VAEntrypointEncSliceLP, VAEntrypointEncSlice]
 		.into_iter()
-		.find(|entrypoint| entrypoints.contains(entrypoint))
+		.filter(|entrypoint| listed.contains(entrypoint))
+		.collect();
+	if let Some(position) = verified.and_then(|verified| order.iter().position(|&e| e == verified)) {
+		let verified = order.remove(position);
+		order.insert(0, verified);
+	}
+	order
+}
+
+fn entrypoint_label(entrypoint: VAEntrypoint) -> &'static str {
+	if entrypoint == VAEntrypointEncSliceLP {
+		"low-power"
+	} else {
+		"slice"
+	}
+}
+
+/// Entry points the startup probe encoded a frame with, per render node and
+/// profile.
+static VERIFIED: Mutex<Vec<(PathBuf, VAProfile, VAEntrypoint)>> = Mutex::new(Vec::new());
+
+fn verified_entrypoint(node: &Path, profile: VAProfile) -> Option<VAEntrypoint> {
+	VERIFIED
+		.lock()
+		.unwrap_or_else(|e| e.into_inner())
+		.iter()
+		.find(|(n, p, _)| n == node && *p == profile)
+		.map(|(.., entrypoint)| *entrypoint)
+}
+
+fn remember_verified(node: &Path, profile: VAProfile, entrypoint: VAEntrypoint) {
+	let mut verified = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+	verified.retain(|(n, p, _)| !(n == node && *p == profile));
+	verified.push((node.to_path_buf(), profile, entrypoint));
 }
 
 fn format_label(format: ConvertFormat) -> &'static str {
@@ -1461,19 +1702,24 @@ pub(crate) fn probe(
 	depth: BitDepth,
 ) -> Result<(), String> {
 	profile(codec, chroma, depth)?;
-	let mut encoder = VaapiEncoder::new(
-		context,
-		NativeFormat {
-			codec,
-			chroma,
-			bit_depth: depth,
-			width: PROBE_EXTENT.0,
-			height: PROBE_EXTENT.1,
-			fps: 60,
-			bitrate: 10_000_000,
-			color: ColorDescription::bt709(),
-		},
-	)?;
+	let format = NativeFormat {
+		codec,
+		chroma,
+		bit_depth: depth,
+		width: PROBE_EXTENT.0,
+		height: PROBE_EXTENT.1,
+		fps: 60,
+		bitrate: 10_000_000,
+		color: ColorDescription::bt709(),
+	};
+	// Each entry point must encode a frame; streams then use the one that did.
+	let encoder = VaapiEncoder::create(context, format, encode_key_frame)?;
+	remember_verified(&encoder.node, encoder.profile, encoder.entrypoint);
+	Ok(())
+}
+
+/// Encode one frame and check that it is a key frame.
+fn encode_key_frame(encoder: &mut VaapiEncoder) -> Result<(), String> {
 	let target = encoder.input_target().map_err(|e| e.to_string())?;
 	let PacketFuture::Native(receiver) = encoder.encode(target).map_err(|e| e.to_string())? else {
 		unreachable!("VA-API frames resolve through the readback thread")

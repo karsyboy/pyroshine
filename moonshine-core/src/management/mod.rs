@@ -869,8 +869,8 @@ fn session_details(view: SessionView, gpu: &str, video_config: &VideoStreamConfi
 }
 
 /// The backend the pipeline encodes a conventional format with: the startup
-/// probe's choice, or without one (`--no-health-check`) the preference's first
-/// candidate, which is what the pipeline tries first.
+/// probe's choice, or for a profile the table lacks (callers that never
+/// probed) the preference's first candidate, which the pipeline tries first.
 fn conventional_backend(video_config: &VideoStreamConfig, format: NegotiatedVideoFormat) -> EncoderBackend {
 	healthcheck::profile_bit(format)
 		.and_then(|bit| video_config.encoder_table.get(bit))
@@ -1137,8 +1137,10 @@ mod encoder_backend_tests {
 	#[test]
 	fn reports_the_startup_backend_of_the_profile() {
 		let h264 = NegotiatedVideoFormat::default();
-		let mut config = VideoStreamConfig::default();
-		config.encoder = EncoderPreference::Vaapi;
+		let mut config = VideoStreamConfig {
+			encoder: EncoderPreference::Vaapi,
+			..Default::default()
+		};
 		// Without a probe the pipeline takes the preference's first backend.
 		assert_eq!(conventional_backend(&config, h264), EncoderBackend::Vaapi);
 		config

@@ -498,6 +498,35 @@ struct Job {
 // SAFETY: opaque NVENC handles of the shared session, which owns them.
 unsafe impl Send for Job {}
 
+/// The color description NVENC encodes with and a requested change it has
+/// not accepted yet. NVENC applies a change by reconfiguring before the next
+/// frame, which can fail; until it succeeds the change remains pending.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ColorState {
+	applied: ColorDescription,
+	pending: Option<ColorDescription>,
+}
+
+impl ColorState {
+	fn new(applied: ColorDescription) -> Self {
+		Self { applied, pending: None }
+	}
+
+	/// Request `description`; requesting the applied one cancels a pending
+	/// change.
+	fn request(&mut self, description: ColorDescription) {
+		self.pending = (description != self.applied).then_some(description);
+	}
+
+	/// NVENC accepted `description`.
+	fn accepted(&mut self, description: ColorDescription) {
+		self.applied = description;
+		if self.pending == Some(description) {
+			self.pending = None;
+		}
+	}
+}
+
 /// An NVENC encoder of one stream epoch.
 pub(crate) struct NvencEncoder {
 	shared: Arc<Shared>,
@@ -515,7 +544,7 @@ pub(crate) struct NvencEncoder {
 	current: usize,
 	submitted: u64,
 	idr_pending: bool,
-	color_pending: Option<ColorDescription>,
+	color: ColorState,
 	jobs: Option<std::sync::mpsc::Sender<Job>>,
 	readback: Option<std::thread::JoinHandle<()>>,
 }
@@ -582,7 +611,7 @@ impl NvencEncoder {
 			current: 0,
 			submitted: 0,
 			idr_pending: true,
-			color_pending: None,
+			color: ColorState::new(format.color),
 			jobs: None,
 			readback: None,
 		};
@@ -957,7 +986,7 @@ impl NvencEncoder {
 	}
 
 	pub(crate) fn set_color_description(&mut self, description: ColorDescription) -> Result<(), EncodeError> {
-		self.color_pending = Some(description);
+		self.color.request(description);
 		Ok(())
 	}
 
@@ -1031,8 +1060,13 @@ impl NvencEncoder {
 				"encode target is not the current NVENC input buffer",
 			));
 		}
-		if let Some(description) = self.color_pending.take() {
+		if let Some(description) = self.color.pending {
+			// The change stays pending until NVENC accepts it: a failed
+			// reconfiguration fails this frame (converted for the new
+			// description) and is retried with the next one, so no frame is
+			// encoded under the previous VUI.
 			self.reconfigure(description)?;
+			self.color.accepted(description);
 			self.idr_pending = true;
 		}
 		let shared = self.shared.clone();
@@ -1260,4 +1294,36 @@ pub(crate) fn probe(
 		return Err("NVENC encoded no key frame".into());
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn color_changes_stay_pending_until_accepted() {
+		let sdr = ColorDescription::bt709();
+		let hdr = ColorDescription::bt2020_pq();
+		let mut color = ColorState::new(sdr);
+		color.request(sdr);
+		assert_eq!(color.pending, None, "the applied description needs no change");
+		color.request(hdr);
+		assert_eq!(color.pending, Some(hdr));
+		// A failed reconfiguration does not call `accepted`: the next frame
+		// retries the same change.
+		assert_eq!(color.pending, Some(hdr));
+		color.accepted(hdr);
+		assert_eq!(
+			color,
+			ColorState {
+				applied: hdr,
+				pending: None
+			}
+		);
+		// Back to SDR, then to the applied HDR before NVENC accepted SDR.
+		color.request(sdr);
+		assert_eq!(color.pending, Some(sdr));
+		color.request(hdr);
+		assert_eq!(color.pending, None);
+	}
 }

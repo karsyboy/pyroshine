@@ -19,31 +19,37 @@ const PROFILE_HIGH: u32 = 100;
 const SLICE_TYPE_P: u8 = 0;
 const SLICE_TYPE_I: u8 = 2;
 
-/// Level limits (Table A-1): level_idc, MaxMBPS, MaxFS.
-const LEVELS: [(u8, u64, u64); 12] = [
-	(30, 40_500, 1_620),
-	(31, 108_000, 3_600),
-	(32, 216_000, 5_120),
-	(40, 245_760, 8_192),
-	(41, 245_760, 8_192),
-	(42, 522_240, 8_704),
-	(50, 589_824, 22_080),
-	(51, 983_040, 36_864),
-	(52, 2_073_600, 36_864),
-	(60, 4_177_920, 139_264),
-	(61, 8_355_840, 139_264),
-	(62, 16_711_680, 139_264),
+/// Level limits (Table A-1): level_idc, MaxMBPS, MaxFS, MaxBR (1000 bit/s).
+const LEVELS: [(u8, u64, u64, u64); 12] = [
+	(30, 40_500, 1_620, 10_000),
+	(31, 108_000, 3_600, 14_000),
+	(32, 216_000, 5_120, 20_000),
+	(40, 245_760, 8_192, 20_000),
+	(41, 245_760, 8_192, 50_000),
+	(42, 522_240, 8_704, 50_000),
+	(50, 589_824, 22_080, 135_000),
+	(51, 983_040, 36_864, 240_000),
+	(52, 2_073_600, 36_864, 240_000),
+	(60, 4_177_920, 139_264, 240_000),
+	(61, 8_355_840, 139_264, 480_000),
+	(62, 16_711_680, 139_264, 800_000),
 ];
 
-/// The lowest level whose frame size and macroblock rate fit. Bitrate limits
-/// are not applied (streams exceed them, like other low-latency encoders).
-pub(super) fn level_idc(width_mbs: u32, height_mbs: u32, fps: u32) -> u8 {
+/// High profile's `cpbBrVclFactor` (Table A-2): MaxBR is in units of
+/// 1250 bit/s.
+const HIGH_BR_FACTOR: u64 = 1250;
+
+/// The lowest level whose frame size, macroblock rate and bitrate (the
+/// stream's constant target) fit; the highest level beyond every limit.
+pub(super) fn level_idc(width_mbs: u32, height_mbs: u32, fps: u32, bitrate: u32) -> u8 {
 	let frame = u64::from(width_mbs) * u64::from(height_mbs);
 	let rate = frame * u64::from(fps);
 	LEVELS
 		.iter()
-		.find(|(_, max_rate, max_frame)| frame <= *max_frame && rate <= *max_rate)
-		.map_or(62, |(level, _, _)| *level)
+		.find(|(_, max_rate, max_frame, max_br)| {
+			frame <= *max_frame && rate <= *max_rate && u64::from(bitrate) <= max_br * HIGH_BR_FACTOR
+		})
+		.map_or(62, |(level, ..)| *level)
 }
 
 fn frame_num(index_since_idr: u64) -> u32 {
@@ -67,7 +73,7 @@ impl H264 {
 		Self {
 			width_mbs,
 			height_mbs,
-			level: level_idc(width_mbs, height_mbs, setup.fps),
+			level: level_idc(width_mbs, height_mbs, setup.fps, setup.bitrate),
 		}
 	}
 
@@ -309,14 +315,26 @@ mod tests {
 
 	#[test]
 	fn level_follows_frame_size_and_rate() {
+		const MBPS: u32 = 1_000_000;
 		// 1080p60: 8160 MBs, 489600 MB/s -> 4.2
-		assert_eq!(level_idc(120, 68, 60), 42);
+		assert_eq!(level_idc(120, 68, 60, 20 * MBPS), 42);
 		// 1440p120: 14400 MBs, 1728000 MB/s -> 5.2
-		assert_eq!(level_idc(160, 90, 120), 52);
+		assert_eq!(level_idc(160, 90, 120, 20 * MBPS), 52);
 		// 2160p60 -> 5.2; 2160p120 -> 6.0
-		assert_eq!(level_idc(240, 135, 60), 52);
-		assert_eq!(level_idc(240, 135, 120), 60);
+		assert_eq!(level_idc(240, 135, 60, 20 * MBPS), 52);
+		assert_eq!(level_idc(240, 135, 120, 20 * MBPS), 60);
 		// Beyond every limit: the highest level.
-		assert_eq!(level_idc(1000, 1000, 240), 62);
+		assert_eq!(level_idc(1000, 1000, 240, 20 * MBPS), 62);
+	}
+
+	#[test]
+	fn level_bounds_the_bitrate() {
+		// High profile 4.2 allows 62.5 Mbit/s, 5.0 168.75 Mbit/s.
+		assert_eq!(level_idc(120, 68, 60, 62_500_000), 42);
+		assert_eq!(level_idc(120, 68, 60, 62_500_001), 50);
+		assert_eq!(level_idc(120, 68, 60, 150_000_000), 50);
+		// 720p30 at 20 Mbit/s: 3.1 by size, 3.2 by rate.
+		assert_eq!(level_idc(80, 45, 30, 20_000_000), 32);
+		assert_eq!(level_idc(120, 68, 60, u32::MAX), 62);
 	}
 }

@@ -326,6 +326,10 @@ Each cycle changes one property, in order: none (unchanged resume), resolution
 stereo/5.1/7.1, audio quality and 5/10 ms packets. Combinations the Vulkan Video
 backend does not encode (conventional 4:4:4, 10-bit H.264) are normalized to the
 nearest supported format; the `settings` field records what was negotiated.
+The capture GPU is probed as at server startup and `--encoder` applies as in
+any other run: `settings` names the encoder each cycle used (`encoder=vaapi`),
+and with an explicit encoder a profile it cannot encode fails that cycle's
+start rather than falling back to another encoder.
 A cycle passes when the epoch delivers at least a quarter of its target frames
 in `--cycle-seconds` (default 2) and the loopback client receives video bytes.
 Full cycles additionally require a successful stop, a bindable video port, no

@@ -105,6 +105,30 @@ fn tight_extent(format: ConvertFormat, (w, h): (u32, u32)) -> (u32, u32) {
 }
 
 #[test]
+fn external_buffers_are_handed_over_through_queue_family_ownership() {
+	use ash::vk::Handle as _;
+	let buffer = vk::Buffer::from_raw(0x1234);
+	let [acquire, release] = external_buffer_handoff(buffer, 2);
+	// Acquired from the external reader for the copy, released back after it.
+	assert_eq!(
+		(acquire.src_queue_family_index, acquire.dst_queue_family_index),
+		(vk::QUEUE_FAMILY_EXTERNAL, 2)
+	);
+	assert_eq!(acquire.dst_access_mask, vk::AccessFlags::TRANSFER_WRITE);
+	assert_eq!(
+		(release.src_queue_family_index, release.dst_queue_family_index),
+		(2, vk::QUEUE_FAMILY_EXTERNAL)
+	);
+	assert_eq!(release.src_access_mask, vk::AccessFlags::TRANSFER_WRITE);
+	for barrier in [acquire, release] {
+		assert_eq!(
+			(barrier.buffer, barrier.offset, barrier.size),
+			(buffer, 0, vk::WHOLE_SIZE)
+		);
+	}
+}
+
+#[test]
 fn layout_matches_hand_computed_planes() {
 	// 1080p NV12 is the tightly packed classic layout.
 	let l = Layout::new(ConvertFormat::Nv12, (1920, 1080)).unwrap();

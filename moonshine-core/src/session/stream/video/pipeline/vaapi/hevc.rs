@@ -23,37 +23,60 @@ const PROFILE_MAIN: u32 = 1;
 const PROFILE_MAIN10: u32 = 2;
 const PROFILE_RANGE_EXTENSIONS: u32 = 4;
 
-/// Main tier level limits (Table A.8): general_level_idc, MaxLumaPs, MaxLumaSr.
-const LEVELS: [(u8, u64, u64); 13] = [
-	(30, 36_864, 552_960),
-	(60, 122_880, 3_686_400),
-	(63, 245_760, 7_372_800),
-	(90, 552_960, 16_588_800),
-	(93, 983_040, 33_177_600),
-	(120, 2_228_224, 66_846_720),
-	(123, 2_228_224, 133_693_440),
-	(150, 8_912_896, 267_386_880),
-	(153, 8_912_896, 534_773_760),
-	(156, 8_912_896, 1_069_547_520),
-	(180, 35_651_584, 1_069_547_520),
-	(183, 35_651_584, 2_139_095_040),
-	(186, 35_651_584, 4_278_190_080),
+/// Level limits (Tables A.8 and A.9): general_level_idc, MaxLumaPs,
+/// MaxLumaSr, and MaxBR of the Main and High tiers (in units of
+/// `CpbVclFactor` bit/s; 0 where the level has no High tier).
+const LEVELS: [(u8, u64, u64, u64, u64); 13] = [
+	(30, 36_864, 552_960, 128, 0),
+	(60, 122_880, 3_686_400, 1_500, 0),
+	(63, 245_760, 7_372_800, 3_000, 0),
+	(90, 552_960, 16_588_800, 6_000, 0),
+	(93, 983_040, 33_177_600, 10_000, 0),
+	(120, 2_228_224, 66_846_720, 12_000, 30_000),
+	(123, 2_228_224, 133_693_440, 20_000, 50_000),
+	(150, 8_912_896, 267_386_880, 25_000, 100_000),
+	(153, 8_912_896, 534_773_760, 40_000, 160_000),
+	(156, 8_912_896, 1_069_547_520, 60_000, 240_000),
+	(180, 35_651_584, 1_069_547_520, 60_000, 240_000),
+	(183, 35_651_584, 2_139_095_040, 120_000, 480_000),
+	(186, 35_651_584, 4_278_190_080, 240_000, 800_000),
 ];
 
 fn poc_lsb(index_since_idr: u64) -> u32 {
 	(index_since_idr % (1 << (LOG2_MAX_POC_LSB_MINUS4 + 4))) as u32
 }
 
-/// The lowest Main tier level whose picture size and sample rate fit. Bitrate
-/// limits are not applied (streams exceed them, like other low-latency
-/// encoders).
-pub(super) fn level_idc(width: u32, height: u32, fps: u32) -> u8 {
+/// `CpbVclFactor` of a profile (Table A.9 and the range extensions' table):
+/// MaxBR is in units of this many bit/s.
+fn cpb_vcl_factor(chroma_444: bool, bit_depth: u32) -> u64 {
+	match (chroma_444, bit_depth > 8) {
+		(false, _) => 1000,
+		(true, false) => 2000,
+		(true, true) => 2500,
+	}
+}
+
+/// The level and tier (`true`: High) of a stream: the lowest Main tier level
+/// whose picture size, sample rate and bitrate (the stream's constant target)
+/// fit, as decoders widely support Main tier, else the lowest High tier level
+/// that fits; level 6.2 High beyond every limit.
+pub(super) fn level_tier(width: u32, height: u32, fps: u32, bitrate: u32, br_factor: u64) -> (u8, bool) {
 	let picture = u64::from(width) * u64::from(height);
 	let rate = picture * u64::from(fps);
+	let fits = |max_picture: u64, max_rate: u64, max_br: u64| {
+		picture <= max_picture && rate <= max_rate && u64::from(bitrate) <= max_br * br_factor
+	};
 	LEVELS
 		.iter()
-		.find(|(_, max_picture, max_rate)| picture <= *max_picture && rate <= *max_rate)
-		.map_or(186, |(level, _, _)| *level)
+		.find(|&&(_, max_picture, max_rate, main_br, _)| fits(max_picture, max_rate, main_br))
+		.map(|&(level, ..)| (level, false))
+		.or_else(|| {
+			LEVELS
+				.iter()
+				.find(|&&(_, max_picture, max_rate, _, high_br)| fits(max_picture, max_rate, high_br))
+				.map(|&(level, ..)| (level, true))
+		})
+		.unwrap_or((186, true))
 }
 
 /// Coding tools and block sizes the driver supports (from
@@ -139,6 +162,7 @@ const VA_PREDICTION_DIRECTION_BI_NOT_EMPTY: u32 = 4;
 pub(super) struct Hevc {
 	profile: u32,
 	level: u8,
+	high_tier: bool,
 	tools: Tools,
 	ctus: u32,
 }
@@ -151,9 +175,17 @@ impl Hevc {
 			(false, _) => PROFILE_MAIN,
 		};
 		let ctb = 1 << tools.log2_ctb;
+		let (level, high_tier) = level_tier(
+			setup.coded_width,
+			setup.coded_height,
+			setup.fps,
+			setup.bitrate,
+			cpb_vcl_factor(setup.chroma_444, setup.bit_depth),
+		);
 		Self {
 			profile,
-			level: level_idc(setup.coded_width, setup.coded_height, setup.fps),
+			level,
+			high_tier,
 			tools,
 			ctus: setup.coded_width.div_ceil(ctb) * setup.coded_height.div_ceil(ctb),
 		}
@@ -168,7 +200,7 @@ impl Hevc {
 
 	fn profile_tier_level(&self, w: &mut BitWriter, setup: &Setup) {
 		w.u(2, 0); // general_profile_space
-		w.flag(false); // general_tier_flag: Main
+		w.flag(self.high_tier); // general_tier_flag
 		w.u(5, self.profile);
 		// general_profile_compatibility_flag[j]: Main streams are also Main 10.
 		let mut compatibility = 1u32 << (31 - self.profile);
@@ -413,7 +445,7 @@ impl Hevc {
 		let mut seq = VAEncSequenceParameterBufferHEVC {
 			general_profile_idc: self.profile as u8,
 			general_level_idc: self.level,
-			general_tier_flag: 0,
+			general_tier_flag: u8::from(self.high_tier),
 			intra_period: 0,
 			intra_idr_period: 0,
 			ip_period: 1,
@@ -543,11 +575,29 @@ mod tests {
 
 	#[test]
 	fn level_follows_picture_size_and_rate() {
-		assert_eq!(level_idc(1920, 1088, 60), 123); // 4.1
-		assert_eq!(level_idc(2560, 1472, 120), 153); // 5.1
-		assert_eq!(level_idc(3840, 2176, 60), 153); // 5.1
-		assert_eq!(level_idc(3840, 2176, 120), 156); // 5.2
-		assert_eq!(level_idc(8192, 8192, 240), 186);
+		let level = |width, height, fps| level_tier(width, height, fps, 10_000_000, 1000);
+		assert_eq!(level(1920, 1088, 60), (123, false)); // 4.1
+		assert_eq!(level(2560, 1472, 120), (153, false)); // 5.1
+		assert_eq!(level(3840, 2176, 60), (153, false)); // 5.1
+		assert_eq!(level(3840, 2176, 120), (156, false)); // 5.2
+		assert_eq!(level(8192, 8192, 240), (186, true));
+	}
+
+	#[test]
+	fn level_and_tier_bound_the_bitrate() {
+		let main = cpb_vcl_factor(false, 8);
+		// 1080p60 Main: 4.1 carries 20 Mbit/s, 5.1 40, 5.2 60.
+		assert_eq!(level_tier(1920, 1088, 60, 20_000_000, main), (123, false));
+		assert_eq!(level_tier(1920, 1088, 60, 50_000_000, main), (156, false));
+		// Beyond Main tier 6.2 (240 Mbit/s): the lowest High tier level.
+		assert_eq!(level_tier(1920, 1088, 60, 300_000_000, main), (183, true));
+		// Main 4:4:4 10 counts MaxBR in 2500 bit/s units.
+		assert_eq!(cpb_vcl_factor(true, 10), 2500);
+		assert_eq!(
+			level_tier(1920, 1088, 60, 50_000_000, cpb_vcl_factor(true, 10)),
+			(123, false)
+		);
+		assert_eq!(level_tier(1920, 1088, 60, u32::MAX, main), (186, true));
 	}
 
 	#[test]

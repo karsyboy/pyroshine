@@ -129,13 +129,20 @@ pub(crate) enum Target {
 	/// in before the conversion and must be left in afterwards.
 	Image { image: vk::Image, layout: vk::ImageLayout },
 	/// One single-plane image per output plane, imported from memory another
-	/// API owns (the DMA-BUF layers of a VA-API surface). Their content is
-	/// replaced: each is acquired from `QUEUE_FAMILY_EXTERNAL` without
-	/// preserving it and released back in `GENERAL` after the copy.
+	/// driver owns (the DMA-BUF layers of a VA-API surface). Their content is
+	/// replaced: each is acquired from `QUEUE_FAMILY_FOREIGN_EXT` without
+	/// preserving it and released back in `GENERAL` after the copy. The VA
+	/// driver is not the Vulkan driver, so `QUEUE_FAMILY_EXTERNAL` (same
+	/// device and driver identity) would not cover the hand-off; the context
+	/// must have `VK_EXT_queue_family_foreign` enabled.
 	ExternalPlanes { images: [vk::Image; 2], count: usize },
-	/// A buffer with exactly this converter's [`Layout`] that another API reads
-	/// in place (an NVENC input buffer shared with CUDA). It receives a
-	/// buffer copy.
+	/// A buffer with exactly this converter's [`Layout`] that another API of
+	/// the same driver reads in place (an NVENC input buffer that CUDA
+	/// imported from an opaque FD). It receives a buffer copy between an
+	/// acquire from and a release to `QUEUE_FAMILY_EXTERNAL`: the external
+	/// reader observes the copy only through that release (and the host's
+	/// fence wait). The acquire does not preserve the previous content, which
+	/// the copy replaces entirely.
 	Buffer { buffer: vk::Buffer },
 }
 
@@ -779,6 +786,27 @@ fn color_range() -> vk::ImageSubresourceRange {
 		base_array_layer: 0,
 		layer_count: 1,
 	}
+}
+
+/// The barriers around a copy into `buffer`, which a reader of the same
+/// driver outside Vulkan (CUDA, for NVENC) consumes in place: ownership is
+/// acquired from `QUEUE_FAMILY_EXTERNAL` before the copy (discarding the
+/// content, which the copy replaces) and released back to it afterwards, which
+/// makes the write available to the external reader.
+fn external_buffer_handoff(buffer: vk::Buffer, queue_family: u32) -> [vk::BufferMemoryBarrier<'static>; 2] {
+	let barrier = vk::BufferMemoryBarrier::default().buffer(buffer).size(vk::WHOLE_SIZE);
+	[
+		barrier
+			.src_access_mask(vk::AccessFlags::empty())
+			.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+			.src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+			.dst_queue_family_index(queue_family),
+		barrier
+			.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+			.dst_access_mask(vk::AccessFlags::empty())
+			.src_queue_family_index(queue_family)
+			.dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL),
+	]
 }
 
 fn find_memory_type(context: &VideoContext, type_bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32, String> {
@@ -1969,7 +1997,7 @@ impl InputConverter {
 								vk::ImageLayout::TRANSFER_DST_OPTIMAL,
 								vk::AccessFlags::empty(),
 								vk::AccessFlags::TRANSFER_WRITE,
-								(vk::QUEUE_FAMILY_EXTERNAL, self.queue_family),
+								(vk::QUEUE_FAMILY_FOREIGN_EXT, self.queue_family),
 							)
 						})
 						.collect();
@@ -2001,7 +2029,7 @@ impl InputConverter {
 								vk::ImageLayout::GENERAL,
 								vk::AccessFlags::TRANSFER_WRITE,
 								vk::AccessFlags::empty(),
-								(self.queue_family, vk::QUEUE_FAMILY_EXTERNAL),
+								(self.queue_family, vk::QUEUE_FAMILY_FOREIGN_EXT),
 							)
 						})
 						.collect();
@@ -2016,13 +2044,14 @@ impl InputConverter {
 					);
 				},
 				Target::Buffer { buffer } => {
+					let [acquire, release] = external_buffer_handoff(buffer, self.queue_family);
 					device.cmd_pipeline_barrier(
 						cmd,
-						src_stage,
+						src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
 						vk::PipelineStageFlags::TRANSFER,
 						vk::DependencyFlags::empty(),
 						&[],
-						&buffer_barrier,
+						&[buffer_barrier[0], acquire],
 						&[],
 					);
 					device.cmd_copy_buffer(
@@ -2031,22 +2060,14 @@ impl InputConverter {
 						buffer,
 						&[vk::BufferCopy::default().size(self.layout.size)],
 					);
-					// Make the copy available before the fence: the reader is
-					// another API that observes the host's fence wait.
-					let available = [vk::BufferMemoryBarrier::default()
-						.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-						.dst_access_mask(vk::AccessFlags::MEMORY_READ)
-						.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-						.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-						.buffer(buffer)
-						.size(vk::WHOLE_SIZE)];
+					// Release the copy to the external reader before the fence.
 					device.cmd_pipeline_barrier(
 						cmd,
 						vk::PipelineStageFlags::TRANSFER,
 						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
 						vk::DependencyFlags::empty(),
 						&[],
-						&available,
+						&[release],
 						&[],
 					);
 				},

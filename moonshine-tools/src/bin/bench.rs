@@ -781,8 +781,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 }
 
-/// Probe the capture GPU exactly as the server does at startup. Blocking GPU
-/// work, so it runs off the async runtime.
 fn encoder_preference(args: &Args) -> EncoderPreference {
 	match args.encoder.as_str() {
 		"vulkan" => EncoderPreference::Vulkan,
@@ -792,6 +790,8 @@ fn encoder_preference(args: &Args) -> EncoderPreference {
 	}
 }
 
+/// Probe the capture GPU exactly as the server does at startup. Blocking GPU
+/// work, so it runs off the async runtime.
 async fn probe_capabilities(args: &Args) -> Result<Capabilities, Box<dyn std::error::Error>> {
 	let mut config = moonshine_core::config::Config::default();
 	config.stream.video.encoder = encoder_preference(args);

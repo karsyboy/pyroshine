@@ -482,11 +482,26 @@ The three conventional encoders sit behind `ConventionalEncoder`
 (`pipeline/backend.rs`): the loop asks it for the next input target, converts
 into it and submits; everything after the encoded packet is shared. VA-API
 writes its own SPS/PPS/VPS, slice headers and AV1 OBUs (`vaapi/h264.rs`,
-`hevc.rs`, `av1.rs`) so the VUI and color description match the stream, and
-reads coded buffers on a readback thread; NVENC maps the CUDA-imported buffer
-and recovers from loss with reference invalidation. A stream's encoder is the
-one its profile was probed with; it never changes during a stream, and a
-failure is reported like any other encoder failure.
+`hevc.rs`, `av1.rs`) so the VUI, color description and level/tier (frame
+size, rate and bitrate) match the stream, and reads coded buffers on a
+readback thread; NVENC maps the CUDA-imported buffer and recovers from loss
+with reference invalidation. A stream's encoder is the one its profile was
+probed with; it never changes during a stream, and a failure is reported like
+any other encoder failure.
+
+The native encoders share their input with other drivers, so ownership is
+explicit. The NVENC input buffer is released by the converter queue to
+`VK_QUEUE_FAMILY_EXTERNAL` (CUDA belongs to the same driver) before the
+conversion fence. VA surfaces come from another driver and are handed over
+through `VK_QUEUE_FAMILY_FOREIGN_EXT`, so VA-API needs
+`VK_EXT_queue_family_foreign`. An input slot is reused only after the
+encoder's work on it completed: a VA submission that failed after the driver
+may have accepted it is synced first, and if completion cannot be established
+the stream ends and the VA objects are left to the driver rather than
+destroyed. A driver-flagged corrupt VA coded buffer fails the frame, which
+forces an IDR. An NVENC color change stays pending until NVENC accepts the
+reconfiguration, so no frame converted for a new color description is encoded
+under the previous one.
 
 PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a
 conventional codec and has no CPU or alternate-codec fallback. `pyrowave.rs`
