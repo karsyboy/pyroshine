@@ -75,7 +75,7 @@ pub struct SessionDetails {
 /// Which encoder backend produces the video stream and on which GPU.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderDetails {
-	/// `vulkan_video` (Pixelforge H.264/HEVC/AV1) or `pyrowave`.
+	/// `vulkan_video` (Pixelforge H.264/HEVC/AV1), `vaapi`, `nvenc` or `pyrowave`.
 	pub backend: String,
 	/// Display name, for example `Vulkan Video`.
 	pub backend_label: String,

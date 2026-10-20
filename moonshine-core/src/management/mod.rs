@@ -68,7 +68,10 @@ use crate::healthcheck::{self, CheckOutcome};
 use crate::session::manager::{SessionManager, SessionView};
 use crate::session::status::{self, ClientPresence, ManagerStatus};
 use crate::session::stream::audio::{AudioQuality, AudioStreamContext};
-use crate::session::stream::video::{ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoCodec};
+use crate::session::stream::video::{
+	ColorPrimaries, ColorRange, EncoderBackend, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
+	VideoCodec, VideoStreamConfig,
+};
 use crate::support;
 
 /// Facts established at startup, reported by `GetServer`.
@@ -674,7 +677,7 @@ impl Management {
 				self.sessions
 					.session_view()
 					.await
-					.map(|view| session_details(view, &gpu))
+					.map(|view| session_details(view, &gpu, &self.running_config.stream.video))
 			},
 		};
 		SessionSnapshot {
@@ -764,7 +767,7 @@ fn pending_pairing(pending: crate::clients::PendingApproval) -> PendingPairing {
 	}
 }
 
-fn session_details(view: SessionView, gpu: &str) -> SessionDetails {
+fn session_details(view: SessionView, gpu: &str, video_config: &VideoStreamConfig) -> SessionDetails {
 	let (video, audio) = match view.streams {
 		Some((video, audio)) => (Some(video), Some(audio)),
 		None => (None, None),
@@ -834,10 +837,18 @@ fn session_details(view: SessionView, gpu: &str) -> SessionDetails {
 						backend_label: "PyroWave (Vulkan compute)".into(),
 						gpu: gpu.into(),
 					},
-					_ => EncoderDetails {
-						backend: "vulkan_video".into(),
-						backend_label: "Vulkan Video".into(),
-						gpu: gpu.into(),
+					_ => {
+						let backend = conventional_backend(video_config, format);
+						EncoderDetails {
+							backend: match backend {
+								EncoderBackend::Vulkan => "vulkan_video",
+								EncoderBackend::Vaapi => "vaapi",
+								EncoderBackend::Nvenc => "nvenc",
+							}
+							.into(),
+							backend_label: backend.label().into(),
+							gpu: gpu.into(),
+						}
 					},
 				}),
 				pyrowave_dialect: video.pyrowave_dialect.map(|dialect| {
@@ -855,6 +866,15 @@ fn session_details(view: SessionView, gpu: &str) -> SessionDetails {
 		}),
 		audio: audio.map(audio_details),
 	}
+}
+
+/// The backend the pipeline encodes a conventional format with: the startup
+/// probe's choice, or without one (`--no-health-check`) the preference's first
+/// candidate, which is what the pipeline tries first.
+fn conventional_backend(video_config: &VideoStreamConfig, format: NegotiatedVideoFormat) -> EncoderBackend {
+	healthcheck::profile_bit(format)
+		.and_then(|bit| video_config.encoder_table.get(bit))
+		.unwrap_or(video_config.encoder.candidates()[0])
 }
 
 fn audio_details(audio: AudioStreamContext) -> AudioDetails {
@@ -1106,5 +1126,24 @@ mod health_report_tests {
 		let recheck = healthcheck::recheck_in_server(&config, None, true);
 		assert_eq!(recheck.checks[0].name, "GPU");
 		assert_eq!(recheck.checks[0].outcome, CheckOutcome::Warning);
+	}
+}
+
+#[cfg(test)]
+mod encoder_backend_tests {
+	use super::*;
+	use crate::session::stream::video::EncoderPreference;
+
+	#[test]
+	fn reports_the_startup_backend_of_the_profile() {
+		let h264 = NegotiatedVideoFormat::default();
+		let mut config = VideoStreamConfig::default();
+		config.encoder = EncoderPreference::Vaapi;
+		// Without a probe the pipeline takes the preference's first backend.
+		assert_eq!(conventional_backend(&config, h264), EncoderBackend::Vaapi);
+		config
+			.encoder_table
+			.insert(healthcheck::profile_bit(h264).unwrap(), EncoderBackend::Nvenc);
+		assert_eq!(conventional_backend(&config, h264), EncoderBackend::Nvenc);
 	}
 }
