@@ -44,6 +44,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Allow UI scale changes through KDE Display Configuration during Desktop Mode. Keep the chosen virtual-output scale during topology enforcement, avoid redundant output transactions, and map input through the scaled EIS region without changing stream resolution. Restore physical displays with their original scales on exit.
+
+- Keep Desktop Mode streaming when KWin temporarily pauses or replaces EIS input devices after changing displays. Suppress input during the transition, clear held state for removed/paused devices, require the correct virtual-display region, and restore the desktop if devices remain unavailable for three seconds. Portal closure and input disconnection still stop immediately. Add protocol-level lifecycle tests and an opt-in five-second takeover test without typing or clicking.
+
 - Restore KDE Desktop Mode without trying to disable KWin virtual outputs, which only support removal by closing their screencast owner. Drain old capture buffers before replacing an output, verify final cleanup, and allow PipeWire's initial 60 Hz format to settle to the requested refresh rate. Add a live 2880×1920/120 Hz capture and owner-cleanup regression test.
 
 - Start on GPUs without Vulkan Video encode. Pyroshine refused to start when the capture GPU's driver had no Vulkan Video encoder, even though PyroWave encodes with compute: Intel GPUs under Mesa (verified on an Arc B390 and a UHD 730) could not stream at all, and with `ANV_DEBUG=video-encode` an Arc B390 failed with "Extension specified does not exist". Such a GPU now gets a compute-only context on the same device and offers PyroWave (4:2:0, 4:4:4 and HDR10 where they pass); H.264, HEVC and AV1 stay unadvertised, and Moonlight clients are told which profiles exist. No other GPU is ever used instead.

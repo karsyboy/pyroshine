@@ -69,34 +69,46 @@ impl Native {
 		if let Self::Kde(kde) = self {
 			kde.retire_other(&target.id)?;
 		}
-		let mut snapshot = self.snapshot()?;
-		let selected = snapshot
-			.outputs
-			.iter_mut()
-			.find(|o| o.key == target.output)
-			.ok_or("The prepared virtual output disappeared")?;
-		selected.mode = target.mode;
-		selected.enabled = true;
-		selected.x = 0;
-		selected.y = 0;
-		selected.scale = 1.0;
-		selected.transform = 0;
-		selected.priority = 1;
-		selected.group = 1;
-		selected.hdr = 0;
-		selected.wcg = 0;
-		selected.replication.clear();
-		for output in &mut snapshot.outputs {
-			if output.key != target.output {
-				if output.enabled && !output.can_disable {
-					return Err(format!("Output {} cannot be disabled", output.name));
-				}
-				output.enabled = false;
-			}
+		let current = self.snapshot()?;
+		let snapshot = takeover_configuration(&current, &target)?;
+		// A scale-only change is already valid. Reapplying an unchanged
+		// topology needlessly replaces EIS devices and can race Display Settings.
+		if verify(&current, &snapshot).is_ok() {
+			return Ok(());
 		}
 		self.apply(&snapshot)?;
 		verify(&self.snapshot()?, &snapshot)
 	}
+}
+
+/// Enforce sole-output capture constraints while leaving UI scale under the
+/// desktop user's control. Pixel mode and logical UI size are independent.
+pub(super) fn takeover_configuration(current: &Snapshot, target: &Target) -> Result<Snapshot> {
+	let mut snapshot = current.clone();
+	let selected = snapshot
+		.outputs
+		.iter_mut()
+		.find(|o| o.key == target.output)
+		.ok_or("The prepared virtual output disappeared")?;
+	selected.mode = target.mode;
+	selected.enabled = true;
+	selected.x = 0;
+	selected.y = 0;
+	selected.transform = 0;
+	selected.priority = 1;
+	selected.group = 1;
+	selected.hdr = 0;
+	selected.wcg = 0;
+	selected.replication.clear();
+	for output in &mut snapshot.outputs {
+		if output.key != target.output {
+			if output.enabled && !output.can_disable {
+				return Err(format!("Output {} cannot be disabled", output.name));
+			}
+			output.enabled = false;
+		}
+	}
+	Ok(snapshot)
 }
 
 pub(super) fn verify(observed: &Snapshot, expected: &Snapshot) -> Result<()> {

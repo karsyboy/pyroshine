@@ -44,9 +44,18 @@ revokes it. `input = false` permits viewing without an input portal session.
 Select **Desktop Mode** in the streaming client. Games selected from the library
 continue to use their isolated Game Mode session. A Desktop Mode launch does
 not execute application commands or hooks. The first implementation uses SDR,
-fixed refresh, scale 1, an embedded cursor and direct PipeWire DMA-BUF capture.
+fixed refresh, an initial scale of 100%, an embedded cursor and direct PipeWire
+DMA-BUF capture.
 It refuses incompatible modes or buffers rather than scaling a physical monitor.
 The compositor chooses how existing windows migrate to the remaining output.
+
+On KDE, change **Scale** for **Pyroshine Desktop Mode** in the desktop's
+**Display Configuration** and select **Apply** while streaming. Fractional and
+integer scaling enlarge icons and text without changing the captured pixel
+resolution. Pyroshine preserves that choice while enforcing physical-display
+takeover, and input coordinates follow the compositor's scaled EIS region.
+The scale belongs to this virtual output; a new virtual output starts at 100%.
+Restoration uses the original physical displays' saved scales.
 
 With `audio = true`, desktop playback moves to an owned streaming sink, including
 new playback streams. The client hears desktop sound while local speakers are
@@ -134,7 +143,16 @@ Native APIs are capability checked; compositor updates may require adaptation.
 Remote input uses a separate RemoteDesktop portal and EIS session. Its restore
 token is `desktop-input-restore-token`; old monitor-selection grants are not
 reused. Revocation, session lock or input transport failure stops Desktop Mode
-and restores. Controllers retain the existing Inputtino path.
+and restores. Display changes can temporarily pause or replace EIS devices;
+input is suppressed until the authorized devices and the virtual display's
+region are ready again, for at most three seconds. Repeated partial updates do
+not extend that deadline, and held keys/buttons are not replayed on replacement
+devices. Controllers retain the existing Inputtino path.
+
+KDE's EIS region physical scale also identifies the virtual output after a UI
+scale change: its logical size, multiplied by that factor, must describe the
+captured pixel mode (allowing logical-pixel rounding). An arbitrary sole region
+cannot substitute for a missing managed output.
 
 ## Validation
 
@@ -145,8 +163,9 @@ protection. These tests use an injected platform; passing them does not validate
 real compositor protocols or GPU capture.
 
 The opt-in KDE capture test adds one virtual output, checks 2880×1920 at
-120 Hz (within native timing rounding), then removes it and verifies the
-original topology. Physical monitors remain enabled:
+120 Hz (within native timing rounding), applies 125%, 175%, 200% and 100% UI
+scales while checking that capture stays at 2880×1920, then removes it and
+verifies the original topology. Physical monitors remain enabled:
 
 ```sh
 MOONSHINE_TEST_DESKTOP=1 cargo test -p moonshine-core \
@@ -155,6 +174,20 @@ MOONSHINE_TEST_DESKTOP=1 cargo test -p moonshine-core \
 ```
 
 It does not validate full takeover, input, audio, reconnects or GNOME.
+
+A separate test temporarily disables physical monitors for five seconds and
+receives frames with authorized input, without injecting events. Run it only
+when a brief desktop takeover is acceptable, after authorizing remote input:
+
+```sh
+MOONSHINE_TEST_TAKEOVER=1 cargo test -p moonshine-core \
+  session::capture::portal::takeover_tests::managed_takeover_keeps_input_across_output_changes \
+  -- --ignored --exact --nocapture
+```
+
+This opt-in is also required before the hardware runner selects the test. It
+checks host capture/input continuity and restoration; client playback, audio
+and reconnect acceptance remain separate.
 Before declaring either desktop supported for release, run this matrix on
 physical KDE and GNOME hosts with a real streaming client:
 
@@ -162,6 +195,7 @@ physical KDE and GNOME hosts with a real streaming client:
 | --- | --- |
 | One monitor and several open apps | Client-sized virtual output only; existing desktop and apps remain usable remotely |
 | Several monitors, mixed scales/rotation, mirrored displays | All physical outputs disabled during takeover; saved topology, primary, modes and exposed color state restored |
+| KDE Display Configuration scale changes during streaming | Apply changes icons/text at 125%, 175% and 200%; pointer remains aligned, stream pixel resolution unchanged, original physical scales restored on exit |
 | Input consent, denied consent, revoked consent and lock | Readiness only with requested input available; denial/revocation/lock rolls back |
 | Audio already playing, new playback, removed audio device | Remote-only audio, then restored destinations/default or a working fallback |
 | Same-mode and changed-size/rate reconnect | Grace cancelled only by authenticated control; replacement validated before switch; no old frames/resources survive |

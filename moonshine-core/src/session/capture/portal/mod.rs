@@ -543,6 +543,7 @@ struct State {
 	mainloop: pw::main_loop::MainLoopRc,
 	stream: CaptureStream,
 	input: DesktopInput,
+	input_readiness: input::Readiness,
 	live: Arc<Live>,
 	format: StreamFormat,
 	/// Why the capture ended; the loop exits once set.
@@ -577,6 +578,19 @@ impl State {
 			} else {
 				index += 1;
 			}
+		}
+	}
+
+	fn check_input(&mut self) {
+		let ready = self.input.ready();
+		self.input.set_suspended(!ready);
+		if self.input_readiness.expired(ready, Instant::now()) {
+			self.ended.get_or_insert_with(|| {
+				capture_failure(
+					"desktop_input_lost",
+					"Remote input devices did not become ready for the virtual output within 3 seconds",
+				)
+			});
 		}
 	}
 
@@ -921,13 +935,9 @@ fn capture(
 				.insert_source(
 					calloop::generic::Generic::new(fd, Interest::READ, Mode::Level),
 					|_, _, state: &mut State| match state.input.dispatch() {
-						Ok(()) if state.input.authorized_devices() => Ok(PostAction::Continue),
 						Ok(()) => {
-							state.ended = Some(capture_failure(
-								"desktop_input_lost",
-								"The compositor revoked remote input devices",
-							));
-							Ok(PostAction::Remove)
+							state.check_input();
+							Ok(PostAction::Continue)
 						},
 						Err(error) => {
 							state.ended = Some(capture_failure("desktop_input_lost", error));
@@ -993,6 +1003,7 @@ fn capture(
 					// Return consumed buffers even without new demand.
 					state.stream.service();
 					state.check_stream();
+					state.check_input();
 					state.log_stats();
 					calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
 				},
@@ -1003,6 +1014,7 @@ fn capture(
 			mainloop: mainloop.clone(),
 			stream,
 			input,
+			input_readiness: input::Readiness::default(),
 			live: live.clone(),
 			format,
 			ended: None,
@@ -1072,6 +1084,7 @@ fn geometry(target: &crate::desktop::Target) -> OutputGeometry {
 		logical_position: Some((0, 0)),
 		logical_size: Some((target.mode.width as i32, target.mode.height as i32)),
 		mapping_id: None,
+		follow_scale: true,
 	}
 }
 pub(crate) fn wait_format(
@@ -1167,5 +1180,74 @@ fn wait_input_devices(
 			);
 		}
 		std::thread::sleep(Duration::from_millis(5));
+	}
+}
+
+#[cfg(test)]
+mod takeover_tests {
+	use super::*;
+
+	/// Uses real portal input, native output takeover and PipeWire capture.
+	/// Sends no keyboard, pointer or touch events.
+	#[test]
+	#[ignore = "requires explicit desktop takeover opt-in, a saved input grant and an unlocked KDE desktop"]
+	fn managed_takeover_keeps_input_across_output_changes() {
+		assert_eq!(std::env::var("MOONSHINE_TEST_TAKEOVER").as_deref(), Ok("1"));
+		let path = token::default_path().expect("Input token directory");
+		assert!(token::load(&path).is_some(), "Authorize remote input before this test");
+		let stop = ShutdownManager::<SessionShutdownReason>::new();
+		let cause = StopCauseSlot::default();
+		let (capture, endpoints) = PortalCapture::new(
+			PortalCaptureConfig {
+				desktop: DesktopConfig {
+					enabled: true,
+					input: true,
+					audio: false,
+					..Default::default()
+				},
+				gpu: None,
+				restore_token: Some(path),
+				resolution: (2880, 1920),
+				refresh_rate: 60,
+			},
+			stop.clone(),
+			cause.clone(),
+		);
+		let launched = capture.launch();
+		let result = match &launched {
+			Ok(_) => {
+				let start = Instant::now();
+				let mut frames = 0;
+				while start.elapsed() < Duration::from_secs(5) && !stop.is_shutdown_triggered() {
+					if let Ok(mut frame) = endpoints.frames.recv_timeout_if(Duration::from_millis(100), true) {
+						frame.consumed.store(true, std::sync::atomic::Ordering::Release);
+						drop(frame.capture_credit.take());
+						frames += 1;
+					}
+				}
+				eprintln!(
+					"desktop-takeover: {frames} frames across {:.2}s",
+					start.elapsed().as_secs_f64()
+				);
+				if stop.is_shutdown_triggered() {
+					Err(format!("Capture stopped during takeover: {:?}", cause.get()))
+				} else if frames == 0 {
+					Err("No capture frames arrived".into())
+				} else {
+					Ok(())
+				}
+			},
+			Err(error) => Err(error.client_message()),
+		};
+		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
+		drop(launched);
+		drop(endpoints);
+		let deadline = Instant::now() + Duration::from_secs(15);
+		while !stop.is_shutdown_completed() && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(20));
+		}
+		assert!(stop.is_shutdown_completed(), "Capture worker cleanup did not complete");
+		assert_eq!(crate::desktop::cleanup_complete(), Ok(()));
+		assert_eq!(result, Ok(()));
 	}
 }

@@ -613,6 +613,42 @@ mod tests {
 				"kde-native-capture: {}x{}, max rate {:?}",
 				format.width, format.height, format.max_framerate
 			);
+			for scale in [1.25, 1.75, 2.0, 1.0] {
+				let mut desired = native.snapshot()?;
+				desired
+					.outputs
+					.iter_mut()
+					.find(|o| o.key == target.output)
+					.ok_or("Virtual output missing")?
+					.scale = scale;
+				native.apply(&desired)?;
+				let observed = native.snapshot()?;
+				super::super::verify(&observed, &desired)?;
+				let managed = super::super::takeover_configuration(&observed, &target)?;
+				if managed.outputs.iter().find(|o| o.key == target.output).map(|o| o.scale) != Some(scale) {
+					return Err("Takeover would reset the user's UI scale".into());
+				}
+				// Dispatch renegotiation without taking over physical monitors.
+				let until = Instant::now() + Duration::from_millis(200);
+				while Instant::now() < until {
+					mainloop
+						.loop_()
+						.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(10)));
+				}
+				let scaled_format = crate::session::capture::portal::wait_format(
+					&mainloop,
+					&stream,
+					&target,
+					async_shutdown::ShutdownManager::new(),
+				)?;
+				if (scaled_format.width, scaled_format.height) != (2880, 1920) {
+					return Err("UI scale changed the capture pixel resolution".into());
+				}
+				eprintln!(
+					"kde-native-capture: UI scale {scale}, capture {}x{}",
+					scaled_format.width, scaled_format.height
+				);
+			}
 			Ok(())
 		})();
 		// Exercise the guard's restore-before-close ordering with a real

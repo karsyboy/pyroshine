@@ -40,6 +40,7 @@ REQUIREMENTS = (
     "pacat",
     "systemd-user",
     "kde-wayland",
+    "desktop-takeover",
     "input-devices",
     "nvidia-gpu",
     "vaapi-encode",
@@ -184,6 +185,9 @@ def probe(args):
     socket = display if os.path.isabs(display) else os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), display)
     found["kde-wayland"] = ("KDE" in desktop and bool(display) and os.path.exists(socket),
                             "KDE Wayland session" if "KDE" in desktop and display else "no KDE Wayland session")
+    input_grant = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "moonshine/desktop-input-restore-token"
+    found["desktop-takeover"] = (os.environ.get("MOONSHINE_TEST_TAKEOVER") == "1" and input_grant.is_file(),
+                                 "explicit takeover opt-in with saved input grant" if os.environ.get("MOONSHINE_TEST_TAKEOVER") == "1" else "set MOONSHINE_TEST_TAKEOVER=1 to allow physical display takeover")
     devices = writable("/dev/uinput") and writable("/dev/uhid")
     found["input-devices"] = (devices, "/dev/uinput and /dev/uhid writable" if devices else "/dev/uinput or /dev/uhid not writable")
     nvidia = os.environ.get("MOONSHINE_TEST_NVML") or next(

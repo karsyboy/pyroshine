@@ -734,9 +734,7 @@ mod tests {
 			let mut state = self.0.borrow_mut();
 			let journal = load(&state.journal)?.unwrap();
 			assert_eq!(journal.active_target.as_deref(), Some(target.id.as_str()));
-			for output in &mut state.current.outputs {
-				output.enabled = output.key == target.output;
-			}
+			state.current = super::super::native::takeover_configuration(&state.current, target)?;
 			if state.fail_commit {
 				return Err("injected failure after physical displays disabled".into());
 			}
@@ -946,6 +944,50 @@ mod tests {
 		assert!(!guard.path.exists());
 		assert_eq!(guard.phase, "idle");
 		guard.restore().unwrap();
+	}
+	#[test]
+	fn desktop_scale_edits_survive_guard_checks_and_hotplug_without_changing_the_baseline() {
+		let (_directory, mut guard, state) = fixture();
+		let baseline = state.borrow().current.clone();
+		let target = prepare(&mut guard);
+		commit(&mut guard, &target);
+		for scale in [1.25, 1.75, 2.0, 1.0] {
+			{
+				let mut state = state.borrow_mut();
+				state
+					.current
+					.outputs
+					.iter_mut()
+					.find(|o| o.key == target.output)
+					.unwrap()
+					.scale = scale;
+				// Hotplug may re-enable a physical monitor. Enforce takeover
+				// without undoing the scale chosen in Display Configuration.
+				state
+					.current
+					.outputs
+					.iter_mut()
+					.find(|o| o.key == "DP-1")
+					.unwrap()
+					.enabled = true;
+			}
+			guard.last_check = Instant::now() - Duration::from_secs(1);
+			guard.tick();
+			assert_eq!(guard.phase, "active");
+			let observed = state.borrow().current.clone();
+			let selected = observed.outputs.iter().find(|o| o.key == target.output).unwrap();
+			assert_eq!(selected.scale, scale);
+			assert_eq!(selected.mode, target.mode);
+			assert!(!observed.outputs.iter().any(|o| o.enabled && o.key != target.output));
+			let desired = super::super::native::takeover_configuration(&observed, &target).unwrap();
+			assert!(
+				verify(&observed, &desired).is_ok(),
+				"no configuration is needed for a scale-only edit"
+			);
+			assert_eq!(guard.journal.as_ref().unwrap().baseline, baseline);
+		}
+		guard.restore().unwrap();
+		assert_eq!(state.borrow().current, baseline);
 	}
 	#[test]
 	fn failure_after_output_creation_rolls_back_owned_resources() {

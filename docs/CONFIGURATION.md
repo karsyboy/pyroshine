@@ -435,7 +435,8 @@ A manually configured `[[application]]` may use `mode = "desktop"` and
 `command = []` to name the entry explicitly; only one Desktop Mode entry is
 automatically added. `mode` defaults to `"game"`. Desktop Mode executes no
 commands, hooks or application unit. `output_scale` applies to Game Mode;
-managed Desktop Mode uses scale 1.
+managed Desktop Mode starts at 100%. On KDE, adjust the virtual display's scale
+in **Display Configuration** while streaming; see [Desktop Mode](DESKTOP_MODE.md).
 
 ## `[[application_scanner]]`
 

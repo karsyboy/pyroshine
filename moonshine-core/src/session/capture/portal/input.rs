@@ -19,6 +19,7 @@
 use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use enumflags2::BitFlags;
 use reis::ei;
@@ -40,6 +41,8 @@ pub(crate) struct OutputGeometry {
 	pub logical_position: Option<(i32, i32)>,
 	pub logical_size: Option<(i32, i32)>,
 	pub mapping_id: Option<String>,
+	/// Managed outputs keep their pixel mode but allow UI scale changes.
+	pub follow_scale: bool,
 }
 
 /// How the encoders present the captured output in the stream, so client
@@ -94,21 +97,31 @@ pub(crate) struct Region {
 	pub y: f64,
 	pub width: f64,
 	pub height: f64,
+	pub physical_scale: f64,
 }
 
 /// The region of `regions` that shows `output`: the one with its mapping ID,
 /// else the one at its logical position and size, else the only region.
+/// Managed outputs also match their pixel mode through EIS's physical scale,
+/// so changing UI scale never changes pointer targeting or stream resolution.
 pub(crate) fn output_region(output: &OutputGeometry, regions: &[(Region, Option<String>)]) -> Option<Region> {
 	if let Some(id) = &output.mapping_id
 		&& let Some((region, _)) = regions.iter().find(|(_, mapping)| mapping.as_ref() == Some(id))
 	{
 		return Some(*region);
 	}
-	if let (Some((x, y)), Some((w, h))) = (output.logical_position, output.logical_size)
-		&& let Some((region, _)) = regions.iter().find(|(r, _)| {
-			r.x == f64::from(x) && r.y == f64::from(y) && r.width == f64::from(w) && r.height == f64::from(h)
-		}) {
-		return Some(*region);
+	if let (Some((x, y)), Some((w, h))) = (output.logical_position, output.logical_size) {
+		return regions.iter().find_map(|(region, _)| {
+			let size_matches = if output.follow_scale {
+				region.physical_scale.is_finite()
+					&& region.physical_scale > 0.0
+					&& region.width == (f64::from(output.width) / region.physical_scale).round()
+					&& region.height == (f64::from(output.height) / region.physical_scale).round()
+			} else {
+				region.width == f64::from(w) && region.height == f64::from(h)
+			};
+			(region.x == f64::from(x) && region.y == f64::from(y) && size_matches).then_some(*region)
+		});
 	}
 	match regions {
 		[(region, _)] => Some(*region),
@@ -141,9 +154,49 @@ impl InputTransport {
 	}
 }
 
+/// EIS devices can be replaced/paused as output regions change. This is not
+/// portal revocation. Bound the unavailable interval without extending it for
+/// repeated partial updates; the socket and portal still fail immediately.
+#[derive(Default)]
+pub(crate) struct Readiness {
+	deadline: Option<Instant>,
+}
+impl Readiness {
+	pub(crate) fn expired(&mut self, ready: bool, now: Instant) -> bool {
+		if ready {
+			self.deadline = None;
+			false
+		} else {
+			now >= *self.deadline.get_or_insert(now + Duration::from_secs(3))
+		}
+	}
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeviceReset {
+	keys: bool,
+	buttons: bool,
+	touches: bool,
+}
+impl DeviceReset {
+	fn merge(&mut self, other: Self) {
+		self.keys |= other.keys;
+		self.buttons |= other.buttons;
+		self.touches |= other.touches;
+	}
+	fn include(&mut self, device: &reis::event::Device) {
+		self.keys |= device.has_capability(DeviceCapability::Keyboard);
+		self.buttons |= device.has_capability(DeviceCapability::Button);
+		self.touches |= device.has_capability(DeviceCapability::Touch);
+	}
+}
+
 /// A libei device and what it can do.
 struct EiDevice {
 	device: reis::event::Device,
+	// reis clears a removed device's interfaces before delivering DeviceRemoved.
+	// Retain its capabilities so the matching held state can still be cleared.
+	reset: DeviceReset,
 	emulating: bool,
 }
 
@@ -156,6 +209,7 @@ struct Eis {
 	sequence: u32,
 	/// Pointer position, kept for devices that offer only relative motion.
 	disconnected: bool,
+	reset: DeviceReset,
 }
 
 /// The desktop input sink of a Desktop Mode session.
@@ -167,6 +221,7 @@ pub(crate) struct DesktopInput {
 	touches: BTreeSet<u32>,
 	warned: BTreeSet<&'static str>,
 	view: std::sync::Arc<StreamView>,
+	suspended: bool,
 }
 
 fn now_micros() -> u64 {
@@ -191,6 +246,7 @@ impl Eis {
 			devices: Vec::new(),
 			sequence: 0,
 			disconnected: false,
+			reset: DeviceReset::default(),
 		})
 	}
 
@@ -264,14 +320,24 @@ impl Eis {
 						kind = ?added.device.device_type(),
 						"Desktop input device added"
 					);
+					let mut reset = DeviceReset::default();
+					reset.include(&added.device);
 					self.devices.push(EiDevice {
 						device: added.device,
+						reset,
 						emulating: false,
 					});
 				},
-				EiEvent::DeviceRemoved(removed) => self.devices.retain(|d| d.device != removed.device),
+				EiEvent::DeviceRemoved(removed) => {
+					if let Some(device) = self.devices.iter().find(|d| d.device == removed.device) {
+						self.reset.merge(device.reset);
+					}
+					self.devices.retain(|d| d.device != removed.device);
+					tracing::debug!(name = removed.device.name(), "Desktop input device removed");
+				},
 				EiEvent::DeviceResumed(resumed) => {
-					let serial = self.serial();
+					tracing::debug!(name = resumed.device.name(), "Desktop input device resumed");
+					let serial = resumed.serial;
 					if let Some(device) = self.devices.iter_mut().find(|d| d.device == resumed.device) {
 						self.sequence += 1;
 						device.device.device().start_emulating(serial, self.sequence);
@@ -279,6 +345,10 @@ impl Eis {
 					}
 				},
 				EiEvent::DevicePaused(paused) => {
+					// The EIS protocol resets paused devices to neutral. Do not
+					// retain those held states for a later resumed/replaced device.
+					self.reset.include(&paused.device);
+					tracing::debug!(name = paused.device.name(), "Desktop input device paused");
 					if let Some(device) = self.devices.iter_mut().find(|d| d.device == paused.device) {
 						device.emulating = false;
 					}
@@ -340,6 +410,7 @@ impl DesktopInput {
 			touches: BTreeSet::new(),
 			warned: BTreeSet::new(),
 			view: std::sync::Arc::default(),
+			suspended: transport == InputTransport::Eis,
 		}
 	}
 
@@ -385,11 +456,33 @@ impl DesktopInput {
 			return Ok(());
 		};
 		let result = eis.dispatch();
+		let reset = std::mem::take(&mut eis.reset);
+		if reset.keys {
+			self.pressed.keys.clear();
+		}
+		if reset.buttons {
+			self.pressed.buttons.clear();
+		}
+		if reset.touches {
+			self.touches.clear();
+		}
 		if result.is_err() {
 			self.pressed = Pressed::default();
 			self.touches.clear();
+			self.suspended = true;
+		} else {
+			// Cache availability on administrative EIS updates. The per-input
+			// path only reads a boolean, rather than locking device interfaces.
+			self.set_suspended(!self.ready());
 		}
 		result
+	}
+
+	pub(crate) fn set_suspended(&mut self, suspended: bool) {
+		if suspended && !self.suspended {
+			self.release_all();
+		}
+		self.suspended = suspended;
 	}
 
 	fn warn_once(&mut self, what: &'static str, message: &str) {
@@ -541,6 +634,15 @@ impl DesktopInput {
 			}
 			return;
 		}
+		if self.suspended {
+			// Do not queue presses to replay on a new device. Reset barriers
+			// still complete while devices are being replaced.
+			self.release_all();
+			if let CaptureInputEvent::Reset { ready, .. } = event {
+				let _ = ready.send(());
+			}
+			return;
+		}
 		match event {
 			CaptureInputEvent::Reset { keys, buttons, ready } => {
 				// The control stream reports what the client held; release
@@ -672,6 +774,7 @@ fn region_list(device: &reis::event::Device) -> Vec<(Region, Option<String>)> {
 					y: f64::from(region.y),
 					width: f64::from(region.width),
 					height: f64::from(region.height),
+					physical_scale: f64::from(region.scale),
 				},
 				region.mapping_id.clone(),
 			)
@@ -690,11 +793,240 @@ mod tests {
 			logical_position: Some((1920, 0)),
 			logical_size: Some((2560, 1440)),
 			mapping_id: None,
+			follow_scale: false,
 		}
 	}
 
 	fn region(x: f64, y: f64, width: f64, height: f64) -> Region {
-		Region { x, y, width, height }
+		Region {
+			x,
+			y,
+			width,
+			height,
+			physical_scale: 1.0,
+		}
+	}
+
+	struct MockEis {
+		server: reis::eis::Context,
+		seat: reis::eis::Seat,
+		device: reis::eis::Device,
+		input: DesktopInput,
+	}
+	impl MockEis {
+		fn new() -> Self {
+			use reis::{PendingRequestResult, eis};
+			let (server_socket, client_socket) = UnixStream::pair().unwrap();
+			let server = eis::Context::new(server_socket).unwrap();
+			let mut input = DesktopInput::eis(client_socket.into(), output()).unwrap();
+			let handshake = server.handshake();
+			handshake.handshake_version(1);
+			server.flush().unwrap();
+			input.dispatch().unwrap();
+			server.read().unwrap();
+			let mut finished = false;
+			while let Some(request) = server.pending_request() {
+				match request {
+					PendingRequestResult::Request(eis::Request::Handshake(
+						_,
+						eis::handshake::Request::InterfaceVersion { name, version },
+					)) => handshake.interface_version(&name, version.min(1)),
+					PendingRequestResult::Request(eis::Request::Handshake(_, eis::handshake::Request::Finish)) => {
+						finished = true
+					},
+					PendingRequestResult::Request(_) => {},
+					other => panic!("mock handshake: {other:?}"),
+				}
+			}
+			assert!(finished);
+			let connection = handshake.connection(1, 1);
+			let seat = connection.seat(1);
+			seat.name("test seat");
+			for (i, interface) in ["ei_keyboard", "ei_pointer_absolute", "ei_button"]
+				.into_iter()
+				.enumerate()
+			{
+				seat.capability(1 << i, interface);
+			}
+			seat.done();
+			server.flush().unwrap();
+			input.dispatch().unwrap();
+			server.read().unwrap();
+			while let Some(request) = server.pending_request() {
+				assert!(matches!(request, PendingRequestResult::Request(_)));
+			}
+			let device = Self::add_device(&seat, 2);
+			server.flush().unwrap();
+			input.dispatch().unwrap();
+			assert!(input.ready());
+			Self {
+				server,
+				seat,
+				device,
+				input,
+			}
+		}
+		fn add_device(seat: &reis::eis::Seat, serial: u32) -> reis::eis::Device {
+			Self::add_scaled_device(seat, serial, 2560, 1440, 1.5)
+		}
+		fn add_scaled_device(
+			seat: &reis::eis::Seat,
+			serial: u32,
+			width: u32,
+			height: u32,
+			scale: f32,
+		) -> reis::eis::Device {
+			use reis::eis;
+			let device = seat.device(1);
+			device.name("test input");
+			device.device_type(eis::device::DeviceType::Virtual);
+			device.interface::<eis::Keyboard>(1);
+			device.interface::<eis::PointerAbsolute>(1);
+			device.interface::<eis::Button>(1);
+			device.region(1920, 0, width, height, scale);
+			device.done();
+			device.resumed(serial);
+			device
+		}
+		fn dispatch(&mut self) {
+			self.server.flush().unwrap();
+			self.input.dispatch().unwrap();
+		}
+	}
+
+	#[test]
+	fn eis_pause_resumes_without_revocation_or_replaying_held_keys() {
+		let mut mock = MockEis::new();
+		let now = Instant::now();
+		let mut readiness = Readiness::default();
+		mock.input.handle(CaptureInputEvent::KeyDown { keycode: 30 });
+		mock.input.handle(CaptureInputEvent::MouseButtonDown { button: 0x110 });
+		assert!(!mock.input.pressed.keys.is_empty());
+		mock.device.paused(3);
+		mock.dispatch();
+		assert!(!mock.input.ready());
+		assert!(!readiness.expired(mock.input.ready(), now));
+		mock.input.set_suspended(true);
+		assert!(mock.input.pressed.keys.is_empty());
+		assert!(mock.input.pressed.buttons.is_empty());
+		mock.input.handle(CaptureInputEvent::KeyDown { keycode: 31 });
+		assert!(mock.input.pressed.keys.is_empty());
+		mock.device.resumed(4);
+		mock.dispatch();
+		mock.input.set_suspended(false);
+		assert!(mock.input.ready());
+		assert!(!readiness.expired(mock.input.ready(), now + Duration::from_secs(2)));
+		assert!(mock.input.pressed.keys.is_empty());
+	}
+
+	#[test]
+	fn eis_replacement_clears_held_state_even_when_ready_in_the_same_dispatch() {
+		let mut mock = MockEis::new();
+		mock.input.handle(CaptureInputEvent::KeyDown { keycode: 30 });
+		mock.device.destroyed(3);
+		mock.device = MockEis::add_device(&mock.seat, 4);
+		mock.dispatch();
+		assert!(mock.input.ready());
+		assert!(mock.input.pressed.keys.is_empty());
+	}
+
+	#[test]
+	fn eis_scale_changes_keep_input_ready_and_map_into_the_new_logical_size() {
+		let mut mock = MockEis::new();
+		mock.input.output.follow_scale = true;
+		for (serial, width, height, scale) in [(3, 1920, 1080, 2.0), (5, 3072, 1728, 1.25), (7, 3840, 2160, 1.0)] {
+			mock.device.destroyed(serial);
+			mock.device = MockEis::add_scaled_device(&mock.seat, serial + 1, width, height, scale);
+			mock.dispatch();
+			assert!(mock.input.ready());
+			assert!(!mock.input.suspended);
+			let device = mock
+				.input
+				.eis
+				.as_ref()
+				.unwrap()
+				.device(DeviceCapability::PointerAbsolute)
+				.unwrap();
+			assert_eq!(
+				mock.input.absolute(0.5, 0.5, Some(&region_list(device))),
+				Some((1920.0 + f64::from(width) / 2.0, f64::from(height) / 2.0))
+			);
+			assert_eq!((mock.input.output.width, mock.input.output.height), (3840, 2160));
+		}
+	}
+
+	#[test]
+	fn managed_regions_follow_fractional_scale_but_reject_stale_or_invalid_regions() {
+		let output = OutputGeometry {
+			width: 2880,
+			height: 1920,
+			logical_position: Some((0, 0)),
+			logical_size: Some((2880, 1920)),
+			follow_scale: true,
+			mapping_id: None,
+		};
+		let scaled = Region {
+			physical_scale: 1.75,
+			..region(0.0, 0.0, 1646.0, 1097.0)
+		};
+		assert_eq!(output_region(&output, &[(scaled, None)]), Some(scaled));
+		let input = DesktopInput::none(output.clone());
+		assert_eq!(input.absolute(0.5, 0.5, Some(&[(scaled, None)])), Some((823.0, 548.5)));
+		for invalid in [
+			Region {
+				physical_scale: 1.0,
+				..scaled
+			},
+			Region {
+				physical_scale: f64::NAN,
+				..scaled
+			},
+			Region {
+				physical_scale: 0.0,
+				..scaled
+			},
+			Region {
+				physical_scale: -1.75,
+				..scaled
+			},
+			Region { x: 10.0, ..scaled },
+			Region {
+				width: 1920.0,
+				height: 1080.0,
+				..scaled
+			},
+			Region {
+				width: 2880.0,
+				height: 1920.0,
+				..scaled
+			},
+		] {
+			assert_eq!(output_region(&output, &[(invalid, None)]), None);
+		}
+	}
+
+	#[test]
+	fn missing_input_has_a_fixed_deadline_and_socket_loss_is_immediate() {
+		let now = Instant::now();
+		let mut readiness = Readiness::default();
+		assert!(!readiness.expired(false, now));
+		assert!(!readiness.expired(false, now + Duration::from_secs(2)));
+		assert!(readiness.expired(false, now + Duration::from_secs(3)));
+		assert!(!readiness.expired(true, now + Duration::from_secs(4)));
+		assert!(!readiness.expired(false, now + Duration::from_secs(5)));
+		assert!(readiness.expired(false, now + Duration::from_secs(8)));
+		let mock = MockEis::new();
+		let MockEis { server, mut input, .. } = mock;
+		drop(server);
+		assert!(input.dispatch().is_err());
+	}
+
+	#[test]
+	fn a_single_stale_region_cannot_match_an_explicit_managed_geometry() {
+		assert_eq!(
+			output_region(&output(), &[(region(0.0, 0.0, 1920.0, 1080.0), None)]),
+			None
+		);
 	}
 
 	#[test]

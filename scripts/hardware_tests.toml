@@ -23,6 +23,7 @@
 #   pacat                libpulse's pacat client
 #   systemd-user         a reachable user systemd manager
 #   kde-wayland          a signed-in, unlocked KDE Wayland session
+#   desktop-takeover     explicit MOONSHINE_TEST_TAKEOVER=1 and a saved desktop input grant
 #   input-devices        writable /dev/uinput and /dev/uhid
 #   nvidia-gpu           an NVIDIA GPU (sets MOONSHINE_TEST_NVML to its PCI address)
 #   pyrowave-library     the pinned PyroWave library (--pyrowave-library or MOONSHINE_PYROWAVE_LIBRARY)
@@ -190,3 +191,8 @@ name = "desktop::native::kde::tests::native_120hz_capture_and_owner_cleanup_on_k
 requires = ["kde-wayland", "render-node", "systemd-user"]
 env = { MOONSHINE_TEST_DESKTOP = "1" }
 timeout = 45
+
+[[test]]
+name = "session::capture::portal::takeover_tests::managed_takeover_keeps_input_across_output_changes"
+requires = ["kde-wayland", "render-node", "systemd-user", "desktop-takeover"]
+timeout = 90
