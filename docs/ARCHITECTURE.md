@@ -705,6 +705,12 @@ another scanner provides, or the same identity found twice, is a duplicate;
 hidden entries keep their ID but are not offered; equal titles from different
 launchers get the launcher's name appended.
 
+**Launcher identities.** `/applist` reports, per offered entry, the launcher
+identities it starts (`<PyroshineSource>steam:620</PyroshineSource>`): a
+discovered entry's own key, or for a manual entry the keys it shadows. Clients
+such as PyroDeck use them to find a game without matching titles; standard
+Moonlight ignores them. See [Client integration](CLIENT_INTEGRATION.md).
+
 **Box art.** Entries carry ordered candidates (launcher art, then icons, then a
 theme icon named like the title). `/appasset` renders the first one that
 decodes on a blocking thread, at most two at a time, letterboxed to Moonlight's

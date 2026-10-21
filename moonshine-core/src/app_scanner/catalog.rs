@@ -149,6 +149,35 @@ impl CatalogSnapshot {
 	pub fn find_key(&self, key: &str) -> Option<&CatalogEntry> {
 		self.entries.iter().find(|entry| entry.key == key)
 	}
+
+	/// The launcher identities (`steam:892970`) each offered entry starts,
+	/// keyed by entry key, in catalog order: a discovered entry's own key, and
+	/// for a manual entry the keys of the discovered entries it shadows, since
+	/// it is the user's override of that game. Manual keys are positions in
+	/// the configuration, not identities, and are never reported.
+	///
+	/// This lets a client find "the entry for Steam app 892970" without
+	/// matching titles, which can be suffixed (`Hades (Steam)`) or overridden.
+	pub fn launcher_identities(&self) -> HashMap<&str, Vec<&str>> {
+		let mut identities: HashMap<&str, Vec<&str>> = HashMap::new();
+		for entry in &self.entries {
+			match (&entry.origin, &entry.state) {
+				(Origin::Discovered { .. }, state) if state.offered() => {
+					identities
+						.entry(entry.key.as_str())
+						.or_default()
+						.push(entry.key.as_str());
+				},
+				(Origin::Discovered { .. }, EntryState::Shadowed { by })
+					if self.find_key(by).is_some_and(|owner| owner.state.offered()) =>
+				{
+					identities.entry(by.as_str()).or_default().push(entry.key.as_str());
+				},
+				_ => {},
+			}
+		}
+		identities
+	}
 }
 
 /// One unit's current entries.
@@ -578,5 +607,58 @@ mod tests {
 		assert_eq!(ids[0], legacy_id("Game"));
 		assert_ne!(ids[1], ids[0]);
 		assert_eq!(snapshot.find(ids[1]).unwrap().application.command, vec!["b"]);
+	}
+
+	/// Clients find a game by launcher identity, never by title: equal
+	/// titles stay apart, a manual override answers for the game it shadows,
+	/// and hidden or duplicate entries report nothing.
+	#[test]
+	fn launcher_identities_follow_offered_entries_and_overrides() {
+		let mut identity = IdentityStore::in_memory();
+		let mut shortcut = found("Valheim.desktop", "Valheim");
+		shortcut.launches = Some("steam:892970".into());
+		let snapshot = catalog(
+			&[app("Portal 2", "custom-portal"), app("Desktop", "plasma")],
+			&[
+				(
+					ScannerKind::Steam,
+					vec![
+						found("892970", "Valheim"),
+						found("620", "Portal 2"),
+						found("1145360", "Hades"),
+						found("1145361", "Hades"),
+					],
+				),
+				(ScannerKind::Heroic, vec![found("legendary/Hades", "Hades")]),
+				(ScannerKind::Desktop, vec![shortcut]),
+			],
+			&mut identity,
+		);
+		let identities = snapshot.launcher_identities();
+		let of = |key: &str| identities.get(key).cloned().unwrap_or_default();
+
+		assert_eq!(of("steam:892970"), vec!["steam:892970"]);
+		// The manual "Portal 2" is what launching Steam app 620 starts.
+		assert_eq!(of("manual:0"), vec!["steam:620"]);
+		assert_eq!(of("steam:620"), Vec::<&str>::new());
+		assert_eq!(of("manual:1"), Vec::<&str>::new());
+		assert_eq!(of("desktop:Valheim.desktop"), Vec::<&str>::new());
+		// Same title, distinct identities and IDs.
+		assert_eq!(of("steam:1145360"), vec!["steam:1145360"]);
+		assert_eq!(of("steam:1145361"), vec!["steam:1145361"]);
+		assert_eq!(of("heroic:legendary/Hades"), vec!["heroic:legendary/Hades"]);
+		let id = |key: &str| snapshot.find_key(key).unwrap().id;
+		assert_ne!(id("steam:1145360"), id("steam:1145361"));
+	}
+
+	#[test]
+	fn hidden_entries_report_no_launcher_identity() {
+		let mut identity = IdentityStore::in_memory();
+		let sources = [(ScannerKind::Steam, vec![found("892970", "Valheim")])];
+		catalog(&[], &sources, &mut identity);
+		identity.set_hidden("steam:892970", true);
+		let snapshot = catalog(&[], &sources, &mut identity);
+		assert_eq!(snapshot.find_key("steam:892970").unwrap().state, EntryState::Hidden);
+		assert!(snapshot.launcher_identities().is_empty());
 	}
 }

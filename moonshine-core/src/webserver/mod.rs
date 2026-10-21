@@ -568,23 +568,7 @@ impl Webserver {
 	}
 
 	fn app_list(&self) -> Response<Full<Bytes>> {
-		let catalog = self.library.catalog();
-		let mut response = "<root status_code=\"200\">".to_string();
-		for entry in catalog.offered() {
-			response += "<App>";
-
-			// Desktop Mode streams what the desktop shares, which is SDR on
-			// the desktops tested; Moonlight then does not ask for HDR.
-			let hdr_supported = u8::from(self.hdr_supported && entry.application.mode.is_game());
-			response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
-			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();
-			response += format!("<ID>{}</ID>", entry.id).as_ref();
-
-			response += "</App>";
-		}
-
-		response += "</root>";
-
+		let response = app_list_xml(&self.library.catalog(), self.hdr_supported);
 		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response
 			.headers_mut()
@@ -717,6 +701,9 @@ impl Webserver {
 				bandwidth::PROBE_BYTES
 			);
 		}
+		// Public like the rest of this document: it only tells an integration
+		// whether `/applist` (paired clients only) carries launcher identities.
+		response += &format!("<PyroshineAppSources>{APP_SOURCES_VERSION}</PyroshineAppSources>");
 		response += "<SupportedDisplayMode></SupportedDisplayMode>";
 		response += &format!("<PairStatus>{paired}</PairStatus>");
 		response += &format!(
@@ -1108,6 +1095,42 @@ impl Webserver {
 	}
 }
 
+/// Version of the `<PyroshineSource>` application metadata in `/applist`,
+/// advertised as `<PyroshineAppSources>` in `/serverinfo`. Bump it only for
+/// an incompatible change; adding elements is compatible.
+pub(crate) const APP_SOURCES_VERSION: u32 = 1;
+
+/// The `/applist` document for `catalog`.
+///
+/// Besides Moonlight's fields, each `<App>` carries one `<PyroshineSource>`
+/// per launcher identity it starts (`steam:892970`; see
+/// [`CatalogSnapshot::launcher_identities`]), so an integration such as
+/// PyroDeck can find a Steam game by its app ID instead of by title.
+/// Moonlight clients ignore unknown elements. The list is only served to
+/// paired clients, like the titles themselves.
+fn app_list_xml(catalog: &crate::app_scanner::CatalogSnapshot, hdr_supported: bool) -> String {
+	let identities = catalog.launcher_identities();
+	let mut response = "<root status_code=\"200\">".to_string();
+	for entry in catalog.offered() {
+		response += "<App>";
+
+		// Desktop Mode streams what the desktop shares, which is SDR on
+		// the desktops tested; Moonlight then does not ask for HDR.
+		let hdr_supported = u8::from(hdr_supported && entry.application.mode.is_game());
+		response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
+		response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();
+		response += format!("<ID>{}</ID>", entry.id).as_ref();
+		for source in identities.get(entry.key.as_str()).into_iter().flatten() {
+			response += format!("<PyroshineSource>{}</PyroshineSource>", escape_xml(source)).as_ref();
+		}
+
+		response += "</App>";
+	}
+
+	response += "</root>";
+	response
+}
+
 /// Authorize a request to the operator route (`POST /unpair`). It can only
 /// remove trust, never grant it.
 ///
@@ -1332,4 +1355,63 @@ pub(crate) fn escape_xml(input: impl AsRef<str>) -> String {
 		.replace(">", "&gt;")
 		.replace("\"", "&quot;")
 		.replace("'", "&apos;")
+}
+
+#[cfg(test)]
+mod app_list_tests {
+	use super::*;
+	use crate::app_scanner::{CatalogEntry, CatalogSnapshot, EntryState, Origin, ScannerKind};
+	use crate::session::application::ApplicationConfig;
+
+	fn entry(key: &str, id: i32, title: &str, origin: Origin, state: EntryState) -> CatalogEntry {
+		CatalogEntry {
+			key: key.into(),
+			id,
+			origin,
+			application: ApplicationConfig {
+				title: title.into(),
+				command: vec!["/usr/bin/steam".into()],
+				..Default::default()
+			},
+			artwork: Vec::new(),
+			artwork_origin: None,
+			state,
+		}
+	}
+
+	fn steam(native_id: &str) -> Origin {
+		Origin::Discovered {
+			scanner: 0,
+			kind: ScannerKind::Steam,
+			native_id: native_id.into(),
+			unit: "/home/u/.local/share/Steam".into(),
+		}
+	}
+
+	#[test]
+	fn applist_reports_launcher_identities_beside_moonlight_fields() {
+		let catalog = CatalogSnapshot::new(
+			1,
+			vec![
+				entry(
+					"manual:0",
+					11,
+					"Desktop & More",
+					Origin::Manual { index: 0 },
+					EntryState::Available,
+				),
+				entry("steam:892970", 22, "Valheim", steam("892970"), EntryState::Available),
+				entry("steam:620", 0, "Portal 2", steam("620"), EntryState::Hidden),
+			],
+		);
+		let xml = app_list_xml(&catalog, true);
+		assert_eq!(
+			xml,
+			"<root status_code=\"200\">\
+			 <App><IsHdrSupported>1</IsHdrSupported><AppTitle>Desktop &amp; More</AppTitle><ID>11</ID></App>\
+			 <App><IsHdrSupported>1</IsHdrSupported><AppTitle>Valheim</AppTitle><ID>22</ID>\
+			 <PyroshineSource>steam:892970</PyroshineSource></App>\
+			 </root>"
+		);
+	}
 }

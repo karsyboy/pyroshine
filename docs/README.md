@@ -35,6 +35,7 @@ the guide for the area being changed:
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |
 | Cross-fork framing and authenticated calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
 | UDP bandwidth calibration protocol, safety and bitrate suggestion | [Bandwidth calibration](BANDWIDTH_CALIBRATION.md) |
+| Launcher identities in the app list and launch error codes for integrations (PyroDeck) | [Client integration](CLIENT_INTEGRATION.md) |
 | Native Wayland/XWayland presentation, HDR and Wine/Proton | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity/report mapping | [Native controllers](NATIVE_CONTROLLERS.md), [DualSense Edge](DUALSENSE_EDGE.md) |
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |

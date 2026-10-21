@@ -16,6 +16,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
+- Report which launcher game each application starts. The paired-client app list now carries `<PyroshineSource>steam:892970</PyroshineSource>` (and `heroic:`, `lutris:`, `desktop:` identities) for every discovered entry, and for a manual entry that overrides a discovered game; `/serverinfo` advertises the version as `<PyroshineAppSources>1</PyroshineAppSources>`. Integrations such as PyroDeck find a Steam game by its app ID instead of by title; Moonlight clients ignore the new elements and application IDs are unchanged. See [Client integration](CLIENT_INTEGRATION.md).
+
 - Add generation-scoped live bitrate controls for Vulkan Video, VA-API and NVENC, with bounded coalescing, accepted-rate and first-picture results, and benchmark `--rate-change` requests. Fixed negotiated bitrate remains the default; updates preserve references and stay inside the startup budget.
 
 - Extend `moonshine-desktop-probe` with read-only `--status`, configurable `--width`/`--height`, opt-in `--timings`, and `--implicit-sync` for comparing synchronization paths. Reports distinguish the requested mode, observed output mode (when supplied by the guard), negotiated PipeWire rate/layout, actual buffer pool and first completed frame. Baseline manifests include capture/encoder source hashes and desktop/PipeWire versions.
