@@ -134,6 +134,9 @@ pub(crate) struct StreamFormat {
 	pub height: u32,
 	/// Frame rate the producer declared, `None` when variable (0/1).
 	pub framerate: Option<Fraction>,
+	/// Maximum frame rate the producer agreed to: the lower of the output's
+	/// refresh and the requested rate (KWin, Mutter).
+	pub max_framerate: Option<Fraction>,
 	pub color: DeclaredColor,
 }
 
@@ -174,6 +177,8 @@ struct Inner {
 	offered: Vec<OfferedFormat>,
 	/// Frame rate requested from the producer.
 	rate: u32,
+	size: Option<(u32, u32)>,
+	active: bool,
 	status: StreamStatus,
 	/// Newest received frame not sent yet.
 	pending: Option<(*mut pw::sys::pw_buffer, Option<i64>)>,
@@ -200,7 +205,13 @@ fn serialize(value: Value) -> Vec<u8> {
 
 /// One `EnumFormat` object: `format` with `modifiers` (a choice the producer
 /// fixates, or a single fixated value) at any size and frame rate.
-fn format_pod(format: &OfferedFormat, modifiers: &[u64], fixated: bool, rate: u32) -> Vec<u8> {
+fn format_pod(
+	format: &OfferedFormat,
+	modifiers: &[u64],
+	fixated: bool,
+	rate: u32,
+	size: Option<(u32, u32)>,
+) -> Vec<u8> {
 	let modifier_value = if fixated || modifiers.len() == 1 {
 		Value::Long(modifiers[0] as i64)
 	} else {
@@ -237,20 +248,23 @@ fn format_pod(format: &OfferedFormat, modifiers: &[u64], fixated: bool, rate: u3
 			},
 			Property::new(
 				spa_sys::SPA_FORMAT_VIDEO_size,
-				Value::Choice(ChoiceValue::Rectangle(Choice(
-					ChoiceFlags::empty(),
-					ChoiceEnum::Range {
-						default: Rectangle {
-							width: 1920,
-							height: 1080,
-						},
-						min: Rectangle { width: 1, height: 1 },
-						max: Rectangle {
-							width: 16384,
-							height: 16384,
-						},
-					},
-				))),
+				size.map(|(width, height)| Value::Rectangle(Rectangle { width, height }))
+					.unwrap_or_else(|| {
+						Value::Choice(ChoiceValue::Rectangle(Choice(
+							ChoiceFlags::empty(),
+							ChoiceEnum::Range {
+								default: Rectangle {
+									width: 1920,
+									height: 1080,
+								},
+								min: Rectangle { width: 1, height: 1 },
+								max: Rectangle {
+									width: 16384,
+									height: 16384,
+								},
+							},
+						)))
+					}),
 			),
 			// Producers deliver frames as content changes, at most at the
 			// (maximum) frame rate; 0/1 means variable. Compositors throttle to
@@ -539,7 +553,7 @@ impl Inner {
 	/// Send the pending frame if the pipeline wants one.
 	fn try_send(&mut self, stream: &pw::stream::Stream) {
 		self.sweep(stream);
-		if self.pending.is_none() {
+		if !self.active || self.pending.is_none() {
 			return;
 		}
 		let Some(credit) = self.sender.try_acquire() else {
@@ -591,7 +605,7 @@ impl Inner {
 		let mut frame = ExportedFrame::from_dmabuf(&dmabuf, index, Arc::new(AtomicBool::new(false)), color_space, None);
 		frame.source_time = source_time(pts, now);
 		// The desktop's output keeps its own size; encoders scale it.
-		frame.scale_to_stream = true;
+		frame.scale_to_stream = self.size.is_none();
 		Ok(frame)
 	}
 
@@ -626,7 +640,7 @@ impl Inner {
 				self.status.failure = Some("no common DMA-BUF modifier with the compositor".into());
 				return;
 			};
-			let pod = format_pod(&offered, &[modifier], true, self.rate);
+			let pod = format_pod(&offered, &[modifier], true, self.rate, self.size);
 			let mut params = [Pod::from_bytes(&pod).expect("serialized pod")];
 			if let Err(error) = stream.update_params(&mut params) {
 				self.status.failure = Some(format!("cannot fixate the DMA-BUF modifier: {error}"));
@@ -648,6 +662,7 @@ impl Inner {
 			width: size.width,
 			height: size.height,
 			framerate: (framerate.num > 0).then_some(framerate),
+			max_framerate: Some(info.max_framerate()).filter(|rate| rate.num > 0 && rate.denom > 0),
 			color: DeclaredColor {
 				transfer: info.transfer_function(),
 				primaries: info.color_primaries(),
@@ -721,11 +736,12 @@ impl CaptureStream {
 	/// Connect to `node_id` on `core` (the portal's PipeWire remote).
 	pub(crate) fn connect(
 		core: &pw::core::CoreRc,
-		node_id: u32,
+		target: &crate::desktop::Target,
 		offered: Vec<OfferedFormat>,
-		rate: u32,
 		sender: CaptureSender,
 	) -> Result<Self, String> {
+		let rate = target.mode.refresh_millihertz / 1000;
+		let size = Some((target.mode.width, target.mode.height));
 		if offered.is_empty() {
 			return Err("the capture GPU imports no DMA-BUF format a screen cast can use".into());
 		}
@@ -736,6 +752,7 @@ impl CaptureStream {
 				*pw::keys::MEDIA_TYPE => "Video",
 				*pw::keys::MEDIA_CATEGORY => "Capture",
 				*pw::keys::MEDIA_ROLE => "Screen",
+				"target.object" => target.serial.map(|s| s.to_string()).unwrap_or_else(|| target.node_id.to_string()),
 			},
 		)
 		.map_err(|e| format!("cannot create the PipeWire stream: {e}"))?;
@@ -743,6 +760,8 @@ impl CaptureStream {
 			sender,
 			offered: offered.clone(),
 			rate,
+			size,
+			active: false,
 			status: StreamStatus::default(),
 			pending: None,
 			in_flight: Vec::new(),
@@ -796,7 +815,7 @@ impl CaptureStream {
 
 		let pods: Vec<Vec<u8>> = offered
 			.iter()
-			.map(|format| format_pod(format, &format.modifiers, false, rate))
+			.map(|format| format_pod(format, &format.modifiers, false, rate, size))
 			.collect();
 		let mut params: Vec<&Pod> = pods
 			.iter()
@@ -805,7 +824,7 @@ impl CaptureStream {
 		stream
 			.connect(
 				spa::utils::Direction::Input,
-				Some(node_id),
+				Some(target.node_id),
 				pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::DONT_RECONNECT,
 				&mut params,
 			)
@@ -819,6 +838,26 @@ impl CaptureStream {
 
 	/// Send the pending frame if the pipeline asked for one, and return the
 	/// buffers it finished with. Called on capture demand and periodically.
+	pub(crate) fn replacement_sender(&self) -> CaptureSender {
+		self.inner.borrow().sender.replacement()
+	}
+	pub(crate) fn set_active(&self, active: bool) {
+		self.inner.borrow_mut().active = active;
+	}
+	pub(crate) fn drained(&self) -> bool {
+		self.inner.borrow_mut().sweep(&self.stream);
+		self.inner.borrow().in_flight.is_empty()
+	}
+	pub(crate) fn validate_frame(&self) -> Result<bool, String> {
+		let mut inner = self.inner.borrow_mut();
+		match inner.pending {
+			Some((buffer, pts)) => {
+				drop(inner.export(buffer, pts)?);
+				Ok(true)
+			},
+			None => Ok(false),
+		}
+	}
 	pub(crate) fn service(&self) {
 		self.inner.borrow_mut().try_send(&self.stream);
 	}
@@ -903,12 +942,12 @@ mod tests {
 			fourcc: 0x3432_5258,
 			modifiers: vec![7, 0],
 		};
-		let open = format_pod(&format, &format.modifiers, false, 60);
+		let open = format_pod(&format, &format.modifiers, false, 60, None);
 		assert_eq!(
 			modifier_choice(Pod::from_bytes(&open).unwrap()),
 			Some((vec![7, 0], true))
 		);
-		let fixed = format_pod(&format, &[0], true, 60);
+		let fixed = format_pod(&format, &[0], true, 60, None);
 		assert_eq!(
 			modifier_choice(Pod::from_bytes(&fixed).unwrap()),
 			Some((vec![0], false))

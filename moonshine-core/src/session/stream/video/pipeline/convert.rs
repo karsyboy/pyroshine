@@ -91,10 +91,11 @@ struct PushConstants {
 	layer_rect: [[i32; 4]; MAX_OVERLAYS],
 	layer_opacity: [f32; MAX_OVERLAYS],
 	layer_opaque: [u32; MAX_OVERLAYS],
+	viewport: [u32; 4],
 }
 
 // Every implementation supports at least 128 bytes of push constants.
-const _: () = assert!(std::mem::size_of::<PushConstants>() == 112);
+const _: () = assert!(std::mem::size_of::<PushConstants>() == 128);
 
 /// Where a late-composition layer's texels come from.
 pub(crate) enum LayerInput<'a> {
@@ -1601,6 +1602,11 @@ impl InputConverter {
 			layer_rect: [[0; 4]; MAX_OVERLAYS],
 			layer_opacity: [0.0; MAX_OVERLAYS],
 			layer_opaque: [0; MAX_OVERLAYS],
+			viewport: {
+				let (x, y, w, h) =
+					crate::session::capture::frame::fit_viewport(source.extent, (self.width, self.height));
+				[x, y, w, h]
+			},
 		};
 		// Per slot: the view to bind, whether staged texels must be uploaded,
 		// and an imported image with its first-use flag (needs acquire/release).

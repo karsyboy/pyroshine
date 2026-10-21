@@ -45,6 +45,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | Area | Responsibility |
 | --- | --- |
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown; `pair.rs` and `diag.rs` subcommands |
+| `desktop/` | Independently supervised existing-desktop output/audio guard, native KDE/GNOME adapters, private lifecycle RPC, durable recovery and reconnect grace |
 | `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
 | `app_scanner/` | Application catalog: Steam, Lutris, Heroic and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
@@ -101,6 +102,7 @@ Other workspace and integration areas:
 | Configuration fields, defaults or semantics | `docs/CONFIGURATION.md` and the owning Rust config/default implementations |
 | PyroWave, codec negotiation, GPU ownership, FEC or transport | `docs/PYROWAVE.md`, `docs/PYROWAVE_COMPATIBILITY.md` |
 | Capture backends, the frame contract or future capture modes | `docs/CAPTURE_BACKENDS.md` |
+| Existing Wayland desktop takeover, native outputs, remote audio or recovery | `docs/DESKTOP_MODE.md` |
 | Capture, cursor lifetime, focus, Steam surfaces/overlays or input | `docs/COMPOSITOR.md` |
 | Native presentation, HDR/color management and Wine/Proton setup | `docs/NATIVE_PRESENTATION.md` |
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
@@ -116,6 +118,10 @@ Other workspace and integration areas:
 
 ## Architectural boundaries
 
+- Managed Desktop Mode display/audio control belongs to the separately supervised
+  user guard in `desktop/`. Frames travel directly through PipeWire and capture
+  admission; never route media payloads through its administrative RPC. A desktop
+  teardown is not Idle until restoration is verified.
 - Keep protocol/session orchestration, compositor scene decisions, encoding,
   packet transport, input/control and packaging in their owning
   layers. Extend existing interfaces rather than coupling unrelated layers or

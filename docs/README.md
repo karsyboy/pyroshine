@@ -6,6 +6,7 @@
 - [Installation](INSTALLATION.md): platform compatibility, SteamOS/portable setup, headless use, networking and upgrades.
 - [Web interface and tray](MANAGEMENT.md): sign in locally or over SSH, pair devices, manage clients, save settings, read stream status, history and updates; the desktop tray.
 - [Manage a headless host](INSTALLATION.md#manage-a-headless-host) and [pair from a terminal](INSTALLATION.md#pair-from-a-terminal): `pyroshine web setup` and `pyroshine pair`, including over SSH.
+- [Managed Desktop Mode](DESKTOP_MODE.md): existing Wayland desktop takeover, input authorization, remote audio and restoration.
 - [NixOS](NIXOS.md): declarative installation, Steam configuration and the `moonshine` service.
 
 ## Advanced configuration and troubleshooting

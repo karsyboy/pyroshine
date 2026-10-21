@@ -89,6 +89,8 @@ zvariant = "5.15.0"
 pipewire = "0.10.1"
 reis = { version = "0.7.1", features = ["calloop"] }
 enumflags2 = "0.7.12"
+wayland-scanner = "0.31"
+libpulse-binding = "2.30"
 
 [dev-dependencies]
 tempfile = "3.27.0"

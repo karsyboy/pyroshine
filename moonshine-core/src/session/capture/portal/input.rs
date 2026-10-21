@@ -6,8 +6,6 @@
 //! - **libei** (`ConnectToEIS`, RemoteDesktop 2: Plasma 6.1+, GNOME 46+): an
 //!   emulated-input connection whose devices the compositor creates for this
 //!   session. Events are framed per device, as libei requires.
-//! - **Portal methods** (`NotifyKeyboardKeycode`, `NotifyPointer*`), the
-//!   fallback for RemoteDesktop 1 portals (Ubuntu 22.04's GNOME 42).
 //!
 //! No virtual kernel input device is created for keyboard or pointer: that
 //! would bypass the compositor's authorization. Controllers stay Inputtino
@@ -18,14 +16,13 @@
 //! disconnects (`Reset`), when the session stops, and before the devices go
 //! away, so the desktop is never left with a stuck key.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 
 use enumflags2::BitFlags;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::session::capture::input::CaptureInputEvent;
 
@@ -43,8 +40,46 @@ pub(crate) struct OutputGeometry {
 	pub logical_position: Option<(i32, i32)>,
 	pub logical_size: Option<(i32, i32)>,
 	pub mapping_id: Option<String>,
-	/// PipeWire node, which the portal methods address absolute motion by.
-	pub node_id: u32,
+}
+
+/// How the encoders present the captured output in the stream, so client
+/// positions can be mapped back onto the output. Updated by the session when
+/// a stream is (re)negotiated; read by the input path.
+#[derive(Debug, Default)]
+pub(crate) struct StreamView {
+	/// Stream width and height packed (`width << 32 | height`); 0 before PLAY.
+	size: std::sync::atomic::AtomicU64,
+	/// The encoder preserves the aspect ratio (letterbox) instead of
+	/// stretching the output over the frame.
+	fit: std::sync::atomic::AtomicBool,
+}
+
+impl StreamView {
+	pub(crate) fn set(&self, width: u32, height: u32, fit: bool) {
+		use std::sync::atomic::Ordering;
+		self.size
+			.store(u64::from(width) << 32 | u64::from(height), Ordering::Release);
+		self.fit.store(fit, Ordering::Release);
+	}
+
+	pub(crate) fn set_fit(&self, fit: bool) {
+		self.fit.store(fit, std::sync::atomic::Ordering::Release);
+	}
+
+	/// A normalized stream position as a normalized output position.
+	fn to_output(&self, source: (u32, u32), x: f64, y: f64) -> (f64, f64) {
+		use std::sync::atomic::Ordering;
+		let size = self.size.load(Ordering::Acquire);
+		let stream = ((size >> 32) as u32, size as u32);
+		if !self.fit.load(Ordering::Acquire) || stream.0 == 0 || stream.1 == 0 {
+			return (x, y);
+		}
+		let (vx, vy, vw, vh) = crate::session::capture::frame::fit_viewport(source, stream);
+		(
+			(x * f64::from(stream.0) - f64::from(vx)) / f64::from(vw),
+			(y * f64::from(stream.1) - f64::from(vy)) / f64::from(vh),
+		)
+	}
 }
 
 /// A point on the output in normalized `[0, 1]` coordinates.
@@ -93,8 +128,6 @@ pub(crate) struct Pressed {
 pub(crate) enum InputTransport {
 	/// libei devices from `ConnectToEIS`.
 	Eis,
-	/// RemoteDesktop portal methods.
-	Portal,
 	/// The user allowed no input, or the portal offers none: view-only.
 	None,
 }
@@ -103,7 +136,6 @@ impl InputTransport {
 	pub(crate) fn as_str(self) -> &'static str {
 		match self {
 			Self::Eis => "libei",
-			Self::Portal => "portal",
 			Self::None => "none",
 		}
 	}
@@ -126,23 +158,15 @@ struct Eis {
 	disconnected: bool,
 }
 
-/// Portal method sender, for RemoteDesktop 1 portals.
-struct PortalMethods {
-	connection: zbus::blocking::Connection,
-	session: OwnedObjectPath,
-	/// Methods whose first call was checked for a refusal.
-	verified: std::cell::RefCell<BTreeSet<&'static str>>,
-}
-
 /// The desktop input sink of a Desktop Mode session.
 pub(crate) struct DesktopInput {
 	transport: InputTransport,
 	eis: Option<Eis>,
-	portal: Option<PortalMethods>,
 	output: OutputGeometry,
 	pressed: Pressed,
 	touches: BTreeSet<u32>,
 	warned: BTreeSet<&'static str>,
+	view: std::sync::Arc<StreamView>,
 }
 
 fn now_micros() -> u64 {
@@ -299,39 +323,29 @@ impl Eis {
 impl DesktopInput {
 	/// Input through libei on `socket`.
 	pub(crate) fn eis(socket: OwnedFd, output: OutputGeometry) -> std::io::Result<Self> {
-		Ok(Self::with(InputTransport::Eis, Some(Eis::new(socket)?), None, output))
-	}
-
-	/// Input through the RemoteDesktop portal's methods.
-	pub(crate) fn portal(connection: zbus::Connection, session: ObjectPath<'_>, output: OutputGeometry) -> Self {
-		let methods = PortalMethods {
-			connection: connection.into(),
-			session: session.into(),
-			verified: Default::default(),
-		};
-		Self::with(InputTransport::Portal, None, Some(methods), output)
+		Ok(Self::with(InputTransport::Eis, Some(Eis::new(socket)?), output))
 	}
 
 	/// No remote input: events are dropped (and logged once).
 	pub(crate) fn none(output: OutputGeometry) -> Self {
-		Self::with(InputTransport::None, None, None, output)
+		Self::with(InputTransport::None, None, output)
 	}
 
-	fn with(
-		transport: InputTransport,
-		eis: Option<Eis>,
-		portal: Option<PortalMethods>,
-		output: OutputGeometry,
-	) -> Self {
+	fn with(transport: InputTransport, eis: Option<Eis>, output: OutputGeometry) -> Self {
 		Self {
 			transport,
 			eis,
-			portal,
 			output,
 			pressed: Pressed::default(),
 			touches: BTreeSet::new(),
 			warned: BTreeSet::new(),
+			view: std::sync::Arc::default(),
 		}
+	}
+
+	/// Follow how the stream presents the output (see [`StreamView`]).
+	pub(crate) fn set_view(&mut self, view: std::sync::Arc<StreamView>) {
+		self.view = view;
 	}
 
 	pub(crate) fn transport(&self) -> InputTransport {
@@ -344,12 +358,25 @@ impl DesktopInput {
 		self.eis.as_ref().map(|eis| eis.context.as_fd())
 	}
 
-	pub(crate) fn set_output(&mut self, output: OutputGeometry) {
-		self.output = output;
+	pub(crate) fn authorized_devices(&self) -> bool {
+		self.transport == InputTransport::None
+			|| self.eis.as_ref().is_some_and(|eis| {
+				eis.device(DeviceCapability::Keyboard).is_some()
+					&& eis.device(DeviceCapability::PointerAbsolute).is_some()
+					&& eis.device(DeviceCapability::Button).is_some()
+			})
+	}
+	pub(crate) fn ready(&self) -> bool {
+		self.authorized_devices()
+			&& (self.transport == InputTransport::None
+				|| self.eis.as_ref().is_some_and(|eis| {
+					eis.device(DeviceCapability::PointerAbsolute)
+						.is_some_and(|device| output_region(&self.output, &region_list(device)).is_some())
+				}))
 	}
 
-	pub(crate) fn output(&self) -> &OutputGeometry {
-		&self.output
+	pub(crate) fn set_output(&mut self, output: OutputGeometry) {
+		self.output = output;
 	}
 
 	/// Handle libei traffic; an error ends remote input for this session.
@@ -371,47 +398,10 @@ impl DesktopInput {
 		}
 	}
 
-	fn portal_call(&self, method: &'static str, body: &(impl serde::Serialize + zbus::zvariant::DynamicType)) {
-		const PORTAL: &str = "org.freedesktop.portal.Desktop";
-		const PATH: &str = "/org/freedesktop/portal/desktop";
-		const INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
-		let Some(portal) = &self.portal else {
-			return;
-		};
-		// The first call of each method waits for the portal's answer, so a
-		// refusal is logged once; later calls are fire and forget: input must
-		// never wait for a D-Bus round trip.
-		if portal.verified.borrow_mut().insert(method) {
-			if let Err(error) = portal
-				.connection
-				.call_method(Some(PORTAL), PATH, Some(INTERFACE), method, body)
-			{
-				tracing::warn!(%error, method, "The portal refused remote input");
-			}
-			return;
-		}
-		let message = zbus::message::Message::method_call(PATH, method)
-			.and_then(|builder| builder.destination(PORTAL))
-			.and_then(|builder| builder.interface(INTERFACE))
-			.and_then(|builder| builder.with_flags(zbus::message::Flags::NoReplyExpected))
-			.and_then(|builder| builder.build(body));
-		match message {
-			Ok(message) => {
-				if let Err(error) = portal.connection.send(&message) {
-					tracing::debug!(%error, method, "Portal input call failed");
-				}
-			},
-			Err(error) => tracing::debug!(%error, method, "Portal input call could not be built"),
-		}
-	}
-
-	fn options() -> HashMap<&'static str, Value<'static>> {
-		HashMap::new()
-	}
-
 	/// Logical desktop position of a normalized output point for libei, or
 	/// stream-logical coordinates for the portal methods.
 	fn absolute(&self, x: f64, y: f64, regions: Option<&[(Region, Option<String>)]>) -> Option<(f64, f64)> {
+		let (x, y) = self.view.to_output((self.output.width, self.output.height), x, y);
 		let (x, y) = normalized(x, y);
 		match regions {
 			Some(regions) => {
@@ -454,11 +444,6 @@ impl DesktopInput {
 			};
 			keyboard.key(keycode, state);
 			eis.frame(device);
-		} else {
-			self.portal_call(
-				"NotifyKeyboardKeycode",
-				&(self.portal_session(), Self::options(), keycode as i32, state),
-			);
 		}
 	}
 
@@ -487,19 +472,7 @@ impl DesktopInput {
 			};
 			buttons.button(button, state);
 			eis.frame(device);
-		} else {
-			self.portal_call(
-				"NotifyPointerButton",
-				&(self.portal_session(), Self::options(), button as i32, state),
-			);
 		}
-	}
-
-	fn portal_session(&self) -> ObjectPath<'_> {
-		self.portal
-			.as_ref()
-			.map(|p| p.session.as_ref())
-			.expect("portal transport")
 	}
 
 	/// Release every pressed key, button and touch point.
@@ -524,8 +497,6 @@ impl DesktopInput {
 		{
 			touch.up(slot);
 			eis.frame(device);
-		} else if self.portal.is_some() {
-			self.portal_call("NotifyTouchUp", &(self.portal_session(), Self::options(), slot));
 		}
 	}
 
@@ -551,15 +522,6 @@ impl DesktopInput {
 				touch.motion(slot, x as f32, y as f32);
 			}
 			eis.frame(device);
-		} else if self.portal.is_some() {
-			let Some((x, y)) = self.absolute(f64::from(x), f64::from(y), None) else {
-				return;
-			};
-			let method = if down { "NotifyTouchDown" } else { "NotifyTouchMotion" };
-			self.portal_call(
-				method,
-				&(self.portal_session(), Self::options(), self.output.node_id, slot, x, y),
-			);
 		}
 		if down {
 			self.touches.insert(slot);
@@ -632,26 +594,15 @@ impl DesktopInput {
 						pointer.motion_absolute(x as f32, y as f32);
 						eis.frame(device);
 					}
-				} else if let Some((x, y)) = self.absolute(nx, ny, None) {
-					self.portal_call(
-						"NotifyPointerMotionAbsolute",
-						&(self.portal_session(), Self::options(), self.output.node_id, x, y),
-					);
 				}
 			},
 			CaptureInputEvent::MouseMoveRelative { dx, dy } => {
-				if let Some(eis) = &self.eis {
-					if let Some(device) = eis.device(DeviceCapability::Pointer)
-						&& let Some(pointer) = device.interface::<ei::Pointer>()
-					{
-						pointer.motion_relative(f32::from(dx), f32::from(dy));
-						eis.frame(device);
-					}
-				} else {
-					self.portal_call(
-						"NotifyPointerMotion",
-						&(self.portal_session(), Self::options(), f64::from(dx), f64::from(dy)),
-					);
+				if let Some(eis) = &self.eis
+					&& let Some(device) = eis.device(DeviceCapability::Pointer)
+					&& let Some(pointer) = device.interface::<ei::Pointer>()
+				{
+					pointer.motion_relative(f32::from(dx), f32::from(dy));
+					eis.frame(device);
 				}
 			},
 			CaptureInputEvent::ScrollVertical { amount } => self.scroll(0, -i32::from(amount)),
@@ -677,23 +628,12 @@ impl DesktopInput {
 
 	/// Scroll in 1/120 wheel steps (positive: right, down).
 	fn scroll(&mut self, x120: i32, y120: i32) {
-		if let Some(eis) = &self.eis {
-			if let Some(device) = eis.device(DeviceCapability::Scroll)
-				&& let Some(scroll) = device.interface::<ei::Scroll>()
-			{
-				scroll.scroll_discrete(x120, y120);
-				eis.frame(device);
-			}
-		} else {
-			// Portal axes: 0 vertical, 1 horizontal; discrete steps are whole notches.
-			for (axis, value) in [(0u32, y120), (1u32, x120)] {
-				if value != 0 {
-					self.portal_call(
-						"NotifyPointerAxisDiscrete",
-						&(self.portal_session(), Self::options(), axis, value / 120),
-					);
-				}
-			}
+		if let Some(eis) = &self.eis
+			&& let Some(device) = eis.device(DeviceCapability::Scroll)
+			&& let Some(scroll) = device.interface::<ei::Scroll>()
+		{
+			scroll.scroll_discrete(x120, y120);
+			eis.frame(device);
 		}
 	}
 
@@ -750,7 +690,6 @@ mod tests {
 			logical_position: Some((1920, 0)),
 			logical_size: Some((2560, 1440)),
 			mapping_id: None,
-			node_id: 42,
 		}
 	}
 
@@ -786,6 +725,26 @@ mod tests {
 		assert_eq!(input.absolute(2.0, -1.0, Some(&regions)), Some((4480.0, 0.0)));
 		// Portal methods take stream-logical coordinates.
 		assert_eq!(input.absolute(0.5, 1.0, None), Some((1280.0, 1440.0)));
+	}
+
+	#[test]
+	fn letterboxed_streams_map_back_onto_the_output() {
+		let mut input = DesktopInput::none(output());
+		let view = std::sync::Arc::new(StreamView::default());
+		input.set_view(view.clone());
+		let regions = [(region(1920.0, 0.0, 2560.0, 1440.0), None)];
+		// A 3840x2160 output in a 16:9 stream fills it.
+		view.set(1920, 1080, true);
+		assert_eq!(input.absolute(0.5, 0.5, Some(&regions)), Some((3200.0, 720.0)));
+		// In a 4:3 stream it is letterboxed: 1440x810 at y 135 of 1440x1080.
+		view.set(1440, 1080, true);
+		assert_eq!(input.absolute(0.5, 0.5, Some(&regions)), Some((3200.0, 720.0)));
+		assert_eq!(input.absolute(0.0, 135.0 / 1080.0, Some(&regions)), Some((1920.0, 0.0)));
+		// The bars clamp to the output's edge.
+		assert_eq!(input.absolute(0.5, 0.01, Some(&regions)), Some((3200.0, 0.0)));
+		// PyroWave stretches: positions are not remapped.
+		view.set_fit(false);
+		assert_eq!(input.absolute(0.0, 135.0 / 1080.0, Some(&regions)).unwrap().1, 180.0);
 	}
 
 	#[test]

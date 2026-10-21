@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -19,7 +19,7 @@ import CheckCircleOutlined from "@mui/icons-material/CheckCircleOutlined";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import WarningAmber from "@mui/icons-material/WarningAmber";
 import { api, errorMessage } from "../api/client";
-import type { AudioDetails, CapturePathStats, CaptureStats, Finding, GpuEngineStats, GpuStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
+import type { DesktopStatus, AudioDetails, CapturePathStats, CaptureStats, Finding, GpuEngineStats, GpuStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
 import { ConfirmDialog, Facts, Hint, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
@@ -189,8 +189,7 @@ function Hero({ onEnd, navigate }: { onEnd: () => void; navigate: (to: string) =
               </Stack>
               {phase === "client_disconnected" && (
                 <Alert severity="warning" variant="outlined" sx={{ mt: 2 }}>
-                  Client disconnected — waiting for it to reconnect. {session.application.title} keeps running until you
-                  end the session or resume from Moonlight.
+                  Client disconnected. {session.capture?.mode === "desktop" ? "Displays and audio restore after the configured reconnect grace period." : `${session.application.title} keeps running until you end the session or resume from Moonlight.`}
                 </Alert>
               )}
               {phase === "reconnecting" && (
@@ -583,7 +582,7 @@ function captureRows(capture: SessionDetails["capture"]): [string, string][] {
     }
     rows.push(["Desktop", capture.current_desktop || capture.desktop || "—"]);
     rows.push(["Remote input", inputLabels[capture.input ?? "none"] ?? capture.input ?? "—"]);
-    rows.push(["Permission", capture.consent === "restored" ? "Remembered by the desktop" : "Granted on the desktop"]);
+    rows.push(["Permission", capture.consent === "restored" ? "Saved permission offered" : "Asked on the desktop"]);
   }
   rows.push(["Captured content", capture.dynamic_range]);
   rows.push(["Capture backend", `${capture.backend === "desktop" ? "XDG Desktop Portal" : "Isolated compositor"} on ${capture.render_node}`]);
@@ -644,10 +643,45 @@ function StreamDetails({ session }: { session: SessionDetails }) {
   );
 }
 
+export function DesktopPanel({ status, busy, onAuthorize, onRestore }: { status: DesktopStatus; busy: boolean; onAuthorize: () => void; onRestore: () => void }) {
+  const now = useNow();
+  if (status.phase === "disabled") return null;
+  const active = ["active", "grace", "preparing", "restoring", "recovery_required"].includes(status.phase);
+  const remaining = status.grace_deadline_ms == null ? null : Math.max(0, Math.ceil((status.grace_deadline_ms - now) / 1000));
+  return <Card sx={{ mb: 3 }}><CardContent>
+    <Typography variant="h6">Desktop Mode</Typography>
+    {status.reason && <Alert severity={status.phase === "recovery_required" ? "error" : "info"} sx={{ my: 1 }}>{status.reason}</Alert>}
+    {status.mode && active && <Typography>{status.mode.width} × {status.mode.height} @ {status.mode.refresh_millihertz / 1000} Hz · SDR virtual display</Typography>}
+    {remaining != null && <Typography>Physical displays restore in {remaining} seconds unless the client reconnects.</Typography>}
+    {status.audio_remote_only && <Typography color="text.secondary">Desktop sound is routed to the client. Local audio routing restores when Desktop Mode ends.</Typography>}
+    {(status.supported || active) && <Stack direction="row" sx={{ gap: 1, mt: 2 }}>
+      <Button disabled={busy || active || !status.supported} onClick={onAuthorize}>Authorize remote input</Button>
+      <Button disabled={busy || !active} onClick={onRestore} variant="outlined">Restore desktop</Button>
+    </Stack>}
+  </CardContent></Card>;
+}
+
 export function DashboardPage({ navigate }: { navigate: (to: string) => void }) {
   const daemon = useDaemon();
   const [confirm, setConfirm] = useState(false);
   const [ending, setEnding] = useState(false);
+  const [desktop, setDesktop] = useState<DesktopStatus | null>(null);
+  const [desktopBusy, setDesktopBusy] = useState(false);
+  useEffect(() => {
+    if (!daemon.connected) return;
+    let active = true;
+    const poll = () => { void api.desktopStatus().then((status) => { if (active) setDesktop(status); }).catch(() => {}); };
+    poll(); const timer = setInterval(poll, 2000);
+    return () => { active = false; clearInterval(timer); };
+  }, [daemon.connected]);
+  const desktopAction = async (restore: boolean) => {
+    setDesktopBusy(true);
+    try {
+      if (restore) { setDesktop(await api.restoreDesktop()); daemon.notify("success", "Desktop configuration restored."); }
+      else { await api.authorizeDesktop(); daemon.notify("success", "Remote input authorized on the host."); }
+    } catch (error) { daemon.notify("error", errorMessage(error)); }
+    finally { setDesktopBusy(false); }
+  };
   const session = daemon.session?.session;
   const lastStop = daemon.session?.last_stop;
 
@@ -668,6 +702,7 @@ export function DashboardPage({ navigate }: { navigate: (to: string) => void }) 
     <>
       <PageHeader title="Dashboard" subtitle={daemon.server ? `${daemon.server.name} · Pyroshine ${daemon.server.version}` : undefined} />
       <Hero onEnd={() => setConfirm(true)} navigate={navigate} />
+      {desktop && <DesktopPanel status={desktop} busy={desktopBusy} onAuthorize={() => void desktopAction(false)} onRestore={() => void desktopAction(true)} />}
       {daemon.session?.phase === "idle" && lastStop?.unexpected && (
         <Alert severity="warning" sx={{ mb: 3 }}>
           The last session ended unexpectedly at {new Date(lastStop.at_ms).toLocaleTimeString()}: {lastStop.detail ?? lastStop.message}
@@ -701,8 +736,7 @@ export function DashboardPage({ navigate }: { navigate: (to: string) => void }) 
         onConfirm={() => void end()}
         onClose={() => setConfirm(false)}
       >
-        This closes <strong>{session?.application.title ?? "the application"}</strong> and disconnects the client, the same
-        as quitting the app from Moonlight. Unsaved game progress may be lost.
+        {session?.capture?.mode === "desktop" ? "This ends Desktop Mode and restores displays and audio routing. Your desktop applications remain open." : <>This closes <strong>{session?.application.title ?? "the application"}</strong> and disconnects the client. Unsaved game progress may be lost.</>}
       </ConfirmDialog>
     </>
   );

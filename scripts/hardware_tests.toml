@@ -22,6 +22,7 @@
 #   ffmpeg               the ffmpeg binary (decodes encoder output)
 #   pacat                libpulse's pacat client
 #   systemd-user         a reachable user systemd manager
+#   kde-wayland          a signed-in, unlocked KDE Wayland session
 #   input-devices        writable /dev/uinput and /dev/uhid
 #   nvidia-gpu           an NVIDIA GPU (sets MOONSHINE_TEST_NVML to its PCI address)
 #   pyrowave-library     the pinned PyroWave library (--pyrowave-library or MOONSHINE_PYROWAVE_LIBRARY)
@@ -183,3 +184,9 @@ env = { MOONSHINE_TEST_PYROWAVE = "1" }
 name = "session::stream::video::pyrowave::tests::pyrowave_imports_compositor_dmabufs_on_gpu"
 requires = ["render-node", "pyrowave-library"]
 env = { MOONSHINE_TEST_GPU = "1", MOONSHINE_TEST_PYROWAVE = "1" }
+
+[[test]]
+name = "desktop::native::kde::tests::native_120hz_capture_and_owner_cleanup_on_kde"
+requires = ["kde-wayland", "render-node", "systemd-user"]
+env = { MOONSHINE_TEST_DESKTOP = "1" }
+timeout = 45

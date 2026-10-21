@@ -26,7 +26,7 @@ pub struct ProbeOptions {
 	pub duration: Duration,
 	/// Frame rate asked of the compositor.
 	pub refresh_rate: u32,
-	/// Ask for remote input and run [`input_script`] after the first frame.
+	/// Ask for remote input and run the scripted input sequence after the first frame.
 	pub input: bool,
 	/// Restore-token file; `None` asks the desktop every time.
 	pub restore_token: Option<std::path::PathBuf>,
@@ -134,6 +134,7 @@ pub fn run(options: ProbeOptions) -> Result<ProbeReport, String> {
 			gpu: None,
 			restore_token: options.restore_token.clone(),
 			refresh_rate: options.refresh_rate,
+			resolution: (1920, 1080),
 		},
 		stop.clone(),
 		StopCauseSlot::default(),

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import fixture from "../api/session.fixture.json";
 import type { AudioDetails, CaptureStats, GpuStats, SessionSnapshot, StreamStats } from "../api/types";
 import { setPreference } from "../state/preferences";
-import { DashboardPage } from "./Dashboard";
+import { DesktopPanel, DashboardPage } from "./Dashboard";
 
 const daemon = vi.hoisted(() => ({
   connected: true,
@@ -454,7 +454,7 @@ describe("capture mode display", () => {
     expect(html).toContain("2560 × 1440 @ 144 Hz");
     expect(html).toContain("ubuntu:GNOME");
     expect(html).toContain("View-only");
-    expect(html).toContain("Remembered by the desktop");
+    expect(html).toContain("Saved permission offered");
     expect(html).toContain("XDG Desktop Portal");
   });
 
@@ -476,5 +476,22 @@ describe("capture mode display", () => {
     expect(game).not.toContain("Captured output");
     expect(game).toContain("Isolated compositor");
     expect(render(snapshot)).not.toContain("Capture backend");
+  });
+});
+
+
+describe("managed desktop recovery", () => {
+  it("shows exact mode, remote audio and a reconnect deadline", () => {
+    const html = renderToStaticMarkup(<DesktopPanel status={{ supported: true, desktop: "kde", phase: "grace", reason: null, mode: { width: 1920, height: 1080, refresh_millihertz: 60000 }, grace_deadline_ms: 32000, audio_remote_only: true }} busy={false} onAuthorize={() => {}} onRestore={() => {}} />);
+    expect(html).toContain("1920 × 1080 @ 60 Hz");
+    expect(html).toContain("30 seconds");
+    expect(html).toContain("Desktop sound is routed to the client");
+    expect(html).toContain("Restore desktop");
+  });
+  it("keeps recovery available when native support disappears", () => {
+    const html = renderToStaticMarkup(<DesktopPanel status={{ supported: false, desktop: "gnome", phase: "recovery_required", reason: "Reconnect the missing monitor", mode: null, grace_deadline_ms: null, audio_remote_only: false }} busy={false} onAuthorize={() => {}} onRestore={() => {}} />);
+    expect(html).toContain("Reconnect the missing monitor");
+    expect(html).toContain("Restore desktop");
+    expect(html).toMatch(/<button(?![^>]*disabled)[^>]*>Restore desktop<\/button>/);
   });
 });

@@ -8,9 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-const FILE_NAME: &str = "desktop-restore-token";
+const FILE_NAME: &str = "desktop-input-restore-token";
 
-/// Where the token lives: `$XDG_DATA_HOME/moonshine/desktop-restore-token`.
+/// Where the token lives: `$XDG_DATA_HOME/moonshine/desktop-input-restore-token`.
 pub(crate) fn default_path() -> Option<PathBuf> {
 	Some(dirs::data_dir()?.join("moonshine").join(FILE_NAME))
 }

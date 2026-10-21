@@ -122,6 +122,10 @@ impl Config {
 	/// Startup and the management interface both apply this check, so a setting
 	/// is rejected with the same reason wherever it is entered.
 	pub fn validate(&self) -> Result<(), String> {
+		if self.desktop.disconnect_grace_secs > 86400 {
+			return Err("desktop.disconnect_grace_secs must be between 0 and 86400".into());
+		}
+
 		self.address
 			.parse::<std::net::IpAddr>()
 			.map_err(|error| format!("address '{}' is not an IP address: {error}", self.address))?;
@@ -267,6 +271,55 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn desktop_mode_is_offered_once_after_the_configured_entries_when_enabled() {
+		let mut config = Config::default();
+		assert!(
+			config.offered_applications().iter().all(|a| a.mode.is_game()),
+			"Desktop Mode is off by default"
+		);
+		config.desktop.enabled = true;
+		let offered = config.offered_applications();
+		let last = offered.last().unwrap();
+		assert_eq!((last.title.as_str(), last.mode), ("Desktop Mode", SessionMode::Desktop));
+		assert_eq!(offered.len(), config.applications.len() + 1);
+		// A configured desktop entry is the user's choice of title; no second one.
+		config.applications.push(ApplicationConfig {
+			title: "My desktop".into(),
+			mode: SessionMode::Desktop,
+			..Default::default()
+		});
+		let offered = config.offered_applications();
+		assert_eq!(offered.iter().filter(|a| a.mode == SessionMode::Desktop).count(), 1);
+		assert_eq!(offered.last().unwrap().title, "My desktop");
+	}
+
+	#[test]
+	fn application_mode_round_trips_and_defaults_to_game() {
+		let entry: ApplicationConfig = toml::from_str("title = \"Desk\"\ncommand = []\nmode = \"desktop\"\n").unwrap();
+		assert_eq!(entry.mode, SessionMode::Desktop);
+		let game: ApplicationConfig = toml::from_str("title = \"Game\"\ncommand = [\"/bin/game\"]\n").unwrap();
+		assert_eq!(game.mode, SessionMode::Game);
+		assert!(
+			!toml::to_string(&game).unwrap().contains("mode"),
+			"Game Mode stays implicit"
+		);
+	}
+
+	#[test]
+	fn desktop_grace_defaults_round_trips_and_is_bounded() {
+		assert_eq!(Config::default().desktop.disconnect_grace_secs, 30);
+		for seconds in [0, 30, 86400] {
+			let config: Config = toml::from_str(&format!("[desktop]\ndisconnect_grace_secs = {seconds}")).unwrap();
+			assert_eq!(config.validate(), Ok(()));
+			let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+			assert_eq!(roundtrip.desktop.disconnect_grace_secs, seconds);
+		}
+		let mut config = Config::default();
+		config.desktop.disconnect_grace_secs = 86401;
+		assert!(config.validate().unwrap_err().contains("desktop.disconnect_grace_secs"));
+	}
 
 	#[test]
 	fn default_configuration_is_valid() {

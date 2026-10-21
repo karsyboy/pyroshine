@@ -41,6 +41,11 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+	/// Inspect, authorize, or recover managed Desktop Mode.
+	Desktop {
+		#[command(subcommand)]
+		action: DesktopCommand,
+	},
 	/// Run health checks and report results, then exit.
 	Healthcheck,
 	/// Pair a Moonlight or Pyrolight device with the running server.
@@ -87,6 +92,19 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum DesktopCommand {
+	/// Inspect native output capabilities and takeover state.
+	Status,
+	/// Restore displays and audio even when the streaming daemon is stopped.
+	Restore,
+	/// Authorize remote keyboard and pointer control on this desktop.
+	Authorize,
+	/// Independently supervised desktop owner (started automatically).
+	#[command(hide = true)]
+	Guard,
+}
+
+#[derive(Subcommand, Debug)]
 enum WebCommand {
 	/// Print the web interface's address.
 	Url,
@@ -117,6 +135,30 @@ async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
 	init_tracing();
+
+	if let Some(Command::Desktop { action }) = &args.command {
+		if matches!(action, DesktopCommand::Authorize) {
+			return moonshine_core::desktop::authorize().await.map_err(|e| eprintln!("{e}"));
+		}
+		let guard = matches!(action, DesktopCommand::Guard);
+		let restore = matches!(action, DesktopCommand::Restore);
+		return tokio::task::spawn_blocking(move || {
+			if guard {
+				moonshine_core::desktop::run_guard()
+			} else {
+				let status = if restore {
+					moonshine_core::desktop::restore()?
+				} else {
+					moonshine_core::desktop::status()?
+				};
+				println!("{}", serde_json::to_string_pretty(&status).map_err(|e| e.to_string())?);
+				Ok(())
+			}
+		})
+		.await
+		.map_err(|e| eprintln!("Desktop command failed: {e}"))?
+		.map_err(|e| eprintln!("{e}"));
+	}
 
 	// Pairing talks to the running server; it must not load/create a config,
 	// probe the GPU, or acquire the daemon's state lock.

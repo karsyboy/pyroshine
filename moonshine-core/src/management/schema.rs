@@ -994,9 +994,14 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"desktop.enabled",
 			"desktop",
 			"Offer Desktop Mode",
-			"List an entry that streams your running Wayland desktop (Plasma, GNOME and other desktops with the XDG Desktop Portal) instead of launching an application. The desktop asks for permission the first time.",
+			"Offer managed Desktop Mode on KDE Plasma or GNOME Wayland: use a client-sized virtual display, disable physical displays, and restore their configuration afterward. Authorize input on the host before unattended use.",
 			FieldKind::Bool,
 		),
+        Field::new(
+            "desktop.disconnect_grace_secs", "desktop", "Reconnect grace",
+            "Seconds to retain the virtual display after client loss. Reconnecting cancels restoration; zero restores immediately. Explicit Stop always restores immediately.",
+            integer(0.0,86400.0,Some("s")),
+        ),
 		Field::new(
 			"desktop.title",
 			"desktop",
@@ -1015,7 +1020,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"desktop.audio",
 			"desktop",
 			"Desktop audio",
-			"Stream what the desktop plays on its default output. Local playback continues.",
+			"Route desktop playback to a streaming sink while Desktop Mode runs, then restore its previous routing. Off leaves host audio unchanged.",
 			FieldKind::Bool,
 		),
 		Field::new(

@@ -219,6 +219,21 @@ pub(crate) const MAX_OVERLAYS: usize = 2;
 /// Layers bottom to top; `None` entries are skipped.
 pub(crate) type FrameOverlays = [Option<FrameOverlay>; MAX_OVERLAYS];
 
+/// Where a `source`-sized image lands when scaled onto a `frame`: the largest
+/// centered rectangle with the source's aspect ratio (`x, y, width, height`
+/// in frame pixels), the rest of the frame black. Equal aspect ratios fill it.
+pub(crate) fn fit_viewport(source: (u32, u32), frame: (u32, u32)) -> (u32, u32, u32, u32) {
+	let (sw, sh) = (u64::from(source.0.max(1)), u64::from(source.1.max(1)));
+	let (fw, fh) = (u64::from(frame.0), u64::from(frame.1));
+	// Width-limited when source is wider than the frame (sw/sh >= fw/fh).
+	let (w, h) = if sw * fh >= sh * fw {
+		(fw, ((sh * fw + sw / 2) / sw).clamp(1, fh))
+	} else {
+		(((sw * fh + sh / 2) / sh).clamp(1, fw), fh)
+	};
+	(((fw - w) / 2) as u32, ((fh - h) / 2) as u32, w as u32, h as u32)
+}
+
 /// Strong ownership of a frame's source DMA-BUF and its plane descriptors.
 #[derive(Clone, Debug)]
 pub(crate) struct SourceLease(
@@ -551,6 +566,16 @@ mod tests {
 		drop(buffer);
 		let frame = rx.recv_timeout(std::time::Duration::ZERO).unwrap();
 		assert_eq!(identity(frame.planes().next().unwrap().fd), expected);
+	}
+
+	#[test]
+	fn scaled_sources_keep_their_aspect_ratio() {
+		assert_eq!(fit_viewport((3840, 2160), (1920, 1080)), (0, 0, 1920, 1080));
+		// Three side-by-side monitors in a 16:9 stream: letterboxed.
+		assert_eq!(fit_viewport((8560, 1440), (2560, 1440)), (0, 504, 2560, 431));
+		// 16:10 in 16:9: pillarboxed.
+		assert_eq!(fit_viewport((2560, 1600), (1920, 1080)), (96, 0, 1728, 1080));
+		assert_eq!(fit_viewport((640, 160), (320, 180)), (0, 50, 320, 80));
 	}
 
 	#[test]

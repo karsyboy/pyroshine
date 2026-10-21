@@ -1,30 +1,6 @@
-//! Desktop Mode: stream the user's running Wayland desktop through the XDG
-//! Desktop Portal.
-//!
-//! The backend owns nothing of the desktop. It asks the portal for a
-//! RemoteDesktop session with one monitor (or a view-only ScreenCast session
-//! where RemoteDesktop is missing or input is disabled), receives the
-//! monitor's frames from PipeWire as DMA-BUFs and forwards client input to
-//! the devices the portal authorized. Stopping closes the portal session;
-//! the desktop, its applications, outputs and layout are never changed.
-//!
-//! | Concern | Where |
-//! | --- | --- |
-//! | Desktop session discovery and per-desktop quirks | [`desktop`] |
-//! | Portal negotiation, consent, restore tokens | [`dbus`], [`token`] |
-//! | Compositor GPU identification | [`device`] |
-//! | PipeWire frames, buffer lifetime, producer completion | [`stream`] |
-//! | Keyboard, pointer and touch through libei or portal methods | [`input`] |
-//!
-//! Everything runs on the `desktop-capture` thread started through
-//! `start_capture_thread`: one calloop loop serves the PipeWire loop, libei,
-//! client input and capture demand. A `desktop-portal` helper thread waits
-//! for the portal closing the session and for the desktop locking, and is
-//! joined before the capture thread exits.
-//!
-//! The portal works the same on every desktop that implements it (KDE Plasma,
-//! GNOME, Ubuntu's GNOME session and others); see `docs/DESKTOP_MODE.md` for
-//! the tested desktops and their differences.
+//! Managed Desktop Mode capture. The desktop guard owns native outputs,
+//! topology and audio routing; this worker receives their PipeWire DMA-BUFs
+//! directly and routes input through a separately authorized portal session.
 
 pub(crate) mod dbus;
 pub(crate) mod desktop;
@@ -46,7 +22,7 @@ use pipewire as pw;
 use serde::{Deserialize, Serialize};
 use smithay::backend::allocator::Fourcc;
 
-use self::dbus::{CursorMode, PortalError, PortalSession, SessionRequest};
+use self::dbus::{PortalError, PortalSession, SessionRequest};
 use self::desktop::{DesktopKind, DesktopSession};
 use self::input::{DesktopInput, InputTransport, OutputGeometry};
 use self::stream::{CaptureStream, StreamFormat};
@@ -82,6 +58,8 @@ pub struct DesktopConfig {
 	pub input: bool,
 	/// Stream the desktop's audio output.
 	pub audio: bool,
+	/// Time to retain takeover after the controlling client disconnects.
+	pub disconnect_grace_secs: u64,
 }
 
 impl Default for DesktopConfig {
@@ -91,6 +69,7 @@ impl Default for DesktopConfig {
 			title: "Desktop Mode".to_string(),
 			input: true,
 			audio: true,
+			disconnect_grace_secs: 30,
 		}
 	}
 }
@@ -106,6 +85,7 @@ pub(crate) struct PortalCaptureConfig {
 	pub restore_token: Option<PathBuf>,
 	/// Frame rate asked of the compositor: the launching client's.
 	pub refresh_rate: u32,
+	pub resolution: (u32, u32),
 }
 
 /// The captured output.
@@ -113,19 +93,21 @@ pub(crate) struct PortalCaptureConfig {
 pub(crate) struct CapturedOutput {
 	pub width: u32,
 	pub height: u32,
-	/// Declared frame rate in millihertz, when the compositor declared one.
+	/// Frame rate in millihertz: the declared rate, else the maximum rate the
+	/// compositor agreed to (its output refresh, or the client's rate if lower).
 	pub refresh_millihertz: Option<u32>,
 	pub logical_position: Option<(i32, i32)>,
 	pub logical_size: Option<(i32, i32)>,
 }
 
-/// How the desktop's consent was obtained.
+/// How the desktop's consent was asked for. The portal alone decides whether
+/// to show its dialog: a saved permission that no longer covers the request
+/// (another source, input added) makes it ask again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Consent {
-	/// The portal accepted a stored restore token (or a desktop-level grant)
-	/// without asking; the stored token was offered.
+	/// A saved permission (restore token) of an earlier session was offered.
 	Restored,
-	/// The portal asked the user (or granted it by policy) for this session.
+	/// No saved permission: the desktop asked, or granted it by its policy.
 	Requested,
 }
 
@@ -137,6 +119,7 @@ pub(crate) struct DesktopReady {
 	pub output: CapturedOutput,
 	pub input: InputTransport,
 	pub consent: Consent,
+	pub lease: String,
 }
 
 /// State the capture thread shares with the session for reconfiguration.
@@ -144,6 +127,16 @@ pub(crate) struct DesktopReady {
 struct Live {
 	/// Current captured size; follows output mode changes.
 	size: Mutex<(u32, u32)>,
+	/// How the stream presents the output, for input mapping.
+	view: Arc<input::StreamView>,
+	mode: Mutex<crate::desktop::Mode>,
+	changes: calloop::channel::Sender<ModeChange>,
+}
+
+#[derive(Debug)]
+struct ModeChange {
+	mode: crate::desktop::Mode,
+	done: tokio::sync::oneshot::Sender<Result<bool, ()>>,
 }
 
 /// Desktop Mode before it runs.
@@ -159,6 +152,9 @@ pub(crate) struct PortalCapture {
 pub(crate) struct LaunchedPortal {
 	ready: DesktopReady,
 	live: Arc<Live>,
+	/// The encoder letterboxes a scaled output (conventional codecs); PyroWave
+	/// stretches it.
+	fit: bool,
 }
 
 /// A thread failure with its operator-facing classification.
@@ -202,7 +198,7 @@ fn consent_hint(desktop: Option<DesktopKind>) -> &'static str {
 			"Accept the request on the host once and keep \"Remember this selection\" checked; \
 			 later sessions then start without asking."
 		},
-		_ => "Accept the screen-sharing request on the host once; later sessions reuse that consent.",
+		_ => "Authorize remote keyboard and pointer access on the host; saved permissions may be reused.",
 	}
 }
 
@@ -241,8 +237,16 @@ impl PortalCapture {
 			input_rx,
 		} = self;
 		let failure: FailureSlot = Arc::default();
+		let (changes, mode_rx) = calloop::channel::channel();
 		let live = Arc::new(Live {
 			size: Mutex::new((0, 0)),
+			view: Arc::default(),
+			mode: Mutex::new(crate::desktop::Mode {
+				width: config.resolution.0,
+				height: config.resolution.1,
+				refresh_millihertz: config.refresh_rate.saturating_mul(1000),
+			}),
+			changes,
 		});
 		let thread_failure = failure.clone();
 		let thread_live = live.clone();
@@ -255,7 +259,17 @@ impl PortalCapture {
 			hold,
 			READY_TIMEOUT,
 			move |ready_tx| {
-				run(config, frame_tx, input_rx, ready_tx, thread_live, thread_stop, cause).map_err(|failure| {
+				run(
+					config,
+					frame_tx,
+					input_rx,
+					ready_tx,
+					thread_live,
+					thread_stop,
+					cause,
+					mode_rx,
+				)
+				.map_err(|failure| {
 					tracing::error!(code = failure.code, "Desktop capture failed: {}", failure.message);
 					let message = failure.message.clone();
 					let _ = thread_failure.set(failure);
@@ -271,7 +285,7 @@ impl PortalCapture {
 				)
 			})
 		})?;
-		Ok(LaunchedPortal { ready, live })
+		Ok(LaunchedPortal { ready, live, fit: true })
 	}
 }
 
@@ -280,38 +294,39 @@ impl LaunchedPortal {
 		&self.ready
 	}
 
-	/// Desktop Mode never changes the desktop's outputs: any stream size is
-	/// served by scaling the captured output in the encoder, and the HDR
-	/// state is the captured content's. The caller refuses a stream whose
-	/// HDR state differs.
-	pub(crate) fn reconfigure(&mut self, mode: OutputMode) -> Result<bool, ()> {
-		let (width, height) = *self.live.size.lock().unwrap_or_else(|e| e.into_inner());
-		if (mode.width, mode.height) != (width, height) {
-			tracing::info!(
-				stream_width = mode.width,
-				stream_height = mode.height,
-				desktop_width = width,
-				desktop_height = height,
-				"Scaling the desktop output to the stream resolution"
-			);
+	/// Whether the stream's encoder keeps the output's aspect ratio when it
+	/// scales it; set before [`Self::reconfigure`] for each negotiated stream.
+	pub(crate) fn set_scaling_fit(&mut self, fit: bool) {
+		self.fit = fit;
+		self.live.view.set_fit(fit);
+	}
+
+	/// Reconfigure the owned native output, never simulate a mode with scaling.
+	pub(crate) async fn reconfigure(&mut self, mode: OutputMode) -> Result<bool, ()> {
+		if mode.hdr {
+			return Err(());
 		}
-		let hdr = self.ready.capabilities.hdr();
-		if mode.hdr != hdr {
-			tracing::warn!(
-				requested_hdr = mode.hdr,
-				desktop_hdr = hdr,
-				"The client's dynamic range differs from the captured desktop's"
-			);
+		let mode = crate::desktop::Mode {
+			width: mode.width,
+			height: mode.height,
+			refresh_millihertz: mode.refresh_rate.saturating_mul(1000),
+		};
+		if *self.live.mode.lock().unwrap_or_else(|e| e.into_inner()) == mode {
+			return Ok(false);
 		}
-		Ok(hdr)
+		let (done, waiting) = tokio::sync::oneshot::channel();
+		self.live.changes.send(ModeChange { mode, done }).map_err(|_| ())?;
+		tokio::time::timeout(Duration::from_secs(20), waiting)
+			.await
+			.map_err(|_| ())?
+			.map_err(|_| ())?
 	}
 }
 
 /// Everything the portal handed over for one session.
 struct PortalSetup {
 	desktop: DesktopSession,
-	session: PortalSession,
-	pipewire: OwnedFd,
+	session: Option<PortalSession>,
 	eis: Option<OwnedFd>,
 	consent: Consent,
 }
@@ -341,70 +356,55 @@ async fn setup(
 		socket = %desktop.wayland_socket.display(),
 		"Starting Desktop Mode"
 	);
+	// A capability probe never changes outputs. Consent is obtained before the
+	// guard begins the durable display transaction.
+	let support = crate::desktop::status().map_err(|e| capture_failure("desktop_guard_unavailable", e))?;
+	if !support.supported {
+		return Err(capture_failure(
+			"desktop_capture_unsupported",
+			support.reason.unwrap_or_else(|| "Desktop Mode is unsupported".into()),
+		));
+	}
+	if !config.desktop.input {
+		return Ok(PortalSetup {
+			desktop,
+			session: None,
+			eis: None,
+			consent: Consent::Requested,
+		});
+	}
 	dbus::register(&connection, APP_ID).await;
 	let restore_token = config.restore_token.as_deref().and_then(token::load);
-	let offered_token = restore_token.is_some();
-	let started = PortalSession::start(
-		&connection,
-		SessionRequest {
-			cursor: CursorMode::Embedded,
-			input: config.desktop.input,
-			restore_token,
-		},
-	)
-	.await;
-	let session = match started {
-		Ok(session) => session,
-		Err(error) => {
-			if let (Some(path), PortalError::Denied | PortalError::Failed(_)) = (&config.restore_token, &error) {
-				// A revoked or stale grant must not be offered again.
+	let offered = restore_token.is_some();
+	let session = PortalSession::start(&connection, SessionRequest { restore_token })
+		.await
+		.map_err(|e| {
+			if matches!(e, PortalError::Denied | PortalError::Failed(_))
+				&& let Some(path) = &config.restore_token
+			{
 				token::forget(path);
 			}
-			return Err(portal_failure(&error, Some(desktop.kind)));
-		},
-	};
+			portal_failure(&e, Some(desktop.kind))
+		})?;
+	let required = dbus::DEVICE_KEYBOARD | dbus::DEVICE_POINTER;
+	if session.devices & required != required {
+		return Err(capture_failure(
+			"desktop_input_denied",
+			"Desktop Mode requires keyboard and pointer authorization",
+		));
+	}
+	let eis = session
+		.connect_to_eis()
+		.await
+		.map_err(|e| portal_failure(&e, Some(desktop.kind)))?;
 	if let (Some(path), Some(token)) = (&config.restore_token, &session.restore_token) {
 		token::store(path, token);
 	}
-	tracing::info!(
-		streams = session.streams.len(),
-		remote_desktop = session.remote_desktop,
-		devices = session.devices,
-		screen_cast_version = session.versions.screen_cast,
-		remote_desktop_version = session.versions.remote_desktop,
-		restored = offered_token,
-		"The desktop authorized the portal session"
-	);
-	let pipewire = session
-		.open_pipewire_remote()
-		.await
-		.map_err(|error| portal_failure(&error, Some(desktop.kind)))?;
-	let input_allowed = session.devices & (dbus::DEVICE_KEYBOARD | dbus::DEVICE_POINTER) != 0;
-	// Diagnostic: `MOONSHINE_DESKTOP_INPUT=portal` uses the portal's input
-	// methods even where libei is offered, to exercise the RemoteDesktop 1
-	// path (Ubuntu 22.04's GNOME 42) on a current desktop.
-	let force_portal_input = std::env::var("MOONSHINE_DESKTOP_INPUT").is_ok_and(|value| value == "portal");
-	let eis = if session.remote_desktop && input_allowed && session.versions.eis() && !force_portal_input {
-		match session.connect_to_eis().await {
-			Ok(fd) => Some(fd),
-			Err(error) => {
-				tracing::warn!(%error, "libei input is unavailable; using the portal's input methods");
-				None
-			},
-		}
-	} else {
-		None
-	};
 	Ok(PortalSetup {
 		desktop,
-		session,
-		pipewire,
-		eis,
-		consent: if offered_token {
-			Consent::Restored
-		} else {
-			Consent::Requested
-		},
+		session: Some(session),
+		eis: Some(eis),
+		consent: if offered { Consent::Restored } else { Consent::Requested },
 	})
 }
 
@@ -456,8 +456,7 @@ enum WatchEvent {
 
 /// Watch the portal session and the desktop's logind session until `done`.
 fn spawn_watcher(
-	connection: zbus::Connection,
-	handle: zbus::zvariant::OwnedObjectPath,
+	portal: Option<(zbus::Connection, zbus::zvariant::OwnedObjectPath)>,
 	session_id: Option<String>,
 	events: calloop::channel::Sender<WatchEvent>,
 	done: tokio::sync::oneshot::Receiver<()>,
@@ -470,6 +469,10 @@ fn spawn_watcher(
 			};
 			runtime.block_on(async move {
 				let closed = async {
+					let Some((connection, handle)) = portal else {
+						std::future::pending::<()>().await;
+						return;
+					};
 					match dbus::closed(&connection, handle.as_ref()).await {
 						Ok(()) => {
 							let _ = events.send(WatchEvent::Closed);
@@ -525,6 +528,9 @@ async fn watch_lock(session_id: Option<String>, events: calloop::channel::Sender
 		return;
 	};
 	let mut changes = proxy.receive_property_changed::<bool>("LockedHint").await;
+	if let Ok(locked) = proxy.get_property::<bool>("LockedHint").await {
+		let _ = events.send(WatchEvent::Locked(locked));
+	}
 	while let Some(change) = changes.next().await {
 		if let Ok(locked) = change.get().await {
 			let _ = events.send(WatchEvent::Locked(locked));
@@ -544,6 +550,13 @@ struct State {
 	locked: bool,
 	stats_at: Instant,
 	stats_sent: u64,
+	core: pw::core::CoreRc,
+	core_error: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+	offered: Vec<stream::OfferedFormat>,
+	guard: crate::desktop::Client,
+	target: crate::desktop::Target,
+	retired: Vec<(CaptureStream, String)>,
+	stop: ShutdownManager<SessionShutdownReason>,
 }
 
 impl State {
@@ -551,9 +564,27 @@ impl State {
 	fn pump(&mut self) {
 		self.mainloop.loop_().iterate(pw::loop_::Timeout::None);
 		self.check_stream();
+		for (stream, _) in &self.retired {
+			stream.service();
+		}
+		let mut index = 0;
+		while index < self.retired.len() {
+			if self.retired[index].0.drained() {
+				let (_, id) = self.retired.remove(index);
+				if let Err(error) = self.guard.retire(&id) {
+					self.ended = Some(capture_failure("desktop_retire_failed", error));
+				}
+			} else {
+				index += 1;
+			}
+		}
 	}
 
 	fn check_stream(&mut self) {
+		if let Some(error) = self.core_error.borrow().clone() {
+			self.ended = Some(capture_failure("desktop_capture_lost", error));
+			return;
+		}
 		let (format, failure) = self
 			.stream
 			.with_status(|status| (status.format, status.failure.clone()));
@@ -566,22 +597,53 @@ impl State {
 		if let Some(format) = format
 			&& format != self.format
 		{
-			tracing::info!(
-				old_width = self.format.width,
-				old_height = self.format.height,
-				width = format.width,
-				height = format.height,
-				"The captured desktop output changed"
-			);
-			*self.live.size.lock().unwrap_or_else(|e| e.into_inner()) = (format.width, format.height);
-			// The encoders keep the negotiated size and scale the new output.
-			self.input.set_output(OutputGeometry {
-				width: format.width,
-				height: format.height,
-				..self.input.output().clone()
-			});
-			self.format = format;
+			self.ended = Some(capture_failure(
+				"desktop_capture_changed",
+				"The compositor changed the managed capture format unexpectedly; restoring displays",
+			));
 		}
+	}
+
+	fn reconfigure(&mut self, mode: crate::desktop::Mode) -> Result<bool, String> {
+		if self.stop.is_shutdown_triggered() {
+			return Err("Session is stopping".into());
+		}
+		let target = self.guard.replacement(mode)?;
+		let replacement = CaptureStream::connect(
+			&self.core,
+			&target,
+			self.offered.clone(),
+			self.stream.replacement_sender(),
+		)?;
+		wait_format(&self.mainloop, &replacement, &target, self.stop.clone())?;
+		self.stream.set_active(false);
+		let deadline = Instant::now() + FORMAT_TIMEOUT;
+		while !self.stream.drained() || self.retired.iter().any(|(s, _)| !s.drained()) {
+			self.mainloop.loop_().iterate(pw::loop_::Timeout::None);
+			self.stream.service();
+			for (stream, _) in &self.retired {
+				stream.service();
+			}
+			if self.stop.is_shutdown_triggered() || Instant::now() >= deadline {
+				return Err("Old desktop capture buffers did not drain before replacement".into());
+			}
+			std::thread::sleep(Duration::from_millis(2));
+		}
+		let target = self.guard.commit(&target.id)?;
+		self.input.set_output(geometry(&target));
+		wait_input(&self.mainloop, &mut self.input, self.stop.clone())?;
+		let format = replacement
+			.with_status(|s| s.format)
+			.ok_or("Replacement stream has no format")?;
+		let previous = std::mem::replace(&mut self.stream, replacement);
+		self.retired.push((previous, self.target.id.clone()));
+		self.target = target;
+		self.format = format;
+		*self.live.size.lock().unwrap_or_else(|e| e.into_inner()) = (mode.width, mode.height);
+		*self.live.mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+		self.live.view.set(mode.width, mode.height, true);
+		self.stream.set_active(true);
+		Ok(false)
 	}
 
 	fn log_stats(&mut self) {
@@ -626,6 +688,7 @@ fn dup(fd: std::os::fd::BorrowedFd<'_>) -> Result<OwnedFd, SessionFailure> {
 		.map_err(|e| capture_failure("desktop_capture_failed", format!("Cannot duplicate a descriptor: {e}.")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
 	config: PortalCaptureConfig,
 	frame_tx: CaptureSender,
@@ -634,6 +697,7 @@ fn run(
 	live: Arc<Live>,
 	stop: ShutdownManager<SessionShutdownReason>,
 	cause: StopCauseSlot,
+	mode_rx: calloop::channel::Channel<ModeChange>,
 ) -> Result<(), SessionFailure> {
 	let runtime = tokio::runtime::Builder::new_current_thread()
 		.enable_all()
@@ -652,7 +716,6 @@ fn run(
 	let PortalSetup {
 		desktop,
 		session,
-		pipewire,
 		eis,
 		consent,
 	} = match setup {
@@ -662,14 +725,39 @@ fn run(
 		Ok(Err(_)) => return Err(portal_failure(&PortalError::TimedOut, desktop_kind.get().copied())),
 		Ok(Ok(setup)) => setup?,
 	};
-	// From here on the portal session is open: every exit closes it below.
+	let mode = crate::desktop::Mode {
+		width: config.resolution.0,
+		height: config.resolution.1,
+		refresh_millihertz: config.refresh_rate.saturating_mul(1000),
+	};
+	let (guard, target) = crate::desktop::Client::prepare(mode, config.desktop.audio)
+		.map_err(|e| capture_failure("desktop_prepare_failed", e))?;
 	let result = capture(
-		&config, frame_tx, input_rx, ready_tx, &live, &stop, &cause, &desktop, &session, pipewire, eis, consent,
+		&config,
+		frame_tx,
+		input_rx,
+		ready_tx,
+		&live,
+		&stop,
+		&cause,
+		&desktop,
+		session.as_ref(),
+		eis,
+		consent,
+		guard.clone(),
+		target,
+		mode_rx,
 	);
+	let restored = guard.restore();
 	runtime.block_on(async {
-		let _ = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
+		if let Some(session) = session {
+			let _ = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
+		}
 	});
-	tracing::info!("Desktop Mode capture stopped; the desktop session is unchanged");
+	if let Err(error) = restored {
+		return Err(capture_failure("desktop_recovery_required", error));
+	}
+
 	result
 }
 
@@ -683,19 +771,13 @@ fn capture(
 	stop: &ShutdownManager<SessionShutdownReason>,
 	cause: &StopCauseSlot,
 	desktop: &DesktopSession,
-	session: &PortalSession,
-	pipewire: OwnedFd,
+	session: Option<&PortalSession>,
 	eis: Option<OwnedFd>,
 	consent: Consent,
+	guard: crate::desktop::Client,
+	target: crate::desktop::Target,
+	mode_rx: calloop::channel::Channel<ModeChange>,
 ) -> Result<(), SessionFailure> {
-	let source = session.streams[0].clone();
-	if session.streams.len() > 1 {
-		tracing::info!(
-			streams = session.streams.len(),
-			"The portal shared several sources; streaming the first"
-		);
-	}
-
 	// The GPU the frames live on, verified like the isolated backend's.
 	let render_node = capture_render_node(config, desktop)?;
 	let render_file = std::fs::OpenOptions::new()
@@ -720,7 +802,7 @@ fn capture(
 		.map_err(|e| capture_failure("desktop_capture_failed", format!("Cannot start PipeWire: {e}.")))?;
 	let context = pw::context::ContextRc::new(&mainloop, None)
 		.map_err(|e| capture_failure("desktop_capture_failed", format!("Cannot start PipeWire: {e}.")))?;
-	let core = context.connect_fd_rc(pipewire, None).map_err(|e| {
+	let core = context.connect_rc(None).map_err(|e| {
 		capture_failure(
 			"desktop_capture_failed",
 			format!("Cannot connect to the desktop's PipeWire: {e}."),
@@ -738,59 +820,46 @@ fn capture(
 			}
 		})
 		.register();
-	let stream = CaptureStream::connect(&core, source.node_id, offered, config.refresh_rate.max(1), frame_tx)
+	let stream = CaptureStream::connect(&core, &target, offered.clone(), frame_tx)
 		.map_err(|error| capture_failure("desktop_capture_failed", error))?;
 
-	// Wait for the compositor to negotiate a format.
-	let deadline = Instant::now() + FORMAT_TIMEOUT;
-	let format = loop {
-		if stop.is_shutdown_triggered() {
-			return Ok(());
-		}
-		mainloop
-			.loop_()
-			.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(20)));
-		let (format, failure) = stream.with_status(|status| (status.format, status.failure.clone()));
-		if let Some(failure) = failure.or_else(|| core_error.borrow().clone()) {
-			return Err(capture_failure(
-				"desktop_capture_unsupported",
-				format!("The desktop's screen cast cannot be streamed: {failure}."),
-			));
-		}
-		if let Some(format) = format {
-			break format;
-		}
-		if Instant::now() > deadline {
-			return Err(capture_failure(
-				"desktop_capture_failed",
-				"The desktop's screen cast did not negotiate a format within 5 seconds.",
-			));
-		}
-	};
-	*live.size.lock().unwrap_or_else(|e| e.into_inner()) = (format.width, format.height);
+	let format = wait_format(&mainloop, &stream, &target, stop.clone())
+		.map_err(|e| capture_failure("desktop_capture_unsupported", e))?;
+	let output_geometry = geometry(&target);
 
-	let geometry = OutputGeometry {
-		width: format.width,
-		height: format.height,
-		logical_position: source.position,
-		logical_size: source.size,
-		mapping_id: source.mapping_id.clone(),
-		node_id: source.node_id,
-	};
-	let input = match eis {
-		Some(fd) => DesktopInput::eis(fd, geometry.clone()).map_err(|e| {
+	let mut input = match eis {
+		Some(fd) => DesktopInput::eis(fd, output_geometry.clone()).map_err(|e| {
 			capture_failure(
 				"desktop_capture_failed",
 				format!("Cannot use the input connection: {e}."),
 			)
 		})?,
-		None if session.remote_desktop && session.devices != 0 => {
-			DesktopInput::portal(session.connection().clone(), session.handle(), geometry.clone())
-		},
-		None => DesktopInput::none(geometry.clone()),
+		None => DesktopInput::none(output_geometry.clone()),
 	};
+	wait_input_devices(&mainloop, &mut input, stop.clone())
+		.map_err(|e| capture_failure("desktop_input_unavailable", e))?;
+	if format.color.color_space() != Some(crate::session::capture::frame::FrameColorSpace::Srgb) {
+		return Err(capture_failure(
+			"desktop_hdr_unsupported",
+			"The prepared virtual output is not SDR",
+		));
+	}
+	let target = guard
+		.commit(&target.id)
+		.map_err(|e| capture_failure("desktop_commit_failed", e))?;
+	input.set_output(geometry(&target));
+	*live.size.lock().unwrap_or_else(|e| e.into_inner()) = (format.width, format.height);
+	wait_input(&mainloop, &mut input, stop.clone()).map_err(|e| capture_failure("desktop_input_unavailable", e))?;
+	input.set_view(live.view.clone());
 	let color = format.color.color_space().expect("checked at negotiation");
 	let hdr = color != crate::session::capture::frame::FrameColorSpace::Srgb;
+	if hdr {
+		return Err(capture_failure(
+			"desktop_hdr_unsupported",
+			"Managed Desktop Mode requires an SDR virtual output",
+		));
+	}
+	stream.set_active(true);
 	let fourcc = Fourcc::try_from(format.fourcc).unwrap_or(Fourcc::Xrgb8888);
 	let ready = DesktopReady {
 		capabilities: CaptureCapabilities {
@@ -806,20 +875,21 @@ fn capture(
 			height: format.height,
 			refresh_millihertz: format
 				.framerate
+				.or(format.max_framerate)
 				.map(|rate| (u64::from(rate.num) * 1000 / u64::from(rate.denom.max(1))) as u32),
-			logical_position: source.position,
-			logical_size: source.size,
+			logical_position: Some((0, 0)),
+			logical_size: Some((format.width as i32, format.height as i32)),
 		},
 		input: input.transport(),
 		consent,
+		lease: guard.lease.clone(),
 	};
 
 	// Watch the portal session and the desktop lock from a helper thread.
 	let (watch_tx, watch_rx) = calloop::channel::channel();
 	let (watch_done, watch_done_rx) = tokio::sync::oneshot::channel();
 	let watcher = spawn_watcher(
-		session.connection().clone(),
-		session.handle().into(),
+		session.map(|s| (s.connection().clone(), s.handle().into())),
 		desktop.session_id.clone(),
 		watch_tx,
 		watch_done_rx,
@@ -851,15 +921,37 @@ fn capture(
 				.insert_source(
 					calloop::generic::Generic::new(fd, Interest::READ, Mode::Level),
 					|_, _, state: &mut State| match state.input.dispatch() {
-						Ok(()) => Ok(PostAction::Continue),
+						Ok(()) if state.input.authorized_devices() => Ok(PostAction::Continue),
+						Ok(()) => {
+							state.ended = Some(capture_failure(
+								"desktop_input_lost",
+								"The compositor revoked remote input devices",
+							));
+							Ok(PostAction::Remove)
+						},
 						Err(error) => {
-							tracing::warn!(%error, "Remote input ended; the desktop stays view-only");
+							state.ended = Some(capture_failure("desktop_input_lost", error));
 							Ok(PostAction::Remove)
 						},
 					},
 				)
 				.map_err(insert_error)?;
 		}
+		handle
+			.insert_source(mode_rx, |event, _, state: &mut State| {
+				if let calloop::channel::Event::Msg(change) = event {
+					match state.reconfigure(change.mode) {
+						Ok(hdr) => {
+							let _ = change.done.send(Ok(hdr));
+						},
+						Err(error) => {
+							state.ended = Some(capture_failure("desktop_reconfigure_failed", error));
+							let _ = change.done.send(Err(()));
+						},
+					}
+				}
+			})
+			.map_err(insert_error)?;
 		handle
 			.insert_source(input_rx, |event, _, state: &mut State| {
 				if let calloop::channel::Event::Msg(event) = event {
@@ -884,10 +976,12 @@ fn capture(
 				},
 				calloop::channel::Event::Msg(WatchEvent::Locked(locked)) => {
 					state.locked = locked;
-					tracing::info!(
-						locked,
-						"The desktop's lock state changed; streaming continues as the desktop shows it"
-					);
+					if locked {
+						state.ended = Some(capture_failure(
+							"desktop_locked",
+							"The host desktop was locked; restoring displays",
+						));
+					}
 				},
 				calloop::channel::Event::Closed => {},
 			})
@@ -915,6 +1009,13 @@ fn capture(
 			locked: false,
 			stats_at: Instant::now(),
 			stats_sent: 0,
+			core: core.clone(),
+			core_error: core_error.clone(),
+			offered,
+			guard: guard.clone(),
+			target,
+			retired: Vec::new(),
+			stop: stop.clone(),
 		};
 		tracing::info!(
 			desktop = desktop.kind.as_str(),
@@ -929,12 +1030,21 @@ fn capture(
 			return Ok(());
 		}
 		while !stop.is_shutdown_triggered() && state.ended.is_none() {
-			event_loop
-				.dispatch(Some(Duration::from_millis(100)), &mut state)
-				.map_err(|e| capture_failure("desktop_capture_failed", format!("Event loop failed: {e}.")))?;
+			if let Err(error) = event_loop.dispatch(Some(Duration::from_millis(100)), &mut state) {
+				state.ended = Some(capture_failure(
+					"desktop_capture_failed",
+					format!("Event loop failed: {error}."),
+				));
+			}
 		}
 		// Release everything held before the devices and the stream go away.
 		state.input.shutdown();
+		state.stream.set_active(false);
+		// Do not return a producer buffer while an encoder can still read it.
+		while !state.stream.drained() || state.retired.iter().any(|(s, _)| !s.drained()) {
+			state.pump();
+			std::thread::sleep(Duration::from_millis(2));
+		}
 		state.pump();
 		match state.ended.take() {
 			Some(ended) if !stop.is_shutdown_triggered() => {
@@ -953,4 +1063,109 @@ fn capture(
 	let _ = watch_done.send(());
 	let _ = watcher.join();
 	result
+}
+
+fn geometry(target: &crate::desktop::Target) -> OutputGeometry {
+	OutputGeometry {
+		width: target.mode.width,
+		height: target.mode.height,
+		logical_position: Some((0, 0)),
+		logical_size: Some((target.mode.width as i32, target.mode.height as i32)),
+		mapping_id: None,
+	}
+}
+pub(crate) fn wait_format(
+	mainloop: &pw::main_loop::MainLoopRc,
+	stream: &CaptureStream,
+	target: &crate::desktop::Target,
+	stop: ShutdownManager<SessionShutdownReason>,
+) -> Result<StreamFormat, String> {
+	let deadline = Instant::now() + FORMAT_TIMEOUT;
+	loop {
+		if stop.is_shutdown_triggered() {
+			return Err("Desktop setup was cancelled".into());
+		}
+		mainloop
+			.loop_()
+			.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
+		let (format, failure) = stream.with_status(|s| (s.format, s.failure.clone()));
+		if let Some(error) = failure {
+			return Err(error);
+		}
+		if let Some(format) = format {
+			let rate = format
+				.framerate
+				.or(format.max_framerate)
+				.map(|r| u64::from(r.num) * 1000 / u64::from(r.denom.max(1)))
+				.unwrap_or(0);
+			if (format.width, format.height) != (target.mode.width, target.mode.height)
+				|| rate.abs_diff(u64::from(target.mode.refresh_millihertz)) > 100
+			{
+				// Native output acknowledgement and PipeWire renegotiation are
+				// asynchronous. In particular, KWin first reports its initial
+				// 60 Hz format even after the requested mode has been applied.
+				// Keep dispatching until the matching format or the deadline.
+				if Instant::now() >= deadline {
+					return Err(format!(
+						"The desktop negotiated {}x{} at {} mHz instead of {}x{} at {} mHz",
+						format.width,
+						format.height,
+						rate,
+						target.mode.width,
+						target.mode.height,
+						target.mode.refresh_millihertz
+					));
+				}
+				continue;
+			}
+			if format.color.color_space() != Some(crate::session::capture::frame::FrameColorSpace::Srgb) {
+				return Err("Managed Desktop Mode requires an SDR virtual output".into());
+			}
+			if stream.validate_frame()? {
+				return Ok(format);
+			}
+		}
+		if Instant::now() >= deadline {
+			return Err("The desktop did not produce an importable frame within 5 seconds".into());
+		}
+	}
+}
+fn wait_input(
+	mainloop: &pw::main_loop::MainLoopRc,
+	input: &mut DesktopInput,
+	stop: ShutdownManager<SessionShutdownReason>,
+) -> Result<(), String> {
+	let deadline = Instant::now() + Duration::from_secs(3);
+	loop {
+		mainloop.loop_().iterate(pw::loop_::Timeout::None);
+		input.dispatch()?;
+		if input.ready() {
+			return Ok(());
+		}
+		if stop.is_shutdown_triggered() || Instant::now() >= deadline {
+			return Err("Remote input devices did not become ready for the virtual output".into());
+		}
+		std::thread::sleep(Duration::from_millis(5));
+	}
+}
+
+fn wait_input_devices(
+	mainloop: &pw::main_loop::MainLoopRc,
+	input: &mut DesktopInput,
+	stop: ShutdownManager<SessionShutdownReason>,
+) -> Result<(), String> {
+	let deadline = Instant::now() + Duration::from_secs(3);
+	loop {
+		mainloop.loop_().iterate(pw::loop_::Timeout::None);
+		input.dispatch()?;
+		if input.authorized_devices() {
+			return Ok(());
+		}
+		if stop.is_shutdown_triggered() || Instant::now() >= deadline {
+			return Err(
+				"Authorized keyboard and pointer devices are unavailable; physical displays remain enabled".into(),
+			);
+		}
+		std::thread::sleep(Duration::from_millis(5));
+	}
 }

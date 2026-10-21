@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
@@ -12,6 +13,7 @@ use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
 use crate::session::stream::video::FrameStats;
+use crate::session::stream::video::VideoCodec;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::VideoStreamHandle;
@@ -193,6 +195,16 @@ impl SessionBackend for SystemSession {
 		cause: StopCauseSlot,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> Result<InitializedSession, SessionFailure> {
+		if crate::desktop::recovery_pending() {
+			let result = tokio::task::spawn_blocking(crate::desktop::status).await;
+			if !matches!(result,Ok(Ok(ref status)) if status.phase == "idle") {
+				return Err(SessionFailure::new(
+					"desktop_recovery_required",
+					"Restore the previous desktop configuration before starting another session.",
+				)
+				.with_hint("Use Restore Desktop in the dashboard or run pyroshine desktop restore."));
+			}
+		}
 		// A calibration run may hold the video port; a session always wins.
 		let _claim = self.video_port.release_for_session().await;
 		InitializedSession::new(
@@ -283,6 +295,26 @@ impl SessionBackend for SystemSession {
 
 	async fn stop_application(&self, unit_name: &str) -> Result<(), ()> {
 		application::stop_application_unit(unit_name).await
+	}
+
+	fn desktop_lease(launched: &LaunchedSession) -> Option<String> {
+		launched.capture.desktop_lease()
+	}
+	async fn verify_desktop_cleanup(&self) -> Result<(), ()> {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+		loop {
+			if tokio::task::spawn_blocking(crate::desktop::cleanup_complete)
+				.await
+				.map_err(|_| ())?
+				.is_ok()
+			{
+				return Ok(());
+			}
+			if tokio::time::Instant::now() >= deadline {
+				return Err(());
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
 	}
 
 	fn capture_details(launched: &LaunchedSession) -> Option<moonshine_management::dto::CaptureDetails> {
@@ -394,7 +426,7 @@ impl InitializedSession {
 		let Self {
 			context,
 			capture,
-			audio_stream: audio,
+			audio_stream: mut audio,
 			video_stream,
 			control_stream,
 			hdr_metadata_rx,
@@ -411,6 +443,9 @@ impl InitializedSession {
 				tracing::error!("Capture launch task failed: {e}");
 				SessionFailure::see_log("capture_start_failed", "The capture backend failed to start.")
 			})??;
+		audio.desktop_sink = capture
+			.desktop_lease()
+			.map(|lease| format!("moonshine.desktop.{lease}"));
 		let capabilities = capture.capabilities();
 		tracing::info!(
 			backend = capabilities.backend.as_str(),
@@ -494,6 +529,7 @@ impl LaunchedSession {
 		video: &VideoStreamContext,
 		capture_pacing: CapturePacing,
 	) -> Result<(), ()> {
+		self.capture.set_scaling_fit(video.format.codec != VideoCodec::PyroWave);
 		let effective_hdr = self.capture.reconfigure(video.output_mode(capture_pacing)).await?;
 		if effective_hdr != video.format.hdr {
 			tracing::warn!(
@@ -629,6 +665,8 @@ impl ActiveSession {
 		capture_pacing: CapturePacing,
 		generation: u64,
 	) -> Result<(), ()> {
+		self.capture
+			.set_scaling_fit(context.format.codec != VideoCodec::PyroWave);
 		let effective_hdr = self.capture.reconfigure(context.output_mode(capture_pacing)).await?;
 		if effective_hdr != context.format.hdr {
 			tracing::warn!(

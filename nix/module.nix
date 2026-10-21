@@ -126,6 +126,7 @@ in
     # Puts `moonshine` on PATH for the healthcheck and pairing subcommands, and
     # is how the polkit rule below gets picked up.
     environment.systemPackages = [ cfg.package ];
+    systemd.packages = [ cfg.package ];
 
     hardware.graphics.enable = true;
 

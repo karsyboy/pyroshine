@@ -20,8 +20,8 @@ const SESSION_VARIABLES: &[&str] = &[
 	"XDG_SESSION_ID",
 ];
 
-/// Desktop families with known portal behavior. Any other desktop that
-/// implements the portals works the same way, without the quirks below.
+/// Desktop families. Native output management currently supports KDE and GNOME;
+/// input authorization is handled separately through the portal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DesktopKind {
 	/// KDE Plasma (`xdg-desktop-portal-kde`, KWin). Consent can be granted
@@ -78,11 +78,13 @@ pub(crate) enum DesktopUnavailable {
 	NoSession,
 	/// The session is an X11 session; Desktop Mode needs Wayland.
 	NotWayland(String),
+	Ambiguous(String),
 }
 
 impl std::fmt::Display for DesktopUnavailable {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
+			Self::Ambiguous(reason) => f.write_str(reason),
 			Self::NoSession => write!(f, "no Wayland desktop session of this user is running"),
 			Self::NotWayland(kind) => write!(
 				f,
@@ -179,9 +181,58 @@ pub(crate) async fn discover(connection: &zbus::Connection) -> Result<DesktopSes
 		session_variables(own.iter().map(String::as_str))
 	});
 	let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-	resolve(variables, runtime_dir.as_deref(), |socket| {
+	let mut desktop = resolve(variables, runtime_dir.as_deref(), |socket| {
 		std::os::unix::net::UnixStream::connect(socket).is_ok()
-	})
+	})?;
+	let sessions = tokio::time::timeout(std::time::Duration::from_secs(3), wayland_logins())
+		.await
+		.map_err(|_| DesktopUnavailable::Ambiguous("Timed out identifying the graphical login".into()))?
+		.map_err(|e| DesktopUnavailable::Ambiguous(format!("Cannot identify the graphical login: {e}")))?;
+	desktop.session_id = Some(select_login(&sessions, desktop.session_id.as_deref())?);
+	Ok(desktop)
+}
+
+fn select_login(sessions: &[String], exported: Option<&str>) -> Result<String, DesktopUnavailable> {
+	if sessions.len() != 1 || exported.is_some_and(|id| id != sessions[0]) {
+		return Err(DesktopUnavailable::Ambiguous(
+			"Desktop Mode requires exactly one Wayland login for this user, matching the exported desktop environment"
+				.into(),
+		));
+	}
+	Ok(sessions[0].clone())
+}
+
+async fn wayland_logins() -> zbus::Result<Vec<String>> {
+	let bus = zbus::Connection::system().await?;
+	let manager = zbus::Proxy::new(
+		&bus,
+		"org.freedesktop.login1",
+		"/org/freedesktop/login1",
+		"org.freedesktop.login1.Manager",
+	)
+	.await?;
+	let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
+		manager.call("ListSessions", &()).await?;
+	// SAFETY: geteuid has no preconditions.
+	let uid = unsafe { libc::geteuid() };
+	let mut matching = Vec::new();
+	for (id, user, _, _, path) in sessions {
+		if user != uid {
+			continue;
+		}
+		let session = zbus::Proxy::new(&bus, "org.freedesktop.login1", path, "org.freedesktop.login1.Session").await?;
+		if session.get_property::<String>("Type").await? == "wayland"
+			&& session.get_property::<String>("State").await? != "closing"
+		{
+			if session.get_property::<bool>("LockedHint").await? {
+				return Err(zbus::Error::Failure(
+					"The host desktop is locked; unlock it before Desktop Mode".into(),
+				));
+			}
+			matching.push(id);
+		}
+	}
+	Ok(matching)
 }
 
 #[cfg(test)]
@@ -190,6 +241,15 @@ mod tests {
 
 	fn vars(entries: &[&str]) -> Vec<(String, String)> {
 		session_variables(entries.iter().copied())
+	}
+
+	#[test]
+	fn graphical_login_must_be_unambiguous_and_match_exported_environment() {
+		assert_eq!(select_login(&["4".into()], Some("4")).unwrap(), "4");
+		assert_eq!(select_login(&["4".into()], None).unwrap(), "4");
+		assert!(select_login(&[], None).is_err());
+		assert!(select_login(&["4".into(), "5".into()], Some("4")).is_err());
+		assert!(select_login(&["4".into()], Some("5")).is_err());
 	}
 
 	#[test]

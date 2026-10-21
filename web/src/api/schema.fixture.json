@@ -40,6 +40,7 @@
     },
     "desktop": {
       "audio": true,
+      "disconnect_grace_secs": 30,
       "enabled": false,
       "input": true,
       "title": "Desktop Mode"
@@ -932,12 +933,28 @@
       {
         "advanced": false,
         "caution": null,
-        "help": "List an entry that streams your running Wayland desktop (Plasma, GNOME and other desktops with the XDG Desktop Portal) instead of launching an application. The desktop asks for permission the first time.",
+        "help": "Offer managed Desktop Mode on KDE Plasma or GNOME Wayland: use a client-sized virtual display, disable physical displays, and restore their configuration afterward. Authorize input on the host before unattended use.",
         "kind": {
           "type": "bool"
         },
         "label": "Offer Desktop Mode",
         "path": "desktop.enabled",
+        "required": false,
+        "section": "desktop"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Seconds to retain the virtual display after client loss. Reconnecting cancels restoration; zero restores immediately. Explicit Stop always restores immediately.",
+        "kind": {
+          "max": 86400.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "s"
+        },
+        "label": "Reconnect grace",
+        "path": "desktop.disconnect_grace_secs",
         "required": false,
         "section": "desktop"
       },
@@ -971,7 +988,7 @@
       {
         "advanced": false,
         "caution": null,
-        "help": "Stream what the desktop plays on its default output. Local playback continues.",
+        "help": "Route desktop playback to a streaming sink while Desktop Mode runs, then restore its previous routing. Off leaves host audio unchanged.",
         "kind": {
           "type": "bool"
         },

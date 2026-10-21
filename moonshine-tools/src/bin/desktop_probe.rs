@@ -2,7 +2,9 @@
 //! authorize a portal session, receive frames and report their delivery and
 //! CPU cost, optionally injecting a scripted input sequence (`--input`).
 //!
-//! The desktop may ask for consent; accept it on the host.
+//! This performs a real 1920x1080 desktop takeover: physical displays are
+//! disabled during the probe and restored afterward. Input needs host consent.
+//! Install/start the desktop guard with the server executable first.
 
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
-#[command(about = "Probe Desktop Mode capture (XDG Desktop Portal + PipeWire) without encoding")]
+#[command(about = "Probe managed Desktop Mode without encoding; temporarily disables physical displays")]
 struct Args {
 	/// Seconds of frames to receive.
 	#[arg(long, default_value_t = 10)]

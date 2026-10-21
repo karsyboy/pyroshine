@@ -71,7 +71,7 @@ pub struct SessionDetails {
 	/// Negotiated audio stream, once RTSP PLAY committed one.
 	pub audio: Option<AudioDetails>,
 	/// What the session streams and how, once capture is running.
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub capture: Option<CaptureDetails>,
 }
 
@@ -100,8 +100,8 @@ pub struct CaptureDetails {
 	/// or `none` (view-only).
 	#[serde(default)]
 	pub input: Option<String>,
-	/// Desktop Mode: `restored` (no prompt) or `requested` (the desktop asked
-	/// or granted it by policy).
+	/// Desktop Mode: `restored` (a saved permission was offered; the desktop
+	/// still asks when it does not cover the request) or `requested`.
 	#[serde(default)]
 	pub consent: Option<String>,
 }
@@ -1060,6 +1060,25 @@ pub struct InstallGuidance {
 	pub label: String,
 	/// Commands or steps, in order.
 	pub steps: Vec<String>,
+}
+
+/// Managed desktop state. This is independent of the streaming daemon's media
+/// workers so an orphaned display remains visible and recoverable.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DesktopStatus {
+	pub supported: bool,
+	pub desktop: String,
+	pub phase: String,
+	pub reason: Option<String>,
+	pub mode: Option<DesktopOutputMode>,
+	pub grace_deadline_ms: Option<u64>,
+	pub audio_remote_only: bool,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DesktopOutputMode {
+	pub width: u32,
+	pub height: u32,
+	pub refresh_millihertz: u32,
 }
 
 #[cfg(test)]

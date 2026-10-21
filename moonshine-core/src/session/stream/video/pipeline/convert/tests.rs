@@ -1179,63 +1179,76 @@ mod gpu {
 	/// Desktop Mode's scaled path (`ExportedFrame::scale_to_stream`): at an
 	/// exact 2:1 downscale the four bilinear taps fall on texel centers, so
 	/// every output pixel is the box average of its 2x2 source texels, for
-	/// odd frames and every output format.
+	/// odd frames and every output format; a source of another aspect ratio
+	/// keeps it, centered between black bars.
 	fn scaled_sources(context: &VideoContext, rng: &mut Rng, failures: &mut Vec<String>) {
-		let frame = (321, 181);
-		let source_extent = (frame.0 * 2, frame.1 * 2);
-		let source_format = vk::Format::B8G8R8A8_UNORM;
-		let bytes = pattern(rng, source_format, source_extent);
-		let image = source_image(context, source_extent, source_format, &bytes);
-		let texel_size = texel_bytes(source_format);
-		let texel = |x: u32, y: u32| {
-			let offset = (y as usize * source_extent.0 as usize + x as usize) * texel_size;
-			decode_texel(source_format, &bytes[offset..offset + texel_size])
-		};
-		for format in FORMATS {
-			let extent = tight_extent(format, frame);
-			let label = format!("{format:?} scaled 642x362 -> 321x181");
-			let result = (|| -> Result<reference::Agreement, String> {
-				let mut converter = InputConverter::create(
-					context.clone(),
-					ConversionQueueMode::Auto,
-					frame,
-					extent,
-					format,
-					4,
-					BT709_LIMITED.space,
-					BT709_LIMITED.full_range,
-					true,
-				)?;
-				let view = converter.source_view(&image, source_format)?;
-				converter
-					.dispatch(
-						&SourceBinding {
-							image: image.image(),
-							view,
-							extent: source_extent,
-							scaled: true,
-							first_use: false,
-						},
-						&[None, None],
-						None,
-					)
-					.map_err(|e| format!("dispatch: {e}"))?;
-				let actual = converter.layout.read_planes(converter.readback())?;
-				let rgb = |x: u32, y: u32| {
-					let (x, y) = (x.min(frame.0 - 1), y.min(frame.1 - 1));
-					let taps = [
-						texel(2 * x, 2 * y),
-						texel(2 * x + 1, 2 * y),
-						texel(2 * x, 2 * y + 1),
-						texel(2 * x + 1, 2 * y + 1),
-					];
-					std::array::from_fn(|c| taps.iter().map(|t| t[c]).sum::<f32>() / 4.0)
-				};
-				let row = rows(extent);
-				let expected = reference::convert(format, BT709_LIMITED, frame, extent, &rgb, &row);
-				reference::compare(&expected, &actual, 1, &row)
-			})();
-			assert_agreement(&label, result, failures);
+		// Same aspect ratio (fills the frame), then a 4:1 source letterboxed
+		// into 16:9 (black bars above and below the 320x80 viewport).
+		for (frame, source_extent) in [((321, 181), (642, 362)), ((320, 180), (640, 160))] {
+			let viewport = crate::session::capture::frame::fit_viewport(source_extent, frame);
+			let source_format = vk::Format::B8G8R8A8_UNORM;
+			let bytes = pattern(rng, source_format, source_extent);
+			let image = source_image(context, source_extent, source_format, &bytes);
+			let texel_size = texel_bytes(source_format);
+			let texel = |x: u32, y: u32| {
+				let offset = (y as usize * source_extent.0 as usize + x as usize) * texel_size;
+				decode_texel(source_format, &bytes[offset..offset + texel_size])
+			};
+			for format in FORMATS {
+				let extent = tight_extent(format, frame);
+				let label = format!(
+					"{format:?} scaled {}x{} -> {}x{} (viewport {viewport:?})",
+					source_extent.0, source_extent.1, frame.0, frame.1
+				);
+				let result = (|| -> Result<reference::Agreement, String> {
+					let mut converter = InputConverter::create(
+						context.clone(),
+						ConversionQueueMode::Auto,
+						frame,
+						extent,
+						format,
+						4,
+						BT709_LIMITED.space,
+						BT709_LIMITED.full_range,
+						true,
+					)?;
+					let view = converter.source_view(&image, source_format)?;
+					converter
+						.dispatch(
+							&SourceBinding {
+								image: image.image(),
+								view,
+								extent: source_extent,
+								scaled: true,
+								first_use: false,
+							},
+							&[None, None],
+							None,
+						)
+						.map_err(|e| format!("dispatch: {e}"))?;
+					let actual = converter.layout.read_planes(converter.readback())?;
+					let (vx, vy, vw, vh) = viewport;
+					let rgb = |x: u32, y: u32| {
+						// Padding replicates the frame's edge pixel.
+						let (x, y) = (x.min(frame.0 - 1), y.min(frame.1 - 1));
+						if x < vx || y < vy || x >= vx + vw || y >= vy + vh {
+							return [0.0; 3];
+						}
+						let (x, y) = (x - vx, y - vy);
+						let taps = [
+							texel(2 * x, 2 * y),
+							texel(2 * x + 1, 2 * y),
+							texel(2 * x, 2 * y + 1),
+							texel(2 * x + 1, 2 * y + 1),
+						];
+						std::array::from_fn(|c| taps.iter().map(|t| t[c]).sum::<f32>() / 4.0)
+					};
+					let row = rows(extent);
+					let expected = reference::convert(format, BT709_LIMITED, frame, extent, &rgb, &row);
+					reference::compare(&expected, &actual, 1, &row)
+				})();
+				assert_agreement(&label, result, failures);
+			}
 		}
 	}
 

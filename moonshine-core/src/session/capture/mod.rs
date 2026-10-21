@@ -24,8 +24,8 @@
 //!   Wayland/XWayland environment, application surfaces, output, scene, focus
 //!   and input to itself.
 //! - [`CaptureBackend::Desktop`] (Desktop Mode) streams the user's running
-//!   Wayland desktop through the XDG Desktop Portal (`portal/`): PipeWire
-//!   frames, input through the devices the portal authorized.
+//!   Wayland desktop through a guard-owned native virtual output: direct
+//!   PipeWire frames, input through separately authorized portal devices.
 //!
 //! A further backend adds a variant to [`CaptureBackend`], [`CaptureSource`]
 //! and [`LiveCapture`]; the compiler then lists every operation it must
@@ -59,8 +59,8 @@ pub(crate) enum CaptureBackend {
 	/// the session, running only the launched application.
 	#[default]
 	Isolated,
-	/// Desktop Mode: the user's running Wayland desktop, captured and
-	/// controlled through the XDG Desktop Portal with the user's consent.
+	/// Desktop Mode: a native virtual output on the user's running Wayland
+	/// desktop, with portal-authorized remote input.
 	Desktop,
 }
 
@@ -196,9 +196,10 @@ impl CaptureSource {
 			CaptureBackend::Desktop => {
 				let config = portal::PortalCaptureConfig {
 					desktop: settings.desktop,
-					gpu: settings.compositor.gpu,
+					gpu: None,
 					restore_token: portal::token::default_path(),
 					refresh_rate: context.refresh_rate,
+					resolution: context.resolution,
 				};
 				let (capture, endpoints) = portal::PortalCapture::new(config, stop, cause);
 				(Self::Desktop(capture), endpoints)
@@ -232,6 +233,12 @@ pub(crate) enum LiveCapture {
 }
 
 impl LiveCapture {
+	pub(crate) fn desktop_lease(&self) -> Option<String> {
+		match self {
+			Self::Desktop(d) => Some(d.ready().lease.clone()),
+			Self::Isolated(_) => None,
+		}
+	}
 	pub(crate) fn capabilities(&self) -> &CaptureCapabilities {
 		match self {
 			Self::Isolated(compositor) => &compositor.ready().capabilities,
@@ -286,12 +293,21 @@ impl LiveCapture {
 		}
 	}
 
+	/// Whether the stream's encoder keeps a scaled source's aspect ratio
+	/// (conventional codecs) or stretches it (PyroWave's scaler). Managed native
+	/// outputs match the stream size; this retains viewport/input bookkeeping.
+	pub(crate) fn set_scaling_fit(&mut self, fit: bool) {
+		if let Self::Desktop(desktop) = self {
+			desktop.set_scaling_fit(fit);
+		}
+	}
+
 	/// Apply `mode` to the live output and return the effective HDR state.
 	/// The caller refuses the stream when that differs from the negotiated one.
 	pub(crate) async fn reconfigure(&mut self, mode: OutputMode) -> Result<bool, ()> {
 		match self {
 			Self::Isolated(compositor) => compositor.reconfigure(mode).await,
-			Self::Desktop(desktop) => desktop.reconfigure(mode),
+			Self::Desktop(desktop) => desktop.reconfigure(mode).await,
 		}
 	}
 }

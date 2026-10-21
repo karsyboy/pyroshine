@@ -115,6 +115,17 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	)
 }
 impl CaptureSender {
+	/// A replacement producer shares admission, but never duplicates the loop's
+	/// demand source. The desktop worker activates only one producer at a time.
+	pub(crate) fn replacement(&self) -> Self {
+		Self {
+			context: self.context.clone(),
+			overlay_caps: self.overlay_caps.clone(),
+			tx: self.tx.clone(),
+			demand_source: None,
+			state: self.state.clone(),
+		}
+	}
 	pub(crate) fn set_context(&self, context: pixelforge::VideoContext) {
 		assert!(
 			self.context.set(context).is_ok(),

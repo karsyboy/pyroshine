@@ -1,18 +1,11 @@
-//! Desktop Mode audio: what the desktop plays on its default output.
+//! Desktop Mode records the guard-owned sink through the user's PipeWire.
+//! The guard journals and redirects desktop playback; this worker only receives
+//! samples and passes them to the existing Opus packet clock. Audio failures
+//! stop the session so cleanup restores the saved destinations.
 //!
-//! In Game Mode the launched application plays into Pyroshine's own
-//! PulseAudio-compatible server. In Desktop Mode nothing is launched, so the
-//! audio stream records the desktop's default sink monitor through the user's
-//! PipeWire instead. Local playback is untouched: recording a monitor does not
-//! move, mute or reconfigure any stream or device, and the capture follows the
-//! default output when the user changes it.
-//!
-//! Frames reach the encoder on the same fixed packet clock as the Pulse
-//! server's: PipeWire delivers periods into a short buffer that each tick
-//! drains by one packet, padded with silence when the desktop is quiet or its
-//! sink suspended. More than [`MAX_BUFFERED_PACKETS`] buffered packets are
-//! dropped oldest first, so a stall never turns into lasting latency. A
-//! PipeWire failure leaves the stream silent rather than ending the session.
+//! Periods enter a buffer bounded to [`MAX_BUFFERED_PACKETS`]. Each packet tick
+//! drains it, padding with silence when the desktop is quiet; excess packets
+//! are dropped oldest first to prevent accumulated latency.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -151,7 +144,12 @@ struct Capture {
 	stream: pw::stream::StreamRc,
 }
 
-fn connect(core: &pw::core::CoreRc, channels: u8, packet_frames: usize) -> Result<Capture, String> {
+fn connect(
+	core: &pw::core::CoreRc,
+	channels: u8,
+	packet_frames: usize,
+	target: Option<&str>,
+) -> Result<Capture, String> {
 	let latency = format!("{packet_frames}/{CAPTURE_SAMPLE_RATE}");
 	let stream = pw::stream::StreamRc::new(
 		core.clone(),
@@ -163,6 +161,7 @@ fn connect(core: &pw::core::CoreRc, channels: u8, packet_frames: usize) -> Resul
 			*pw::keys::STREAM_CAPTURE_SINK => "true",
 			*pw::keys::NODE_LATENCY => latency.as_str(),
 			*pw::keys::APP_NAME => "Pyroshine",
+				"target.object" => target.unwrap_or("@DEFAULT_AUDIO_SINK@"),
 			"node.description" => "Pyroshine Desktop Mode",
 		},
 	)
@@ -223,6 +222,7 @@ impl DesktopAudio {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn spawn(
 		capture: bool,
+		sink: Option<String>,
 		channels: u8,
 		packet_duration_ms: u32,
 		frame_tx: crossbeam_channel::Sender<AudioFrame>,
@@ -242,6 +242,7 @@ impl DesktopAudio {
 				let _worker = worker;
 				run(
 					capture,
+					sink,
 					channels,
 					packet_duration_ms,
 					frame_tx,
@@ -262,6 +263,7 @@ fn packet_frames(packet_duration_ms: u32) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn run(
 	capture: bool,
+	sink: Option<String>,
 	mut channels: u8,
 	mut packet_duration_ms: u32,
 	frame_tx: crossbeam_channel::Sender<AudioFrame>,
@@ -301,13 +303,20 @@ fn run(
 		},
 		None => None,
 	};
+	if capture && pipewire.is_none() {
+		return;
+	}
+	let must_capture = capture;
 	let mut capture = pipewire.as_ref().and_then(|(_, _, core)| {
-		connect(core, channels, packet_frames(packet_duration_ms))
+		connect(core, channels, packet_frames(packet_duration_ms), sink.as_deref())
 			.inspect_err(|error| tracing::warn!(%error, "Desktop audio is unavailable; streaming silence"))
 			.ok()
 	});
 	if capture.is_some() {
 		tracing::info!(channels, packet_duration_ms, "Capturing the desktop's audio output");
+	}
+	if must_capture && capture.is_none() {
+		return;
 	}
 	let mut silence = PacketBuffer::new(channels, packet_frames(packet_duration_ms));
 	let epoch = Instant::now();
@@ -316,6 +325,12 @@ fn run(
 	let mut heard = false;
 
 	while !stop.is_shutdown_triggered() {
+		if capture
+			.as_ref()
+			.is_some_and(|c| matches!(c.stream.state(), pw::stream::StreamState::Error(_)))
+		{
+			break;
+		}
 		while let Ok(request) = reconfigure_rx.try_recv() {
 			if request.reconfigure_capture
 				&& (request.channels != channels || request.packet_duration_ms != packet_duration_ms)
@@ -329,7 +344,7 @@ fn run(
 				// A new format needs a new stream; PipeWire converts the sink's layout.
 				drop(capture.take());
 				capture = pipewire.as_ref().and_then(|(_, _, core)| {
-					connect(core, channels, packet_frames(packet_duration_ms))
+					connect(core, channels, packet_frames(packet_duration_ms), sink.as_deref())
 						.inspect_err(
 							|error| tracing::warn!(%error, "Desktop audio reconfiguration failed; streaming silence"),
 						)

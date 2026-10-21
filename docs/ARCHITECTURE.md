@@ -415,8 +415,11 @@ is the seam between it and the rest of the session. `SystemSession` selects a
 backend when it initializes a session (`CaptureBackend`), creates it
 (`CaptureSource`), launches it and waits for readiness, then uses the running
 backend (`LiveCapture`) for the application's display, the capability report
-and output-mode changes. Only isolated Game Mode exists: the session's own
-Smithay compositor, described below.
+and output-mode changes. Game Mode uses the session's own Smithay compositor.
+Desktop Mode uses the signed-in desktop's native virtual display, with lifecycle and restoration owned
+by a separately supervised user guard. PipeWire frames reach the same capture
+admission path directly. See [Managed Desktop Mode](DESKTOP_MODE.md) for the
+transaction, adapters, input and audio ownership.
 
 - Every backend runs on a thread started by `start_capture_thread`, which
   registers its worker guard first, keeps the capture GPU alive until the

@@ -3,11 +3,9 @@
 A capture backend produces the frames a session streams. The session layer
 selects it, starts it, wires its endpoints into the streams, applies negotiated
 output modes and stops it; everything specific to a source stays inside the
-backend. One backend exists: isolated Game Mode, the session's own headless
-Smithay compositor. This guide describes the contract a backend meets, so that
-capture of an existing desktop or of a managed virtual monitor can be added
-without changing the encoders, transport, session manager or the isolated
-backend. Code paths are relative to `moonshine-core/src/session/`.
+backend. Game Mode uses the session's own headless Smithay compositor.
+[Managed Desktop Mode](DESKTOP_MODE.md) uses a virtual monitor on the existing
+Wayland desktop. Both meet the contract below and share encoders and transport. Code paths are relative to `moonshine-core/src/session/`.
 
 ## Responsibilities
 
@@ -129,8 +127,11 @@ refresh rate are the live `OutputMode`.
 
 ## Existing desktop and virtual monitor capture
 
-These modes are not implemented. The differences below are what a backend for
-them must resolve; the shared layer and the pipeline do not change for them.
+Desktop Mode implements the virtual-monitor column through native KDE and GNOME
+adapters. Its guard owns display/audio transactions and recovery; capture receives
+PipeWire DMA-BUFs directly, with embedded cursor and EIS input. Ordinary physical
+monitor sharing is not a Desktop Mode fallback. See [Desktop Mode](DESKTOP_MODE.md)
+for capability requirements and acceptance checks.
 
 | Aspect | Isolated Game Mode | Existing desktop | Virtual monitor on that desktop |
 | --- | --- | --- | --- |
@@ -176,26 +177,12 @@ them must resolve; the shared layer and the pipeline do not change for them.
 
 ## Limitations and integration points
 
-The seam covers capture. These parts still assume the isolated backend and
-must be generalized by the first backend that needs them:
-
-- **Input.** `CaptureEndpoints::input` is a calloop channel of the
-  compositor's `CompositorInputEvent`.
-- **Capture demand wakeup.** The channel's demand signal is a calloop `Ping`;
-  a backend without a calloop loop polls `requested()` or registers the ping's
-  source in its own loop.
-- **Application environment.** `ApplicationDisplay` names the session's own
-  Wayland and X11 displays; launching into an existing desktop needs the
-  application unit to inherit the desktop environment instead.
-- **Audio.** The session's PulseAudio-compatible server is the only audio
-  source.
-- **Diagnostics.** `CaptureOrigin` and its `DirectReject` reasons describe the
-  isolated compositor's capture paths; other backends report no reason.
-  Startup failure codes and the stop reason are named after the compositor.
-- **Frame contract.** No producer fence, crop, damage or YUV source format is
-  carried; see [Frame contract](#frame-contract).
-- **Management.** Session details do not name the capture backend.
-- **Benchmarks.** `moonshine-bench` drives the isolated backend only.
+The seam covers capture; desktop output and audio administration live in the
+separate guard. `CaptureInputEvent` is shared, backend details identify the mode
+in management status, and desktop frames carry native completion ownership.
+`moonshine-bench` still drives only the isolated backend. Use
+`moonshine-desktop-probe` for managed capture diagnostics; it temporarily takes
+over displays and requires the guard. Real client acceptance remains necessary.
 
 ## Validation
 

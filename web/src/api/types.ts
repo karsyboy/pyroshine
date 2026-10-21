@@ -563,3 +563,13 @@ export interface LibraryApplication {
   artwork: string | null;
   command: string[];
 }
+
+export interface DesktopStatus {
+  supported: boolean;
+  desktop: string;
+  phase: string;
+  reason: string | null;
+  mode: { width: number; height: number; refresh_millihertz: number } | null;
+  grace_deadline_ms: number | null;
+  audio_remote_only: boolean;
+}

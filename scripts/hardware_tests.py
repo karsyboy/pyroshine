@@ -39,6 +39,7 @@ REQUIREMENTS = (
     "ffmpeg",
     "pacat",
     "systemd-user",
+    "kde-wayland",
     "input-devices",
     "nvidia-gpu",
     "vaapi-encode",
@@ -178,6 +179,11 @@ def probe(args):
         if shutil.which("systemctl") else None
     state = systemd.stdout.strip() if systemd else ""
     found["systemd-user"] = (state in ("running", "degraded"), f"user manager: {state or 'unreachable'}")
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    socket = display if os.path.isabs(display) else os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), display)
+    found["kde-wayland"] = ("KDE" in desktop and bool(display) and os.path.exists(socket),
+                            "KDE Wayland session" if "KDE" in desktop and display else "no KDE Wayland session")
     devices = writable("/dev/uinput") and writable("/dev/uhid")
     found["input-devices"] = (devices, "/dev/uinput and /dev/uhid writable" if devices else "/dev/uinput or /dev/uhid not writable")
     nvidia = os.environ.get("MOONSHINE_TEST_NVML") or next(

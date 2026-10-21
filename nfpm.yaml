@@ -38,6 +38,8 @@ contents:
     dst: /usr/lib/udev/rules.d/60-pyroshine.rules
   - src: ./dist/pyroshine-modules.conf
     dst: /usr/lib/modules-load.d/pyroshine.conf
+  - src: ./dist/pyroshine-desktop-guard.service
+    dst: /usr/lib/systemd/user/pyroshine-desktop-guard.service
   - src: ./dist/pyroshine@.service
     dst: /usr/lib/systemd/system/pyroshine@.service
   - src: ./dist/50-pyroshine-inhibit-sleep.rules
@@ -91,6 +93,8 @@ overrides:
   deb:
     depends:
       - libc6
+      - libpipewire-0.3-0
+      - libpulse0
       - libopus0
       - libevdev2
       - libxkbcommon0
@@ -110,6 +114,8 @@ overrides:
   rpm:
     depends:
       - glibc
+      - pipewire-libs
+      - pulseaudio-libs
       - opus
       - libevdev
       - libxkbcommon
@@ -133,6 +139,8 @@ overrides:
       - libffi
       - libxkbcommon
       - mesa
+      - libpipewire
+      - libpulse
       - opus
       - vulkan-icd-loader
       - wayland

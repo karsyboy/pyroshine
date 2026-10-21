@@ -98,6 +98,8 @@ impl StopRecord {
 /// sessions and restarts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TeardownFailure {
+	/// The guard retains desktop resources until an explicit recovery succeeds.
+	DesktopNotRestored,
 	/// Stopping the application unit failed or did not answer in time, so its
 	/// termination is not established.
 	ApplicationNotStopped,
@@ -109,6 +111,7 @@ impl TeardownFailure {
 	/// Operator-facing explanation.
 	pub(crate) fn message(self) -> &'static str {
 		match self {
+			Self::DesktopNotRestored => "Desktop restoration is incomplete. Use Restore Desktop to retry.",
 			Self::ApplicationNotStopped => "The application could not be confirmed stopped; Pyroshine is restarting.",
 			Self::DeadlineExceeded => "The session did not stop within its deadline; Pyroshine is restarting.",
 		}
@@ -220,6 +223,11 @@ pub(crate) fn describe_stop(reason: SessionShutdownReason) -> (&'static str, &'s
 		),
 		Reason::InputHandlerStopped => ("input_failed", "Input handling stopped unexpectedly.", true),
 		Reason::CompositorStopped => ("compositor_failed", "The compositor stopped unexpectedly.", true),
+		Reason::DesktopGraceExpired => (
+			"desktop_grace_expired",
+			"Desktop Mode ended after its reconnect deadline.",
+			false,
+		),
 		Reason::DesktopCaptureStopped => ("desktop_capture_ended", "The desktop capture ended.", true),
 		Reason::TransitionFailed => (
 			"transition_failed",

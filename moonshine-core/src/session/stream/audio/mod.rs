@@ -415,6 +415,7 @@ pub(crate) struct AudioStream {
 	/// The Pulse server's socket; `None` for desktop audio.
 	pulse_socket: Option<UnixListener>,
 	pub pulse_socket_path: PathBuf,
+	pub(crate) desktop_sink: Option<String>,
 	udp_socket: tokio::net::UdpSocket,
 	source: AudioSource,
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -434,6 +435,7 @@ impl AudioStream {
 			return Ok(AudioStream {
 				pulse_socket: None,
 				pulse_socket_path: PathBuf::new(),
+				desktop_sink: None,
 				udp_socket,
 				source,
 				stop,
@@ -477,6 +479,7 @@ impl AudioStream {
 		Ok(AudioStream {
 			pulse_socket: Some(pulse_socket),
 			pulse_socket_path,
+			desktop_sink: None,
 			udp_socket,
 			source: AudioSource::Pulse,
 			stop,
@@ -534,6 +537,7 @@ impl AudioStream {
 			.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?,
 			(AudioSource::Desktop { capture }, _) => desktop::DesktopAudio::spawn(
 				capture,
+				self.desktop_sink,
 				context.audio_config.channels as u8,
 				context.packet_duration_ms,
 				frame_tx,
