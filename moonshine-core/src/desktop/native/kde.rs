@@ -624,7 +624,7 @@ mod tests {
 				native.apply(&desired)?;
 				let observed = native.snapshot()?;
 				super::super::verify(&observed, &desired)?;
-				let managed = super::super::takeover_configuration(&observed, &target)?;
+				let managed = super::super::takeover_configuration(&observed, &target, None)?;
 				if managed.outputs.iter().find(|o| o.key == target.output).map(|o| o.scale) != Some(scale) {
 					return Err("Takeover would reset the user's UI scale".into());
 				}

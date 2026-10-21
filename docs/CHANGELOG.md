@@ -16,6 +16,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
+- Remember Desktop Mode UI scale per paired client, keyed to its verified certificate. Reapply it on future launches and client switches, retain it across mode changes and reconnects, and keep preferences separate from physical-monitor recovery. Diagnostic probes do not overwrite client preferences.
+
 - Add managed Desktop Mode for the existing Wayland session, with native KDE Plasma and GNOME adapters: a client-sized SDR virtual display, physical-display takeover, remote-only audio, input authorization, configurable reconnect grace and an independent recovery guard. Add Dashboard recovery controls and `pyroshine desktop status|authorize|restore`. Games retain isolated sessions. Automated recovery tests are included; physical KDE/GNOME streaming acceptance remains to be completed. See [Desktop Mode](DESKTOP_MODE.md).
 
 - Manage Pyroshine in the browser. The server serves its management interface at `http://127.0.0.1:47990/` (`[management]`), the same on a desktop and on a headless host, with no desktop, browser, GTK or Node.js needed on the host: dashboard, applications, clients and pairing, session history, settings, diagnostics, updates and maintenance, live over Server-Sent Events, usable on phones. Reach it from another computer through an SSH tunnel, or over HTTPS on another address. See [Web interface and tray](MANAGEMENT.md).

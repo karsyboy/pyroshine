@@ -78,6 +78,7 @@ impl Default for DesktopConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct PortalCaptureConfig {
 	pub desktop: DesktopConfig,
+	pub client_identity: Option<String>,
 	/// `compositor.gpu`: the GPU to import on when the compositor does not
 	/// advertise its own.
 	pub gpu: Option<String>,
@@ -744,7 +745,7 @@ fn run(
 		height: config.resolution.1,
 		refresh_millihertz: config.refresh_rate.saturating_mul(1000),
 	};
-	let (guard, target) = crate::desktop::Client::prepare(mode, config.desktop.audio)
+	let (guard, target) = crate::desktop::Client::prepare(mode, config.desktop.audio, config.client_identity.clone())
 		.map_err(|e| capture_failure("desktop_prepare_failed", e))?;
 	let result = capture(
 		&config,
@@ -1206,6 +1207,7 @@ mod takeover_tests {
 					..Default::default()
 				},
 				gpu: None,
+				client_identity: None,
 				restore_token: Some(path),
 				resolution: (2880, 1920),
 				refresh_rate: 60,

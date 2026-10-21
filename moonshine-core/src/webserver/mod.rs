@@ -492,13 +492,15 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.launch(params, local_address, peer_address).await
+					self.launch(params, local_address, peer_address, peer_cert_fingerprint.clone())
+						.await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.resume(params, local_address, peer_address).await
+					self.resume(params, local_address, peer_address, peer_cert_fingerprint.clone())
+						.await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
@@ -792,6 +794,7 @@ impl Webserver {
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
+		client_identity: Option<String>,
 	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
@@ -899,6 +902,7 @@ impl Webserver {
 				audio_channel_mask,
 				hdr,
 				client_ip: peer_address.ip(),
+				client_identity,
 				vrr_requested,
 			})
 			.await;
@@ -960,6 +964,7 @@ impl Webserver {
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
+		client_identity: Option<String>,
 	) -> Response<Full<Bytes>> {
 		// The whole request is validated before the session manager publishes
 		// keys or rotates authorization, so a malformed resume changes nothing.
@@ -971,7 +976,10 @@ impl Webserver {
 			},
 		};
 
-		let mut resume_request = crate::session::ResumeRequest::default();
+		let mut resume_request = crate::session::ResumeRequest {
+			client_identity,
+			..Default::default()
+		};
 		if let Some(mode) = params.remove("mode") {
 			match DisplayMode::parse(&mode) {
 				Ok(mode) => {

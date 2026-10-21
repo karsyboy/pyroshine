@@ -60,7 +60,7 @@ impl Native {
 			Self::Kde(_) => Ok(target.clone()),
 		}
 	}
-	pub fn commit(&mut self, target: &Target) -> Result<()> {
+	pub fn commit(&mut self, target: &Target, scale: Option<f64>) -> Result<()> {
 		let target = match self {
 			Self::Gnome(a) => a.resolve(target)?,
 			Self::Kde(_) => target.clone(),
@@ -70,7 +70,7 @@ impl Native {
 			kde.retire_other(&target.id)?;
 		}
 		let current = self.snapshot()?;
-		let snapshot = takeover_configuration(&current, &target)?;
+		let snapshot = takeover_configuration(&current, &target, scale)?;
 		// A scale-only change is already valid. Reapplying an unchanged
 		// topology needlessly replaces EIS devices and can race Display Settings.
 		if verify(&current, &snapshot).is_ok() {
@@ -83,7 +83,7 @@ impl Native {
 
 /// Enforce sole-output capture constraints while leaving UI scale under the
 /// desktop user's control. Pixel mode and logical UI size are independent.
-pub(super) fn takeover_configuration(current: &Snapshot, target: &Target) -> Result<Snapshot> {
+pub(super) fn takeover_configuration(current: &Snapshot, target: &Target, scale: Option<f64>) -> Result<Snapshot> {
 	let mut snapshot = current.clone();
 	let selected = snapshot
 		.outputs
@@ -91,6 +91,12 @@ pub(super) fn takeover_configuration(current: &Snapshot, target: &Target) -> Res
 		.find(|o| o.key == target.output)
 		.ok_or("The prepared virtual output disappeared")?;
 	selected.mode = target.mode;
+	if let Some(scale) = scale {
+		if !super::preferences::valid_scale(scale) {
+			return Err("Invalid Desktop Mode UI scale".into());
+		}
+		selected.scale = scale;
+	}
 	selected.enabled = true;
 	selected.x = 0;
 	selected.y = 0;
@@ -206,7 +212,7 @@ pub(super) trait Platform {
 	fn prepare(&mut self, id: &str, mode: Mode) -> Result<Target>;
 	fn resolve_target(&mut self, target: &Target) -> Result<Target>;
 	fn apply(&mut self, snapshot: &Snapshot) -> Result<()>;
-	fn commit(&mut self, target: &Target) -> Result<()>;
+	fn commit(&mut self, target: &Target, scale: Option<f64>) -> Result<()>;
 	fn retire(&mut self, id: &str) -> Result<()>;
 	fn pump(&mut self) -> Result<()>;
 }
@@ -223,8 +229,8 @@ impl Platform for Native {
 	fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
 		Native::apply(self, snapshot)
 	}
-	fn commit(&mut self, target: &Target) -> Result<()> {
-		Native::commit(self, target)
+	fn commit(&mut self, target: &Target, scale: Option<f64>) -> Result<()> {
+		Native::commit(self, target, scale)
 	}
 	fn retire(&mut self, id: &str) -> Result<()> {
 		Native::retire(self, id)

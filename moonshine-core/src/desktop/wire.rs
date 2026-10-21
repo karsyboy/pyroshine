@@ -18,6 +18,12 @@ pub(super) enum Request {
 		lease: Option<String>,
 		mode: Mode,
 		audio: bool,
+		#[serde(default)]
+		client: Option<String>,
+	},
+	SelectClient {
+		lease: String,
+		client: String,
 	},
 	Commit {
 		lease: String,
@@ -144,12 +150,13 @@ impl Client {
 	pub fn observer(lease: String) -> Self {
 		Self { lease, _owner: None }
 	}
-	pub fn prepare(mode: Mode, audio: bool) -> Result<(Self, Target)> {
+	pub fn prepare(mode: Mode, audio: bool, client: Option<String>) -> Result<(Self, Target)> {
 		ensure()?;
 		let reply = request(&Request::Prepare {
 			lease: None,
 			mode,
 			audio,
+			client,
 		})?;
 		let lease = reply.lease.ok_or("Guard supplied no desktop lease")?;
 		let target = reply.target.ok_or("Guard supplied no capture target")?;
@@ -184,9 +191,17 @@ impl Client {
 			lease: Some(self.lease.clone()),
 			mode,
 			audio: false,
+			client: None,
 		})?
 		.target
 		.ok_or_else(|| "Guard supplied no replacement target".into())
+	}
+	pub fn select_client(&self, client: String) -> Result<()> {
+		request(&Request::SelectClient {
+			lease: self.lease.clone(),
+			client,
+		})
+		.map(|_| ())
 	}
 	pub fn commit(&self, target: &str) -> Result<Target> {
 		request(&Request::Commit {

@@ -1170,6 +1170,7 @@ async fn run_benchmark(
 		// The benchmark is the local client: it discovers the video endpoint
 		// with a legacy PING from loopback below.
 		client_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+		client_identity: None,
 		vrr_requested: args.vrr,
 	};
 

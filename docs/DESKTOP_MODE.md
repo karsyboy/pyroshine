@@ -44,8 +44,8 @@ revokes it. `input = false` permits viewing without an input portal session.
 Select **Desktop Mode** in the streaming client. Games selected from the library
 continue to use their isolated Game Mode session. A Desktop Mode launch does
 not execute application commands or hooks. The first implementation uses SDR,
-fixed refresh, an initial scale of 100%, an embedded cursor and direct PipeWire
-DMA-BUF capture.
+fixed refresh, a per-client UI scale (initially 100%), an embedded cursor and
+direct PipeWire DMA-BUF capture.
 It refuses incompatible modes or buffers rather than scaling a physical monitor.
 The compositor chooses how existing windows migrate to the remaining output.
 
@@ -54,8 +54,22 @@ On KDE, change **Scale** for **Pyroshine Desktop Mode** in the desktop's
 integer scaling enlarge icons and text without changing the captured pixel
 resolution. Pyroshine preserves that choice while enforcing physical-display
 takeover, and input coordinates follow the compositor's scaled EIS region.
-The scale belongs to this virtual output; a new virtual output starts at 100%.
+Pyroshine remembers the chosen scale separately for each paired client and
+applies it on future launches, including after a server or host restart.
+Same-client reconnects and resolution/rate changes retain the current scale.
+If a different paired client resumes the retained desktop, its saved scale is
+applied; a client without a saved preference starts at 100%.
 Restoration uses the original physical displays' saved scales.
+
+Preferences live in `$XDG_STATE_HOME/moonshine/desktop-preferences.json`
+(normally `~/.local/state/moonshine/desktop-preferences.json`), separately from
+the recovery journal. The key is the client's verified pairing certificate,
+so changing its name or network address does not reset the scale. A new
+certificate gets a new preference. Local diagnostic probes have no client
+identity and do not overwrite these preferences. Changes are saved while the
+virtual output is active and once more before restoration. A preference write
+failure is logged and never blocks monitor recovery. Both native adapters apply
+the saved scale; unsupported scale/mode combinations are refused by the desktop.
 
 With `audio = true`, desktop playback moves to an owned streaming sink, including
 new playback streams. The client hears desktop sound while local speakers are
@@ -156,7 +170,9 @@ cannot substitute for a missing managed output.
 
 ## Validation
 
-Automated tests cover durable snapshots before mutation, prepare/commit faults,
+Automated tests cover per-client scale persistence/isolation, quick Stop,
+same-client and different-client resume, replacement modes and preference-write
+failures, as well as durable snapshots before mutation, prepare/commit faults,
 failed restoration, helper restart, missing monitors and reconnect, stale
 leases/deadlines, capture-owner loss, grace expiry, configuration and management
 protection. These tests use an injected platform; passing them does not validate
@@ -196,6 +212,7 @@ physical KDE and GNOME hosts with a real streaming client:
 | One monitor and several open apps | Client-sized virtual output only; existing desktop and apps remain usable remotely |
 | Several monitors, mixed scales/rotation, mirrored displays | All physical outputs disabled during takeover; saved topology, primary, modes and exposed color state restored |
 | KDE Display Configuration scale changes during streaming | Apply changes icons/text at 125%, 175% and 200%; pointer remains aligned, stream pixel resolution unchanged, original physical scales restored on exit |
+| Per-client scale after Stop, restart and reconnect | Each paired client recovers its own scale; changed-size/rate reconnect preserves it; diagnostic probes do not overwrite client preferences |
 | Input consent, denied consent, revoked consent and lock | Readiness only with requested input available; denial/revocation/lock rolls back |
 | Audio already playing, new playback, removed audio device | Remote-only audio, then restored destinations/default or a working fallback |
 | Same-mode and changed-size/rate reconnect | Grace cancelled only by authenticated control; replacement validated before switch; no old frames/resources survive |

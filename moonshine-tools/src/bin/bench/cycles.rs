@@ -499,6 +499,7 @@ fn context(args: &Args, settings: Settings, cycle: u32) -> SessionContext {
 		audio_channel_mask,
 		hdr: settings.hdr,
 		client_ip: Ipv4Addr::LOCALHOST.into(),
+		client_identity: None,
 		vrr_requested: args.vrr,
 	}
 }

@@ -4,6 +4,7 @@ mod audio;
 pub(crate) mod grace;
 mod guard;
 mod native;
+mod preferences;
 mod wire;
 
 use serde::{Deserialize, Serialize};

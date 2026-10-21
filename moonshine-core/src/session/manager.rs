@@ -1570,6 +1570,16 @@ impl<B: SessionBackend> SessionCore<B> {
 			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
 			return Err(());
 		}
+		if let Some(client) = request.client_identity.clone()
+			&& let Some(lease) = guard.live().and_then(|live| live.record.desktop_lease.clone())
+		{
+			// Administrative work only. Serialize client selection with resume
+			// generations; no frame or input-event loop performs this RPC.
+			tokio::task::spawn_blocking(move || crate::desktop::Client::observer(lease).select_client(client))
+				.await
+				.map_err(|e| tracing::warn!("Desktop client selection task failed: {e}"))?
+				.map_err(|e| tracing::warn!("Cannot apply the resuming client's desktop scale: {e}"))?;
+		}
 		guard.rotate_authorization(client_ip, request.vrr_requested)?;
 		// Keys were validated at the HTTP boundary; the ledger keeps nonce
 		// allocation continuous when the client resumes with the same key.

@@ -1,6 +1,7 @@
 //! Independently supervised owner of the desktop transaction and recovery journal.
 use super::audio::{Audio, AudioSnapshot};
 use super::native::{Native, Platform, restore_configuration, verify};
+use super::preferences;
 use super::wire::{self, Reply, Request};
 use super::{DesktopStatus, Result, Snapshot, Target};
 use crate::session::capture::portal::desktop;
@@ -31,6 +32,11 @@ struct Journal {
 	audio: Option<AudioSnapshot>,
 	committed: bool,
 	active_target: Option<String>,
+	#[serde(default)]
+	client: Option<String>,
+	/// Save only a scale belonging to a fully committed client/output pair.
+	#[serde(default)]
+	scale_ready: bool,
 }
 struct Guard {
 	native: Box<dyn Platform>,
@@ -139,6 +145,42 @@ fn dead(fd: &OwnedFd) -> bool {
 	unsafe { libc::poll(&mut poll, 1, 0) > 0 }
 }
 impl Guard {
+	fn preferences_path(&self) -> PathBuf {
+		self.path.with_file_name("desktop-preferences.json")
+	}
+	fn saved_scale(&self, client: Option<&str>) -> f64 {
+		client
+			.and_then(|client| match preferences::scale(&self.preferences_path(), client) {
+				Ok(scale) => scale,
+				Err(error) => {
+					tracing::warn!(%error, "Cannot read Desktop Mode scale preference; using 100%");
+					None
+				},
+			})
+			.unwrap_or(1.0)
+	}
+	fn remember_scale(&self, current: &Snapshot) {
+		let Some(journal) = self.journal.as_ref().filter(|j| j.scale_ready) else {
+			return;
+		};
+		let Some(client) = &journal.client else {
+			return;
+		};
+		let Some(target) = journal
+			.targets
+			.iter()
+			.find(|t| Some(&t.id) == journal.active_target.as_ref())
+		else {
+			return;
+		};
+		let Some(output) = current.outputs.iter().find(|o| o.key == target.output && o.enabled) else {
+			return;
+		};
+		if let Err(error) = preferences::remember(&self.preferences_path(), client, output.scale) {
+			// Preferences must not prevent monitor recovery (for example on a full disk).
+			tracing::warn!(%error, "Cannot save Desktop Mode scale preference");
+		}
+	}
 	fn persist(&self) -> Result<()> {
 		if let Some(journal) = &self.journal {
 			save(&self.path, journal)?;
@@ -182,6 +224,7 @@ impl Guard {
 		}
 		let started = Instant::now();
 		let current = self.native.snapshot()?;
+		self.remember_scale(&current);
 		let owned: Vec<_> = journal
 			.targets
 			.iter()
@@ -273,8 +316,14 @@ impl Guard {
 				self.restore()?;
 				Ok(None)
 			},
-			Request::Prepare { lease, mode, audio } => {
+			Request::Prepare {
+				lease,
+				mode,
+				audio,
+				client,
+			} => {
 				let mode = mode.validate()?;
+				let client = client.as_deref().map(preferences::client_key).transpose()?;
 				if let Some(lease) = lease {
 					self.check(&lease)?;
 				} else {
@@ -313,6 +362,8 @@ impl Guard {
 						audio: audio_snapshot,
 						committed: false,
 						active_target: None,
+						client,
+						scale_ready: false,
 					});
 					self.grace_revision = 0;
 					self.owner = Some(owner);
@@ -353,6 +404,19 @@ impl Guard {
 			},
 			Request::Commit { lease, target } => {
 				self.check(&lease)?;
+				let current = self.native.snapshot()?;
+				self.remember_scale(&current);
+				let scale = self
+					.journal
+					.as_ref()
+					.and_then(|j| {
+						j.targets
+							.iter()
+							.find(|t| Some(&t.id) == j.active_target.as_ref())
+							.and_then(|t| current.outputs.iter().find(|o| o.key == t.output && o.enabled))
+							.map(|o| o.scale)
+					})
+					.unwrap_or_else(|| self.saved_scale(self.journal.as_ref().and_then(|j| j.client.as_deref())));
 				let target = self
 					.journal
 					.as_ref()
@@ -368,6 +432,7 @@ impl Guard {
 					.ok_or("Unknown desktop target")? = target.clone();
 				journal.committed = true;
 				journal.active_target = Some(target.id.clone());
+				journal.scale_ready = false;
 				self.phase = "committing".into();
 				if let (Some(control), Some(snapshot)) = (&mut self.audio, &mut journal.audio) {
 					control.update_snapshot(snapshot)?;
@@ -378,7 +443,9 @@ impl Guard {
 				{
 					control.route(snapshot)?;
 				}
-				self.native.commit(&target)?;
+				self.native.commit(&target, Some(scale))?;
+				self.journal.as_mut().ok_or("Desktop lease disappeared")?.scale_ready = true;
+				self.persist()?;
 				self.phase = if self.grace_deadline_ms.is_some() {
 					"grace"
 				} else {
@@ -386,6 +453,44 @@ impl Guard {
 				}
 				.into();
 				Ok(Some(target))
+			},
+			Request::SelectClient { lease, client } => {
+				self.check(&lease)?;
+				let client = preferences::client_key(&client)?;
+				if self
+					.journal
+					.as_ref()
+					.is_some_and(|j| j.client.as_ref() == Some(&client))
+				{
+					return Ok(None);
+				}
+				if !matches!(self.phase.as_str(), "active" | "grace") {
+					return Err("A desktop output transition is in progress; retry resume".into());
+				}
+				let current = self.native.snapshot()?;
+				self.remember_scale(&current);
+				let scale = self.saved_scale(Some(&client));
+				let journal = self.journal.as_mut().ok_or("Desktop lease disappeared")?;
+				let target = journal
+					.targets
+					.iter()
+					.find(|t| Some(&t.id) == journal.active_target.as_ref())
+					.cloned()
+					.ok_or("No active Desktop Mode output")?;
+				journal.client = Some(client);
+				journal.scale_ready = false;
+				self.phase = "committing".into();
+				self.persist()?;
+				self.native.commit(&target, Some(scale))?;
+				self.journal.as_mut().ok_or("Desktop lease disappeared")?.scale_ready = true;
+				self.persist()?;
+				self.phase = if self.grace_deadline_ms.is_some() {
+					"grace"
+				} else {
+					"active"
+				}
+				.into();
+				Ok(None)
 			},
 			Request::Retire { lease, target } => {
 				self.check(&lease)?;
@@ -440,6 +545,9 @@ impl Guard {
 				self.last_check = Instant::now();
 				let current = self.native.snapshot()?;
 				let changed = self.last_topology.as_ref().is_none_or(|last| last != &current);
+				if changed {
+					self.remember_scale(&current);
+				}
 				self.last_topology = Some(current);
 				if self.phase == "recovery_required"
 					&& (changed
@@ -459,7 +567,7 @@ impl Guard {
 						.and_then(|j| j.targets.iter().find(|t| Some(&t.id) == j.active_target.as_ref()))
 						.cloned()
 				{
-					self.native.commit(&target)?;
+					self.native.commit(&target, None)?;
 				}
 			}
 
@@ -617,7 +725,8 @@ pub fn run_guard() -> Result<()> {
 					mutation = matches!(
 						request,
 						Request::Prepare { .. } | Request::Commit { .. } | Request::Restore { .. }
-					);
+					) || (matches!(request, Request::SelectClient { .. })
+						&& matches!(guard.phase.as_str(), "active" | "grace"));
 					let watch = matches!(request, Request::Watch { .. });
 					let result = guard.handle(request, peer.pid)?;
 					if watch {
@@ -730,11 +839,11 @@ mod tests {
 			state.current = snapshot.clone();
 			Ok(())
 		}
-		fn commit(&mut self, target: &Target) -> Result<()> {
+		fn commit(&mut self, target: &Target, scale: Option<f64>) -> Result<()> {
 			let mut state = self.0.borrow_mut();
 			let journal = load(&state.journal)?.unwrap();
 			assert_eq!(journal.active_target.as_deref(), Some(target.id.as_str()));
-			state.current = super::super::native::takeover_configuration(&state.current, target)?;
+			state.current = super::super::native::takeover_configuration(&state.current, target, scale)?;
 			if state.fail_commit {
 				return Err("injected failure after physical displays disabled".into());
 			}
@@ -824,6 +933,9 @@ mod tests {
 		(directory, guard, state)
 	}
 	fn prepare(guard: &mut Guard) -> Target {
+		prepare_client(guard, None)
+	}
+	fn prepare_client(guard: &mut Guard, client: Option<String>) -> Target {
 		guard
 			.handle(
 				Request::Prepare {
@@ -833,6 +945,7 @@ mod tests {
 						height: 1080,
 						refresh_millihertz: 60000,
 					},
+					client,
 					audio: false,
 				},
 				std::process::id() as i32,
@@ -979,7 +1092,7 @@ mod tests {
 			assert_eq!(selected.scale, scale);
 			assert_eq!(selected.mode, target.mode);
 			assert!(!observed.outputs.iter().any(|o| o.enabled && o.key != target.output));
-			let desired = super::super::native::takeover_configuration(&observed, &target).unwrap();
+			let desired = super::super::native::takeover_configuration(&observed, &target, None).unwrap();
 			assert!(
 				verify(&observed, &desired).is_ok(),
 				"no configuration is needed for a scale-only edit"
@@ -988,6 +1101,253 @@ mod tests {
 		}
 		guard.restore().unwrap();
 		assert_eq!(state.borrow().current, baseline);
+	}
+
+	#[test]
+	fn per_client_scale_survives_restoration_and_replacement_without_changing_physical_scales() {
+		let (_directory, mut guard, state) = fixture();
+		let baseline = state.borrow().current.clone();
+		let phone = "a".repeat(64);
+		let laptop = "b".repeat(64);
+		let target = prepare_client(&mut guard, Some(phone.clone()));
+		commit(&mut guard, &target);
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			1.0
+		);
+		state
+			.borrow_mut()
+			.current
+			.outputs
+			.iter_mut()
+			.find(|o| o.key == target.output)
+			.unwrap()
+			.scale = 2.0;
+		// No timer tick: a quick Stop must still save the last chosen scale.
+		guard.restore().unwrap();
+		assert_eq!(state.borrow().current, baseline);
+		assert_eq!(preferences::scale(&guard.preferences_path(), &phone), Ok(Some(2.0)));
+		let target = prepare_client(&mut guard, Some(laptop.clone()));
+		commit(&mut guard, &target);
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			1.0
+		);
+		state
+			.borrow_mut()
+			.current
+			.outputs
+			.iter_mut()
+			.find(|o| o.key == target.output)
+			.unwrap()
+			.scale = 1.25;
+		guard.last_check = Instant::now() - Duration::from_secs(1);
+		guard.tick();
+		assert_eq!(preferences::scale(&guard.preferences_path(), &laptop), Ok(Some(1.25)));
+		let replacement = guard
+			.handle(
+				Request::Prepare {
+					lease: Some(guard.journal.as_ref().unwrap().lease.clone()),
+					mode: super::super::Mode {
+						width: 2560,
+						height: 1600,
+						refresh_millihertz: 120000,
+					},
+					audio: false,
+					client: None,
+				},
+				std::process::id() as i32,
+			)
+			.unwrap()
+			.unwrap();
+		commit(&mut guard, &replacement);
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == replacement.output)
+				.unwrap()
+				.scale,
+			1.25
+		);
+		guard.restore().unwrap();
+		let target = prepare_client(&mut guard, Some(phone));
+		commit(&mut guard, &target);
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			2.0
+		);
+		guard.restore().unwrap();
+		assert_eq!(state.borrow().current, baseline);
+	}
+
+	#[test]
+	fn a_different_client_resuming_the_retained_output_gets_its_own_scale() {
+		let (_directory, mut guard, state) = fixture();
+		let phone = "a".repeat(64);
+		let laptop = "b".repeat(64);
+		let target = prepare_client(&mut guard, Some(phone.clone()));
+		commit(&mut guard, &target);
+		state
+			.borrow_mut()
+			.current
+			.outputs
+			.iter_mut()
+			.find(|o| o.key == target.output)
+			.unwrap()
+			.scale = 2.0;
+		let lease = guard.journal.as_ref().unwrap().lease.clone();
+		let select = |guard: &mut Guard, client: String| {
+			guard
+				.handle(
+					Request::SelectClient {
+						lease: lease.clone(),
+						client,
+					},
+					std::process::id() as i32,
+				)
+				.unwrap();
+		};
+		select(&mut guard, laptop.clone());
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			1.0
+		);
+		assert_eq!(preferences::scale(&guard.preferences_path(), &phone), Ok(Some(2.0)));
+		state
+			.borrow_mut()
+			.current
+			.outputs
+			.iter_mut()
+			.find(|o| o.key == target.output)
+			.unwrap()
+			.scale = 1.5;
+		// Same-client reconnect preserves the current choice without reapplying.
+		select(&mut guard, laptop.clone());
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			1.5
+		);
+		select(&mut guard, phone);
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			2.0
+		);
+		assert_eq!(preferences::scale(&guard.preferences_path(), &laptop), Ok(Some(1.5)));
+		assert_eq!(guard.journal.as_ref().unwrap().targets.len(), 1);
+		guard.phase = "preparing".into();
+		assert!(
+			guard
+				.handle(
+					Request::SelectClient { lease, client: laptop },
+					std::process::id() as i32
+				)
+				.is_err()
+		);
+		assert_eq!(
+			state
+				.borrow()
+				.current
+				.outputs
+				.iter()
+				.find(|o| o.key == target.output)
+				.unwrap()
+				.scale,
+			2.0
+		);
+		guard.restore().unwrap();
+	}
+
+	#[test]
+	fn failed_profile_application_does_not_replace_a_saved_scale_and_preference_errors_do_not_block_restore() {
+		let (_directory, mut guard, state) = fixture();
+		let baseline = state.borrow().current.clone();
+		let client = "a".repeat(64);
+		preferences::remember(&guard.preferences_path(), &client, 1.75).unwrap();
+		let target = prepare_client(&mut guard, Some(client.clone()));
+		let lease = guard.journal.as_ref().unwrap().lease.clone();
+		state.borrow_mut().fail_commit = true;
+		assert!(
+			guard
+				.handle(
+					Request::Commit {
+						lease,
+						target: target.id
+					},
+					std::process::id() as i32
+				)
+				.is_err()
+		);
+		state
+			.borrow_mut()
+			.current
+			.outputs
+			.iter_mut()
+			.find(|o| o.key == target.output)
+			.unwrap()
+			.scale = 3.0;
+		guard.recover();
+		assert_eq!(guard.phase, "idle");
+		assert_eq!(preferences::scale(&guard.preferences_path(), &client), Ok(Some(1.75)));
+		state.borrow_mut().fail_commit = false;
+		let target = prepare_client(&mut guard, Some(client.clone()));
+		commit(&mut guard, &target);
+		state
+			.borrow_mut()
+			.current
+			.outputs
+			.iter_mut()
+			.find(|o| o.key == target.output)
+			.unwrap()
+			.scale = 2.0;
+		crate::durable::fail_next("rename", libc::EIO);
+		guard.restore().unwrap();
+		assert_eq!(state.borrow().current, baseline);
+		assert_eq!(preferences::scale(&guard.preferences_path(), &client), Ok(Some(1.75)));
 	}
 	#[test]
 	fn failure_after_output_creation_rolls_back_owned_resources() {
@@ -1003,6 +1363,7 @@ mod tests {
 							height: 1080,
 							refresh_millihertz: 60000
 						},
+						client: None,
 						audio: false
 					},
 					std::process::id() as i32
@@ -1055,6 +1416,7 @@ mod tests {
 						height: 1440,
 						refresh_millihertz: 120000,
 					},
+					client: None,
 					audio: false,
 				},
 				std::process::id() as i32,
@@ -1202,6 +1564,7 @@ mod tests {
 						height: 1080,
 						refresh_millihertz: 60000,
 					},
+					client: None,
 					audio: false,
 				},
 				child.id() as i32,

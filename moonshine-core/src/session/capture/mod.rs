@@ -196,6 +196,7 @@ impl CaptureSource {
 			CaptureBackend::Desktop => {
 				let config = portal::PortalCaptureConfig {
 					desktop: settings.desktop,
+					client_identity: context.client_identity.clone(),
 					gpu: None,
 					restore_token: portal::token::default_path(),
 					refresh_rate: context.refresh_rate,

@@ -132,6 +132,7 @@ pub fn run(options: ProbeOptions) -> Result<ProbeReport, String> {
 				..DesktopConfig::default()
 			},
 			gpu: None,
+			client_identity: None,
 			restore_token: options.restore_token.clone(),
 			refresh_rate: options.refresh_rate,
 			resolution: (1920, 1080),

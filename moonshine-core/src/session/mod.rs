@@ -142,6 +142,9 @@ pub struct SessionContext {
 	/// The current launch/resume client is owned by `StreamAuthorization`;
 	/// this launch metadata does not change when the retained session resumes.
 	pub client_ip: IpAddr,
+	/// Verified TLS certificate fingerprint for per-client desktop preferences.
+	/// Absent for local tools; never derived from a request's uniqueid or IP.
+	pub client_identity: Option<String>,
 
 	/// The launching client asked for VRR presentation (`clientVrrRequested`).
 	/// Carried by its authorization generation, like a resume's request.
@@ -153,6 +156,7 @@ pub struct SessionContext {
 /// values are retained to drive and diagnose compositor/capture changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResumeRequest {
+	pub client_identity: Option<String>,
 	pub resolution: Option<(u32, u32)>,
 	pub refresh_rate: Option<u32>,
 	pub hdr: Option<bool>,

@@ -465,6 +465,7 @@ fn context() -> SessionContext {
 		audio_channel_mask: 0x3,
 		hdr: false,
 		client_ip: "127.0.0.1".parse().unwrap(),
+		client_identity: None,
 		vrr_requested: false,
 	}
 }
