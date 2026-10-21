@@ -50,6 +50,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Make `pyroshine pair` use `MOONSHINE_MANAGEMENT_BUS` when it is set, like `pyroshine web` and `diag`. A pairing command started for a test instance on its own bus previously reached the live service on the session bus instead.
+
 - Resume Desktop Mode video on an unchanged desktop. Keep the newest capture during a disconnect, refresh its admission after reconnect, and wait for the current client's video endpoint before producing the recovery frame. Previously that frame could be discarded before endpoint discovery, leaving a quiet desktop black until another redraw or session restart.
 
 - Fail the desktop probe when its capture worker stops before the requested duration or reports a failure, even if some frames were received.

@@ -196,7 +196,9 @@ is ignored with a warning.
 A server test instance beside a live service also cannot own the management
 name on the shared session bus. `MOONSHINE_MANAGEMENT_BUS` (a D-Bus address,
 for example of a private `dbus-daemon`) serves its management interface there
-instead; applications still start through the session bus's systemd.
+instead; applications still start through the session bus's systemd. Set the
+same variable for `pyroshine pair`, `web` and `diag` aimed at the test
+instance: without it they reach the live service on the session bus.
 
 ### Output
 

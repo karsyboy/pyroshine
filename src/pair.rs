@@ -10,13 +10,11 @@ use moonshine_management::{API_VERSION, BUS_NAME, ManagementError, ManagementPro
 const REQUEST_WAIT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub async fn run(name: &str) -> Result<(), String> {
-	let connection = zbus::connection::Builder::session()
-		.map_err(bus_error)?
-		.method_timeout(Duration::from_secs(5))
-		.build()
-		.await
-		.map_err(bus_error)?;
+/// Pair interactively. `bus` is the address of the bus serving the management
+/// interface (`MOONSHINE_MANAGEMENT_BUS` for a test instance), or `None` for
+/// the session bus.
+pub async fn run(name: &str, bus: Option<String>) -> Result<(), String> {
+	let connection = open(bus.as_deref()).await?;
 	let proxy = connect(&connection).await?;
 	if !std::io::stdin().is_terminal() {
 		return Err("Use an interactive terminal on the host, or SSH with a terminal (ssh -t user@host).".into());
@@ -29,6 +27,18 @@ pub async fn run(name: &str) -> Result<(), String> {
 		REQUEST_WAIT,
 	)
 	.await
+}
+
+async fn open(bus: Option<&str>) -> Result<zbus::Connection, String> {
+	match bus {
+		Some(address) => zbus::connection::Builder::address(address),
+		None => zbus::connection::Builder::session(),
+	}
+	.map_err(bus_error)?
+	.method_timeout(Duration::from_secs(5))
+	.build()
+	.await
+	.map_err(bus_error)
 }
 
 fn bus_error(error: zbus::Error) -> String {
