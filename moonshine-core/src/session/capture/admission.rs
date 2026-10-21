@@ -20,6 +20,13 @@ pub(crate) struct CaptureCredit {
 	state: Arc<AtomicU64>,
 	ticket: u64,
 }
+impl CaptureCredit {
+	/// A retained producer frame can outlive a receiver's reconnect reset.
+	/// Its pixels remain owned, but admission must be claimed for the new epoch.
+	pub(crate) fn is_current(&self) -> bool {
+		self.state.load(Ordering::Acquire) == self.ticket
+	}
+}
 impl Drop for CaptureCredit {
 	fn drop(&mut self) {
 		// An old epoch's completion must never replenish a new epoch's credit.
@@ -394,9 +401,12 @@ mod tests {
 		let (tx, rx) = capture_channel();
 		pending(&rx);
 		let old = tx.try_acquire().unwrap();
+		assert!(old.is_current());
 		rx.reset();
+		assert!(!old.is_current(), "retained pixels need a new epoch's credit");
 		pending(&rx);
 		let current = tx.try_acquire().unwrap();
+		assert!(current.is_current());
 		drop(old);
 		assert!(tx.occupied());
 		drop(current);

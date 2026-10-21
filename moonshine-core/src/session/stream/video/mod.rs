@@ -729,6 +729,10 @@ fn spawn_handle_video_packets(
 	mut fps: u32,
 	log_stats: bool,
 ) {
+	// An activated epoch is not yet deliverable until StartB and the current
+	// client's PING. In particular, do not discard the only recovery frame of
+	// an idle desktop while its endpoint is still being discovered.
+	demand.set(false);
 	tokio::spawn(async move {
 		// Declared first so it is released after the socket and channel below.
 		let _worker = worker;
@@ -752,6 +756,7 @@ fn spawn_handle_video_packets(
 		let mut transport_window = diagnostics::TransportWindow::new(log_stats);
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			let mut delivery_changed = false;
 			tokio::select! {
 				result = &mut start, if !started => {
 					if result.is_err() {
@@ -759,6 +764,7 @@ fn spawn_handle_video_packets(
 						break;
 					}
 					started = true;
+					delivery_changed = true;
 				},
 				Ok(()) = pause_rx.changed() => {
 					if !paused { client_address = None; }
@@ -786,7 +792,7 @@ fn spawn_handle_video_packets(
 							fps = context.fps;
 							active_generation = generation;
 							paused = false;
-							demand.set(true);
+							delivery_changed = true;
 							let tos = if context.qos { 160 } else { 0 };
 							let _ = socket.set_tos_v4(tos);
 							let _ = ready.send(());
@@ -816,6 +822,7 @@ fn spawn_handle_video_packets(
 											},
 											Ok(()) = authorization.changed() => {
 												if authorization.borrow_and_update().generation() != active_generation {
+													demand.set(false);
 													break None;
 												}
 											},
@@ -905,6 +912,10 @@ fn spawn_handle_video_packets(
 					}
 				},
 
+				Ok(()) = authorization.changed() => {
+					authorization.borrow_and_update();
+					delivery_changed = true;
+				},
 				message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
 					let (len, address) = match message {
 						Ok(Ok((len, address))) => (len, address),
@@ -920,10 +931,22 @@ fn spawn_handle_video_packets(
 					if authorization.borrow().admits_media_ping(MediaStream::Video, address, &buf[..len]) {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some((authorization.borrow().generation(), address));
+						delivery_changed = true;
 					} else {
 						tracing::debug!(%address, len, "Ignoring unauthorized video endpoint discovery datagram");
 					}
 				},
+			}
+			if delivery_changed {
+				demand.set(
+					deliverable(
+						client_address,
+						started && !paused,
+						active_generation,
+						authorization.borrow().generation(),
+					)
+					.is_some(),
+				);
 			}
 		}
 
@@ -1674,11 +1697,12 @@ mod tests {
 	}
 
 	/// Review 2026-10-05 PERF-001: every pause (urgent notification or the
-	/// ordered barrier) clears media demand, and only an epoch activation
-	/// restores it, so producers stop while no client can receive media.
+	/// ordered barrier) clears media demand. Activation alone must not consume
+	/// the first recovery frame before the client discovers its video endpoint.
 	#[tokio::test]
-	async fn pauses_clear_media_demand_until_an_epoch_activates() {
+	async fn resumed_media_waits_for_the_current_video_endpoint() {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
 		let stop = ShutdownManager::new();
 		let start = StartLatch::new();
 		let (tx, rx) = mpsc::channel(16);
@@ -1700,7 +1724,21 @@ mod tests {
 			false,
 		);
 		start.open();
-		assert!(demand.wanted());
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let wait_for_demand = |wanted| {
+			let demand = demand.clone();
+			async move {
+				tokio::time::timeout(std::time::Duration::from_secs(1), async {
+					while demand.wanted() != wanted {
+						tokio::task::yield_now().await;
+					}
+				})
+				.await
+				.unwrap();
+			}
+		};
+		client.send_to(b"PING", server).await.unwrap();
+		wait_for_demand(true).await;
 		let activate = || async {
 			let (ready, activated) = tokio::sync::oneshot::channel();
 			tx.send(VideoPacketMessage::BeginEpoch {
@@ -1718,7 +1756,12 @@ mod tests {
 		acknowledged.await.unwrap();
 		assert!(!demand.wanted());
 		activate().await;
-		assert!(demand.wanted());
+		assert!(
+			!demand.wanted(),
+			"activation must retain recovery until a video endpoint exists"
+		);
+		client.send_to(b"PING", server).await.unwrap();
+		wait_for_demand(true).await;
 		// Urgent notification alone.
 		pause_tx.send_modify(|g| *g += 1);
 		tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1728,8 +1771,13 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		// The other ordering is valid too: discovery during pause cannot
+		// resume capture, but must be usable as soon as PLAY activates it.
+		client.send_to(b"PING", server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		assert!(!demand.wanted());
 		activate().await;
-		assert!(demand.wanted());
+		wait_for_demand(true).await;
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 		stop.wait_shutdown_complete().await;
 	}

@@ -1367,7 +1367,7 @@ mod takeover_tests {
 				client_identity: None,
 				restore_token: Some(path),
 				resolution: (2880, 1920),
-				diagnostics: false,
+				diagnostics: true,
 				implicit_sync: false,
 				refresh_rate: 60,
 			},
@@ -1395,6 +1395,28 @@ mod takeover_tests {
 				}
 				if frames == 0 {
 					return Err("No capture frames arrived".into());
+				}
+				// Same-mode reconnect retains the producer but resets admission.
+				// Stop requesting captures long enough for outstanding buffers to
+				// drain, then require pixels without input or another output change.
+				for cycle in 0..12 {
+					std::thread::sleep(Duration::from_millis(250));
+					let report = launched.diagnostics().ok_or("Capture diagnostics missing")?;
+					if !report.request_driven && report.pending != 1 {
+						return Err(format!("Paused producer lost its latest picture: {report:?}"));
+					}
+					endpoints.frames.reset();
+					let resumed_at = Instant::now();
+					let mut frame = endpoints
+						.frames
+						.recv_timeout_if(Duration::from_millis(500), true)
+						.map_err(|e| format!("Same-mode reconnect {cycle} produced no frame: {e}"))?;
+					eprintln!(
+						"desktop-reconnect: cycle={cycle} first_frame_us={}",
+						resumed_at.elapsed().as_micros()
+					);
+					frame.consumed.store(true, std::sync::atomic::Ordering::Release);
+					drop(frame.capture_credit.take());
 				}
 				// Simulate a consumer holding a read across replacement. The old
 				// stream must wait for consumption before its producer can retire.

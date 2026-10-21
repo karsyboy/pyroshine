@@ -50,6 +50,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Resume Desktop Mode video on an unchanged desktop. Keep the newest capture during a disconnect, refresh its admission after reconnect, and wait for the current client's video endpoint before producing the recovery frame. Previously that frame could be discarded before endpoint discovery, leaving a quiet desktop black until another redraw or session restart.
+
 - Fail the desktop probe when its capture worker stops before the requested duration or reports a failure, even if some frames were received.
 
 - Recover VA-API H.264/HEVC from a trusted retained reference when available, with matching DPB and packed headers; keep keyframe fallback for AV1 and unsafe references. Coalesce covered NVENC invalidation calls while preserving through-head recovery and its default preset. Static scenes submit pending reference recovery too.

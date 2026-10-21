@@ -157,9 +157,12 @@ consumption hold until GPU reads finish. Pool census counts actual announcements
 separately from the requested minimum of three buffers (producer, pending and GPU
 ownership).
 
-`process` drains to the newest buffer, claims admission before exporting it, and
-retains one pending frame. Replacing pending pixels transfers the existing
-credit. Producer completion is registered with a shared epoll source; the capture
+`process` drains to the newest buffer and retains one pending frame, including
+while media delivery is paused. A damage-driven producer may send no further
+picture until the desktop changes, so renewed demand must be able to publish the
+retained picture. Only publication requires admission; reconnect resets replace
+an obsolete credit without discarding those pixels. Replacing pending pixels
+transfers a current credit. Producer completion is registered with a shared epoll source; the capture
 loop publishes only after nonblocking readiness succeeds. Error/hangup or an
 unsignaled fence beyond 50 ms fails capture; elapsed time never implies readiness.
 Startup validates completed pixels before committing takeover and discards those

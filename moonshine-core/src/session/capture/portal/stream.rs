@@ -723,6 +723,9 @@ impl Inner {
 			return;
 		}
 		let pending = self.pending.as_mut().expect("completed pending buffer");
+		if pending.credit.as_ref().is_some_and(|credit| !credit.is_current()) {
+			pending.credit = None;
+		}
 		if pending.credit.is_none() {
 			pending.credit = self.sender.try_acquire();
 		}
@@ -906,12 +909,16 @@ impl Inner {
 		let carried_credit = self.pending.as_mut().and_then(|p| p.credit.take());
 		self.discard_pending(stream);
 		let credit = if self.active {
-			let Some(credit) = carried_credit.or_else(|| self.sender.try_acquire()) else {
+			let credit = carried_credit
+				.filter(CaptureCredit::is_current)
+				.or_else(|| self.sender.try_acquire());
+			if credit.is_none() {
 				self.status.no_credit += 1;
-				self.requeue(stream, id);
-				return;
-			};
-			Some(credit)
+			}
+			// Desktop producers may stop after the last damaged frame. Retain
+			// that single owned picture during a pause so renewed demand can
+			// publish it without requiring input or another desktop redraw.
+			credit
 		} else {
 			None
 		}; // Pre-commit first-frame validation, never publication.
