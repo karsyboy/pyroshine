@@ -714,7 +714,10 @@ impl Worker {
 		if due.is_empty() && self.last_refresh_ms.is_some() {
 			return;
 		}
-		self.publish_view(true);
+		// The first refresh of a library without scanners only publishes the
+		// manual catalog; claiming a scan would contradict the initial view,
+		// which already said nothing is being scanned.
+		self.publish_view(!due.is_empty());
 		for index in due {
 			// A stop request ends the work between sources.
 			if self.stop.load(Ordering::Acquire) {
