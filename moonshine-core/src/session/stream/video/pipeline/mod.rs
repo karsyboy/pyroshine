@@ -1418,6 +1418,7 @@ impl VideoPipelineInner {
 		packetizer.warm_up(
 			fec_controller.percentage(),
 			fec_controller.minimum_packets(ctx.minimum_fec_packets),
+			|| stop_session_manager.is_shutdown_triggered(),
 		);
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
@@ -1726,6 +1727,7 @@ impl VideoPipelineInner {
 			} else {
 				ctx.minimum_fec_packets
 			},
+			|| stop_session_manager.is_shutdown_triggered(),
 		);
 
 		// The encoder is asynchronous: each `encode()` returns a future that
