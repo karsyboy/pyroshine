@@ -16,6 +16,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
+- Add generation-scoped live bitrate controls for Vulkan Video, VA-API and NVENC, with bounded coalescing, accepted-rate and first-picture results, and benchmark `--rate-change` requests. Fixed negotiated bitrate remains the default; updates preserve references and stay inside the startup budget.
+
+- Extend `moonshine-desktop-probe` with read-only `--status`, configurable `--width`/`--height`, opt-in `--timings`, and `--implicit-sync` for comparing synchronization paths. Reports distinguish the requested mode, observed output mode (when supplied by the guard), negotiated PipeWire rate/layout, actual buffer pool and first completed frame. Baseline manifests include capture/encoder source hashes and desktop/PipeWire versions.
+
 - Remember Desktop Mode UI scale per paired client, keyed to its verified certificate. Reapply it on future launches and client switches, retain it across mode changes and reconnects, and keep preferences separate from physical-monitor recovery. Diagnostic probes do not overwrite client preferences.
 
 - Add managed Desktop Mode for the existing Wayland session, with native KDE Plasma and GNOME adapters: a client-sized SDR virtual display, physical-display takeover, remote-only audio, input authorization, configurable reconnect grace and an independent recovery guard. Add Dashboard recovery controls and `pyroshine desktop status|authorize|restore`. Games retain isolated sessions. Automated recovery tests are included; physical KDE/GNOME streaming acceptance remains to be completed. See [Desktop Mode](DESKTOP_MODE.md).
@@ -45,6 +49,15 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Scan faster at startup. The initial scan runs while the host checks run, and icon lookups no longer walk symlinked theme directories or theme contexts that hold no application icons. With Steam (52 games) and desktop-entry (138 entries) scanners, a scan on a CachyOS/KDE host fell from 1.2–1.7 s to under 40 ms of CPU, with the same box art for every entry; a 2,000-game Steam library scans in about 40 ms.
 
 ### Fixed
+
+- Fail the desktop probe when its capture worker stops before the requested duration or reports a failure, even if some frames were received.
+
+- Recover VA-API H.264/HEVC from a trusted retained reference when available, with matching DPB and packed headers; keep keyframe fallback for AV1 and unsafe references. Coalesce covered NVENC invalidation calls while preserving through-head recovery and its default preset. Static scenes submit pending reference recovery too.
+- Close guard-owned display resources when a successful prepare/commit reply cannot reach its requester, including cancellation while a native stream is being announced.
+- Schedule capable request-driven PipeWire producers with bounded, admission-aware paint pacing; unknown producers retain their existing scheduling.
+
+- Keep Desktop Mode producer-fence waits off PipeWire callbacks. Capture now tracks stream and buffer generations, waits for GPU completion through the owning event loop, rejects stale/resent buffers, and retains removed buffers until encoder reads finish. Negotiate explicit acquire/release timelines on the verified capture GPU when both ends support them, with a fresh implicit-only stream on setup failure. Drain and disconnect old consumers before retiring their virtual output during mode replacement.
+- Discover KDE outputs through either the output registry or classic per-output globals when the full required mode/topology capabilities exist. Preserve fractional refresh precision in PipeWire offers and verify the applied virtual-output mode before capture readiness.
 
 - Allow UI scale changes through KDE Display Configuration during Desktop Mode. Keep the chosen virtual-output scale during topology enforcement, avoid redundant output transactions, and map input through the scaled EIS region without changing stream resolution. Restore physical displays with their original scales on exit.
 

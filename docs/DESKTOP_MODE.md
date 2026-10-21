@@ -122,8 +122,32 @@ For a source build, install the user unit following
 [Contributing](../CONTRIBUTING.md). The main server command can create a separate
 transient user unit using its own executable when the installed unit is absent.
 The standalone `moonshine-desktop-probe` needs the guard installed or already
-started with the server executable. The probe performs a real 1920×1080 takeover
-and restores afterward; it is not a read-only capability check.
+started with the server executable. Use `--status` to query the running guard
+without starting a service or changing displays. Without `--status`, the probe
+performs a real takeover and restores afterward (1920×1080 at 60 Hz by default).
+
+```sh
+moonshine-desktop-probe --status
+moonshine-desktop-probe --width 2880 --height 1920 --fps 120 --duration 10 --timings --json capture.json
+# Repeat the same workload using implicit synchronization:
+moonshine-desktop-probe --width 2880 --height 1920 --fps 120 --duration 10 --timings --implicit-sync --json capture-implicit.json
+```
+
+Capture reports include the requested mode, the guard's observed native mode
+(`null` with older guards), PipeWire's rational rate/ceiling, format/modifier,
+plane count, actual pool, sync mode and first completed frame. Delivered FPS is
+measured separately and can be lower on idle desktops. `--timings` adds bounded
+histograms for callback time, producer-ready delay, acquire-to-publish delay and
+consumer hold duration. Percentiles are logarithmic bucket upper bounds in µs;
+maxima are exact. Timing collection is disabled during ordinary sessions and
+adds measurement overhead when enabled. The existing pipeline benchmark's
+`frame_age` distribution covers content timestamp through final socket submission;
+the capture-only probe does not measure encoding or transport.
+
+The implicit override affects this diagnostic probe only. Normal capture probes
+explicit timeline synchronization on the selected GPU, negotiates it only when
+the producer supports it, and reopens an implicit-only candidate after setup
+failure. Neither mode permits CPU video buffers or another GPU.
 
 ## Ownership and adapters
 
@@ -140,7 +164,9 @@ admission and the existing encoder. Retired capture streams keep their buffers
 until GPU consumers release them. No per-frame IPC passes through the guard.
 
 KDE uses pinned output-device, output-management and screencast Wayland
-protocols, including custom modes and output priority. GNOME uses Mutter's
+protocols, including custom modes and output priority. Discovery prefers the
+output registry and otherwise uses classic per-output globals; both require
+management/device capabilities sufficient for complete mode and topology recovery. GNOME uses Mutter's
 native ScreenCast platform virtual monitors and temporary DisplayConfig changes,
 including logical mirror groups and layout mode. Both snapshots include mode,
 position, scale, transform, primary/priority and exposed color state. The guard
@@ -148,7 +174,8 @@ reconciles stable output identities on recovery and verifies observed settings.
 KWin virtual outputs cannot be disabled through output configuration: recovery
 first restores physical displays with the owned output still live, then closes
 its owner and verifies the final topology. Replacement waits for old capture
-buffers to drain before closing their owner. PipeWire format negotiation may
+buffers to drain and disconnects the old PipeWire consumer before closing its
+native producer owner. PipeWire format negotiation may
 briefly report the initial 60 Hz mode; readiness waits for the requested mode
 within its existing deadline.
 

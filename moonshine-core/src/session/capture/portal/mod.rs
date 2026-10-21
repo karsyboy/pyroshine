@@ -6,8 +6,13 @@ pub(crate) mod dbus;
 pub(crate) mod desktop;
 pub(crate) mod device;
 pub(crate) mod input;
+mod ledger;
+pub mod metrics;
+mod pacer;
 pub mod probe;
+pub(crate) mod readiness;
 pub(crate) mod stream;
+pub(crate) mod sync;
 pub(crate) mod token;
 
 use std::os::fd::OwnedFd;
@@ -87,6 +92,8 @@ pub(crate) struct PortalCaptureConfig {
 	/// Frame rate asked of the compositor: the launching client's.
 	pub refresh_rate: u32,
 	pub resolution: (u32, u32),
+	pub diagnostics: bool,
+	pub implicit_sync: bool,
 }
 
 /// The captured output.
@@ -132,6 +139,7 @@ struct Live {
 	view: Arc<input::StreamView>,
 	mode: Mutex<crate::desktop::Mode>,
 	changes: calloop::channel::Sender<ModeChange>,
+	diagnostics: Mutex<Option<metrics::CaptureReport>>,
 }
 
 #[derive(Debug)]
@@ -248,6 +256,7 @@ impl PortalCapture {
 				refresh_millihertz: config.refresh_rate.saturating_mul(1000),
 			}),
 			changes,
+			diagnostics: Mutex::new(None),
 		});
 		let thread_failure = failure.clone();
 		let thread_live = live.clone();
@@ -291,6 +300,9 @@ impl PortalCapture {
 }
 
 impl LaunchedPortal {
+	pub(crate) fn diagnostics(&self) -> Option<metrics::CaptureReport> {
+		self.live.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
 	pub(crate) fn ready(&self) -> &DesktopReady {
 		&self.ready
 	}
@@ -565,6 +577,7 @@ impl State {
 	/// Run the PipeWire loop without blocking and check the stream.
 	fn pump(&mut self) {
 		self.mainloop.loop_().iterate(pw::loop_::Timeout::None);
+		self.stream.service();
 		self.check_stream();
 		for (stream, _) in &self.retired {
 			stream.service();
@@ -624,13 +637,25 @@ impl State {
 			return Err("Session is stopping".into());
 		}
 		let target = self.guard.replacement(mode)?;
-		let replacement = CaptureStream::connect(
+		let (replacement, _) = open_stream(
 			&self.core,
 			&target,
 			self.offered.clone(),
 			self.stream.replacement_sender(),
+			StreamOptions {
+				mainloop: self.mainloop.clone(),
+				readiness: self.stream.readiness(),
+				sync_device: self.stream.sync_device(),
+				diagnostics: self
+					.live
+					.diagnostics
+					.lock()
+					.unwrap_or_else(|e| e.into_inner())
+					.as_ref()
+					.is_some_and(|d| d.timings_enabled),
+			},
+			self.stop.clone(),
 		)?;
-		wait_format(&self.mainloop, &replacement, &target, self.stop.clone())?;
 		self.stream.set_active(false);
 		let deadline = Instant::now() + FORMAT_TIMEOUT;
 		while !self.stream.drained() || self.retired.iter().any(|(s, _)| !s.drained()) {
@@ -644,16 +669,24 @@ impl State {
 			}
 			std::thread::sleep(Duration::from_millis(2));
 		}
+		// KWin closes old producer nodes during commit. Disconnect the drained
+		// consumer first, and flush that destruction before the native owner is
+		// retired, so late node/port updates cannot address a removed resource.
+		self.stream.disconnect_drained()?;
+		pipewire_roundtrip(&self.mainloop, &self.core, &self.stop)?;
 		let target = self.guard.commit(&target.id)?;
 		self.input.set_output(geometry(&target));
 		wait_input(&self.mainloop, &mut self.input, self.stop.clone())?;
 		let format = replacement
 			.with_status(|s| s.format)
 			.ok_or("Replacement stream has no format")?;
+		replacement.observe_output(target.observed_mode);
 		let previous = std::mem::replace(&mut self.stream, replacement);
 		self.retired.push((previous, self.target.id.clone()));
 		self.target = target;
 		self.format = format;
+		self.stats_sent = 0;
+		self.stats_at = Instant::now();
 		*self.live.size.lock().unwrap_or_else(|e| e.into_inner()) = (mode.width, mode.height);
 		*self.live.mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
 		self.live.view.set(mode.width, mode.height, true);
@@ -835,11 +868,23 @@ fn capture(
 			}
 		})
 		.register();
-	let stream = CaptureStream::connect(&core, &target, offered.clone(), frame_tx)
-		.map_err(|error| capture_failure("desktop_capture_failed", error))?;
-
-	let format = wait_format(&mainloop, &stream, &target, stop.clone())
-		.map_err(|e| capture_failure("desktop_capture_unsupported", e))?;
+	let readiness = readiness::Readiness::new().map_err(|e| capture_failure("desktop_capture_failed", e))?;
+	let (stream, format) = open_stream(
+		&core,
+		&target,
+		offered.clone(),
+		frame_tx,
+		StreamOptions {
+			mainloop: mainloop.clone(),
+			readiness: readiness.clone(),
+			diagnostics: config.diagnostics,
+			sync_device: (!config.implicit_sync)
+				.then(|| sync::SyncDevice::probe(std::os::fd::AsFd::as_fd(&render_file)))
+				.flatten(),
+		},
+		stop.clone(),
+	)
+	.map_err(|e| capture_failure("desktop_capture_unsupported", e))?;
 	let output_geometry = geometry(&target);
 
 	let mut input = match eis {
@@ -874,7 +919,9 @@ fn capture(
 			"Managed Desktop Mode requires an SDR virtual output",
 		));
 	}
+	stream.observe_output(target.observed_mode);
 	stream.set_active(true);
+	*live.diagnostics.lock().unwrap_or_else(|e| e.into_inner()) = Some(stream.report());
 	let fourcc = Fourcc::try_from(format.fourcc).unwrap_or(Fourcc::Xrgb8888);
 	let ready = DesktopReady {
 		capabilities: CaptureCapabilities {
@@ -920,6 +967,24 @@ fn capture(
 		let mut event_loop: EventLoop<State> = EventLoop::try_new()
 			.map_err(|e| capture_failure("desktop_capture_failed", format!("Cannot create the event loop: {e}.")))?;
 		let handle = event_loop.handle();
+		handle
+			.insert_source(
+				calloop::generic::Generic::new(dup(readiness.fd())?, Interest::READ, Mode::Level),
+				|_, _, state: &mut State| {
+					state.stream.service();
+					state.check_stream();
+					Ok(PostAction::Continue)
+				},
+			)
+			.map_err(insert_error)?;
+		if stream.request_driven() {
+			handle
+				.insert_source(calloop::timer::Timer::immediate(), |_, _, state: &mut State| {
+					state.stream.service();
+					calloop::timer::TimeoutAction::ToDuration(state.stream.schedule_after())
+				})
+				.map_err(insert_error)?;
+		}
 		let pipewire_fd = dup(mainloop.loop_().fd())?;
 		handle
 			.insert_source(
@@ -1006,6 +1071,10 @@ fn capture(
 					state.check_stream();
 					state.check_input();
 					state.log_stats();
+					let mut diagnostics = state.live.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+					if diagnostics.is_some() {
+						*diagnostics = Some(state.stream.report());
+					}
 					calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(100))
 				},
 			)
@@ -1059,6 +1128,12 @@ fn capture(
 			std::thread::sleep(Duration::from_millis(2));
 		}
 		state.pump();
+		{
+			let mut diagnostics = state.live.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+			if diagnostics.is_some() {
+				*diagnostics = Some(state.stream.report());
+			}
+		}
 		match state.ended.take() {
 			Some(ended) if !stop.is_shutdown_triggered() => {
 				// Recorded before this thread's exit stops the session.
@@ -1088,6 +1163,83 @@ fn geometry(target: &crate::desktop::Target) -> OutputGeometry {
 		follow_scale: true,
 	}
 }
+struct StreamOptions {
+	mainloop: pw::main_loop::MainLoopRc,
+	readiness: std::rc::Rc<readiness::Readiness>,
+	sync_device: Option<std::rc::Rc<sync::SyncDevice>>,
+	diagnostics: bool,
+}
+
+fn pipewire_roundtrip(
+	mainloop: &pw::main_loop::MainLoopRc,
+	core: &pw::core::CoreRc,
+	stop: &ShutdownManager<SessionShutdownReason>,
+) -> Result<(), String> {
+	let done = std::rc::Rc::new(std::cell::Cell::new(false));
+	let sequence = core.sync(0).map_err(|e| e.to_string())?;
+	let received = done.clone();
+	let _listener = core
+		.add_listener_local()
+		.done(move |id, seq| {
+			if id == pw::core::PW_ID_CORE && seq == sequence {
+				received.set(true);
+			}
+		})
+		.register();
+	let deadline = Instant::now() + FORMAT_TIMEOUT;
+	while !done.get() {
+		if stop.is_shutdown_triggered() || Instant::now() >= deadline {
+			return Err("PipeWire did not acknowledge capture disconnection before replacement".into());
+		}
+		mainloop
+			.loop_()
+			.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(5)));
+	}
+	Ok(())
+}
+
+fn open_stream(
+	core: &pw::core::CoreRc,
+	target: &crate::desktop::Target,
+	offered: Vec<stream::OfferedFormat>,
+	sender: CaptureSender,
+	options: StreamOptions,
+	stop: ShutdownManager<SessionShutdownReason>,
+) -> Result<(CaptureStream, StreamFormat), String> {
+	let request_driven = pacer::probe(core, &options.mainloop, target.node_id, &stop);
+	let candidate = CaptureStream::connect(
+		core,
+		target,
+		offered.clone(),
+		sender,
+		options.readiness.clone(),
+		options.diagnostics,
+		options.sync_device.clone(),
+		request_driven,
+	)?;
+	match wait_format(&options.mainloop, &candidate, target, stop.clone()) {
+		Ok(format) => Ok((candidate, format)),
+		Err(error) if options.sync_device.is_some() && !stop.is_shutdown_triggered() => {
+			tracing::warn!(%error, "Reopening capture with implicit synchronization before desktop commit");
+			let sender = candidate.replacement_sender();
+			drop(candidate);
+			let stream = CaptureStream::connect(
+				core,
+				target,
+				offered,
+				sender,
+				options.readiness,
+				options.diagnostics,
+				None,
+				request_driven,
+			)?;
+			let format = wait_format(&options.mainloop, &stream, target, stop)?;
+			Ok((stream, format))
+		},
+		Err(error) => Err(error),
+	}
+}
+
 pub(crate) fn wait_format(
 	mainloop: &pw::main_loop::MainLoopRc,
 	stream: &CaptureStream,
@@ -1102,6 +1254,7 @@ pub(crate) fn wait_format(
 		mainloop
 			.loop_()
 			.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
+		stream.service();
 		let (format, failure) = stream.with_status(|s| (s.format, s.failure.clone()));
 		if let Some(error) = failure {
 			return Err(error);
@@ -1194,6 +1347,10 @@ mod takeover_tests {
 	#[ignore = "requires explicit desktop takeover opt-in, a saved input grant and an unlocked KDE desktop"]
 	fn managed_takeover_keeps_input_across_output_changes() {
 		assert_eq!(std::env::var("MOONSHINE_TEST_TAKEOVER").as_deref(), Ok("1"));
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
 		let path = token::default_path().expect("Input token directory");
 		assert!(token::load(&path).is_some(), "Authorize remote input before this test");
 		let stop = ShutdownManager::<SessionShutdownReason>::new();
@@ -1210,14 +1367,16 @@ mod takeover_tests {
 				client_identity: None,
 				restore_token: Some(path),
 				resolution: (2880, 1920),
+				diagnostics: false,
+				implicit_sync: false,
 				refresh_rate: 60,
 			},
 			stop.clone(),
 			cause.clone(),
 		);
-		let launched = capture.launch();
-		let result = match &launched {
-			Ok(_) => {
+		let mut launched = capture.launch();
+		let result = match &mut launched {
+			Ok(launched) => (|| -> Result<(), String> {
 				let start = Instant::now();
 				let mut frames = 0;
 				while start.elapsed() < Duration::from_secs(5) && !stop.is_shutdown_triggered() {
@@ -1232,13 +1391,47 @@ mod takeover_tests {
 					start.elapsed().as_secs_f64()
 				);
 				if stop.is_shutdown_triggered() {
-					Err(format!("Capture stopped during takeover: {:?}", cause.get()))
-				} else if frames == 0 {
-					Err("No capture frames arrived".into())
-				} else {
-					Ok(())
+					return Err(format!("Capture stopped during takeover: {:?}", cause.get()));
 				}
-			},
+				if frames == 0 {
+					return Err("No capture frames arrived".into());
+				}
+				// Simulate a consumer holding a read across replacement. The old
+				// stream must wait for consumption before its producer can retire.
+				for (width, height, refresh_rate) in [(2880, 1920, 120), (1920, 1080, 60), (1920, 1080, 60)] {
+					let mut held = endpoints
+						.frames
+						.recv_timeout_if(Duration::from_secs(2), true)
+						.map_err(|e| e.to_string())?;
+					let consumed = held.consumed.clone();
+					drop(held.capture_credit.take());
+					let release = std::thread::spawn(move || {
+						std::thread::sleep(Duration::from_millis(100));
+						consumed.store(true, std::sync::atomic::Ordering::Release);
+					});
+					let configured = runtime.block_on(launched.reconfigure(OutputMode {
+						width,
+						height,
+						refresh_rate,
+						hdr: false,
+						capture_pacing: super::super::CapturePacing::Fixed,
+					}));
+					release.join().map_err(|_| "Reader release panicked")?;
+					configured.map_err(|_| "Desktop replacement failed")?;
+					drop(held);
+					let mut frame = endpoints
+						.frames
+						.recv_timeout_if(Duration::from_secs(2), true)
+						.map_err(|e| e.to_string())?;
+					let dimensions = (frame.width, frame.height);
+					frame.consumed.store(true, std::sync::atomic::Ordering::Release);
+					drop(frame.capture_credit.take());
+					if dimensions != (width, height) {
+						return Err(format!("Replacement published stale geometry: {dimensions:?}"));
+					}
+				}
+				Ok(())
+			})(),
 			Err(error) => Err(error.client_message()),
 		};
 		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
@@ -1250,6 +1443,12 @@ mod takeover_tests {
 		}
 		assert!(stop.is_shutdown_completed(), "Capture worker cleanup did not complete");
 		assert_eq!(crate::desktop::cleanup_complete(), Ok(()));
-		assert_eq!(result, Ok(()));
+		assert_eq!(
+			result,
+			Ok(()),
+			"Capture failure: {:?}; stop: {:?}",
+			cause.get(),
+			stop.shutdown_reason()
+		);
 	}
 }

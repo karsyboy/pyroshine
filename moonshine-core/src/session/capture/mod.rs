@@ -195,6 +195,8 @@ impl CaptureSource {
 			},
 			CaptureBackend::Desktop => {
 				let config = portal::PortalCaptureConfig {
+					diagnostics: false,
+					implicit_sync: false,
 					desktop: settings.desktop,
 					client_identity: context.client_identity.clone(),
 					gpu: None,

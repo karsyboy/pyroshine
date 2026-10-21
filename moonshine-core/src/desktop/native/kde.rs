@@ -80,6 +80,9 @@ struct Stream {
 #[derive(Default)]
 struct State {
 	registry: Option<registry::KdeOutputDeviceRegistryV2>,
+	classic: bool,
+	classic_offers: Vec<(u32, u32)>,
+	classic_devices: HashMap<u32, ObjectId>,
 	manager: Option<manager::KdeOutputManagementV2>,
 	cast: Option<cast_manager::ZkdeScreencastUnstableV1>,
 	devices: HashMap<ObjectId, Device>,
@@ -100,7 +103,7 @@ impl Kde {
 		let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| e.to_string())?;
 		let connection = Connection::from_socket(stream).map_err(|e| e.to_string())?;
 		let queue = connection.new_event_queue();
-		connection.display().get_registry(&queue.handle(), ());
+		let registry = connection.display().get_registry(&queue.handle(), ());
 		let mut this = Self {
 			connection,
 			queue,
@@ -108,10 +111,21 @@ impl Kde {
 			sync: 0,
 		};
 		this.synchronize()?;
-		if this.state.registry.is_none() || this.state.manager.is_none() || this.state.cast.is_none() {
-			return Err("KWin lacks native virtual-output, output registry, or custom-mode configuration support; update Plasma".into());
+		if this.state.manager.is_none() || this.state.cast.is_none() {
+			return Err("KWin lacks native virtual-output or custom-mode configuration support; update Plasma".into());
+		}
+		// Prefer registry discovery when both styles are advertised. Binding
+		// both represents each physical output twice and makes restoration unsafe.
+		if this.state.registry.is_none() {
+			this.state.classic = true;
+			for (name, version) in std::mem::take(&mut this.state.classic_offers) {
+				this.state.bind_classic(&registry, name, version, &this.queue.handle());
+			}
 		}
 		this.synchronize()?;
+		if this.state.devices.is_empty() {
+			return Err("KWin exposes no outputs with the required mode, priority and topology capabilities".into());
+		}
 		Ok(this)
 	}
 	pub fn pump(&mut self, wait: Duration) -> Result<()> {
@@ -277,11 +291,24 @@ impl Kde {
 		output.mode = requested;
 		let output_key = output.key.clone();
 		self.apply(&snapshot)?;
+		let observed = self
+			.snapshot()?
+			.outputs
+			.into_iter()
+			.find(|o| o.key == output_key)
+			.ok_or("Virtual output disappeared after mode apply")?;
+		if observed.mode.width != requested.width
+			|| observed.mode.height != requested.height
+			|| observed.mode.refresh_millihertz.abs_diff(requested.refresh_millihertz) > 100
+		{
+			return Err("KWin did not apply the exact requested output mode".into());
+		}
 		let stream = &self.state.streams[id];
 		Ok(Target {
 			id: id.into(),
 			node_id: stream.node.ok_or("KWin supplied no PipeWire node")?,
 			serial: stream.serial,
+			observed_mode: Some(observed.mode),
 			output: output_key,
 			mode: requested,
 		})
@@ -359,6 +386,35 @@ impl Kde {
 		self.synchronize()
 	}
 }
+/// Every property we mutate is available at management version 18; devices
+/// need 18 as well so priority and custom-mode state can be observed on restore.
+fn supported_management(version: u32) -> Option<u32> {
+	(version >= 18).then_some(version.min(22))
+}
+impl State {
+	fn bind_classic(&mut self, registry: &wl_registry::WlRegistry, name: u32, version: u32, q: &QueueHandle<Self>) {
+		if version < 18 {
+			return;
+		}
+		let proxy: device::KdeOutputDeviceV2 = registry.bind(name, version.min(26), q, ());
+		self.classic_devices.insert(name, proxy.id());
+		self.devices.insert(
+			proxy.id(),
+			Device {
+				proxy: Some(proxy),
+				scale: 1.0,
+				..Default::default()
+			},
+		);
+	}
+	fn remove_device(&mut self, id: &ObjectId) {
+		if let Some(device) = self.devices.remove(id) {
+			for mode in device.modes {
+				self.modes.remove(&mode);
+			}
+		}
+	}
+}
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
 	fn event(
 		state: &mut Self,
@@ -368,6 +424,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 		_: &Connection,
 		q: &QueueHandle<Self>,
 	) {
+		if let wl_registry::Event::GlobalRemove { name } = event {
+			state.classic_offers.retain(|(global, _)| *global != name);
+			if let Some(id) = state.classic_devices.remove(&name) {
+				state.remove_device(&id);
+			}
+			return;
+		}
 		if let wl_registry::Event::Global {
 			name,
 			interface,
@@ -378,7 +441,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 				"kde_output_device_registry_v2" if version >= 21 => {
 					state.registry = Some(registry.bind(name, version.min(26), q, ()))
 				},
-				"kde_output_management_v2" if version >= 22 => state.manager = Some(registry.bind(name, 22, q, ())),
+				"kde_output_management_v2" => {
+					if let Some(version) = supported_management(version) {
+						state.manager = Some(registry.bind(name, version, q, ()));
+					}
+				},
+				"kde_output_device_v2" => {
+					if state.classic {
+						state.bind_classic(registry, name, version, q);
+					} else {
+						state.classic_offers.push((name, version));
+					}
+				},
 				"zkde_screencast_unstable_v1" if version >= 4 => {
 					state.cast = Some(registry.bind(name, version.min(6), q, ()))
 				},
@@ -431,7 +505,7 @@ impl Dispatch<device::KdeOutputDeviceV2, ()> for State {
 		_: &QueueHandle<Self>,
 	) {
 		if matches!(event, device::Event::Removed) {
-			state.devices.remove(&proxy.id());
+			state.remove_device(&proxy.id());
 			return;
 		}
 		let d = state.devices.entry(proxy.id()).or_insert_with(|| Device {
@@ -547,6 +621,13 @@ delegate_noop!(State: ignore cast_manager::ZkdeScreencastUnstableV1);
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn compatibility_floor_covers_every_required_request_and_observation() {
+		assert_eq!(super::supported_management(17), None);
+		assert_eq!(super::supported_management(18), Some(18));
+		assert_eq!(super::supported_management(21), Some(21));
+		assert_eq!(super::supported_management(26), Some(22));
+	}
 	use super::*;
 
 	/// Adds/removes one virtual output; physical displays stay enabled.
@@ -601,8 +682,16 @@ mod tests {
 			let mainloop = pipewire::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
 			let context = pipewire::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
 			let core = context.connect_rc(None).map_err(|e| e.to_string())?;
-			let stream =
-				crate::session::capture::portal::stream::CaptureStream::connect(&core, &target, offered, sender)?;
+			let stream = crate::session::capture::portal::stream::CaptureStream::connect(
+				&core,
+				&target,
+				offered,
+				sender,
+				crate::session::capture::portal::readiness::Readiness::new()?,
+				false,
+				crate::session::capture::portal::sync::SyncDevice::probe(file.as_fd()),
+				false,
+			)?;
 			let format = crate::session::capture::portal::wait_format(
 				&mainloop,
 				&stream,

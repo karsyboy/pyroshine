@@ -1747,6 +1747,40 @@ impl SessionManager {
 		self.core.session_view().await
 	}
 
+	/// Stage a conventional encoder bitrate for this authorization generation.
+	/// Benchmark only: no operator setting, network command or ABR policy.
+	/// The reply identifies the first submitted picture or the terminal failure.
+	pub async fn bench_set_bitrate(
+		&self,
+		bitrate: u32,
+	) -> Result<tokio::sync::oneshot::Receiver<super::stream::video::rate::RateUpdate>, String> {
+		let mut guard = self.core.lock().await;
+		let generation = guard
+			.authorization_tx
+			.as_ref()
+			.ok_or("no live authorization")?
+			.borrow()
+			.generation();
+		let live = guard.live().ok_or("no live session")?;
+		if live.transition.is_some() {
+			return Err("session transition in progress".into());
+		}
+		let Some(SessionState::Active(active)) = &live.state else {
+			return Err("video is not active".into());
+		};
+		active.rate_control().request(generation, bitrate)
+	}
+
+	/// Last rate request for diagnostics; a staged rate is not yet installed.
+	pub async fn bench_bitrate_status(&self) -> Option<super::stream::video::rate::RateUpdate> {
+		let mut guard = self.core.lock().await;
+		let live = guard.live()?;
+		let Some(SessionState::Active(active)) = &live.state else {
+			return None;
+		};
+		active.rate_control().status()
+	}
+
 	/// Returns a receiver for per-frame encoding statistics.
 	///
 	/// Call **before** `initialize_session()` to receive stats from the start.

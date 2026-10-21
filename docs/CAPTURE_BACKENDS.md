@@ -148,6 +148,52 @@ for capability requirements and acceptance checks.
 | Audio | The session's PulseAudio-compatible server | The desktop's audio output | Same |
 | Controllers | Inputtino devices | Unchanged | Unchanged |
 
+## Managed PipeWire completion and ownership
+
+The capture loop owns a generation ledger for every announced buffer. A removed
+announcement cannot be requeued by an old GPU completion, even when PipeWire
+reuses its address. Removed published frames retain their DMA-BUF lease and
+consumption hold until GPU reads finish. Pool census counts actual announcements,
+separately from the requested minimum of three buffers (producer, pending and GPU
+ownership).
+
+`process` drains to the newest buffer, claims admission before exporting it, and
+retains one pending frame. Replacing pending pixels transfers the existing
+credit. Producer completion is registered with a shared epoll source; the capture
+loop publishes only after nonblocking readiness succeeds. Error/hangup or an
+unsignaled fence beyond 50 ms fails capture; elapsed time never implies readiness.
+Startup validates completed pixels before committing takeover and discards those
+validation pixels before streaming starts.
+
+Explicit synchronization is offered only after timeline create/import, eventfd
+wait and signal succeed on the verified capture node. Negotiation offers a
+three-block layout requiring timeline metadata, followed by the one-plane
+implicit layout. Two syncobj descriptors are distinct from the pixel plane. Each
+dequeued release point has one owned action, including no-credit/replaced frames;
+published frames signal only after final consumption. Removal retains that action
+until the GPU is done. Unscheduled-release promises are cleared only after taking
+ownership; no timer guesses at ownership of undelivered buffers.
+
+A failed explicit candidate is closed before a new implicit-only candidate is
+negotiated, before readiness or display commit. The implicit path snapshots write
+fences at arrival; older kernels use DMA-BUF poll readiness rather than assuming
+that queue order proves completion. Both paths remain GPU-only.
+
+Request-driven producers are discovered by binding the exact PipeWire node and
+reading `node.supports-request`, with a bounded, cancellation-aware probe. Unknown
+or ordinary producers keep producer-driven scheduling. A capable producer uses a
+lazy consumer driver: requests coalesce, only completed graph cycles permit a new
+cycle, and delivered paints set the negotiated cadence. Empty cursor/frame-callback
+cycles do not consume a paint interval. Admission suppresses triggers without
+credit; a bounded heartbeat retries a lost cycle. State and timers belong to one
+stream generation and stop with it. Probe reports include the scheduling mode and
+request/trigger counts. This uses PipeWire 0.3.40 or newer; native Mutter scheduling
+still requires qualification on a GNOME host.
+
+Before committing a replacement, the loop drains the old consumer, disconnects
+it and waits for a bounded PipeWire round trip. The guard can then retire the
+old producer without leaving updates addressed to a removed client-node resource.
+
 ## Adding a backend
 
 1. Add a variant to `CaptureBackend`, `CaptureSource` and `LiveCapture`, and
@@ -181,8 +227,10 @@ The seam covers capture; desktop output and audio administration live in the
 separate guard. `CaptureInputEvent` is shared, backend details identify the mode
 in management status, and desktop frames carry native completion ownership.
 `moonshine-bench` still drives only the isolated backend. Use
-`moonshine-desktop-probe` for managed capture diagnostics; it temporarily takes
-over displays and requires the guard. Real client acceptance remains necessary.
+`moonshine-desktop-probe` for managed capture diagnostics. Its `--status` mode
+queries an already-running guard without starting it or changing outputs. Capture
+probes temporarily take over displays and require the guard. Real client
+acceptance remains necessary.
 
 ## Validation
 

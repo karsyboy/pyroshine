@@ -26,7 +26,7 @@ use crate::session::capture::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAY
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "b09e1365155e91710497be22eac6500f04bf74ea";
+pub(crate) const SOURCE_REVISION: &str = "78084ece21b1725d193442a7619660625f3f735a";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;

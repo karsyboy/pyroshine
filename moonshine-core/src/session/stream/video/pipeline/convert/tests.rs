@@ -371,7 +371,17 @@ fn self_check_pattern_has_no_neutral_or_repeated_chroma() {
 		}
 		chroma.dedup();
 	}
-	assert_eq!(std::mem::size_of::<PushConstants>(), 112);
+}
+
+#[test]
+fn push_constants_match_the_shader_viewport_and_overlay_layout() {
+	// std430 offsets in shaders/convert.comp. The viewport follows both
+	// overlays; checking its offset also catches omitted alignment padding.
+	assert_eq!(std::mem::size_of::<PushConstants>(), 128);
+	assert_eq!(std::mem::offset_of!(PushConstants, layer_rect), 64);
+	assert_eq!(std::mem::offset_of!(PushConstants, layer_opacity), 96);
+	assert_eq!(std::mem::offset_of!(PushConstants, layer_opaque), 104);
+	assert_eq!(std::mem::offset_of!(PushConstants, viewport), 112);
 }
 
 #[test]
@@ -421,7 +431,7 @@ fn stream_encode_decode_matches_reference_on_gpu() {
 #[ignore = "needs a VA-API encoder and ffmpeg: MOONSHINE_TEST_GPU=1"]
 fn vaapi_encode_decode_matches_reference_on_gpu() {
 	gpu::require();
-	gpu::native_encode_decode_matrix(EncoderBackend::Vaapi);
+	gpu::native_encode_decode_matrix(EncoderBackend::Vaapi, false);
 }
 
 /// [`vaapi_encode_decode_matches_reference_on_gpu`] for the NVENC backend
@@ -431,7 +441,23 @@ fn vaapi_encode_decode_matches_reference_on_gpu() {
 #[ignore = "needs an NVIDIA GPU with NVENC and ffmpeg: MOONSHINE_TEST_GPU=1"]
 fn nvenc_encode_decode_matches_reference_on_gpu() {
 	gpu::require();
-	gpu::native_encode_decode_matrix(EncoderBackend::Nvenc);
+	gpu::native_encode_decode_matrix(EncoderBackend::Nvenc, false);
+}
+
+/// Drop three distinct moving pictures, including the first recovery AU.
+/// A later recovery must use a decoder-retained safe parent or an IDR.
+#[test]
+#[ignore = "needs a VA-API encoder and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn vaapi_loss_recovery_decodes_on_gpu() {
+	gpu::require();
+	gpu::native_encode_decode_matrix(EncoderBackend::Vaapi, true);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with NVENC and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn nvenc_loss_recovery_decodes_on_gpu() {
+	gpu::require();
+	gpu::native_encode_decode_matrix(EncoderBackend::Nvenc, true);
 }
 
 /// Pins the Pixelforge input-slot contract modelled by `FakeSlots` in the
@@ -1950,7 +1976,19 @@ mod gpu {
 				.unwrap();
 				let mut stream = Vec::new();
 				let mut padding_bytes = 0;
-				for _ in 0..frame_count {
+				for index in 0..frame_count {
+					if stream_config {
+						let ceiling = encoder_config(case, frame, true).target_bitrate;
+						let requested = match index {
+							2 => Some(ceiling / 2),
+							5 => Some(ceiling),
+							7 => Some(u32::MAX),
+							_ => None,
+						};
+						if let Some(rate) = requested {
+							assert_eq!(encoder.set_bitrate(rate).unwrap(), rate.min(ceiling));
+						}
+					}
 					converter
 						.convert(
 							&source,
@@ -1962,7 +2000,15 @@ mod gpu {
 						)
 						.unwrap();
 					let image = encoder.input_image();
-					let mut data = block_on(encoder.encode(image).unwrap()).unwrap().data;
+					let packet = block_on(encoder.encode(image).unwrap()).unwrap();
+					if stream_config {
+						assert_eq!(
+							packet.is_key_frame,
+							index == 0,
+							"rate change must preserve references ({label}, frame {index})"
+						);
+					}
+					let mut data = packet.data;
 					// Decode what production transmits.
 					padding_bytes +=
 						crate::session::stream::video::pipeline::padding::strip(&mut data, video_format(case.codec));
@@ -2019,12 +2065,18 @@ mod gpu {
 	/// Native (VA-API or NVENC) counterpart of [`encode_decode_matrix`] with
 	/// the stream configuration: CBR, full range, one IDR request at frame 4
 	/// and a reference invalidation at frame 8.
-	pub(super) fn native_encode_decode_matrix(backend: EncoderBackend) {
+	pub(super) fn native_encode_decode_matrix(backend: EncoderBackend, loss_injection: bool) {
 		use crate::session::stream::video::pipeline::backend::{ConventionalEncoder, EncoderInput, NativeFormat};
 		use crate::session::stream::video::pipeline::{nvenc, vaapi};
 		use crate::session::stream::video::{BitDepth, ChromaFormat, VideoCodec};
 
-		const FRAMES: usize = 12;
+		let frame_count = std::env::var("MOONSHINE_TEST_RFI_FRAMES")
+			.ok()
+			.map(|v| v.parse::<usize>().unwrap())
+			.unwrap_or(12);
+		assert!((12..=300).contains(&frame_count));
+		let loss_start = if frame_count > 264 { 260 } else { 6 };
+		let lost = |index: usize| loss_injection && (loss_start..=loss_start + 2).contains(&index);
 		let mut failures = Vec::new();
 		let mut checked = 0;
 		let capture_context = context();
@@ -2100,7 +2152,9 @@ mod gpu {
 					width: frame.0,
 					height: frame.1,
 					fps: 60,
-					bitrate: 50_000_000,
+					// Abrupt moving-picture color changes need enough bits for
+					// the strict reference tolerance, before any loss is injected.
+					bitrate: if loss_injection { 100_000_000 } else { 50_000_000 },
 					color: pixelforge::ColorDescription::bt709().with_full_range(true),
 				};
 				let created = match backend {
@@ -2125,8 +2179,20 @@ mod gpu {
 						continue;
 					},
 				};
+				let retained = match &encoder {
+					ConventionalEncoder::Vaapi(e) => e.reference_capacity(),
+					_ => 0,
+				};
+				eprintln!("{label}: decoder-retained reference capacity {retained}");
 				checked += 1;
 				let rgb = smooth(frame);
+				let moving = |index: usize, x, y| {
+					let mut pixel = rgb(x, y);
+					if loss_injection {
+						pixel[index % 3] = 0.15 + 0.7 * ((index % 4) as f32 / 3.0);
+					}
+					pixel.map(|c| (c * 255.0).round() / 255.0)
+				};
 				let bytes: Vec<u8> = (0..frame.1)
 					.flat_map(|y| (0..frame.0).map(move |x| (x, y)))
 					.flat_map(|(x, y)| rgb(x, y).map(|c| (c * 255.0).round() as u8).into_iter().chain([255]))
@@ -2150,15 +2216,49 @@ mod gpu {
 				let mut stream = Vec::new();
 				let mut keys = Vec::new();
 				let mut error = None;
-				for index in 0..FRAMES {
+				for index in 0..frame_count {
 					match index {
+						2 => {
+							assert_eq!(encoder.set_bitrate(format.bitrate / 2).unwrap(), format.bitrate / 2);
+						},
+						5 => {
+							assert_eq!(encoder.set_bitrate(format.bitrate).unwrap(), format.bitrate);
+						},
+						7 => {
+							assert_eq!(encoder.set_bitrate(u32::MAX).unwrap(), format.bitrate);
+						},
 						4 => encoder.request_idr(),
 						8 => encoder.invalidate_reference_frames(6),
 						_ => {},
 					}
+					if loss_injection && index == loss_start + 2 {
+						encoder.invalidate_reference_frames(loss_start as u64);
+					}
+					if loss_injection && index == loss_start + 3 {
+						encoder.invalidate_reference_frames(loss_start as u64 + 2);
+					}
+					let moving_source = loss_injection.then(|| {
+						let bytes: Vec<u8> = (0..frame.1)
+							.flat_map(|y| (0..frame.0).map(move |x| (x, y)))
+							.flat_map(|(x, y)| {
+								moving(index, x, y)
+									.map(|c| (c * 255.0).round() as u8)
+									.into_iter()
+									.chain([255])
+							})
+							.collect();
+						source_image(&capture_context, frame, vk::Format::R8G8B8A8_UNORM, &bytes)
+					});
 					let packet = encoder.input_target().map_err(|e| e.to_string()).and_then(|target| {
 						converter
-							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
+							.convert(
+								moving_source.as_ref().unwrap_or(&source),
+								vk::Format::R8G8B8A8_UNORM,
+								false,
+								false,
+								&[None, None],
+								target,
+							)
 							.map_err(|e| format!("convert: {e:?}"))?;
 						let future = encoder.encode(target).map_err(|e| e.to_string())?;
 						block_on(future).map_err(|e| e.to_string())
@@ -2170,7 +2270,9 @@ mod gpu {
 								video_format(case.codec),
 							);
 							keys.push(packet.is_key_frame);
-							stream.extend(packet.data);
+							if !(lost(index)) {
+								stream.extend(packet.data);
+							}
 						},
 						Err(e) => {
 							error = Some(format!("{label} frame {index}: {e}"));
@@ -2184,8 +2286,11 @@ mod gpu {
 					failures.push(error);
 					continue;
 				}
-				if !keys[0] || !keys[4] || keys[1..4].iter().any(|&key| key) {
+				if !keys[0] || !keys[4] || keys[1..4].iter().chain(&keys[5..8]).any(|&key| key) {
 					failures.push(format!("{label}: key frames {keys:?}, expected frames 0 and 4"));
+				}
+				if retained > 1 && (keys[8] || loss_injection && (keys[loss_start + 2] || keys[loss_start + 3])) {
+					failures.push(format!("{label}: retained safe parent should avoid IDR: {keys:?}"));
 				}
 				let key_frames: Vec<usize> = (0..keys.len()).filter(|&i| keys[i]).collect();
 				eprintln!("{label}: {} bytes, key frames {key_frames:?}", stream.len());
@@ -2202,22 +2307,38 @@ mod gpu {
 						continue;
 					},
 				};
-				if (w, h) != frame || decoded.len() != FRAMES {
+				let expected_count = if loss_injection { frame_count - 3 } else { frame_count };
+				if (w, h) != frame || decoded.len() != expected_count {
 					failures.push(format!(
-						"{label}: decoded {} frames of {w}x{h}, expected {FRAMES} of {frame:?}",
+						"{label}: decoded {} frames of {w}x{h}, expected {expected_count} of {frame:?}",
 						decoded.len()
 					));
 					continue;
 				}
-				let expected = reference::convert(output, color, frame, frame, &decoded_rgb, &|_| true);
-				compare_decoded(
-					&label,
-					&expected,
-					&decoded,
-					frame,
-					depth == BitDepth::Ten,
-					&mut failures,
-				);
+				if loss_injection {
+					for (index, decoded) in (0..frame_count).filter(|i| !lost(*i)).zip(&decoded) {
+						let expected =
+							reference::convert(output, color, frame, frame, &|x, y| moving(index, x, y), &|_| true);
+						compare_decoded(
+							&format!("{label} surviving AU {index}"),
+							&expected,
+							std::slice::from_ref(decoded),
+							frame,
+							depth == BitDepth::Ten,
+							&mut failures,
+						);
+					}
+				} else {
+					let expected = reference::convert(output, color, frame, frame, &decoded_rgb, &|_| true);
+					compare_decoded(
+						&label,
+						&expected,
+						&decoded,
+						frame,
+						depth == BitDepth::Ten,
+						&mut failures,
+					);
+				}
 			}
 		}
 		assert!(checked > 0, "{} encoded no profile on this GPU", backend.label());

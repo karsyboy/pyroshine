@@ -426,6 +426,11 @@ impl H265 {
             .frame_rate_denominator(common.config.frame_rate_denominator)
             .push(&mut h265_rc_layer_info);
         let rc_layers = [rc_layer_info];
+        // Begin describes the state left by the previous submission; the
+        // control command below installs the new target inside this scope.
+        let begin_layers = [rc_layer_info
+            .average_bitrate(u64::from(common.installed_bitrate))
+            .max_bitrate(u64::from(common.installed_bitrate))];
 
         let mut h265_rc_info = vk::VideoEncodeH265RateControlInfoKHR::default()
             .gop_frame_count(common.config.gop_size)
@@ -442,6 +447,11 @@ impl H265 {
         // Reset and write start timestamp
         reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
+        let mut begin_rc_info = if common.rate_changed() {
+            rc_info.layers(&begin_layers)
+        } else {
+            rc_info
+        };
         let is_first_frame = plan.is_first_frame();
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()
@@ -455,7 +465,7 @@ impl H265 {
                 .video_session_parameters(common.session_params)
                 .reference_slots(&reference_slots_for_begin)
                 .push(&mut h265_rc_info)
-                .push(&mut rc_info)
+                .push(&mut begin_rc_info)
         };
 
         unsafe {
@@ -482,6 +492,16 @@ impl H265 {
                     command_buffer,
                     &control_info,
                 );
+            }
+        }
+
+        if !is_first_frame && common.rate_changed() {
+            let control = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL)
+                .push(&mut rc_info)
+                .push(&mut h265_rc_info);
+            unsafe {
+                (common.video_queue_fn.fp().cmd_control_video_coding_khr)(command_buffer, &control);
             }
         }
 

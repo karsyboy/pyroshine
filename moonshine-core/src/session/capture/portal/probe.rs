@@ -26,6 +26,11 @@ pub struct ProbeOptions {
 	pub duration: Duration,
 	/// Frame rate asked of the compositor.
 	pub refresh_rate: u32,
+	/// Collect bounded capture timings; disabled for ordinary sessions.
+	pub timings: bool,
+	/// Diagnose the implicit path even when explicit sync is supported.
+	pub implicit_sync: bool,
+	pub resolution: (u32, u32),
 	/// Ask for remote input and run the scripted input sequence after the first frame.
 	pub input: bool,
 	/// Restore-token file; `None` asks the desktop every time.
@@ -60,6 +65,7 @@ impl Percentiles {
 /// The probe's findings.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProbeReport {
+	pub capture: super::metrics::CaptureReport,
 	pub desktop: String,
 	pub current_desktop: String,
 	pub render_node: String,
@@ -123,7 +129,17 @@ pub(crate) fn input_script(width: u32, height: u32) -> Vec<CaptureInputEvent> {
 
 /// Run the probe. Blocks for the portal consent and `options.duration`.
 pub fn run(options: ProbeOptions) -> Result<ProbeReport, String> {
+	crate::desktop::Mode {
+		width: options.resolution.0,
+		height: options.resolution.1,
+		refresh_millihertz: options.refresh_rate.saturating_mul(1000),
+	}
+	.validate()?;
+	if options.duration.is_zero() {
+		return Err("Probe duration must be positive".into());
+	}
 	let stop = ShutdownManager::<SessionShutdownReason>::new();
+	let cause = StopCauseSlot::default();
 	let (capture, endpoints) = PortalCapture::new(
 		PortalCaptureConfig {
 			desktop: DesktopConfig {
@@ -135,10 +151,12 @@ pub fn run(options: ProbeOptions) -> Result<ProbeReport, String> {
 			client_identity: None,
 			restore_token: options.restore_token.clone(),
 			refresh_rate: options.refresh_rate,
-			resolution: (1920, 1080),
+			resolution: options.resolution,
+			diagnostics: options.timings,
+			implicit_sync: options.implicit_sync,
 		},
 		stop.clone(),
-		StopCauseSlot::default(),
+		cause.clone(),
 	);
 	let launched = capture.launch().map_err(|failure| failure.client_message())?;
 	let ready = launched.ready().clone();
@@ -183,16 +201,28 @@ pub fn run(options: ProbeOptions) -> Result<ProbeReport, String> {
 	}
 	let seconds = started.elapsed().as_secs_f64();
 	let cpu = cpu_time().saturating_sub(cpu_started).as_secs_f64();
+	let interrupted = stop.is_shutdown_triggered();
 	let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
-	drop(launched);
 	drop(frames);
 	// Wait for the capture thread: it closes the portal session.
 	let deadline = Instant::now() + Duration::from_secs(10);
 	while !stop.is_shutdown_completed() && Instant::now() < deadline {
 		std::thread::sleep(Duration::from_millis(20));
 	}
+	if !stop.is_shutdown_completed() {
+		return Err("Capture thread did not stop; desktop restoration is not confirmed".into());
+	}
+	check_completion(interrupted, &cause)?;
+	let capture = launched
+		.diagnostics()
+		.ok_or("The capture worker returned no diagnostic observations")?;
+	drop(launched);
 	let frames_received = ages.len() as u64;
+	if frames_received == 0 {
+		return Err("The probe received no completed frames".into());
+	}
 	Ok(ProbeReport {
+		capture,
 		desktop: ready.desktop.kind.as_str().into(),
 		current_desktop: ready.desktop.current_desktop.clone(),
 		render_node: ready.capabilities.render_node.display().to_string(),
@@ -211,4 +241,60 @@ pub fn run(options: ProbeOptions) -> Result<ProbeReport, String> {
 		cpu_percent: cpu / seconds * 100.0,
 		input_events,
 	})
+}
+
+fn check_completion(interrupted: bool, cause: &StopCauseSlot) -> Result<(), String> {
+	if let Some(cause) = cause.get() {
+		return Err(cause.detail);
+	}
+	if interrupted {
+		return Err("Capture stopped before the requested probe duration completed".into());
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn early_worker_exit_cannot_report_a_successful_partial_measurement() {
+		let cause = StopCauseSlot::default();
+		assert!(check_completion(false, &cause).is_ok());
+		assert!(check_completion(true, &cause).is_err());
+		cause.record(crate::session::failure::StopCause {
+			detail: "producer disappeared".into(),
+			hint: None,
+			unexpected: true,
+			reported: false,
+		});
+		assert_eq!(check_completion(true, &cause).unwrap_err(), "producer disappeared");
+		assert!(
+			check_completion(false, &cause).is_err(),
+			"failure during shutdown must also be reported"
+		);
+	}
+
+	#[test]
+	fn invalid_capture_requests_fail_before_connecting_to_the_desktop() {
+		for (resolution, refresh_rate, duration) in [
+			((0, 1080), 60, 1),
+			((1920, 0), 60, 1),
+			((1920, 1080), 0, 1),
+			((1920, 1080), 1001, 1),
+			((1920, 1080), 60, 0),
+		] {
+			assert!(
+				run(ProbeOptions {
+					duration: Duration::from_secs(duration),
+					refresh_rate,
+					timings: false,
+					implicit_sync: false,
+					resolution,
+					input: false,
+					restore_token: None
+				})
+				.is_err()
+			);
+		}
+	}
 }

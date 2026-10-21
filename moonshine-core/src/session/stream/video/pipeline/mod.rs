@@ -852,6 +852,7 @@ impl VideoPipeline {
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		demand: crate::session::stream::MediaDemand,
 		stop_cause: crate::session::failure::StopCauseSlot,
+		rate_rx: super::rate::RateReceiver,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -859,6 +860,7 @@ impl VideoPipeline {
 			tracing::error!(%error, "Cannot start video pipeline");
 		})?;
 		let inner = VideoPipelineInner {
+			rate_rx,
 			capture_context,
 			config,
 			context,
@@ -904,6 +906,7 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
+	rate_rx: super::rate::RateReceiver,
 	capture_context: VideoContext,
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
@@ -960,6 +963,7 @@ impl VideoPipelineInner {
 		let Some(EpochActivation { generation, applied }) = activation else {
 			return Ok(());
 		};
+		self.rate_rx.activate(generation);
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		packet_tx
 			.blocking_send(VideoPacketMessage::BeginEpoch {
@@ -1435,6 +1439,13 @@ impl VideoPipelineInner {
 		let mut resend_last = false;
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			if let Some(rate) = self.rate_rx.take() {
+				rate.finish(
+					super::rate::RateState::Failed,
+					None,
+					Some("live bitrate is supported by conventional encoders only".into()),
+				);
+			}
 			if let Ok(command) = reconfigure_rx.try_recv() {
 				frame_rx.reset();
 				return Ok(Some(command));
@@ -1781,6 +1792,7 @@ impl VideoPipelineInner {
 		// A requested IDR not yet submitted. Persistent across iterations so a
 		// recovery that cannot be admitted yet (network credits) is retried.
 		let mut pending_idr = false;
+		let mut pending_replay = false;
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
@@ -1793,6 +1805,10 @@ impl VideoPipelineInner {
 		// the current epoch and advances on reset (which restarts the consumer's
 		// numbering). A rare readback drop can skew this by a frame, which at
 		// worst over-invalidates into a (safe) IDR.
+		let mut installed_rate = encoder
+			.set_bitrate(ctx.bitrate.try_into().map_err(|_| "bitrate exceeds u32")?)
+			.map_err(|e| e.to_string())?;
+		let mut pending_rate: Option<super::rate::PendingRate> = None;
 		let mut submitted_count: u64 = 0;
 		let mut frame_number_base: u64 = 0;
 
@@ -1813,7 +1829,8 @@ impl VideoPipelineInner {
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let reconfigure = reconfigure_rx.try_recv().ok();
-			if reconfigure.is_some() {
+			if let Some(command) = &reconfigure {
+				self.rate_rx.activate(command.generation);
 				frame_rx.reset();
 				// Exit through the flush/drain barrier below. It guarantees every
 				// packet from the old encoder epoch is consumed before activation.
@@ -1838,13 +1855,33 @@ impl VideoPipelineInner {
 			while let Ok(activation) = reset_request_rx.try_recv() {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				frame_rx.reset();
+				let activation_generation = activation.generation;
 				// The consumer orders activation after every old encoder future/batch.
 				frame_ctx_tx
 					.blocking_send(ConsumerMessage::ResetCounters(activation))
 					.map_err(|_| "video consumer stopped during resume".to_string())?;
+				self.rate_rx.activate(activation_generation);
+				pending_rate = None;
+				installed_rate = encoder
+					.set_bitrate(ctx.bitrate.try_into().map_err(|_| "bitrate exceeds u32")?)
+					.map_err(|e| e.to_string())?;
+				submitted_count = encoder.next_display_order();
 				frame_number_base = submitted_count;
 				encoder.request_idr();
 				pending_idr = true;
+			}
+
+			if let Some(mut rate) = self.rate_rx.take() {
+				match encoder.set_bitrate(rate.requested()) {
+					Ok(accepted) => {
+						if let Some(old) = pending_rate.take() {
+							old.finish(super::rate::RateState::Superseded, None, None);
+						}
+						rate.stage(accepted);
+						pending_rate = Some(rate);
+					},
+					Err(error) => rate.finish(super::rate::RateState::Failed, None, Some(error.to_string())),
+				}
 			}
 
 			// Drain any pending IDR requests.
@@ -1870,12 +1907,20 @@ impl VideoPipelineInner {
 			// falls back to an IDR when no reference survives).
 			loop {
 				match invalidate_request_rx.try_recv() {
-					Ok((first, _last)) => {
+					Ok((first, last)) => {
+						// Ambiguous wrapped/future indices cannot establish a safe
+						// parent. A fresh IDR is also safe after rare readback drops.
+						if first == 0 || first > last || submitted_count - frame_number_base >= u64::from(u32::MAX) {
+							encoder.request_idr();
+							pending_idr = true;
+							continue;
+						}
 						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
 						tracing::debug!(
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						pending_replay = true;
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
@@ -1910,13 +1955,13 @@ impl VideoPipelineInner {
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the static scene from the latest converted frame
 					// (see `encode_static_recovery`).
-					if pending_idr
+					if (pending_idr || pending_replay || pending_rate.is_some())
 						&& has_encoded && last_output
 						&& conventional_can_admit(&in_flight, credit_limit)
 						&& self.demand.may_replay(2 * frame_interval)
 					{
-						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
-						// Use current time as created_at for the re-encoded IDR (no actual frame).
+						tracing::debug!("Re-encoding last frame for pending recovery or rate control (no re-import)");
+						// A replay has no new source frame; timestamp the submission now.
 						let now = std::time::Instant::now();
 						let restore = |_: &mut ConventionalEncoder, target: Target| -> Result<(), EncodeError> {
 							match input_converter.copy_last_output(target) {
@@ -1925,9 +1970,11 @@ impl VideoPipelineInner {
 								Err(e) => Err(EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(e))),
 							}
 						};
+						let encoded_order = encoder.next_display_order();
 						match encode_static_recovery(&mut encoder, restore) {
 							Ok(future) => {
 								pending_idr = false;
+								pending_replay = false;
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
@@ -1950,7 +1997,11 @@ impl VideoPipelineInner {
 								};
 								// Count this frame in flight; the consumer decrements when done.
 								let outstanding = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-								submitted_count += 1;
+								if let Some(rate) = pending_rate.take() {
+									installed_rate = rate.accepted();
+									rate.finish(super::rate::RateState::Applied, Some(encoded_order), None);
+								}
+								submitted_count = encoder.next_display_order();
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(
 									FrameContext {
 										outstanding: outstanding.min(u8::MAX as usize) as u8,
@@ -1961,6 +2012,10 @@ impl VideoPipelineInner {
 								));
 							},
 							Err(e) => {
+								if let Some(rate) = pending_rate.take() {
+									rate.finish(super::rate::RateState::Failed, None, Some(e.to_string()));
+									encoder.set_bitrate(installed_rate).map_err(|error| error.to_string())?;
+								}
 								// The IDR stays pending and is retried on the next frame.
 								apply_failure(&mut failures, &encoder_failure(EncodeStage::Submit, &e), None)?;
 							},
@@ -2314,6 +2369,7 @@ impl VideoPipelineInner {
 				// Encode the converted image. This is asynchronous: it submits the
 				// frame without blocking; the encoded packet is produced by the
 				// readback thread and handled by the consumer thread.
+				let encoded_order = encoder.next_display_order();
 				let encode_result = encoder.encode(target);
 
 				let t4_encoded = std::time::Instant::now();
@@ -2323,6 +2379,7 @@ impl VideoPipelineInner {
 						failures.record_success();
 						// Any requested IDR applies to this submitted frame.
 						pending_idr = false;
+						pending_replay = false;
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
@@ -2348,7 +2405,11 @@ impl VideoPipelineInner {
 						};
 						// Count this frame in flight; the consumer decrements when done.
 						let outstanding = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-						submitted_count += 1;
+						if let Some(rate) = pending_rate.take() {
+							installed_rate = rate.accepted();
+							rate.finish(super::rate::RateState::Applied, Some(encoded_order), None);
+						}
+						submitted_count = encoder.next_display_order();
 						if frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(
 								FrameContext {
@@ -2365,6 +2426,10 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
+						if let Some(rate) = pending_rate.take() {
+							rate.finish(super::rate::RateState::Failed, None, Some(e.to_string()));
+							encoder.set_bitrate(installed_rate).map_err(|error| error.to_string())?;
+						}
 						// The input was converted but never encoded: re-anchor the
 						// reference chain with an IDR on the next frame.
 						if apply_failure(&mut failures, &encoder_failure(EncodeStage::Submit, &e), None)?

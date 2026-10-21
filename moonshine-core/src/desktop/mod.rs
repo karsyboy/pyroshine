@@ -10,7 +10,7 @@ mod wire;
 use serde::{Deserialize, Serialize};
 
 pub(crate) use guard::{cleanup_complete, recovery_pending};
-pub use guard::{restore, run_guard, status};
+pub use guard::{restore, run_guard, status, status_read_only};
 pub(crate) use wire::Client;
 pub(crate) type Result<T> = std::result::Result<T, String>;
 
@@ -71,6 +71,8 @@ pub(crate) struct Target {
 	pub id: String,
 	pub node_id: u32,
 	pub serial: Option<u64>,
+	#[serde(default)]
+	pub observed_mode: Option<Mode>,
 	pub output: String,
 	pub mode: Mode,
 }

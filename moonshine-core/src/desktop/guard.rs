@@ -387,6 +387,7 @@ impl Guard {
 						id: id.clone(),
 						node_id: 0,
 						serial: None,
+						observed_mode: None,
 						output: String::new(),
 						mode,
 					});
@@ -535,6 +536,15 @@ impl Guard {
 			},
 		}
 	}
+	fn deliver_reply(&mut self, stream: &mut UnixStream, reply: &Reply, owns_transaction: bool) {
+		if wire::write_message(stream, reply).is_err() && owns_transaction {
+			// A requester can disappear while Mutter is creating/announcing
+			// its node. Its PID may still live: a lost successful reply must
+			// roll back the journal rather than wait for process death.
+			self.recover();
+		}
+	}
+
 	fn tick(&mut self) {
 		let result = (|| -> Result<()> {
 			self.native.pump()?;
@@ -609,6 +619,10 @@ impl Guard {
 
 pub fn status() -> Result<DesktopStatus> {
 	wire::ensure()?;
+	wire::request(&Request::Status).map(|r| r.status)
+}
+/// Query an already-running guard without starting a service or replaying recovery.
+pub fn status_read_only() -> Result<DesktopStatus> {
 	wire::request(&Request::Status).map(|r| r.status)
 }
 pub fn restore() -> Result<DesktopStatus> {
@@ -720,6 +734,7 @@ pub fn run_guard() -> Result<()> {
 					.set_write_timeout(Some(Duration::from_secs(1)))
 					.map_err(|e| e.to_string())?;
 				let mut mutation = false;
+				let mut owns_transaction = false;
 				let result = peer(&stream).and_then(|peer| {
 					let request: Request = wire::read_message(&mut stream)?;
 					mutation = matches!(
@@ -728,7 +743,9 @@ pub fn run_guard() -> Result<()> {
 					) || (matches!(request, Request::SelectClient { .. })
 						&& matches!(guard.phase.as_str(), "active" | "grace"));
 					let watch = matches!(request, Request::Watch { .. });
+					let transaction = matches!(request, Request::Prepare { .. } | Request::Commit { .. });
 					let result = guard.handle(request, peer.pid)?;
+					owns_transaction = transaction && guard.owner_pid == peer.pid;
 					if watch {
 						guard.owner_connection = Some(stream.try_clone().map_err(|e| e.to_string())?);
 					}
@@ -752,7 +769,7 @@ pub fn run_guard() -> Result<()> {
 					target,
 					error,
 				};
-				let _ = wire::write_message(&mut stream, &reply);
+				guard.deliver_reply(&mut stream, &reply, owns_transaction);
 			},
 			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
 			Err(e) => return Err(e.to_string()),
@@ -812,6 +829,7 @@ mod tests {
 				id: id.into(),
 				node_id: 7,
 				serial: Some(42),
+				observed_mode: Some(mode),
 				output: id.into(),
 				mode,
 			})
@@ -1017,6 +1035,48 @@ mod tests {
 		observed = saved.clone();
 		observed.layout_mode = Some(2);
 		assert!(verify(&observed, &saved).is_err());
+	}
+
+	#[test]
+	fn requester_disappearing_during_creation_or_after_commit_restores_owned_resources() {
+		for committed in [false, true] {
+			let (_directory, mut guard, state) = fixture();
+			let baseline = state.borrow().current.clone();
+			let target = prepare(&mut guard);
+			if committed {
+				commit(&mut guard, &target);
+			}
+			let reply = Reply {
+				status: guard.status(),
+				lease: guard.journal.as_ref().map(|j| j.lease.clone()),
+				target: Some(target),
+				error: None,
+			};
+			let (requester, mut responder) = UnixStream::pair().unwrap();
+			drop(requester);
+			guard.deliver_reply(&mut responder, &reply, true);
+			assert_eq!(guard.phase, "idle");
+			assert!(guard.journal.is_none());
+			assert_eq!(state.borrow().current, baseline);
+		}
+	}
+
+	#[test]
+	fn discarded_status_reply_cannot_restore_someone_elses_lease() {
+		let (_directory, mut guard, _state) = fixture();
+		let target = prepare(&mut guard);
+		commit(&mut guard, &target);
+		let reply = Reply {
+			status: guard.status(),
+			lease: None,
+			target: None,
+			error: None,
+		};
+		let (requester, mut responder) = UnixStream::pair().unwrap();
+		drop(requester);
+		guard.deliver_reply(&mut responder, &reply, false);
+		assert_eq!(guard.phase, "active");
+		assert!(guard.journal.is_some());
 	}
 
 	#[test]

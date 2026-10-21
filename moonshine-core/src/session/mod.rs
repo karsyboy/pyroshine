@@ -650,6 +650,10 @@ pub(crate) struct ActiveSession {
 }
 
 impl ActiveSession {
+	pub(crate) fn rate_control(&self) -> stream::video::rate::RateControl {
+		self.video_handle.rate_control.clone()
+	}
+
 	/// Reset the video stream's frame counters and force an IDR for a resuming client.
 	pub(crate) async fn reset_video_stream(&self, generation: u64) -> Result<(), ()> {
 		self.video_handle.request_reset(generation).await

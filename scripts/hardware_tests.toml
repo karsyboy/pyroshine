@@ -196,3 +196,13 @@ timeout = 45
 name = "session::capture::portal::takeover_tests::managed_takeover_keeps_input_across_output_changes"
 requires = ["kde-wayland", "render-node", "systemd-user", "desktop-takeover"]
 timeout = 90
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::vaapi_loss_recovery_decodes_on_gpu"
+requires = ["render-node", "vaapi-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::nvenc_loss_recovery_decodes_on_gpu"
+requires = ["render-node", "nvenc", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }

@@ -1,4 +1,5 @@
 pub mod pyrowave_protocol;
+pub mod rate;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
@@ -411,6 +412,7 @@ impl VideoStreamContext {
 /// immediately, then wait on a persistent [`StartLatch`] until `StartB`.
 #[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
+	pub(crate) rate_control: rate::RateControl,
 	start: StartLatch,
 	idr_tx: broadcast::Sender<()>,
 	/// Reference frame invalidation requests, carrying the inclusive
@@ -547,6 +549,7 @@ impl VideoStreamHandle {
 		let (idr_tx, idr_rx) = broadcast::channel(16);
 		let (packet_tx, packet_rx) = mpsc::channel(16);
 		let handle = Self {
+			rate_control: rate::channel(0).0,
 			pause_tx: watch::channel(0u64).0,
 			start: StartLatch::new(),
 			idr_tx,
@@ -644,6 +647,7 @@ impl VideoStream {
 		}
 		let (reconfigure_tx, reconfigure_rx) = std::sync::mpsc::channel();
 		let pacing = context.frame_pacing();
+		let (rate_control, rate_rx) = rate::channel(generation);
 
 		// Spawn packet handler — registered now, gated behind the start latch.
 		let demand = MediaDemand::new();
@@ -682,10 +686,12 @@ impl VideoStream {
 			reconfigure_rx,
 			demand,
 			stop_cause,
+			rate_rx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
 		Ok(VideoStreamHandle {
+			rate_control,
 			start,
 			idr_tx,
 			invalidate_tx,

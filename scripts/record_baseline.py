@@ -119,8 +119,8 @@ def run(command, **kwargs):
 
 def output(command):
     try:
-        result = run(command)
-    except FileNotFoundError:
+        result = run(command, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -165,6 +165,16 @@ def checkout():
         "dirty_paths": status.splitlines() if status else [],
         "version": workspace["workspace"]["package"]["version"],
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
+        "capture_encode_sources": {
+            str(path.relative_to(ROOT)): sha256(path)
+            for directory, pattern in (
+                ("moonshine-core/src/session/capture", "*.rs"),
+                ("moonshine-core/src/session/stream/video/pipeline", "*.rs"),
+                ("moonshine-core/src/desktop", "*.rs"),
+                ("moonshine-core/protocols", "*.xml"),
+            )
+            for path in sorted((ROOT / directory).rglob(pattern))
+        },
         "pinned_git_dependencies": pinned,
         "pyrowave_pins": pyrowave,
         "pyrowave_patches": sorted(
@@ -207,6 +217,13 @@ def host():
         "memory_kib": int(memory[1]) if memory else None,
         "cpu_governor": read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
         "gpus": vulkan(),
+        "desktop": {
+            "current_desktop": os.environ.get("XDG_CURRENT_DESKTOP"),
+            "session_type": os.environ.get("XDG_SESSION_TYPE"),
+            "kwin": output(["kwin_wayland", "--version"]),
+            "gnome_shell": output(["gnome-shell", "--version"]),
+            "pipewire": output(["pipewire", "--version"]),
+        },
         "render_nodes": sorted(path.name for path in Path("/dev/dri").glob("renderD*")),
         "amdgpu_power_profile": [
             read(path) for path in Path("/sys/class/drm").glob("card*/device/power_dpm_force_performance_level")

@@ -196,6 +196,7 @@ impl Gnome {
 			id: id.into(),
 			node_id,
 			serial: None,
+			observed_mode: None,
 			output: String::new(),
 			mode,
 		})
@@ -217,6 +218,12 @@ impl Gnome {
 		}
 		let mut result = target.clone();
 		result.output = key(&candidates[0].0);
+		result.observed_mode = self
+			.snapshot()?
+			.outputs
+			.into_iter()
+			.find(|o| o.key == result.output)
+			.map(|o| o.mode);
 		Ok(result)
 	}
 	pub fn apply(&mut self, desired: &Snapshot) -> Result<()> {

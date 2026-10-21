@@ -205,7 +205,32 @@ pub(crate) enum ConventionalEncoder {
 	Nvenc(super::nvenc::NvencEncoder),
 }
 
+/// Live rates stay within the negotiated startup budget: allocated output storage,
+/// codec level and receiver capacity remain valid without a new stream epoch.
+pub(super) fn bounded_bitrate(requested: u32, ceiling: u32) -> Result<u32, EncodeError> {
+	if requested == 0 || ceiling == 0 {
+		return Err(EncodeError::native("live bitrate must be non-zero"));
+	}
+	Ok(requested.min(ceiling))
+}
+
 impl ConventionalEncoder {
+	pub(crate) fn next_display_order(&self) -> u64 {
+		match self {
+			Self::Vulkan(e) => e.next_display_order(),
+			Self::Vaapi(e) => e.next_display_order(),
+			Self::Nvenc(e) => e.next_display_order(),
+		}
+	}
+
+	pub(crate) fn set_bitrate(&mut self, requested: u32) -> Result<u32, EncodeError> {
+		match self {
+			Self::Vulkan(encoder) => encoder.set_bitrate(requested).map_err(EncodeError::Vulkan),
+			Self::Vaapi(encoder) => encoder.set_bitrate(requested),
+			Self::Nvenc(encoder) => encoder.set_bitrate(requested),
+		}
+	}
+
 	/// Force the next submitted frame to be an IDR (key) frame.
 	pub(crate) fn request_idr(&mut self) {
 		match self {

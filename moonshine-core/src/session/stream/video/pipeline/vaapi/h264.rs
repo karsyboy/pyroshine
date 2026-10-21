@@ -1,6 +1,6 @@
 //! H.264 High profile (4:2:0 8-bit) sequence/picture headers and VA-API
 //! parameter buffers for a low-latency stream: IDR then P frames, one
-//! reference, no reordering (ITU-T H.264).
+//! active reference, bounded DPB, no reordering (ITU-T H.264).
 //!
 //! The SPS and PPS are packed here so the VUI carries the stream's color
 //! description. Slice headers are packed too where the driver takes them:
@@ -64,6 +64,7 @@ pub(super) struct H264 {
 	width_mbs: u32,
 	height_mbs: u32,
 	level: u8,
+	max_references: usize,
 }
 
 impl H264 {
@@ -71,6 +72,7 @@ impl H264 {
 		let width_mbs = setup.coded_width / MB;
 		let height_mbs = setup.coded_height / MB;
 		Self {
+			max_references: setup.max_references,
 			width_mbs,
 			height_mbs,
 			level: level_idc(width_mbs, height_mbs, setup.fps, setup.bitrate),
@@ -95,8 +97,8 @@ impl H264 {
 		w.flag(false); // seq_scaling_matrix_present_flag
 		w.ue(LOG2_MAX_FRAME_NUM_MINUS4);
 		w.ue(2); // pic_order_cnt_type: derived from frame_num (no reordering)
-		w.ue(1); // max_num_ref_frames
-		w.flag(false); // gaps_in_frame_num_value_allowed_flag
+		w.ue(self.max_references as u32); // max_num_ref_frames
+		w.flag(true); // lost pictures may leave frame_num gaps
 		w.ue(self.width_mbs - 1);
 		w.ue(self.height_mbs - 1); // pic_height_in_map_units_minus1
 		w.flag(true); // frame_mbs_only_flag
@@ -144,7 +146,7 @@ impl H264 {
 		w.ue(16); // log2_max_mv_length_vertical
 		// Decoders may output every frame as soon as it is decoded.
 		w.ue(0); // max_num_reorder_frames
-		w.ue(1); // max_dec_frame_buffering
+		w.ue(self.max_references as u32); // max_dec_frame_buffering
 	}
 
 	fn pps(&self) -> Vec<u8> {
@@ -188,7 +190,16 @@ impl H264 {
 			w.se(0); // slice_qp_delta
 		} else {
 			w.flag(false); // num_ref_idx_active_override_flag: one reference
-			w.flag(false); // ref_pic_list_modification_flag_l0
+			let older = frame
+				.reference
+				.is_some_and(|(_, index)| index + 1 != frame.index_since_idr);
+			w.flag(older); // ref_pic_list_modification_flag_l0
+			if older {
+				let (_, index) = frame.reference.expect("trusted older reference");
+				w.ue(0); // subtract abs_diff_pic_num from current PicNum
+				w.ue((frame.index_since_idr - index - 1) as u32);
+				w.ue(3); // end of list modifications
+			}
 			w.flag(false); // dec_ref_pic_marking(): adaptive_ref_pic_marking_mode_flag
 			w.ue(0); // cabac_init_idc
 			w.se(0); // slice_qp_delta
@@ -211,7 +222,7 @@ impl H264 {
 			intra_idr_period: 0,
 			ip_period: 1,
 			bits_per_second: setup.bitrate,
-			max_num_ref_frames: 1,
+			max_num_ref_frames: self.max_references as u32,
 			picture_width_in_mbs: self.width_mbs as u16,
 			picture_height_in_mbs: self.height_mbs as u16,
 			..Default::default()
@@ -282,8 +293,8 @@ impl H264 {
 		let reference = frame
 			.reference
 			.map(|(surface, index)| Self::picture(surface, frame_num(index), (2 * index) as i32));
-		if let Some(reference) = reference {
-			picture.ReferenceFrames[0] = reference;
+		for (slot, &(surface, index)) in picture.ReferenceFrames.iter_mut().zip(frame.retained.iter().flatten()) {
+			*slot = Self::picture(surface, frame_num(index), (2 * index) as i32);
 		}
 		// SAFETY: writing a plain-data bitfield view of a union.
 		let fields = unsafe { &mut picture.pic_fields.bits };

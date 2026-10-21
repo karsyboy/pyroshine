@@ -28,6 +28,7 @@ mod av1;
 mod bits;
 mod h264;
 mod hevc;
+mod recovery;
 pub(crate) mod sys;
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
@@ -388,6 +389,7 @@ pub(super) struct Setup {
 	pub coded_height: u32,
 	pub fps: u32,
 	pub bitrate: u32,
+	pub max_references: usize,
 	pub chroma_444: bool,
 	pub bit_depth: u32,
 	pub color: ColorDescription,
@@ -403,6 +405,7 @@ impl Setup {
 /// One frame's position in the reference structure.
 pub(super) struct Frame {
 	pub idr: bool,
+	pub retained: [Option<(VASurfaceID, u64)>; recovery::MAX_REFS],
 	/// Frames since the last IDR (0 for the IDR itself).
 	pub index_since_idr: u64,
 	/// IDRs before this one (`idr_pic_id`).
@@ -488,16 +491,18 @@ pub(crate) struct VaapiEncoder {
 	config: VAConfigID,
 	context: VAContextID,
 	slots: Vec<Slot>,
-	recon: [VASurfaceID; 2],
+	recon: Vec<VASurfaceID>,
+	dpb: recovery::Dpb,
 	codec: Codec,
 	setup: Setup,
+	bitrate_ceiling: u32,
+	installed_bitrate: u32,
 	packed_headers: u32,
 	convert: ConvertFormat,
 	current: usize,
 	submitted: u64,
 	index_since_idr: u64,
 	idr_count: u64,
-	last_recon: Option<(VASurfaceID, u64)>,
 	idr_pending: bool,
 	jobs: Option<std::sync::mpsc::Sender<Job>>,
 	readback: Option<std::thread::JoinHandle<()>>,
@@ -594,6 +599,26 @@ impl VaapiEncoder {
 		};
 		display.check(status, "config attributes").map_err(|e| e.to_string())?;
 		let [rt, rc, packed] = attributes.map(|a| a.value);
+		let mut references = VAConfigAttrib {
+			type_: VAConfigAttribEncMaxRefFrames,
+			value: 0,
+		};
+		// SAFETY: a single valid attribute and the already selected profile.
+		let refs_status = unsafe { (va.get_config_attributes)(raw, profile.profile, entrypoint, &mut references, 1) };
+		// EncMaxRefFrames bounds the *active list*, which stays at one.
+		// We allocate the retained reconstructions ourselves. Four short-term
+		// entries fit H.264/HEVC's DPB at every selected level, and both VA
+		// picture parameter arrays; no additional prediction references or
+		// reorder delay are enabled. Unknown capability keeps one entry.
+		let max_references = if refs_status == VA_STATUS_SUCCESS as i32
+			&& references.value != VA_ATTRIB_NOT_SUPPORTED
+			&& references.value & 0xffff >= 1
+			&& profile.kind != Kind::Av1
+		{
+			recovery::MAX_REFS
+		} else {
+			1
+		};
 		// Codec tools: HEVC features, block sizes and prediction directions;
 		// AV1 features and their two extensions.
 		let mut codec_attributes = match profile.kind {
@@ -649,6 +674,11 @@ impl VaapiEncoder {
 
 		let coded_width = format.width.next_multiple_of(16);
 		let coded_height = format.height.next_multiple_of(16);
+		tracing::debug!(
+			reported_refs = references.value,
+			retained_refs = max_references,
+			"VA-API reference retention"
+		);
 		let setup = Setup {
 			width: format.width,
 			height: format.height,
@@ -656,6 +686,7 @@ impl VaapiEncoder {
 			coded_height,
 			fps: format.fps,
 			bitrate: format.bitrate,
+			max_references,
 			chroma_444: format.chroma == ChromaFormat::Yuv444,
 			bit_depth: u32::from(format.bit_depth.bits()),
 			color: format.color,
@@ -728,7 +759,8 @@ impl VaapiEncoder {
 			config,
 			context: VA_INVALID_ID,
 			slots: Vec::new(),
-			recon: [VA_INVALID_SURFACE; 2],
+			recon: Vec::new(),
+			dpb: recovery::Dpb::new(max_references),
 			codec,
 			setup,
 			packed_headers: wanted,
@@ -737,7 +769,8 @@ impl VaapiEncoder {
 			submitted: 0,
 			index_since_idr: 0,
 			idr_count: 0,
-			last_recon: None,
+			bitrate_ceiling: format.bitrate,
+			installed_bitrate: format.bitrate,
 			idr_pending: true,
 			jobs: None,
 			readback: None,
@@ -790,7 +823,7 @@ impl VaapiEncoder {
 				},
 			},
 		];
-		let mut surfaces = [VA_INVALID_SURFACE; INPUT_SURFACES + 2];
+		let mut surfaces = vec![VA_INVALID_SURFACE; INPUT_SURFACES + self.setup.max_references + 1];
 		// SAFETY: valid display, output array and attributes.
 		let status = unsafe {
 			(va.create_surfaces)(
@@ -808,7 +841,7 @@ impl VaapiEncoder {
 			.display
 			.check(status, "create surfaces")
 			.map_err(|e| e.to_string())?;
-		self.recon = [surfaces[INPUT_SURFACES], surfaces[INPUT_SURFACES + 1]];
+		self.recon = surfaces[INPUT_SURFACES..].to_vec();
 		for &surface in &surfaces[..INPUT_SURFACES] {
 			self.slots.push(Slot {
 				surface,
@@ -903,12 +936,35 @@ impl VaapiEncoder {
 		(self.convert, (self.setup.coded_width, self.setup.coded_height))
 	}
 
-	pub(crate) fn request_idr(&mut self) {
-		self.idr_pending = true;
+	pub(crate) fn set_bitrate(&mut self, requested: u32) -> Result<u32, EncodeError> {
+		let accepted = super::backend::bounded_bitrate(requested, self.bitrate_ceiling)?;
+		self.setup.bitrate = accepted;
+		Ok(accepted)
 	}
 
-	pub(crate) fn invalidate_reference_frames(&mut self, _display_order: u64) {
+	#[cfg(test)]
+	pub(crate) fn reference_capacity(&self) -> usize {
+		self.setup.max_references
+	}
+
+	pub(crate) fn next_display_order(&self) -> u64 {
+		self.submitted
+	}
+
+	pub(crate) fn request_idr(&mut self) {
 		self.idr_pending = true;
+		self.dpb.clear();
+	}
+
+	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) {
+		if matches!(self.codec, Codec::Av1(_)) || display_order >= self.submitted {
+			self.request_idr();
+			return;
+		}
+		self.dpb.invalidate(display_order);
+		if self.dpb.anchor().is_none() {
+			self.request_idr();
+		}
 	}
 
 	pub(crate) fn set_color_description(&mut self, description: ColorDescription) -> Result<(), EncodeError> {
@@ -964,23 +1020,35 @@ impl VaapiEncoder {
 				"encode target is not the current VA-API input surface",
 			));
 		}
-		let idr = self.idr_pending || self.last_recon.is_none();
+		let idr = self.idr_pending || self.dpb.anchor().is_none();
 		if idr {
 			self.index_since_idr = 0;
+			self.dpb.clear();
 		}
+		// Current output never aliases any decoder-retained reconstruction.
+		let recon = *self
+			.recon
+			.iter()
+			.find(|&&surface| !self.dpb.contains(surface))
+			.ok_or_else(|| EncodeError::native("no free reconstructed surface"))?;
 		let frame = Frame {
+			retained: self.dpb.references(),
 			idr,
 			index_since_idr: self.index_since_idr,
 			idr_count: self.idr_count,
-			recon: self.recon[(self.submitted % 2) as usize],
-			reference: if idr { None } else { self.last_recon },
+			recon,
+			reference: if idr {
+				None
+			} else {
+				self.dpb.anchor().map(|r| (r.surface, r.codec_order))
+			},
 		};
 		let (surface, coded) = (slot.surface, slot.coded);
 		self.shared.busy.lock().unwrap_or_else(|e| e.into_inner())[index] = true;
 		if let Err(SubmitError { error, accepted }) = self.submit(&frame, surface, coded) {
 			// The reference chain is unknown after a failed submission.
 			self.idr_pending = true;
-			self.last_recon = None;
+			self.dpb.clear();
 			if !accepted {
 				self.shared.busy.lock().unwrap_or_else(|e| e.into_inner())[index] = false;
 				return Err(error);
@@ -1025,7 +1093,8 @@ impl VaapiEncoder {
 			self.idr_pending = false;
 			self.idr_count += 1;
 		}
-		self.last_recon = Some((frame.recon, frame.index_since_idr));
+		self.installed_bitrate = self.setup.bitrate;
+		self.dpb.push(frame.recon, self.submitted, frame.index_since_idr);
 		self.index_since_idr += 1;
 		self.submitted += 1;
 		self.current = (self.current + 1) % self.slots.len();
@@ -1043,6 +1112,10 @@ impl VaapiEncoder {
 			self.av1_buffers(codec, &mut buffers, frame, coded)?;
 		} else {
 			self.annex_b_buffers(&mut buffers, frame, coded)?;
+		}
+		if !frame.idr && self.setup.bitrate != self.installed_bitrate {
+			// RC/HRD change at the next picture; reset=0 preserves prediction.
+			buffers.rate_control(&self.setup)?;
 		}
 		let _submitting = self.shared.lock.lock().unwrap_or_else(|e| e.into_inner());
 		let va = display.va;
@@ -1185,7 +1258,7 @@ impl Drop for VaapiEncoder {
 				.slots
 				.iter()
 				.map(|slot| slot.surface)
-				.chain(self.recon)
+				.chain(self.recon.iter().copied())
 				.filter(|&surface| surface != VA_INVALID_SURFACE)
 				.collect();
 			if !surfaces.is_empty() {
