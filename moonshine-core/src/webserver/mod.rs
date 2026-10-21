@@ -710,6 +710,13 @@ impl Webserver {
 			"<currentgame>{}</currentgame>",
 			session_context.clone().map(|s| s.application_id).unwrap_or(0)
 		);
+		// Public like `currentgame`, which it qualifies: what Steam reports
+		// about the running game (launching, updating, running, exited).
+		if session_context.is_some()
+			&& let Some(game) = self.session_manager.steam_game().await
+		{
+			response += &format!("<PyroshineGameState>{}</PyroshineGameState>", game.state.as_str());
+		}
 		response += &format!(
 			"<state>{}</state>",
 			session_context

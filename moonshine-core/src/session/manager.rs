@@ -282,6 +282,8 @@ struct SessionRecord {
 	context: SessionContext,
 	/// Compositor state belongs to this session lifetime, not a client generation.
 	foreground: watch::Receiver<Option<moonshine_management::dto::ForegroundApplication>>,
+	/// Steam's state of the launched game, once a Steam game was launched.
+	steam_game: Option<watch::Receiver<Option<moonshine_management::dto::SteamGameDetails>>>,
 	/// Contexts used by the live encoders, once streaming.
 	streams: Option<(VideoStreamContext, AudioStreamContext)>,
 	/// Application unit this session may own. Recorded before the launch is
@@ -360,6 +362,7 @@ pub(crate) struct SessionView {
 	pub application_title: String,
 	pub application_id: i32,
 	pub foreground_application: Option<moonshine_management::dto::ForegroundApplication>,
+	pub steam_game: Option<moonshine_management::dto::SteamGameDetails>,
 	pub resolution: (u32, u32),
 	pub refresh_rate: u32,
 	pub hdr: bool,
@@ -671,6 +674,12 @@ impl<B: SessionBackend> SessionCore<B> {
 		self.lock().await.live().map(|live| live.record.foreground.clone())
 	}
 
+	pub(crate) async fn subscribe_steam_game(
+		&self,
+	) -> Option<watch::Receiver<Option<moonshine_management::dto::SteamGameDetails>>> {
+		self.lock().await.live().and_then(|live| live.record.steam_game.clone())
+	}
+
 	/// Read-only view of the live session for status reporting.
 	pub(crate) async fn session_view(&self) -> Option<SessionView> {
 		let mut guard = self.lock().await;
@@ -686,6 +695,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				application_title: context.application.title.clone(),
 				application_id: context.application_id,
 				foreground_application: live.record.foreground.borrow().clone(),
+				steam_game: live.record.steam_game.as_ref().and_then(|state| state.borrow().clone()),
 				resolution: context.resolution,
 				refresh_rate: context.refresh_rate,
 				hdr: context.hdr,
@@ -1021,6 +1031,7 @@ impl<B: SessionBackend> SessionCore<B> {
 					stop: stop.clone(),
 					context: context.clone(),
 					foreground,
+					steam_game: None,
 					streams: None,
 					application_unit: None,
 					start_latches: Vec::new(),
@@ -1126,6 +1137,10 @@ impl<B: SessionBackend> SessionCore<B> {
 			if live.record.context.application.mode.is_game() {
 				live.record.application_unit = Some(application_unit_name());
 			}
+			// Before the application starts, so Steam's first log lines (an
+			// update right after start) are not mistaken for earlier history.
+			live.record.steam_game =
+				crate::session::steam_game::observe(&live.record.context.application, live.record.stop.clone());
 			let Some(SessionState::Initialized(session)) = live.state.take() else {
 				unreachable!("checked above");
 			};
@@ -1742,6 +1757,20 @@ impl SessionManager {
 		self.core.subscribe_foreground().await
 	}
 
+	/// Steam's state of the launched game while a Steam game's session is live.
+	pub(crate) async fn subscribe_steam_game(
+		&self,
+	) -> Option<watch::Receiver<Option<moonshine_management::dto::SteamGameDetails>>> {
+		self.core.subscribe_steam_game().await
+	}
+
+	/// Steam's current state of the launched game, if a Steam game's session is live.
+	pub(crate) async fn steam_game(&self) -> Option<moonshine_management::dto::SteamGameDetails> {
+		self.subscribe_steam_game()
+			.await
+			.and_then(|state| state.borrow().clone())
+	}
+
 	/// Read-only view of the live session, if any.
 	pub(crate) async fn session_view(&self) -> Option<SessionView> {
 		self.core.session_view().await
@@ -1915,6 +1944,7 @@ impl SessionManager {
 				stop: ShutdownManager::new(),
 				context,
 				foreground,
+				steam_game: None,
 				streams: None,
 				application_unit: None,
 				start_latches: Vec::new(),
@@ -1927,6 +1957,17 @@ impl SessionManager {
 			state: None,
 			transition: None,
 		}));
+		sender
+	}
+
+	/// Attach a Steam game state to the live test session, as launching a
+	/// Steam game does.
+	pub(crate) async fn report_steam_game_for_test(
+		&self,
+	) -> watch::Sender<Option<moonshine_management::dto::SteamGameDetails>> {
+		let (sender, receiver) = watch::channel(None);
+		let mut guard = self.core.lock().await;
+		guard.live().expect("a live test session").record.steam_game = Some(receiver);
 		sender
 	}
 

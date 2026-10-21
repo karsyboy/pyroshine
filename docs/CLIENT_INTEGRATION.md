@@ -51,6 +51,34 @@ finds no identity for a game on a host advertising version 1 can report that
 the game is not installed (or is hidden); without the element, the host
 cannot answer the question.
 
+## Steam game state
+
+While a session launched from a Steam game (`steam … steam://rungameid/<id>`)
+is live, `/serverinfo` reports what Steam says about that game next to
+`currentgame`:
+
+```xml
+<currentgame>1943979320</currentgame><PyroshineGameState>running</PyroshineGameState>
+```
+
+| Value | Meaning |
+| --- | --- |
+| `launching` | Steam is starting or launching the game; nothing reported yet. |
+| `updating` | Steam is downloading or applying an update first. |
+| `running` | The game's processes run. |
+| `exited` | The game exited; Steam (Big Picture) still runs in the session. |
+
+The element is absent when idle, for other applications and until the state
+is known. It is public like `currentgame`, which it only qualifies. The
+management interface reports the same in `SessionDetails.steam_game`
+(`app_id`, `state`, `since_ms`).
+
+Pyroshine reads it from the lines Steam appends to `logs/content_log.txt`
+and `logs/gameprocess_log.txt` of the client the command starts
+(`~/.steam/root`, or the Flathub Flatpak's data directory) after the launch,
+once a second and bounded, without touching the stream. A game ending does
+not end the session: Steam keeps it, as before.
+
 ## Launch errors
 
 A launch that cannot start returns a GameStream error whose message the
@@ -69,13 +97,17 @@ management interface's problem log):
 Automated:
 
 ```sh
-cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_instance
+cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_instance steam_game
 ```
 
 - `catalog::tests::launcher_identities_*`: own keys, manual overrides, equal
   titles, hidden entries.
 - `webserver::app_list_tests`: the `/applist` document.
 - `webserver::security_tests::serverinfo_advertises_the_app_sources_version`.
+- `session::steam_game::tests`: log parsing from real Steam lines, the state
+  machine, tailing across partial writes and rotation, read bounds, and the
+  observer ending with the session.
+- `webserver::security_tests::serverinfo_reports_steam_game_state_with_the_running_game`.
 - `session::steam_instance::tests`: Steam command detection, process
   detection by user and state, hooks and Desktop Mode exemptions.
 

@@ -20,7 +20,12 @@
       "audio_channel_mask": 3
     },
     "video": null,
-    "audio": null
+    "audio": null,
+    "steam_game": {
+      "app_id": 892970,
+      "state": "updating",
+      "since_ms": 1500
+    }
   },
   "last_stop": null
 }

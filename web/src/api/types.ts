@@ -15,10 +15,14 @@ export interface SessionSnapshot {
   last_stop: LastStop | null;
 }
 
+export type SteamGameState = "launching" | "updating" | "running" | "exited";
+
 export interface SessionDetails {
   epoch: number;
   application: { id: number; title: string };
   foreground_application?: { title: string } | null;
+  /** What Steam reports about the launched Steam game; absent for other apps and older daemons. */
+  steam_game?: { app_id: number; state: SteamGameState; since_ms: number } | null;
   client_address: string;
   started_at_ms: number;
   requested: {

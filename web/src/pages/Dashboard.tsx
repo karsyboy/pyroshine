@@ -19,7 +19,7 @@ import CheckCircleOutlined from "@mui/icons-material/CheckCircleOutlined";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import WarningAmber from "@mui/icons-material/WarningAmber";
 import { api, errorMessage } from "../api/client";
-import type { DesktopStatus, AudioDetails, CapturePathStats, CaptureStats, Finding, GpuEngineStats, GpuStats, SessionDetails, SessionPhase, StreamStats } from "../api/types";
+import type { DesktopStatus, AudioDetails, CapturePathStats, CaptureStats, Finding, GpuEngineStats, GpuStats, SessionDetails, SessionPhase, SteamGameState, StreamStats } from "../api/types";
 import { ConfirmDialog, Facts, Hint, PageHeader, StatusDot, phaseLabels } from "../components/common";
 import { Sparkline } from "../components/Sparkline";
 import { useDaemon, useNow } from "../state/daemon";
@@ -44,6 +44,14 @@ function formatChips(session: SessionDetails, stats: StreamStats | null): string
   if (stats?.epoch === session.epoch && stats.capture?.pacing === "vrr") chips.push("VRR capture");
   return chips;
 }
+
+// Steam's own progress, read from its logs (moonshine-core session/steam_game.rs).
+const steamGameStates: Record<SteamGameState, string> = {
+  launching: "Launching",
+  updating: "Updating",
+  running: "Running",
+  exited: "Exited (Steam still open)",
+};
 
 const pacingLabels: Record<CaptureStats["pacing"], string> = {
   vrr: "VRR capture",
@@ -630,6 +638,9 @@ function StreamDetails({ session }: { session: SessionDetails }) {
             rows={[
               ...captureRows(session.capture),
               ["Foreground application", session.foreground_application?.title ?? "—"],
+              ...(session.steam_game
+                ? [["Steam game", `${steamGameStates[session.steam_game.state]} (app ${session.steam_game.app_id})`] as [string, string]]
+                : []),
               ["Moonlight application", session.application.title],
               ["Application ID", String(session.application.id)],
               ["Client", session.client_address],

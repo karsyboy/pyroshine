@@ -16,6 +16,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
+- Show what Steam reports about a streamed Steam game: launching, updating, running or exited. The Dashboard's session card lists it, the management interface reports it as `steam_game`, and `/serverinfo` as `<PyroshineGameState>` so clients such as PyroDeck can tell an update from a hang. Pyroshine reads the lines Steam appends to its content and game-process logs, once a second, and never changes the session because of them. See [Client integration](CLIENT_INTEGRATION.md#steam-game-state).
 - Report which launcher game each application starts. The paired-client app list now carries `<PyroshineSource>steam:892970</PyroshineSource>` (and `heroic:`, `lutris:`, `desktop:` identities) for every discovered entry, and for a manual entry that overrides a discovered game; `/serverinfo` advertises the version as `<PyroshineAppSources>1</PyroshineAppSources>`. Integrations such as PyroDeck find a Steam game by its app ID instead of by title; Moonlight clients ignore the new elements and application IDs are unchanged. See [Client integration](CLIENT_INTEGRATION.md).
 
 - Add generation-scoped live bitrate controls for Vulkan Video, VA-API and NVENC, with bounded coalescing, accepted-rate and first-picture results, and benchmark `--rate-change` requests. Fixed negotiated bitrate remains the default; updates preserve references and stay inside the startup budget.

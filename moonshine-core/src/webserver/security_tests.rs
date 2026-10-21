@@ -1096,3 +1096,66 @@ async fn serverinfo_advertises_the_app_sources_version() {
 	assert_eq!(xml_value(&body, "PyroshineAppSources"), APP_SOURCES_VERSION.to_string());
 	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
 }
+
+/// `currentgame` says which game runs; `PyroshineGameState` adds what Steam
+/// reports about it, and only while a Steam game's session is live.
+#[tokio::test]
+async fn serverinfo_reports_steam_game_state_with_the_running_game() {
+	use moonshine_management::dto::{SteamGameDetails, SteamGameState};
+	let Fixture { server, .. } = fixture(true, WebLimits::default());
+	let (_, idle) = http(&server, REMOTE, get("/serverinfo", "192.168.1.10")).await;
+	assert!(!idle.contains("PyroshineGameState"), "{idle}");
+
+	let _foreground = server
+		.session_manager
+		.reporting_session_for_test(SessionContext {
+			application: crate::session::application::ApplicationConfig {
+				title: "Valheim".into(),
+				command: vec!["/usr/bin/steam".into(), "steam://rungameid/892970".into()],
+				..Default::default()
+			},
+			application_id: 77,
+			resolution: (1280, 800),
+			refresh_rate: 60,
+			hdr: false,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: "127.0.0.1".parse().unwrap(),
+			client_identity: None,
+			vrr_requested: false,
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				crate::session::RemoteInputKey::from_bytes([7; 16]),
+				crate::session::RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let (_, unknown) = http(&server, REMOTE, get("/serverinfo", "192.168.1.10")).await;
+	assert_eq!(xml_value(&unknown, "currentgame"), "77");
+	assert!(!unknown.contains("PyroshineGameState"), "{unknown}");
+
+	let steam = server.session_manager.report_steam_game_for_test().await;
+	for (state, text) in [
+		(SteamGameState::Updating, "updating"),
+		(SteamGameState::Running, "running"),
+	] {
+		steam.send_replace(Some(SteamGameDetails {
+			app_id: 892970,
+			state,
+			since_ms: 1,
+		}));
+		let (_, body) = http(&server, REMOTE, get("/serverinfo", "192.168.1.10")).await;
+		assert_eq!(xml_value(&body, "PyroshineGameState"), text);
+	}
+	assert_eq!(
+		server
+			.session_manager
+			.session_view()
+			.await
+			.unwrap()
+			.steam_game
+			.unwrap()
+			.state,
+		SteamGameState::Running
+	);
+	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+}

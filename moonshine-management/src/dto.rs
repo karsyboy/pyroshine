@@ -73,6 +73,43 @@ pub struct SessionDetails {
 	/// What the session streams and how, once capture is running.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub capture: Option<CaptureDetails>,
+	/// What Steam reports about the game, when the application launches a
+	/// Steam game (`steam://rungameid/<id>`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub steam_game: Option<SteamGameDetails>,
+}
+
+/// Steam's own state of the game a session launched, read from Steam's logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteamGameState {
+	/// Steam is starting or launching the game; nothing reported yet.
+	Launching,
+	/// Steam is downloading or applying an update before launching.
+	Updating,
+	/// The game's processes are running.
+	Running,
+	/// The game ran and exited; Steam itself may still be open.
+	Exited,
+}
+
+impl SteamGameState {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Launching => "launching",
+			Self::Updating => "updating",
+			Self::Running => "running",
+			Self::Exited => "exited",
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteamGameDetails {
+	pub app_id: u32,
+	pub state: SteamGameState,
+	/// When the state was entered.
+	pub since_ms: u64,
 }
 
 /// The capture backend of a running session.

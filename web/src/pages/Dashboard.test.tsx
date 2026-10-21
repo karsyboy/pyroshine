@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import fixture from "../api/session.fixture.json";
+import fixtureJson from "../api/session.fixture.json";
 import type { AudioDetails, CaptureStats, GpuStats, SessionSnapshot, StreamStats } from "../api/types";
 import { setPreference } from "../state/preferences";
 import { DesktopPanel, DashboardPage } from "./Dashboard";
@@ -14,6 +14,10 @@ const daemon = vi.hoisted(() => ({
   history: [],
 }));
 vi.mock("../state/daemon", () => ({ useDaemon: () => daemon, useNow: () => 2000 }));
+
+// JSON imports widen string unions (`steam_game.state`); the Rust DTO test
+// keeps the fixture valid.
+const fixture = fixtureJson as SessionSnapshot;
 
 function render(snapshot: SessionSnapshot) {
   daemon.session = snapshot;
@@ -46,6 +50,26 @@ describe("foreground session display", () => {
   it.each([null, undefined])("falls back for unavailable metadata or an older daemon (%s)", (foreground) => {
     const html = render({ ...snapshot, session: { ...snapshot.session!, foreground_application: foreground } });
     expect(html).toMatch(/<h4[^>]*>Steam<\/h4>/);
+  });
+});
+
+describe("Steam game state", () => {
+  const snapshot: SessionSnapshot = { ...fixture, phase: "streaming" };
+
+  it.each([
+    ["launching", "Launching"],
+    ["updating", "Updating"],
+    ["running", "Running"],
+    ["exited", "Exited (Steam still open)"],
+  ] as const)("shows what Steam reports (%s)", (state, label) => {
+    const html = render({ ...snapshot, session: { ...snapshot.session!, steam_game: { app_id: 892970, state, since_ms: 1 } } });
+    expect(html).toContain("Steam game");
+    expect(html).toContain(`${label} (app 892970)`);
+  });
+
+  it.each([null, undefined])("omits the row for other applications and older daemons (%s)", (steamGame) => {
+    const html = render({ ...snapshot, session: { ...snapshot.session!, steam_game: steamGame } });
+    expect(html).not.toContain("Steam game");
   });
 });
 

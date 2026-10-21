@@ -430,8 +430,9 @@ fn json<T: serde::Serialize>(value: &T) -> String {
 	serde_json::to_string(value).expect("management documents serialize")
 }
 
-/// Recompute the public session state on lifecycle, client ownership or
-/// compositor foreground changes, or when a waiting session runs out of patience.
+/// Recompute the public session state on lifecycle, client ownership,
+/// compositor foreground or Steam game state changes, or when a waiting
+/// session runs out of patience.
 async fn follow_sessions(management: &Management) {
 	let mut status = management.sessions.subscribe_status();
 	let mut presence = management.sessions.subscribe_presence();
@@ -441,6 +442,10 @@ async fn follow_sessions(management: &Management) {
 		let client = *presence.borrow_and_update();
 		let mut foreground = management.sessions.subscribe_foreground().await;
 		if let Some(receiver) = foreground.as_mut() {
+			receiver.borrow_and_update();
+		}
+		let mut steam_game = management.sessions.subscribe_steam_game().await;
+		if let Some(receiver) = steam_game.as_mut() {
 			receiver.borrow_and_update();
 		}
 		let snapshot = management.session_snapshot(&manager, &client).await;
@@ -504,11 +509,21 @@ async fn follow_sessions(management: &Management) {
 				_ => std::future::pending().await,
 			}
 		};
+		// Like the compositor's, a closed Steam observer is a stopped session.
+		let wait_steam_game = async {
+			if let Some(receiver) = steam_game.as_mut()
+				&& receiver.changed().await.is_ok()
+			{
+				return;
+			}
+			std::future::pending::<()>().await;
+		};
 		tokio::select! {
 			changed = status.changed() => if changed.is_err() { return },
 			changed = presence.changed() => if changed.is_err() { return },
 			() = wait_patience => {},
 			() = wait_foreground => {},
+			() = wait_steam_game => {},
 		}
 	}
 }
@@ -779,6 +794,7 @@ fn session_details(view: SessionView, gpu: &str, video_config: &VideoStreamConfi
 			title: view.application_title,
 		},
 		foreground_application: view.foreground_application,
+		steam_game: view.steam_game,
 		capture: view.capture,
 		client_address: display_address(view.client_ip),
 		started_at_ms: unix_millis(view.started_at),

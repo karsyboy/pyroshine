@@ -213,7 +213,10 @@ sequenceDiagram
    a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY` and `PULSE_SERVER`.
    A Steam command without `pre_command` hooks is refused first while another
    Steam client of the user runs (`session/steam_instance.rs`), since Steam's
-   single-instance hand-off would open the game on the host's desktop.
+   single-instance hand-off would open the game on the host's desktop. For a
+   Steam game, `session/steam_game.rs` then follows Steam's logs for the
+   game's state (launching, updating, running, exited) for the management
+   interface and `/serverinfo`; the unit itself is the Steam client.
 3. **Negotiation.** RTSP DESCRIBE advertises the probed formats. ANNOUNCE carries
    the client's codec, chroma, dynamic range, resolution, FPS, bitrate, packet
    size, encryption and audio layout; it is validated and stored as a *pending*

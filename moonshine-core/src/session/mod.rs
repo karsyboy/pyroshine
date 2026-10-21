@@ -44,6 +44,7 @@ pub(crate) mod lifecycle;
 pub mod manager;
 pub(crate) mod negotiation;
 pub(crate) mod status;
+pub(crate) mod steam_game;
 pub(crate) mod steam_instance;
 pub mod stream;
 
