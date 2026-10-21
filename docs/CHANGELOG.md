@@ -43,6 +43,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Changed
 
+- Refuse a Steam launch while another Steam client of the service's user is running, before the streamed `steam` command can hand the game to it: the client's error dialog now says that Steam is running on the host (with its process ID) instead of the game opening on the host's desktop and the stream ending. Pyroshine never closes or signals that Steam. Entries with a `pre_command` are not checked, so the documented hook that closes a desktop Steam keeps working. See [Close a desktop Steam before streaming Steam](TIPS.md#close-a-desktop-steam-before-streaming-steam).
+
 - Keep application IDs stable. Discovered games keep the ID clients know across renames, reinstalls, rescans and restarts (recorded with visibility choices in `library.toml` beside `state.toml`); the first start after upgrading reports the same IDs as before. Manual entries keep their title-derived IDs.
 - Keep offering games whose library cannot be read. A Steam library on an unmounted drive, or a launcher file that is half-written, no longer drops its games: they stay offered from the last successful scan (also across restarts) for up to seven days, marked in the Library page, and the scan is retried.
 - Offer each game once. A desktop shortcut to a Steam, Lutris or Heroic game that a scanner already provides, or the same game found by two scanners, is no longer listed twice; a manual `[[application]]` with a discovered game's title replaces it (to override its command or box art); equal titles from different launchers are told apart, for example `Hades (Steam)` and `Hades (Heroic)`.

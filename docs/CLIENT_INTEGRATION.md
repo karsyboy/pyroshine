@@ -60,6 +60,7 @@ management interface's problem log):
 
 | Code | Cause |
 | --- | --- |
+| `steam_already_running` | A Steam client of the service's user is already running outside the session and would take the launch over. The launch is refused before the command runs; Pyroshine never closes that Steam. Entries with `pre_command` hooks are not checked. |
 | `session_busy` | Another session is starting or stopping. |
 | `launch_timeout` | The application did not reach an active state in time. |
 
@@ -68,10 +69,16 @@ management interface's problem log):
 Automated:
 
 ```sh
-cargo test -p moonshine-core --lib -- app_scanner::catalog webserver
+cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_instance
 ```
 
 - `catalog::tests::launcher_identities_*`: own keys, manual overrides, equal
   titles, hidden entries.
 - `webserver::app_list_tests`: the `/applist` document.
 - `webserver::security_tests::serverinfo_advertises_the_app_sources_version`.
+- `session::steam_instance::tests`: Steam command detection, process
+  detection by user and state, hooks and Desktop Mode exemptions.
+
+Manual, on a host with Steam installed: with the desktop Steam running,
+launching a Steam game from a client reports `steam_already_running` and the
+game does not open on the desktop; with it closed, the game streams.

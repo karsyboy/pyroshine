@@ -244,6 +244,12 @@ impl Application {
 				.with_hint(format!("Stop it with: systemctl --user stop {}", context.unit_name))
 			})?;
 
+		// With the previous unit gone, a running Steam belongs to someone else
+		// and would take this launch over (see `steam_instance`).
+		if let Some(failure) = crate::session::steam_instance::check_current_user(&config).await {
+			return Err(failure);
+		}
+
 		// Launch the application as a transient systemd service unit.
 		let options = LaunchOptions {
 			title: &config.title,

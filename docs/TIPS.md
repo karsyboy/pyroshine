@@ -10,7 +10,7 @@ If journal access is denied, prefix `journalctl` with `sudo`.
 | Server fails to start | Read `journalctl -u "pyroshine@$USER" -b -n 100 --no-pager`, then [check the host](#healthcheck-fails). |
 | Pairing does not finish | [Use a fresh request and its PIN](#pairing-does-not-complete). |
 | Launch or stream fails with an error | Read the client's error message, then **Diagnostics → Recent problems** in the web interface; [details](#read-why-a-launch-or-stream-failed). |
-| Steam opens locally / client reports 503 | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
+| Steam opens locally / "Steam is already running on the host" | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
 | Steam or games missing / cannot launch | [Check default applications](#steam-or-games-are-missing). |
 | Keyboard, mouse or gamepad unavailable | [Check input access](#keyboard-mouse-or-gamepads-do-not-work). |
 | Web interface unreachable / no tray | [Web interface troubleshooting](MANAGEMENT.md#troubleshooting); `pyroshine pair` still works. |
@@ -145,9 +145,12 @@ changes. See the [reference](CONFIGURATION.md) for command fields and scanners.
 
 ## Close a desktop Steam before streaming Steam
 
-Steam is single-instance per user. An existing desktop instance takes over the
-streamed launch, opening Big Picture locally and causing a 503 error.
-Quit it manually, or edit the existing Steam entry to close it automatically:
+Steam is single-instance per user: a Steam already running on the host's
+desktop would take a streamed Steam launch over and open the game locally.
+Pyroshine therefore refuses the launch while another Steam of the service's
+user runs, and the client shows "Steam is already running on the host
+(process N)". It never closes that Steam itself. Quit it manually, or edit the
+existing Steam entry to close it automatically:
 
 ```toml
 [[application]]
@@ -158,7 +161,10 @@ pre_command = [
 ]
 ```
 
-This closes local Steam and waits up to 30 seconds before streaming it.
+This closes local Steam and waits up to 30 seconds before streaming it. An
+entry with a `pre_command` is not checked for a running Steam, since its hook
+runs first; put the same `pre_command` on the `type = "steam"` scanner to
+close a desktop Steam before streamed games too.
 See [upstream issue #134](https://github.com/hgaiser/moonshine/issues/134).
 
 ## Prevent the host from suspending while streaming
