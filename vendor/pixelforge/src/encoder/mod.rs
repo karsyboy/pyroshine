@@ -569,6 +569,8 @@ trait EncoderApi: Send {
     fn input_image(&self) -> vk::Image;
     fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
+    fn set_bitrate(&mut self, requested: u32) -> Result<u32>;
+    fn next_display_order(&self) -> u64;
     fn request_idr(&mut self);
     fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
     fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
@@ -596,6 +598,12 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     }
     fn flush(&mut self) -> Result<()> {
         codec::CodecEncoder::flush(self)
+    }
+    fn set_bitrate(&mut self, requested: u32) -> Result<u32> {
+        codec::CodecEncoder::set_bitrate(self, requested)
+    }
+    fn next_display_order(&self) -> u64 {
+        self.common.input_frame_num
     }
     fn request_idr(&mut self) {
         codec::CodecEncoder::request_idr(self)
@@ -697,6 +705,20 @@ impl Encoder {
     /// outstanding future has been resolved.
     pub fn flush(&mut self) -> Result<()> {
         self.0.flush()
+    }
+
+    /// Stage a CBR bitrate for the next submitted frame without resetting the
+    /// session or its references. Returns the accepted target, bounded by the
+    /// startup bitrate and this profile's device limit. A failed submission
+    /// retains the staged change for retry. CQP/VBR sessions reject this operation.
+    pub fn set_bitrate(&mut self, requested: u32) -> Result<u32> {
+        self.0.set_bitrate(requested)
+    }
+
+    /// Display order assigned by the next encode attempt. Failed attempts can
+    /// consume an order; callers must not infer this from successful packets.
+    pub fn next_display_order(&self) -> u64 {
+        self.0.next_display_order()
     }
 
     /// Request that the next frame be an IDR frame.

@@ -22,11 +22,11 @@ use super::format::{
 };
 use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
 use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
+use crate::session::capture::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "b09e1365155e91710497be22eac6500f04bf74ea";
+pub(crate) const SOURCE_REVISION: &str = "78084ece21b1725d193442a7619660625f3f735a";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -1415,7 +1415,7 @@ mod tests {
 	#[test]
 	#[ignore = "needs a GPU and the pinned PyroWave build: MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_PYROWAVE=1"]
 	fn pyrowave_imports_compositor_dmabufs_on_gpu() {
-		use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+		use crate::session::capture::frame::{ExportedFrame, FrameColorSpace};
 		use crate::session::stream::video::{ColorRange, NegotiatedVideoFormat, VideoCodec};
 		use ash::vk::TaggedStructure;
 		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};

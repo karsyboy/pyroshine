@@ -106,6 +106,8 @@ advertised resolution.
   rate and bitrate, Main tier first. The low-power encoder is preferred and
   the slice encoder used when low-power cannot encode the profile (for
   example older Intel GPUs without the HuC firmware its rate control needs).
+  H.264/HEVC keep a bounded short-term DPB for trusted-reference recovery; AV1
+  still requests a keyframe on loss.
 - **NVENC:** HEVC 4:4:4 10-bit is not implemented (Vulkan Video encodes it on
   NVIDIA). The encoder uses NVIDIA's lowest-latency preset with infinite GOP
   and recovers from loss with reference invalidation.
@@ -151,7 +153,9 @@ An encoder becomes **encode tested** on a GPU and driver after:
    `vaapi_encode_decode_matches_reference_on_gpu` and
    `nvenc_encode_decode_matches_reference_on_gpu` for the other encoders
    (decoded with `ffmpeg` and compared with the CPU reference, including an IDR
-   request and a reference invalidation mid-stream), and
+   request, reference invalidation and live bitrate changes mid-stream),
+   `vaapi_loss_recovery_decodes_on_gpu` and `nvenc_loss_recovery_decodes_on_gpu`
+   (moving-picture loss, including loss of a recovery picture), and
    `pyrowave_imports_compositor_dmabufs_on_gpu` for PyroWave (see
    [testing](TESTING.md)).
 

@@ -1,17 +1,18 @@
-//! Embedded headless Smithay compositor for Moonshine.
+//! Embedded headless Smithay compositor: the isolated Game Mode capture
+//! backend.
 //!
-//! This module replaces the external Gamescope compositor and PipeWire capture
-//! with an in-process Smithay compositor. Frames are rendered to GBM-backed
-//! DMA-BUFs and exported directly to the video encoder.
+//! The compositor owns everything unique to an isolated session: the Wayland
+//! display, XWayland, application surfaces, the virtual output, scene, focus
+//! and input injection. It produces frames for the shared capture contract in
+//! `session::capture`: client DMA-BUFs exported directly, or the
+//! scene rendered into GBM-backed DMA-BUFs.
 
-pub(crate) mod admission;
 mod capture;
 mod color_management;
 mod color_render;
 mod cursor;
 mod focus;
 mod foreground;
-pub(crate) mod frame;
 mod gpu_timing;
 mod handlers;
 pub(crate) mod input;
@@ -36,12 +37,16 @@ use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
 use crate::session::SessionContext;
+// The shared capture contract this backend produces; submodules reach it as
+// `super::frame` and `super::admission`.
+use crate::session::capture::{ApplicationDisplay, CaptureCapabilities, CapturePacing, OutputMode};
+use crate::session::capture::{admission, frame};
 use crate::session::manager::SessionShutdownReason;
 
-use self::admission::{CaptureReceiver, CaptureSender, capture_channel};
-pub(crate) use self::capture::{CapturePacing, DirectReject};
-use self::input::CompositorInputEvent;
+use self::admission::{CaptureSender, capture_channel};
+pub(crate) use self::capture::DirectReject;
 use self::state::MoonshineCompositor;
+use crate::session::capture::input::CaptureInputEvent;
 
 /// Keyboard configuration for the compositor's XKB state.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -176,39 +181,18 @@ pub(crate) struct CompositorContext {
 	pub log_stats: bool,
 }
 
-/// Information sent from the compositor thread once XWayland is ready.
+/// Sent from the compositor thread once XWayland is ready.
 pub(crate) struct CompositorReady {
-	/// X11 display number (e.g. `:1` → `1`).
-	pub xdisplay: u32,
-	/// Wayland socket name for the session compositor.
-	pub wayland_display: String,
-	/// Whether this compositor can switch HDR on later without restarting.
-	pub hdr_capable: bool,
+	pub display: ApplicationDisplay,
+	pub capabilities: CaptureCapabilities,
 }
 
-/// Properties of the live virtual output. Only these require changing the
-/// running compositor; codec, bitrate, chroma, bit depth and transport
-/// settings belong to the video pipeline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OutputMode {
-	pub width: u32,
-	pub height: u32,
-	pub refresh_rate: u32,
-	pub hdr: bool,
-	/// Capture pacing the current client asked for; the compositor applies
-	/// [`CompositorConfig::vrr_capture`] on top of it.
-	pub capture_pacing: CapturePacing,
-}
+/// How long the compositor may take from thread start to XWayland readiness.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct CompositorReconfigure {
 	mode: OutputMode,
 	applied: tokio::sync::oneshot::Sender<Result<bool, String>>,
-}
-
-/// Handles returned by `Compositor::new()` for wiring into streams.
-pub(crate) struct CompositorHandles {
-	pub frame_rx: CaptureReceiver,
-	pub input_tx: calloop::channel::Sender<CompositorInputEvent>,
 }
 
 /// Producer endpoints handed to the compositor thread at launch.
@@ -225,9 +209,7 @@ pub(crate) struct Compositor {
 	stop: ShutdownManager<SessionShutdownReason>,
 	frame_tx: CaptureSender,
 	foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	input_rx: calloop::channel::Channel<CompositorInputEvent>,
-	ready_tx: std::sync::mpsc::SyncSender<CompositorReady>,
-	ready_rx: std::sync::mpsc::Receiver<CompositorReady>,
+	input_rx: calloop::channel::Channel<CaptureInputEvent>,
 	reconfigure_tx: calloop::channel::Sender<CompositorReconfigure>,
 	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 }
@@ -273,10 +255,9 @@ impl Compositor {
 		context: CompositorContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		foreground_tx: tokio::sync::watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
-	) -> (Self, CompositorHandles) {
-		let (frame_tx, frame_rx) = capture_channel();
-		let (input_tx, input_rx) = calloop::channel::channel();
-		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+	) -> (Self, crate::session::capture::CaptureEndpoints) {
+		let (frame_tx, frames) = capture_channel();
+		let (input, input_rx) = calloop::channel::channel();
 		let (reconfigure_tx, reconfigure_rx) = calloop::channel::channel();
 
 		(
@@ -287,12 +268,10 @@ impl Compositor {
 				frame_tx,
 				foreground_tx,
 				input_rx,
-				ready_tx,
-				ready_rx,
 				reconfigure_tx,
 				reconfigure_rx,
 			},
-			CompositorHandles { frame_rx, input_tx },
+			crate::session::capture::CaptureEndpoints { frames, input },
 		)
 	}
 
@@ -306,8 +285,6 @@ impl Compositor {
 			frame_tx,
 			foreground_tx,
 			input_rx,
-			ready_tx,
-			ready_rx,
 			reconfigure_tx,
 			reconfigure_rx,
 		} = self;
@@ -320,72 +297,32 @@ impl Compositor {
 			hdr: context.hdr,
 			capture_pacing: CapturePacing::Fixed,
 		};
-		// Registered before the thread exists: session completion then implies
-		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
-		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)
-			.map_err(|()| "the session stopped before the compositor started".to_string())?;
-		// The driver releases the compositor thread's EGL state in thread-local
-		// destructors after the thread body returns. On NVIDIA, destroying a
-		// Vulkan device while they run deadlocks inside the driver:
-		// vkDestroyDevice, the exiting EGL thread and an exiting driver thread
-		// wait on each other forever. The capture device must therefore outlive
-		// the compositor thread itself, not just `run_compositor`, whichever
-		// stream thread drops it last, and completion is released only once the
-		// thread has fully exited.
+		// The capture device outlives the compositor thread, EGL thread-local
+		// destructors included, whichever stream thread drops it last; see
+		// `start_capture_thread`. Session completion then also implies the
+		// compositor state (buffer pools, client buffers, Xwayland) is gone.
 		let capture_context = frame_tx.context_hold();
-		let outputs = CompositorOutputs {
-			frame_tx,
-			ready_tx,
-			foreground_tx,
-		};
-		// Why the thread ended before readiness. The thread drops its ready
-		// sender before reporting, so a disconnected ready channel waits briefly
-		// for the reason.
-		let (failure_tx, failure_rx) = mpsc::sync_channel::<String>(1);
-		let stopped = stop.trigger_shutdown_token(SessionShutdownReason::CompositorStopped);
-		let compositor = std::thread::Builder::new()
-			.name("compositor".to_string())
-			.spawn(move || {
-				let _stopped = stopped;
-				if let Err(e) = run_compositor(config, context, outputs, input_rx, reconfigure_rx, stop) {
-					tracing::error!("Compositor failed: {e}");
-					let _ = failure_tx.try_send(e);
-				}
-			})
-			.map_err(|e| {
-				tracing::error!("Failed to spawn compositor thread: {e}");
-				format!("the compositor thread could not be created: {e}")
-			})?;
-		std::thread::Builder::new()
-			.name("compositor-exit".to_string())
-			.spawn(move || {
-				let _ = compositor.join();
-				drop(capture_context);
-				drop(worker);
-			})
-			.map_err(|e| {
-				tracing::error!("Failed to spawn compositor exit thread: {e}");
-				format!("the compositor exit thread could not be created: {e}")
-			})?;
-
-		let ready = match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-			Ok(ready) => ready,
-			Err(mpsc::RecvTimeoutError::Disconnected) => {
-				return Err(failure_rx
-					.recv_timeout(std::time::Duration::from_secs(1))
-					.unwrap_or_else(|_| "the compositor stopped before it was ready".to_string()));
+		let thread_stop = stop.clone();
+		let ready = crate::session::capture::start_capture_thread(
+			"compositor",
+			&stop,
+			SessionShutdownReason::CompositorStopped,
+			capture_context,
+			READY_TIMEOUT,
+			move |ready_tx| {
+				let outputs = CompositorOutputs {
+					frame_tx,
+					ready_tx,
+					foreground_tx,
+				};
+				run_compositor(config, context, outputs, input_rx, reconfigure_rx, thread_stop)
+					.inspect_err(|e| tracing::error!("Compositor failed: {e}"))
 			},
-			Err(mpsc::RecvTimeoutError::Timeout) => {
-				tracing::warn!("Timed out waiting for compositor ready");
-				return Err(failure_rx
-					.try_recv()
-					.unwrap_or_else(|_| "the compositor did not become ready within 5 seconds".to_string()));
-			},
-		};
+		)?;
 
 		// Mirrors the launch-time format selection: HDR only when capable.
 		let mode = OutputMode {
-			hdr: requested.hdr && ready.hdr_capable,
+			hdr: requested.hdr && ready.capabilities.hdr(),
 			..requested
 		};
 		Ok(LaunchedCompositor {
@@ -428,7 +365,7 @@ fn run_compositor(
 	config: CompositorConfig,
 	context: CompositorContext,
 	outputs: CompositorOutputs,
-	input_rx: calloop::channel::Channel<CompositorInputEvent>,
+	input_rx: calloop::channel::Channel<CaptureInputEvent>,
 	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
@@ -533,6 +470,13 @@ fn run_compositor(
 		.flatten();
 	let hdr_capable = hdr_render_format.is_some();
 	let hdr = context.hdr && hdr_capable;
+	let capabilities = CaptureCapabilities {
+		backend: crate::session::capture::CaptureBackend::Isolated,
+		render_node: render_node.clone(),
+		sdr_format: sdr_render_format.0,
+		hdr_format: hdr_render_format.as_ref().map(|(fourcc, _)| *fourcc),
+		presentation_pacing: config.vrr_capture == VrrCapture::Auto,
+	};
 	let (render_fourcc, render_modifiers) = if hdr {
 		hdr_render_format.clone().expect("HDR capability checked")
 	} else {
@@ -628,7 +572,7 @@ fn run_compositor(
 		ready_tx,
 		&render_node,
 		hdr,
-		hdr_capable,
+		capabilities,
 		config.steam_mode,
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
@@ -733,7 +677,7 @@ fn run_compositor(
 					let angle = f64::from(bench_pointer_ticks) * 0.05;
 					let (x, y) = (16384.0 + 8000.0 * angle.cos(), 16384.0 + 8000.0 * angle.sin());
 					input::process_input(
-						CompositorInputEvent::MouseMoveAbsolute {
+						CaptureInputEvent::MouseMoveAbsolute {
 							x: x as i16,
 							y: y as i16,
 							screen_width: i16::MAX,
@@ -923,9 +867,17 @@ mod reconfigure_tests {
 		};
 		let mut compositor = LaunchedCompositor {
 			ready: CompositorReady {
-				xdisplay: 0,
-				wayland_display: String::new(),
-				hdr_capable: true,
+				display: crate::session::capture::ApplicationDisplay {
+					xdisplay: 0,
+					wayland_display: String::new(),
+				},
+				capabilities: crate::session::capture::CaptureCapabilities {
+					backend: crate::session::capture::CaptureBackend::Isolated,
+					render_node: std::path::PathBuf::new(),
+					sdr_format: smithay::backend::allocator::Fourcc::Abgr8888,
+					hdr_format: Some(smithay::backend::allocator::Fourcc::Abgr16161616f),
+					presentation_pacing: true,
+				},
 			},
 			reconfigure_tx,
 			mode,
@@ -986,7 +938,7 @@ mod xwayland_tests {
 	/// The compositor in Steam mode, as the service runs it.
 	fn launch() -> (
 		async_shutdown::ShutdownManager<SessionShutdownReason>,
-		super::CompositorHandles,
+		crate::session::capture::CaptureEndpoints,
 		super::LaunchedCompositor,
 	) {
 		let (stop, handles, launched, _) = launch_with_foreground();
@@ -995,7 +947,7 @@ mod xwayland_tests {
 
 	fn launch_with_foreground() -> (
 		async_shutdown::ShutdownManager<SessionShutdownReason>,
-		super::CompositorHandles,
+		crate::session::capture::CaptureEndpoints,
 		super::LaunchedCompositor,
 		tokio::sync::watch::Receiver<Option<moonshine_management::dto::ForegroundApplication>>,
 	) {
@@ -1025,7 +977,7 @@ mod xwayland_tests {
 	#[ignore = "needs a GPU render node and Xwayland"]
 	fn foreground_follows_primary_focus_titles_and_window_lifetime() {
 		let (stop, _handles, launched, mut foreground) = launch_with_foreground();
-		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let set_title = |window, title: &str| {
 			conn.change_property8(
@@ -1166,7 +1118,7 @@ mod xwayland_tests {
 		const GAME_APP: u32 = 219990;
 		const STEAM_APP: u32 = 769;
 		let (stop, _handles, launched) = launch();
-		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let active = |conn: &x11rb::rust_connection::RustConnection| cardinal(conn, root, b"_NET_ACTIVE_WINDOW");
 
@@ -1254,7 +1206,7 @@ mod xwayland_tests {
 		const GAME_APP: u32 = 219990;
 		const STEAM_APP: u32 = 769;
 		let (stop, _handles, launched) = launch();
-		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let baselayer = conn
 			.intern_atom(false, b"GAMESCOPECTRL_BASELAYER_APPID")
@@ -1318,7 +1270,7 @@ mod xwayland_tests {
 	fn steam_browser_subwindow_keeps_focus_when_overlay_closes() {
 		const GAME_APP: u32 = 219990;
 		let (stop, _handles, launched) = launch();
-		let display = format!(":{}", launched.ready().xdisplay);
+		let display = format!(":{}", launched.ready().display.xdisplay);
 		let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let input_focus =
@@ -1381,7 +1333,7 @@ mod xwayland_tests {
 	fn input_focus_window_is_raised_in_the_x_stack() {
 		const GAME_APP: u32 = 219990;
 		let (stop, _handles, launched) = launch();
-		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let input_focus =
 			|conn: &x11rb::rust_connection::RustConnection| conn.get_input_focus().unwrap().reply().unwrap().focus;
@@ -1450,7 +1402,7 @@ mod xwayland_tests {
 	#[ignore = "needs a GPU render node and Xwayland"]
 	fn live_output_reconfiguration_resizes_windows_held_at_output_size() {
 		let (stop, _handles, mut launched) = launch();
-		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().xdisplay))).unwrap();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let size = |window| {
 			let geometry = conn.get_geometry(window).unwrap().reply().unwrap();
@@ -1499,7 +1451,7 @@ mod xwayland_tests {
 	#[ignore = "needs a GPU render node and Xwayland"]
 	fn x11_errors_on_destroyed_focus_windows_are_not_fatal() {
 		let (stop, _handles, launched) = launch();
-		let display = launched.ready().xdisplay;
+		let display = launched.ready().display.xdisplay;
 		let (conn, screen_num) = x11rb::connect(Some(&format!(":{display}"))).unwrap();
 		let root = conn.setup().roots[screen_num].root;
 		let focus = super::x11_focus::X11Focus::open(display).expect("X11 focus connection");

@@ -165,6 +165,7 @@ pub(super) struct Hevc {
 	high_tier: bool,
 	tools: Tools,
 	ctus: u32,
+	max_references: usize,
 }
 
 impl Hevc {
@@ -183,6 +184,7 @@ impl Hevc {
 			cpb_vcl_factor(setup.chroma_444, setup.bit_depth),
 		);
 		Self {
+			max_references: setup.max_references,
 			profile,
 			level,
 			high_tier,
@@ -241,7 +243,7 @@ impl Hevc {
 		w.u(16, 0xffff); // vps_reserved_0xffff_16bits
 		self.profile_tier_level(&mut w, setup);
 		w.flag(true); // vps_sub_layer_ordering_info_present_flag
-		w.ue(1); // vps_max_dec_pic_buffering_minus1: current + one reference
+		w.ue(self.max_references as u32); // retained references plus current
 		w.ue(0); // vps_max_num_reorder_pics
 		w.ue(0); // vps_max_latency_increase_plus1
 		w.u(6, 0); // vps_max_layer_id
@@ -281,7 +283,7 @@ impl Hevc {
 		w.ue(setup.bit_depth - 8); // bit_depth_chroma_minus8
 		w.ue(LOG2_MAX_POC_LSB_MINUS4);
 		w.flag(true); // sps_sub_layer_ordering_info_present_flag
-		w.ue(1); // sps_max_dec_pic_buffering_minus1
+		w.ue(self.max_references as u32); // retained references plus current
 		w.ue(0); // sps_max_num_reorder_pics
 		w.ue(0); // sps_max_latency_increase_plus1
 		w.ue(t.log2_min_cb - 3);
@@ -392,17 +394,14 @@ impl Hevc {
 		if !frame.idr {
 			w.u(LOG2_MAX_POC_LSB_MINUS4 + 4, poc_lsb(frame.index_since_idr));
 			w.flag(false); // short_term_ref_pic_set_sps_flag: st_ref_pic_set(0) follows
-			match reference {
-				Some((_, index)) => {
-					w.ue(1); // num_negative_pics
-					w.ue(0); // num_positive_pics
-					w.ue((frame.index_since_idr - index - 1) as u32); // delta_poc_s0_minus1
-					w.flag(true); // used_by_curr_pic_s0_flag
-				},
-				None => {
-					w.ue(0);
-					w.ue(0);
-				},
+			let retained = frame.retained.iter().flatten().rev();
+			w.ue(retained.clone().count() as u32); // num_negative_pics
+			w.ue(0); // num_positive_pics
+			let mut previous = frame.index_since_idr;
+			for &(surface, index) in retained {
+				w.ue((previous - index - 1) as u32); // negative POC deltas, newest first
+				w.flag(reference.is_some_and(|r| r.0 == surface));
+				previous = index;
 			}
 			if t.temporal_mvp {
 				w.flag(temporal_mvp); // slice_temporal_mvp_enabled_flag
@@ -525,8 +524,28 @@ impl Hevc {
 			nal_unit_type: if frame.idr { NAL_IDR_W_RADL } else { NAL_TRAIL_R },
 			..Default::default()
 		};
-		if let Some(reference) = reference {
-			picture.reference_frames[0] = reference;
+		for (slot, &(surface, index)) in picture
+			.reference_frames
+			.iter_mut()
+			.zip(frame.retained.iter().flatten().rev())
+		{
+			*slot = VAPictureHEVC {
+				picture_id: surface,
+				pic_order_cnt: index as i32,
+				flags: if reference.is_some_and(|r| r.picture_id == surface) {
+					VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
+				} else {
+					0
+				},
+				..Default::default()
+			};
+		}
+		if temporal_mvp {
+			picture.collocated_ref_pic_index = picture
+				.reference_frames
+				.iter()
+				.position(|r| reference.is_some_and(|a| a.picture_id == r.picture_id))
+				.expect("retained safe reference") as u8;
 		}
 		let slice_type = self.slice_type(frame);
 		let coding_type = match slice_type {

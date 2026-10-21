@@ -525,6 +525,7 @@ mod tests {
 			coded_height: height.next_multiple_of(16),
 			fps: 60,
 			bitrate: 20_000_000,
+			max_references: 1,
 			chroma_444: false,
 			bit_depth,
 			color: ColorDescription::bt709(),
@@ -551,6 +552,7 @@ mod tests {
 			index_since_idr,
 			idr_count: 0,
 			recon: 7,
+			retained: [None; 4],
 			reference: (!idr).then(|| (6, index_since_idr - 1)),
 		}
 	}

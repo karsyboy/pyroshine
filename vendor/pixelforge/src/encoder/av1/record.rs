@@ -308,6 +308,11 @@ impl Av1 {
             .frame_rate_denominator(common.config.frame_rate_denominator)
             .push(&mut av1_rc_layer_info);
         let rc_layers = [rc_layer_info];
+        // Begin describes the state left by the previous submission; the
+        // control command below installs the new target inside this scope.
+        let begin_layers = [rc_layer_info
+            .average_bitrate(u64::from(common.installed_bitrate))
+            .max_bitrate(u64::from(common.installed_bitrate))];
 
         let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
         if !rc.is_disabled() {
@@ -343,7 +348,11 @@ impl Av1 {
         reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
 
         // Ash links pNext chains in place, so each command needs its own extension structs.
-        let mut begin_rc_info = rc_info;
+        let mut begin_rc_info = if common.rate_changed() {
+            rc_info.layers(&begin_layers)
+        } else {
+            rc_info
+        };
         let mut begin_av1_rc_info = av1_rc_info;
         let begin_coding_info = if is_first_frame {
             vk::VideoBeginCodingInfoKHR::default()
@@ -382,6 +391,18 @@ impl Av1 {
                 common
                     .video_queue_fn
                     .cmd_control_video_coding(command_buffer, &control_info);
+            }
+        }
+
+        if !should_reset_coding_state && common.rate_changed() {
+            let control = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL)
+                .push(&mut rc_info)
+                .push(&mut av1_rc_info);
+            unsafe {
+                common
+                    .video_queue_fn
+                    .cmd_control_video_coding(command_buffer, &control);
             }
         }
 

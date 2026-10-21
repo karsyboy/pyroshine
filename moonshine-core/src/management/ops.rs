@@ -286,6 +286,60 @@ impl Management {
 	}
 }
 
+impl super::Management {
+	pub(crate) async fn op_desktop_status(&self) -> moonshine_management::dto::DesktopStatus {
+		if !self
+			.running_config
+			.offered_applications()
+			.iter()
+			.any(|a| a.mode == crate::session::application::SessionMode::Desktop)
+			&& !crate::desktop::recovery_pending()
+		{
+			return moonshine_management::dto::DesktopStatus {
+				phase: "disabled".into(),
+				..Default::default()
+			};
+		}
+		match tokio::task::spawn_blocking(crate::desktop::status).await {
+			Ok(Ok(status)) => status,
+			result => moonshine_management::dto::DesktopStatus {
+				phase: if crate::desktop::recovery_pending() {
+					"recovery_required"
+				} else {
+					"unsupported"
+				}
+				.into(),
+				reason: Some(match result {
+					Ok(Err(error)) => error,
+					Err(error) => error.to_string(),
+					_ => unreachable!(),
+				}),
+				..Default::default()
+			},
+		}
+	}
+	pub(crate) async fn op_desktop_authorize(&self) -> Result<(), ManagementError> {
+		crate::desktop::authorize().await.map_err(ManagementError::Failed)
+	}
+	pub(crate) async fn op_desktop_restore(&self) -> Result<moonshine_management::dto::DesktopStatus, ManagementError> {
+		let desktop_session = self
+			.op_session()
+			.session
+			.as_ref()
+			.and_then(|s| s.capture.as_ref())
+			.is_some_and(|c| c.mode == "desktop");
+		let status = tokio::task::spawn_blocking(crate::desktop::restore)
+			.await
+			.map_err(|e| ManagementError::Failed(e.to_string()))?
+			.map_err(ManagementError::Failed)?;
+		if desktop_session {
+			let _ = self.sessions.stop_session().await;
+		}
+		self.sessions.finish_desktop_recovery().await;
+		Ok(status)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

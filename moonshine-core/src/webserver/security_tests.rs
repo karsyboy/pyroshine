@@ -680,6 +680,7 @@ async fn malformed_resume_from_another_client_preserves_reported_address() {
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: client,
+			client_identity: None,
 			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				crate::session::RemoteInputKey::from_bytes([7; 16]),
@@ -696,7 +697,7 @@ async fn malformed_resume_from_another_client_preserves_reported_address() {
 		("hdrMode", Some("yes")),
 		("surroundAudioInfo", Some("196611")),
 	] {
-		let response = body_text(server.resume(launch_params(&[(name, value)]), None, peer).await).await;
+		let response = body_text(server.resume(launch_params(&[(name, value)]), None, peer, None).await).await;
 		assert!(response.contains("status_code=\"400\""), "{name}: {response}");
 		assert!(
 			!response.contains("Failed to update session keys"),
@@ -756,13 +757,13 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 		("clientVrrRequested", Some("yes")),
 	];
 	for (name, value) in malformed {
-		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer).await).await;
+		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer, None).await).await;
 		assert!(launch.contains("status_code=\"400\""), "{name}={value:?}: {launch}");
 		assert!(
 			!launch.contains("application"),
 			"{name}={value:?} reached application lookup: {launch}"
 		);
-		let resume = body_text(server.resume(launch_params(&[(name, value)]), None, peer).await).await;
+		let resume = body_text(server.resume(launch_params(&[(name, value)]), None, peer, None).await).await;
 		if name != "appid" {
 			assert!(resume.contains("status_code=\"400\""), "{name}={value:?}: {resume}");
 			assert!(
@@ -783,9 +784,9 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 		("clientVrrRequested", Some("1")),
 		("clientVrrRequested", Some("0")),
 	] {
-		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer).await).await;
+		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer, None).await).await;
 		assert!(launch.contains("find application"), "{launch}");
-		let resume = body_text(server.resume(launch_params(&[(name, value)]), None, peer).await).await;
+		let resume = body_text(server.resume(launch_params(&[(name, value)]), None, peer, None).await).await;
 		assert!(resume.contains("Failed to update session keys"), "{resume}");
 	}
 
@@ -1032,6 +1033,7 @@ async fn catalog_refresh_during_an_active_stream_leaves_it_untouched() {
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: client,
+			client_identity: None,
 			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				crate::session::RemoteInputKey::from_bytes([7; 16]),

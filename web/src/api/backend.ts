@@ -2,6 +2,7 @@
 // Pyroshine server (`/api/v1/`).
 
 import type {
+  DesktopStatus,
   AuthState,
   ClientsSnapshot,
   ConfigDocument,
@@ -63,6 +64,9 @@ export interface Backend {
 
   overview(): Promise<Overview>;
   endSession(): Promise<void>;
+  desktopStatus(): Promise<DesktopStatus>;
+  authorizeDesktop(): Promise<void>;
+  restoreDesktop(): Promise<DesktopStatus>;
   /// Shut down normally and start again; ends a running session.
   restart(): Promise<void>;
   approvePairing(clientId: string, request: string, pin: string, label: string): Promise<void>;

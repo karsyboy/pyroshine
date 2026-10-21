@@ -79,9 +79,10 @@ flowchart LR
 | `rtsp.rs` | RTSP OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY; parse and validate negotiated stream contexts | Encoders or sockets |
 | `ingress.rs` | Bounded, cancellable tasks for accepted HTTP, HTTPS and RTSP connections | Protocol semantics |
 | `session/manager.rs` | The single session's lifecycle, transitions, authorization generations, keys and teardown | Resource creation details |
-| `session/mod.rs` (`SystemSession`) | Builds the compositor, application and streams for each transition | Lifecycle decisions |
+| `session/mod.rs` (`SystemSession`) | Builds the capture source, application and streams for each transition | Lifecycle decisions |
 | `session/application.rs` | Run the application, pre/post commands and output routing as the `moonshine-session.service` systemd user unit | — |
-| `session/compositor/` | Wayland/XWayland server, scene, focus, cursor, Steam classification, output mode, capture and frame export | Codec negotiation, transport |
+| `session/capture/` | Capture backend selection, start and readiness contract, capabilities, output mode; the shared frame contract (`frame.rs`) and capture admission (`admission.rs`) | Scene, focus, encoding |
+| `session/compositor/` | The isolated capture backend: Wayland/XWayland server, scene, focus, cursor, Steam classification, output, capture and frame export | Codec negotiation, transport |
 | `session/stream/video/` | Import, convert and encode captured frames; packetize, protect, encrypt, pace and send | Scene composition |
 | `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
 | `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
@@ -407,6 +408,30 @@ Tests: `session/manager/lifecycle_tests.rs` drives the manager through a fake
 backend with barriers and fault injection at every transition await; stream
 workers have socket-release tests in their modules.
 
+## Capture backends
+
+A capture backend produces the frames a session streams; `session/capture/`
+is the seam between it and the rest of the session. `SystemSession` selects a
+backend when it initializes a session (`CaptureBackend`), creates it
+(`CaptureSource`), launches it and waits for readiness, then uses the running
+backend (`LiveCapture`) for the application's display, the capability report
+and output-mode changes. Game Mode uses the session's own Smithay compositor.
+Desktop Mode uses the signed-in desktop's native virtual display, with lifecycle and restoration owned
+by a separately supervised user guard. PipeWire frames reach the same capture
+admission path directly. See [Managed Desktop Mode](DESKTOP_MODE.md) for the
+transaction, adapters, input and audio ownership.
+
+- Every backend runs on a thread started by `start_capture_thread`, which
+  registers its worker guard first, keeps the capture GPU alive until the
+  thread has fully exited and stops the session when the thread ends.
+- Every backend produces `ExportedFrame`s through the same admission channel,
+  so import, conversion, encoding and transport are identical for all of them.
+- Scene, focus, input injection, XWayland and the output stay inside the
+  backend; the session layer never reaches into them.
+
+See [Capture backends](CAPTURE_BACKENDS.md) for the contract, how existing
+desktop and virtual-monitor capture differ, and what a new backend must add.
+
 ## Compositor and presentation
 
 `session/compositor/` embeds a headless Smithay compositor on its own calloop
@@ -420,7 +445,8 @@ thread. It owns:
 - native `wp_color_management_v1` surface descriptions and scene color draws
   (`color_management.rs`, `color_render.rs`);
 - input injection into the Smithay seat (`input.rs`);
-- capture and frame export (`capture.rs`, `admission.rs`, `frame.rs`).
+- capture eligibility, pacing and frame export (`capture.rs`, `state.rs`) into
+  the shared capture contract (`session/capture/`).
 
 Capture pacing is per client epoch. With fixed pacing (every standard client)
 the refresh timer is the only capture clock: each refresh deadline offers at
@@ -455,7 +481,7 @@ compositor capture ─ExportedFrame─▶ video-pipeline thread ─encoded frame
    (admission credit)             import → convert/encode            packetize → FEC → encrypt → pace
 ```
 
-**Admission.** `compositor/admission.rs` gives the consumer receiver-driven
+**Admission.** `capture/admission.rs` gives the consumer receiver-driven
 demand: one credit and one handoff slot. The compositor claims the credit before
 any export or rendering. Two signals are independent:
 
@@ -1017,6 +1043,7 @@ Changes must preserve these properties unless a task explicitly redesigns them:
 
 | Topic | Guide |
 | --- | --- |
+| Capture backend contract, frame contract and future capture modes | [Capture backends](CAPTURE_BACKENDS.md) |
 | Scene eligibility, cursor, late composition, Steam focus and input | [Compositor](COMPOSITOR.md) |
 | Capture admission, encoder queues and transport accounting | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC, pacing and GPU matrix | [PyroWave](PYROWAVE.md) |

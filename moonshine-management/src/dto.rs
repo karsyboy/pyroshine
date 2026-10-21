@@ -70,6 +70,50 @@ pub struct SessionDetails {
 	pub video: Option<VideoDetails>,
 	/// Negotiated audio stream, once RTSP PLAY committed one.
 	pub audio: Option<AudioDetails>,
+	/// What the session streams and how, once capture is running.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub capture: Option<CaptureDetails>,
+}
+
+/// The capture backend of a running session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaptureDetails {
+	/// `game` (the isolated compositor) or `desktop` (the running desktop).
+	pub mode: String,
+	/// `Game Mode` or `Desktop Mode`.
+	pub mode_label: String,
+	/// `isolated` or `desktop` (XDG Desktop Portal).
+	pub backend: String,
+	/// DRM render node frames are captured and encoded on.
+	pub render_node: String,
+	/// `SDR` or `HDR`: what the captured content delivers.
+	pub dynamic_range: String,
+	/// Desktop Mode: the captured desktop output.
+	#[serde(default)]
+	pub output: Option<CapturedOutputDetails>,
+	/// Desktop Mode: `kde`, `gnome` or `other`, and `XDG_CURRENT_DESKTOP`.
+	#[serde(default)]
+	pub desktop: Option<String>,
+	#[serde(default)]
+	pub current_desktop: Option<String>,
+	/// Desktop Mode: how remote input reaches the desktop: `libei`, `portal`
+	/// or `none` (view-only).
+	#[serde(default)]
+	pub input: Option<String>,
+	/// Desktop Mode: `restored` (a saved permission was offered; the desktop
+	/// still asks when it does not cover the request) or `requested`.
+	#[serde(default)]
+	pub consent: Option<String>,
+}
+
+/// A captured desktop output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedOutputDetails {
+	pub width: u32,
+	pub height: u32,
+	/// Declared refresh in millihertz, when the desktop declared one.
+	#[serde(default)]
+	pub refresh_millihertz: Option<u32>,
 }
 
 /// Which encoder backend produces the video stream and on which GPU.
@@ -1016,6 +1060,25 @@ pub struct InstallGuidance {
 	pub label: String,
 	/// Commands or steps, in order.
 	pub steps: Vec<String>,
+}
+
+/// Managed desktop state. This is independent of the streaming daemon's media
+/// workers so an orphaned display remains visible and recoverable.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DesktopStatus {
+	pub supported: bool,
+	pub desktop: String,
+	pub phase: String,
+	pub reason: Option<String>,
+	pub mode: Option<DesktopOutputMode>,
+	pub grace_deadline_ms: Option<u64>,
+	pub audio_remote_only: bool,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DesktopOutputMode {
+	pub width: u32,
+	pub height: u32,
+	pub refresh_millihertz: u32,
 }
 
 #[cfg(test)]

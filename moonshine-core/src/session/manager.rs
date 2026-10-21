@@ -37,7 +37,7 @@ use crate::session::SessionKeysSender;
 use crate::session::SystemSession;
 use crate::session::application_unit_name;
 use crate::session::authorization::StreamAuthorization;
-use crate::session::compositor::CapturePacing;
+use crate::session::capture::CapturePacing;
 use crate::session::compositor::CompositorConfig;
 use crate::session::failure::{Problem, SessionFailure, StopCauseSlot};
 use crate::session::keys::KeyLedger;
@@ -121,6 +121,11 @@ pub enum SessionShutdownReason {
 	InputHandlerStopped,
 	/// Compositor stopped unexpectedly.
 	CompositorStopped,
+	/// Desktop Mode capture ended (sharing stopped on the desktop, the
+	/// output or desktop went away, or the capture failed).
+	DesktopCaptureStopped,
+	/// Desktop reconnect grace or initial client-attachment deadline expired.
+	DesktopGraceExpired,
 	/// A launch, start or reconfiguration failed after changing resources.
 	TransitionFailed,
 }
@@ -206,6 +211,18 @@ pub(crate) trait SessionBackend: Send + Sync + 'static {
 	/// idempotent; `Ok` for an absent unit. `Err` keeps the session from being
 	/// reported idle.
 	fn stop_application(&self, unit_name: &str) -> impl Future<Output = Result<(), ()>> + Send;
+
+	fn desktop_lease(_launched: &Self::Launched) -> Option<String> {
+		None
+	}
+	fn verify_desktop_cleanup(&self) -> impl Future<Output = Result<(), ()>> + Send {
+		async { Ok(()) }
+	}
+
+	/// What the launched session captures, for status reporting.
+	fn capture_details(_launched: &Self::Launched) -> Option<moonshine_management::dto::CaptureDetails> {
+		None
+	}
 }
 
 enum SessionState<B: SessionBackend> {
@@ -279,6 +296,9 @@ struct SessionRecord {
 	first_generation: Option<u64>,
 	/// Why the session ended, recorded by whatever ended it.
 	cause: StopCauseSlot,
+	/// The running capture backend, once launched.
+	capture: Option<moonshine_management::dto::CaptureDetails>,
+	desktop_lease: Option<String>,
 }
 
 struct LiveSession<B: SessionBackend> {
@@ -348,6 +368,7 @@ pub(crate) struct SessionView {
 	/// Current authorized launch/resume client, or the launch client while initializing.
 	pub client_ip: IpAddr,
 	pub streams: Option<(VideoStreamContext, AudioStreamContext)>,
+	pub capture: Option<moonshine_management::dto::CaptureDetails>,
 }
 
 struct SessionManagerInner<B: SessionBackend> {
@@ -673,6 +694,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				// Initialization publishes the record before creating its first grant.
 				client_ip: client_ip.unwrap_or(context.client_ip),
 				streams: live.record.streams.clone(),
+				capture: live.record.capture.clone(),
 			}
 		})
 	}
@@ -753,7 +775,13 @@ impl<B: SessionBackend> SessionCore<B> {
 			transition = ?transition.map(|t| t.kind),
 			"Stopping session"
 		);
-		let deadline = tokio::time::Instant::now() + SESSION_TEARDOWN_DEADLINE;
+		let desktop_session = record.context.application.mode == crate::session::application::SessionMode::Desktop;
+		let allowance = if desktop_session {
+			Duration::from_secs(30)
+		} else {
+			SESSION_TEARDOWN_DEADLINE
+		};
+		let deadline = tokio::time::Instant::now() + allowance;
 		let result = tokio::time::timeout_at(deadline, async {
 			let mut application = record.application_unit;
 			let mut application_stopped = true;
@@ -788,11 +816,19 @@ impl<B: SessionBackend> SessionCore<B> {
 		})
 		.await;
 
-		let failure = match result {
+		let mut failure = match result {
 			Ok(true) => None,
 			Ok(false) => Some(TeardownFailure::ApplicationNotStopped),
 			Err(_) => Some(TeardownFailure::DeadlineExceeded),
 		};
+		if desktop_session
+			&& failure.is_none()
+			&& !matches!(
+				tokio::time::timeout_at(deadline, self.backend.verify_desktop_cleanup()).await,
+				Ok(Ok(()))
+			) {
+			failure = Some(TeardownFailure::DesktopNotRestored);
+		}
 		let mut guard = self.lock().await;
 		guard.last_stop = Some(StopRecord {
 			epoch,
@@ -807,6 +843,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				Err("the application unit's termination could not be established")
 			},
 			Some(TeardownFailure::DeadlineExceeded) => Err("teardown exceeded its deadline"),
+			Some(TeardownFailure::DesktopNotRestored) => Err("desktop restoration is incomplete"),
 		};
 		match result {
 			Ok(()) => {
@@ -815,7 +852,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				tracing::info!(epoch, "Session stopped; ready for a new session.");
 				done.send_replace(TeardownStatus::Completed);
 			},
-			Err(failure) => {
+			Err(detail) => {
 				// Workers may still own ports, the Pulse socket or GPU objects, or the
 				// application may still run: never report idle. Restarting the service
 				// is the only safe recovery.
@@ -823,11 +860,13 @@ impl<B: SessionBackend> SessionCore<B> {
 				drop(guard);
 				tracing::error!(
 					epoch,
-					failure,
-					deadline_secs = SESSION_TEARDOWN_DEADLINE.as_secs(),
-					"Session teardown failed; refusing new sessions and stopping the service"
+					detail,
+					deadline_secs = allowance.as_secs(),
+					"Session teardown failed; refusing new sessions until recovery"
 				);
-				let _ = self.shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
+				if failure != Some(TeardownFailure::DesktopNotRestored) {
+					let _ = self.shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
+				}
 				done.send_replace(TeardownStatus::Failed);
 			},
 		}
@@ -988,6 +1027,8 @@ impl<B: SessionBackend> SessionCore<B> {
 					started_at: SystemTime::now(),
 					first_generation: None,
 					cause: cause.clone(),
+					capture: None,
+					desktop_lease: None,
 				},
 				state: None,
 				transition: None,
@@ -1080,8 +1121,11 @@ impl<B: SessionBackend> SessionCore<B> {
 				.begin_transition(TransitionKind::Launch)
 				.map_err(|()| SessionFailure::busy("The session could not be launched."))?;
 			let live = guard.live().expect("checked above");
-			// Recorded before anything can create the unit.
-			live.record.application_unit = Some(application_unit_name());
+			// Recorded before anything can create the unit. Desktop Mode
+			// launches no application, so its teardown stops no unit.
+			if live.record.context.application.mode.is_game() {
+				live.record.application_unit = Some(application_unit_name());
+			}
 			let Some(SessionState::Initialized(session)) = live.state.take() else {
 				unreachable!("checked above");
 			};
@@ -1095,9 +1139,13 @@ impl<B: SessionBackend> SessionCore<B> {
 			let mut guard = core.lock().await;
 			let outcome = match result {
 				Ok(Ok(launched)) => {
+					let capture = B::capture_details(&launched);
+					let desktop_lease = B::desktop_lease(&launched);
 					let state = SessionState::Launched(launched);
 					match guard.committable(&ticket) {
 						Some(live) => {
+							live.record.capture = capture;
+							live.record.desktop_lease = desktop_lease;
 							live.state = Some(state);
 							live.transition = None;
 							guard.progress_at = Instant::now();
@@ -1522,6 +1570,16 @@ impl<B: SessionBackend> SessionCore<B> {
 			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
 			return Err(());
 		}
+		if let Some(client) = request.client_identity.clone()
+			&& let Some(lease) = guard.live().and_then(|live| live.record.desktop_lease.clone())
+		{
+			// Administrative work only. Serialize client selection with resume
+			// generations; no frame or input-event loop performs this RPC.
+			tokio::task::spawn_blocking(move || crate::desktop::Client::observer(lease).select_client(client))
+				.await
+				.map_err(|e| tracing::warn!("Desktop client selection task failed: {e}"))?
+				.map_err(|e| tracing::warn!("Cannot apply the resuming client's desktop scale: {e}"))?;
+		}
 		guard.rotate_authorization(client_ip, request.vrr_requested)?;
 		// Keys were validated at the HTTP boundary; the ledger keeps nonce
 		// allocation continuous when the client resumes with the same key.
@@ -1575,6 +1633,7 @@ impl SessionManager {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		compositor_config: CompositorConfig,
+		desktop_config: crate::session::capture::portal::DesktopConfig,
 		video_config: VideoStreamConfig,
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
@@ -1594,8 +1653,12 @@ impl SessionManager {
 			},
 			video_port.clone(),
 		);
+		let grace_secs = desktop_config.disconnect_grace_secs;
 		let backend = SystemSession {
-			compositor_config,
+			capture_settings: crate::session::capture::CaptureSettings {
+				compositor: compositor_config,
+				desktop: desktop_config,
+			},
 			video_config,
 			audio_config,
 			control_config,
@@ -1607,13 +1670,36 @@ impl SessionManager {
 			video_port,
 			frame_limit,
 		};
+		let core = SessionCore::new(backend, shutdown)?;
+		spawn_desktop_deadlines(
+			core.clone(),
+			presence_tx.subscribe(),
+			Duration::from_secs(stream_timeout.max(1)),
+			Duration::from_secs(grace_secs),
+		);
 		Ok(Self {
-			core: SessionCore::new(backend, shutdown)?,
+			core,
 			stats_tx,
 			presence_tx,
 			problems_tx: broadcast::channel(32).0,
 			calibration,
 		})
+	}
+
+	pub(crate) async fn finish_desktop_recovery(&self) {
+		let mut guard = self.core.lock().await;
+		if guard
+			.last_stop
+			.as_ref()
+			.is_some_and(|s| s.failure == Some(TeardownFailure::DesktopNotRestored))
+			&& matches!(guard.lifecycle, Lifecycle::Stopping(_))
+		{
+			guard.lifecycle = Lifecycle::Idle;
+			guard.teardown_failed = false;
+			if let Some(stop) = &mut guard.last_stop {
+				stop.failure = None;
+			}
+		}
 	}
 
 	/// The UDP bandwidth calibration service.
@@ -1659,6 +1745,40 @@ impl SessionManager {
 	/// Read-only view of the live session, if any.
 	pub(crate) async fn session_view(&self) -> Option<SessionView> {
 		self.core.session_view().await
+	}
+
+	/// Stage a conventional encoder bitrate for this authorization generation.
+	/// Benchmark only: no operator setting, network command or ABR policy.
+	/// The reply identifies the first submitted picture or the terminal failure.
+	pub async fn bench_set_bitrate(
+		&self,
+		bitrate: u32,
+	) -> Result<tokio::sync::oneshot::Receiver<super::stream::video::rate::RateUpdate>, String> {
+		let mut guard = self.core.lock().await;
+		let generation = guard
+			.authorization_tx
+			.as_ref()
+			.ok_or("no live authorization")?
+			.borrow()
+			.generation();
+		let live = guard.live().ok_or("no live session")?;
+		if live.transition.is_some() {
+			return Err("session transition in progress".into());
+		}
+		let Some(SessionState::Active(active)) = &live.state else {
+			return Err("video is not active".into());
+		};
+		active.rate_control().request(generation, bitrate)
+	}
+
+	/// Last rate request for diagnostics; a staged rate is not yet installed.
+	pub async fn bench_bitrate_status(&self) -> Option<super::stream::video::rate::RateUpdate> {
+		let mut guard = self.core.lock().await;
+		let live = guard.live()?;
+		let Some(SessionState::Active(active)) = &live.state else {
+			return None;
+		};
+		active.rate_control().status()
 	}
 
 	/// Returns a receiver for per-frame encoding statistics.
@@ -1769,6 +1889,7 @@ impl SessionManager {
 			Default::default(),
 			Default::default(),
 			Default::default(),
+			Default::default(),
 			"127.0.0.1".into(),
 			30,
 			false,
@@ -1800,6 +1921,8 @@ impl SessionManager {
 				started_at: SystemTime::now(),
 				first_generation: None,
 				cause: StopCauseSlot::default(),
+				capture: None,
+				desktop_lease: None,
 			},
 			state: None,
 			transition: None,
@@ -1825,6 +1948,100 @@ impl<B: SessionBackend> SessionCore<B> {
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+/// The desktop lease survives video generations. Observe authenticated control
+/// ownership directly, never the management UI or raw protocol traffic.
+fn spawn_desktop_deadlines(
+	core: SessionCore<SystemSession>,
+	mut presence: watch::Receiver<ClientPresence>,
+	attach: Duration,
+	grace: Duration,
+) {
+	tokio::spawn(async move {
+		let mut status = core.subscribe_status();
+		let mut clock: Option<crate::desktop::grace::Grace> = None;
+		let mut published = None;
+		let mut grace_revision = 0u64;
+		loop {
+			if core.shutdown.is_shutdown_triggered() {
+				return;
+			}
+			let current_presence = *presence.borrow_and_update();
+			let info = {
+				let inner = core.lock().await;
+				match &inner.lifecycle {
+					Lifecycle::Live(live)
+						if live.record.context.application.mode
+							== crate::session::application::SessionMode::Desktop =>
+					{
+						live.record.desktop_lease.as_ref().map(|lease| {
+							(
+								live.record.epoch,
+								lease.clone(),
+								inner.authorization_tx.as_ref().map(|tx| tx.borrow().generation())
+									== Some(current_presence.generation)
+									&& current_presence.attached,
+							)
+						})
+					},
+					_ => None,
+				}
+			};
+			let now = Instant::now();
+			match info {
+				Some((epoch, lease, attached)) => {
+					if clock.as_ref().is_none_or(|c| c.epoch != epoch) {
+						clock = Some(crate::desktop::grace::Grace::new(epoch, lease, now, attach, grace));
+						published = None;
+					}
+					let current = clock.as_mut().expect("created above");
+					current.observe(now, attached);
+					if current.expired(now) {
+						let mut inner = core.lock().await;
+						// A reconnect may have authenticated while the lock was pending.
+						let present = *presence.borrow();
+						let attached = inner.authorization_tx.as_ref().map(|tx| tx.borrow().generation())
+							== Some(present.generation)
+							&& present.attached;
+						if !attached {
+							core.begin_teardown(&mut inner, Some(epoch), SessionShutdownReason::DesktopGraceExpired);
+						}
+						clock = None;
+						published = None;
+					} else if published != Some(current.deadline) {
+						published = Some(current.deadline);
+						grace_revision += 1;
+						let revision = grace_revision;
+						let client = crate::desktop::Client::observer(current.lease.clone());
+						let deadline_ms = current.deadline.map(|deadline| {
+							let remaining = deadline.saturating_duration_since(Instant::now());
+							let epoch = std::time::SystemTime::now()
+								.duration_since(std::time::UNIX_EPOCH)
+								.unwrap_or_default();
+							epoch.saturating_add(remaining).as_millis().min(u64::MAX as u128) as u64
+						});
+						tokio::task::spawn_blocking(move || {
+							if let Err(error) = client.grace(deadline_ms, revision) {
+								tracing::debug!(%error,"Desktop grace status update failed");
+							}
+						});
+					}
+				},
+				None => {
+					clock = None;
+					published = None;
+				},
+			}
+			let deadline = clock.as_ref().and_then(|c| c.deadline);
+			tokio::select! {
+				_ = core.shutdown.wait_shutdown_triggered() => return,
+				changed = status.changed() => if changed.is_err() { return; },
+				changed = presence.changed() => if changed.is_err() { return; },
+				_ = async { match deadline { Some(d) => tokio::time::sleep_until(d.into()).await, None => std::future::pending::<()>().await } } => {},
+			}
+		}
+	});
+}
 
 #[cfg(test)]
 mod tests {

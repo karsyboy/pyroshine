@@ -118,6 +118,7 @@ pub(crate) fn scan(config: &SteamApplicationScannerConfig) -> SourceScan {
 				}
 				let application = ApplicationConfig {
 					title,
+					mode: crate::session::application::SessionMode::Game,
 					pre_command: config.pre_command.clone(),
 					post_command: config.post_command.clone(),
 					command: config

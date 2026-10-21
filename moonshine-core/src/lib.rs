@@ -6,6 +6,7 @@ pub mod calibration;
 pub mod clients;
 pub mod config;
 pub(crate) mod crypto;
+pub mod desktop;
 pub mod discovery;
 pub(crate) mod durable;
 pub(crate) mod gpu;

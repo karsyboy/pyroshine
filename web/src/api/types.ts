@@ -31,6 +31,27 @@ export interface SessionDetails {
   };
   video: VideoDetails | null;
   audio: AudioDetails | null;
+  /** What the session streams; absent from older daemons and before capture runs. */
+  capture?: CaptureDetails | null;
+}
+
+export interface CaptureDetails {
+  /** `game` (isolated compositor) or `desktop` (the running desktop). */
+  mode: string;
+  mode_label: string;
+  /** `isolated` or `desktop` (XDG Desktop Portal). */
+  backend: string;
+  render_node: string;
+  /** `SDR` or `HDR`: what the captured content delivers. */
+  dynamic_range: string;
+  output?: { width: number; height: number; refresh_millihertz?: number | null } | null;
+  /** `kde`, `gnome` or `other`. */
+  desktop?: string | null;
+  current_desktop?: string | null;
+  /** `libei`, `portal` or `none` (view-only). */
+  input?: string | null;
+  /** `restored` or `requested`. */
+  consent?: string | null;
 }
 
 export interface VideoDetails {
@@ -541,4 +562,14 @@ export interface LibraryApplication {
   can_hide: boolean;
   artwork: string | null;
   command: string[];
+}
+
+export interface DesktopStatus {
+  supported: boolean;
+  desktop: string;
+  phase: string;
+  reason: string | null;
+  mode: { width: number; height: number; refresh_millihertz: number } | null;
+  grace_deadline_ms: number | null;
+  audio_remote_only: boolean;
 }

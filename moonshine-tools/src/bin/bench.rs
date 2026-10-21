@@ -62,6 +62,12 @@ struct Args {
 	#[arg(long, default_value_t = 1400)]
 	packet_size: usize,
 
+	/// Stream the running desktop (Desktop Mode, through the XDG Desktop
+	/// Portal) instead of launching `command` in the isolated compositor. The
+	/// resolution must match the captured output.
+	#[arg(long)]
+	desktop: bool,
+
 	/// Command to run (application to spawn).
 	command: Vec<String>,
 
@@ -84,6 +90,11 @@ struct Args {
 	/// Target bitrate in bits per second.
 	#[arg(long, default_value_t = 20_000_000)]
 	bitrate: usize,
+
+	/// Benchmark-only live conventional rate change, SECONDS:BITS_PER_SECOND;
+	/// repeat in time order. Rates above the startup budget are clamped.
+	#[arg(long, value_parser = parse_rate_change, conflicts_with_all = ["capabilities", "pyrowave_matrix", "cycles", "reconnect_cycles"])]
+	rate_change: Vec<(u64, u32)>,
 
 	/// Video codec.
 	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1", "pyrowave"])]
@@ -194,6 +205,19 @@ const EXIT_UNSUPPORTED: i32 = 3;
 /// send control pings, so the production timeout would end every run longer
 /// than it (including `--duration 0` and long soak runs) after one minute.
 const STREAM_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+fn parse_rate_change(value: &str) -> Result<(u64, u32), String> {
+	let (time, rate) = value.split_once(':').ok_or("use SECONDS:BITS_PER_SECOND")?;
+	let time = time.parse::<u64>().map_err(|_| "invalid rate-change time")?;
+	if time > 86_400 {
+		return Err("rate changes must be within 24 hours".into());
+	}
+	let rate = rate.parse::<u32>().map_err(|_| "invalid rate-change bitrate")?;
+	if rate == 0 {
+		return Err("rate-change bitrate must be non-zero".into());
+	}
+	Ok((time, rate))
+}
 
 fn parse_codec_list(value: &str) -> Result<String, String> {
 	let valid = value
@@ -760,12 +784,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.init();
 
 	let args = Args::parse();
+	if args.rate_change.len() > 64 || args.rate_change.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+		return Err(boxed_error("at most 64 rate changes, ordered by time"));
+	}
+	if !args.rate_change.is_empty() && args.codec == "pyrowave" {
+		return Err(boxed_error("live rates require a conventional codec"));
+	}
 
 	if args.capabilities {
 		return run_capabilities(&args).await;
 	}
 
-	if args.command.is_empty() {
+	if args.command.is_empty() && !args.desktop {
 		tracing::error!("No command provided. Usage: moonshine-bench [OPTIONS] <COMMAND>");
 		std::process::exit(1);
 	}
@@ -881,6 +911,7 @@ fn workload(
 		"resolution": resolution,
 		"fps": target_fps,
 		"bitrate_bps": args.bitrate,
+		"rate_changes": args.rate_change,
 		"chroma": format.map(|format| format.chroma.to_string()).unwrap_or_else(|| args.chroma.clone()),
 		"bit_depth": format.map(|format| format.bit_depth.bits()),
 		"range": format.map(|format| format!("{:?}", format.range).to_lowercase()),
@@ -1095,6 +1126,7 @@ async fn run_benchmark(
 			bench_pointer: bench_pointer(args),
 			..Default::default()
 		},
+		Default::default(),
 		VideoStreamConfig {
 			fec_percentage: args.fec_percentage,
 			fec_mode: match args.fec_mode.as_str() {
@@ -1139,6 +1171,11 @@ async fn run_benchmark(
 
 	let app_config = ApplicationConfig {
 		title: "bench".to_string(),
+		mode: if args.desktop {
+			moonshine_core::config::SessionMode::Desktop
+		} else {
+			moonshine_core::config::SessionMode::Game
+		},
 		command: args.command.clone(),
 		..Default::default()
 	};
@@ -1158,6 +1195,7 @@ async fn run_benchmark(
 		// The benchmark is the local client: it discovers the video endpoint
 		// with a legacy PING from loopback below.
 		client_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+		client_identity: None,
 		vrr_requested: args.vrr,
 	};
 
@@ -1324,6 +1362,9 @@ async fn run_benchmark(
 		None
 	};
 	let mut interrupted = false;
+	let rate_started = tokio::time::Instant::now();
+	let mut rate_changes = args.rate_change.iter().copied().peekable();
+	let mut rate_results = Vec::new();
 
 	loop {
 		let duration_remaining = duration_deadline
@@ -1331,6 +1372,19 @@ async fn run_benchmark(
 			.unwrap_or(Duration::from_secs(86400 * 365 * 100)); // ~100 years = no limit
 		tokio::select! {
 			biased;
+			_ = tokio::time::sleep_until(rate_started + Duration::from_secs(rate_changes.peek().map_or(86400 * 365, |(seconds, _)| *seconds))), if rate_changes.peek().is_some() => {
+				let (seconds, rate) = rate_changes.next().unwrap();
+				let outcome = match session_manager.bench_set_bitrate(rate).await {
+					Ok(reply) => match tokio::time::timeout(Duration::from_secs(5), reply).await {
+						Ok(Ok(update)) => serde_json::to_value(update)?,
+						Ok(Err(_)) => serde_json::json!({"state": "failed", "error": "rate reply closed"}),
+						Err(_) => serde_json::json!({"state": "pending", "status": session_manager.bench_bitrate_status().await}),
+					},
+					Err(error) => serde_json::json!({"state": "failed", "error": error}),
+				};
+				tracing::info!(?outcome, "Live bitrate benchmark update");
+				rate_results.push(serde_json::json!({"scheduled_s": seconds, "requested_bps": rate, "result": outcome}));
+			},
 			result = stats_rx.recv() => {
 				match result {
 					Ok(stats) => {
@@ -1460,6 +1514,7 @@ async fn run_benchmark(
 		"resources": resources,
 		"stats_lagged": stats_lagged,
 		"runtime_probe": runtime_probe,
+		"rate_updates": rate_results,
 	});
 
 	if args.detach_seconds > 0 && !interrupted {

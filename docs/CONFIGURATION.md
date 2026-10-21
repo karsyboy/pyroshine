@@ -374,7 +374,7 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 | Setting | Type / default | Effect |
 | --- | --- | --- |
 | `title` | string, required | Application name shown to clients. Also used to derive its ID, so keep titles distinct and stable. A discovered game with the same title (ignoring case) is replaced by this entry, which lets you override its command or box art. |
-| `command` | array of strings, required | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
+| `command` | array of strings, required for Game Mode | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
 | `boxart` | optional path string, unset | Local cover image (PNG, JPEG, WebP, BMP or ICO). Missing art is resolved from an icon named like the title when possible. |
 | `output_scale` | optional number, effective `1.0` | Wayland output scale for this application. Finite values from `0.25` through `8.0` are accepted; other values fall back to `1.0`. The physical video resolution stays at the client's requested size. |
 | `pre_command` | array of command arrays, `[]` | Run in order before launching the app, via systemd `ExecStartPre`. A failed command can prevent launch. Every entry must name an executable found in `PATH` (or an absolute path); otherwise the launch fails and the log names the entry (for example `pre_command[1]`). |
@@ -408,6 +408,36 @@ launch_timeout_secs = 10
 ```
 
 Desktop sessions have [session and login-screen limitations](TIPS.md#run-a-desktop-environment-for-a-full-remote-desktop).
+
+## `[desktop]`
+
+[Managed Desktop Mode](DESKTOP_MODE.md) takes over the existing KDE Plasma or
+GNOME Wayland session for the Desktop Mode entry. Library games remain isolated.
+It creates a client-sized SDR virtual display, disables physical outputs, and
+restores display configuration after Stop or a disconnect grace period. Existing
+applications stay open; window placement is best effort.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `enabled` | boolean, `false` | Offer one Desktop Mode entry to clients. |
+| `title` | string, `"Desktop Mode"` | Name of the automatically offered entry. |
+| `input` | boolean, `true` | Authorize remote keyboard/pointer through the host portal and EIS; false permits view-only. |
+| `audio` | boolean, `true` | Route desktop playback to the client and restore destinations on exit; false keeps playback local. |
+| `disconnect_grace_secs` | integer 0–86400, `30` | Retain takeover during reconnect; 0 restores immediately on disconnect. Explicit Stop always restores immediately. |
+
+```toml
+[desktop]
+enabled = true
+disconnect_grace_secs = 30
+```
+
+A manually configured `[[application]]` may use `mode = "desktop"` and
+`command = []` to name the entry explicitly; only one Desktop Mode entry is
+automatically added. `mode` defaults to `"game"`. Desktop Mode executes no
+commands, hooks or application unit. `output_scale` applies to Game Mode;
+managed Desktop Mode remembers the scale chosen by each paired client, starting
+at 100% for a new client. On KDE, adjust the virtual display's scale in
+**Display Configuration** while streaming; see [Desktop Mode](DESKTOP_MODE.md).
 
 ## `[[application_scanner]]`
 

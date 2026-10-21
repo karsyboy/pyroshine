@@ -73,12 +73,12 @@ they occur. The verified hardware is listed in [GPU compatibility](GPU_COMPATIBI
 
 | Capability | Status | Code | Automated tests | Hardware check |
 | --- | --- | --- | --- | --- |
-| Direct DMA-BUF export of the application's buffer | Implemented | `compositor/capture.rs` (`DirectReject`), `compositor/state.rs`, `compositor/frame.rs` | `capture::tests`, `frame::tests` | `bench` (`capture.direct`), `hw:gpu_import_after_source_owner_teardown_and_fd_reuse` |
+| Direct DMA-BUF export of the application's buffer | Implemented | `compositor/capture.rs` (`DirectReject`), `compositor/state.rs`, `capture/frame.rs` | `compositor::capture::tests`, `frame::tests` | `bench` (`capture.direct`), `hw:gpu_import_after_source_owner_teardown_and_fd_reuse` |
 | Late composition (cursor, Steam notification drawn by the converter) | Implemented | `compositor/cursor.rs`, `pipeline/convert.rs` | `cursor::*_tests`, `convert/tests.rs` | `bench` (`hevc-1080p60-cursor`, `capture.direct_late`) |
 | Composited GLES fallback | Implemented | `compositor/state.rs`, `compositor/scaling.rs` | `scaling::tests`, `handlers::tests` | `bench` (`*-composited`) |
-| Fixed-rate capture | Implemented | `compositor/capture.rs` `CapturePacing::Fixed`, `admission.rs` | `capture::cadence_tests`, `admission::tests` | `bench` (pacing) |
+| Fixed-rate capture | Implemented | `capture/mod.rs` `CapturePacing::Fixed`, `compositor/capture.rs`, `capture/admission.rs` | `capture::cadence_tests`, `admission::tests` | `bench` (pacing) |
 | VRR-aware (presentation-driven) capture | Implemented; client-side VRR presentation is unverified here | `CapturePacing::Vrr`, `PresentationLimiter` | `cadence_tests`, `lifecycle_tests::capture_pacing_follows_each_generations_vrr_request` | `bench --vrr` (`hevc-1080p120-vrr`), `cycles --vrr` |
-| Bounded capture admission and GPU completion | Implemented | `compositor/admission.rs`, `pipeline/mod.rs` credits | `admission::tests`, `pipeline` | `bench` (frame age, outstanding) |
+| Bounded capture admission and GPU completion | Implemented | `capture/admission.rs`, `pipeline/mod.rs` credits | `admission::tests`, `pipeline` | `bench` (frame age, outstanding) |
 
 ## Transport
 
@@ -100,6 +100,8 @@ they occur. The verified hardware is listed in [GPU compatibility](GPU_COMPATIBI
 | Reconnect, unchanged and with changed codec/resolution/FPS/bitrate/HDR/chroma/audio | Implemented | `manager.rs` resume plans, `video/mod.rs` epochs | `lifecycle_tests::hundred_reconnect_cycles_alternate_every_negotiated_axis` | `cycles --reconnect-cycles` |
 | Stale generations and completed sessions cannot affect newer ones | Implemented | `manager.rs` (`is_current`, epoch-scoped teardown), `authorization.rs` | `stale_generation_cannot_commit`, `completed_session_cannot_affect_its_successor`, `stale_peer_cannot_detach_its_replacement` | — |
 | Cancellation during startup, service shutdown | Implemented | `manager.rs` | `stop_cancels_every_transition_await`, `service_shutdown_during_every_transition_completes` | — |
+| Capture backend start, readiness, failure and release | Implemented | `session/capture/mod.rs` (`start_capture_thread`, `CaptureSource`, `LiveCapture`) | `session::capture::tests` (mock backends: init failure, panic, cancellation, ready timeout, exit after readiness, refused start, GPU hold released after thread-local state) | `compositor::xwayland_tests` (`hw:`), `cycles` |
+| Managed desktop takeover on existing Wayland session | Implemented: native KDE/GNOME adapters, SDR, physical-output disable/restore, grace and remote audio | `desktop/`, `capture/portal/`, `audio/desktop.rs` | `desktop::guard::tests`, `desktop::grace::tests`, `lifecycle_tests::desktop_mode`, protected management routes and Dashboard tests | Physical KDE/GNOME acceptance outstanding; [matrix](DESKTOP_MODE.md#validation) |
 | Encoder initialization failure, encoder/device loss | Implemented (teardown) | `pipeline/failure.rs`, watchdog in `manager.rs` | `failure_of_each_transition_…`, `watchdog_triggered_cleanup_completes`, `pipeline::encoder_failures_are_classified_by_recovery`, `device_lost_is_detected_by_driver_result` | — (no safe way to induce device loss) |
 | Application unit stop exactly once; failed or hung stops not reported idle | Implemented | `session/application.rs`, `manager.rs` | `every_application_unit_is_stopped_exactly_once`, `failed_application_stop_is_not_reported_idle`, `application::tests` | `hw:transient_unit_stop_establishes_termination`, `hw:launch_failures_and_exits_report_the_exit_status`, `cycles` |
 | Release of workers, sockets, XWayland, DMA-BUFs after stop | Implemented | `lifecycle.rs` worker guards, `compositor/xwayland_process.rs` | `teardown_waits_for_delayed_workers_…`, `xwayland_process::tests`, socket tests in `video`/`audio` | `cycles` (port, unit, children, DMA-BUF descriptors), `hw:gpu_import_after_source_owner_teardown_and_fd_reuse` |

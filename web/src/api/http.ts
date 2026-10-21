@@ -171,6 +171,9 @@ export const http: Backend = {
 
   overview: () => json("overview"),
   endSession: () => request("POST", "session/end", {}),
+  desktopStatus: () => json("desktop"),
+  authorizeDesktop: () => request("POST", "desktop/authorize", {}),
+  restoreDesktop: () => request("POST", "desktop/restore", {}),
   restart: () => request("POST", "server/restart", {}),
   approvePairing: (clientId, requestToken, pin, label) =>
     request("POST", "pairing/approve", { client_id: clientId, request: requestToken, pin, label }),

@@ -12,6 +12,10 @@ pub trait Management {
 	fn get_server(&self) -> zbus::Result<String>;
 	/// [`crate::dto::SessionSnapshot`].
 	fn get_session(&self) -> zbus::Result<String>;
+	/// Managed display state, independent of media workers.
+	fn get_desktop(&self) -> zbus::Result<String>;
+	fn authorize_desktop(&self) -> zbus::Result<()>;
+	fn restore_desktop(&self) -> zbus::Result<String>;
 	/// End the current session through the daemon's canonical teardown. This
 	/// also stops the launched application.
 	fn end_session(&self) -> zbus::Result<()>;

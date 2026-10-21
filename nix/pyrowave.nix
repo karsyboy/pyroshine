@@ -10,8 +10,8 @@ let
   # Authoritative Pyroshine source. Never replace this with Themaister's
   # upstream repository: the fork carries the color-metadata API used here.
   sourceUrl = "https://github.com/karsyboy/pyrowave";
-  sourceRevision = "b09e1365155e91710497be22eac6500f04bf74ea";
-  graniteRevision = "fb178c8080d163419e8d20f10715c61c53c1ec9b";
+  sourceRevision = "78084ece21b1725d193442a7619660625f3f735a";
+  graniteRevision = "53090429539bf3404250d18fe58db971f0907c04";
   volkRevision = "47cddf7ed97b94118a08aacb548a411188e016cc";
   vulkanHeadersRevision = "6802bb4733b63ed5efd3adb308a6c885ef180ea1";
 

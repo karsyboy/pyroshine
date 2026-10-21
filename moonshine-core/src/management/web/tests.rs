@@ -360,6 +360,20 @@ async fn changes_need_this_origin_and_the_session_csrf_token() {
 }
 
 #[tokio::test]
+async fn desktop_controls_require_authentication_and_csrf_before_any_host_action() {
+	let server = start().await;
+	let mut browser = Browser::new(&server);
+	assert_eq!(browser.send("GET", "/api/v1/desktop", &[], None).await.status, 401);
+	for path in ["/api/v1/desktop/authorize", "/api/v1/desktop/restore"] {
+		assert_eq!(browser.send("POST", path, &[], Some("{}")).await.status, 401);
+	}
+	browser.sign_in(&server).await;
+	for path in ["/api/v1/desktop/authorize", "/api/v1/desktop/restore"] {
+		assert_eq!(browser.send("POST", path, &[], Some("{}")).await.status, 403);
+	}
+}
+
+#[tokio::test]
 async fn unknown_hosts_are_refused_to_defeat_dns_rebinding() {
 	let server = start().await;
 	let port = server.address.port();

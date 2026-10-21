@@ -20,6 +20,7 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   build-essential clang cmake dbus libc++-dev libc++abi-dev libclang-dev \
   libdrm-dev libevdev-dev libgbm-dev libopus-dev libwayland-dev \
+  libpipewire-0.3-dev libspa-0.2-dev libpulse-dev \
   libxkbcommon-dev patchelf pkg-config
 ```
 
@@ -97,6 +98,7 @@ install the artifacts and integration files:
 ```sh
 sudo install -Dm755 target/release/moonshine /usr/bin/pyroshine
 sudo install -Dm755 dist/start-pyroshine.sh /usr/bin/start-pyroshine.sh
+sudo install -Dm644 dist/pyroshine-desktop-guard.service /usr/lib/systemd/user/pyroshine-desktop-guard.service
 sudo install -Dm755 /tmp/pyrowave-install/lib/libpyrowave-shared.so.1 /usr/lib/libpyrowave-shared.so.1
 sudo install -Dm644 dist/pyroshine@.service /usr/lib/systemd/system/pyroshine@.service
 sudo install -Dm644 dist/60-pyroshine.rules /usr/lib/udev/rules.d/60-pyroshine.rules
@@ -146,6 +148,18 @@ startup log. Use your overridden config path for the check if it differs.
 
 Remove the old layer artifacts and session environment on upgrade as described
 in [native presentation migration](docs/NATIVE_PRESENTATION.md#upgrade-migration).
+
+For managed Desktop Mode, restore the desktop and stop its separate user guard
+before replacing binaries, then reload the user manager after installation:
+
+```sh
+pyroshine desktop restore
+systemctl --user stop pyroshine-desktop-guard.service
+systemctl --user daemon-reload
+```
+
+The unit is started on demand. See [Desktop Mode](docs/DESKTOP_MODE.md) for native
+compositor requirements and live acceptance checks.
 
 Repeat the build, stop, install, and start steps for subsequent manual upgrades.
 Do not replace your config or pairing state with defaults. If validation fails,

@@ -615,7 +615,7 @@ mod tests {
 	#[ignore = "needs a GPU render node: MOONSHINE_TEST_GPU=1"]
 	fn gpu_import_after_source_owner_teardown_and_fd_reuse() {
 		use super::DmaBufImporter;
-		use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+		use crate::session::capture::frame::{ExportedFrame, FrameColorSpace};
 		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 		use smithay::backend::allocator::{Allocator, Fourcc, Modifier};
 		use std::sync::Arc;
@@ -662,7 +662,7 @@ mod tests {
 		let node = crate::healthcheck::find_render_node(&None).unwrap();
 		let file = std::fs::OpenOptions::new().read(true).write(true).open(node).unwrap();
 		let verified = crate::gpu::capture_context(&file).unwrap();
-		let (sender, receiver) = crate::session::compositor::admission::capture_channel();
+		let (sender, receiver) = crate::session::capture::admission::capture_channel();
 		sender.set_context(verified.clone());
 		let context = receiver.context().unwrap();
 		assert_eq!(context.physical_device(), verified.physical_device());

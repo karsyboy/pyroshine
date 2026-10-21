@@ -45,6 +45,9 @@ retained controllers are in `session/stream/control/`; media epochs, endpoint
 discovery and pause/stop interruption in `session/stream/video/mod.rs` and
 `session/stream/audio/mod.rs`.
 
+Managed Desktop Mode has a separate [physical KDE/GNOME acceptance matrix](DESKTOP_MODE.md#validation).
+Its injected-platform recovery tests do not establish compositor or audio compatibility.
+
 ## Hardware tests
 
 Every ignored test is listed in `scripts/hardware_tests.toml` with what it

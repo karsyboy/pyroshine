@@ -298,6 +298,15 @@ impl ImportableModifiers {
 		self.0.len()
 	}
 
+	/// The importable modifiers of `fourcc`, in the driver's order.
+	pub(crate) fn modifiers(&self, fourcc: u32) -> Vec<u64> {
+		self.0
+			.iter()
+			.filter(|(candidate, _)| *candidate == fourcc)
+			.map(|(_, modifier)| *modifier)
+			.collect()
+	}
+
 	#[cfg(test)]
 	pub(crate) fn from_pairs(pairs: Vec<(u32, u64)>) -> Self {
 		Self(pairs)

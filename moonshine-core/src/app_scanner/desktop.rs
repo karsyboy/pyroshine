@@ -261,6 +261,7 @@ fn parse_desktop_application(
 			.map(str::to_string),
 		application: ApplicationConfig {
 			title,
+			mode: crate::session::application::SessionMode::Game,
 			boxart: None,
 			command,
 			output_scale: None,

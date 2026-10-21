@@ -7,6 +7,7 @@
   libdrm,
   libevdev,
   libpulseaudio,
+  pipewire,
   libxkbcommon,
   libgbm,
   libopus,
@@ -84,6 +85,7 @@ rustPlatform.buildRustPackage {
     libdrm
     libevdev
     libpulseaudio
+    pipewire
     libxkbcommon
     libgbm # smithay's GPU buffer allocation (split out of mesa in nixpkgs)
     libopus
@@ -97,6 +99,10 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
+    install -Dm644 dist/pyroshine-desktop-guard.service $out/lib/systemd/user/pyroshine-desktop-guard.service
+    substituteInPlace $out/lib/systemd/user/pyroshine-desktop-guard.service \
+      --replace-fail /usr/bin/pyroshine $out/bin/moonshine
+
     # The web management interface, found next to the executable
     # (bin/../share/pyroshine/web). The server shows the desktop tray itself
     # (a child process of bin/moonshine) in desktop sessions.

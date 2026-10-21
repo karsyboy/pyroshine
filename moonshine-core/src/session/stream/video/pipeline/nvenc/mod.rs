@@ -17,6 +17,7 @@
 //! Lost frames are invalidated in the encoder's reference list (NVENC picks an
 //! older reference) when the GPU supports it, else an IDR re-anchors the stream.
 
+mod recovery;
 pub(crate) mod sys;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -541,6 +542,9 @@ pub(crate) struct NvencEncoder {
 	width: u32,
 	height: u32,
 	reference_invalidation: bool,
+	recovery: recovery::Recovery,
+	bitrate_ceiling: u32,
+	pending_bitrate: u32,
 	current: usize,
 	submitted: u64,
 	idr_pending: bool,
@@ -608,6 +612,9 @@ impl NvencEncoder {
 			width: format.width,
 			height: format.height,
 			reference_invalidation: false,
+			recovery: recovery::Recovery::default(),
+			bitrate_ceiling: format.bitrate,
+			pending_bitrate: format.bitrate,
 			current: 0,
 			submitted: 0,
 			idr_pending: true,
@@ -740,6 +747,16 @@ impl NvencEncoder {
 		rc.set_enableLookahead(0);
 		self.apply_codec_config(format.chroma, format.bit_depth, format.color);
 
+		// SAFETY: apply_codec_config initialized the union member for this codec.
+		let retained = unsafe {
+			match self.codec {
+				VideoCodec::H264 => self.config.encodeCodecConfig.h264Config.maxNumRefFrames,
+				VideoCodec::Hevc => self.config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB,
+				VideoCodec::Av1 => self.config.encodeCodecConfig.av1Config.maxNumRefFramesInDPB,
+				VideoCodec::PyroWave => 0,
+			}
+		};
+		self.recovery = recovery::Recovery::new(retained);
 		let init = &mut *self.init;
 		init.version = INITIALIZE_PARAMS_VER;
 		init.encodeGUID = profile.codec;
@@ -956,16 +973,76 @@ impl NvencEncoder {
 		(self.layout.format, self.extent, ROW_ALIGNMENT)
 	}
 
+	pub(crate) fn set_bitrate(&mut self, requested: u32) -> Result<u32, EncodeError> {
+		let accepted = super::backend::bounded_bitrate(requested, self.bitrate_ceiling)?;
+		let previous = self.pending_bitrate;
+		self.pending_bitrate = accepted;
+		if let Err(error) = self.apply_bitrate() {
+			self.pending_bitrate = previous;
+			return Err(error);
+		}
+		Ok(accepted)
+	}
+
+	/// Reconfigure a copy, committing parameters only after SDK acceptance.
+	/// A bitrate-only change leaves resetEncoder/forceIDR clear.
+	fn apply_bitrate(&mut self) -> Result<(), EncodeError> {
+		if self.config.rcParams.averageBitRate == self.pending_bitrate {
+			return Ok(());
+		}
+		let mut config = *self.config;
+		config.rcParams.averageBitRate = self.pending_bitrate;
+		config.rcParams.maxBitRate = self.pending_bitrate;
+		config.rcParams.vbvBufferSize =
+			self.pending_bitrate / self.init.frameRateNum.max(1) * self.init.frameRateDen.max(1);
+		config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+		let mut init = *self.init;
+		init.encodeConfig = &mut config;
+		let mut params = NV_ENC_RECONFIGURE_PARAMS {
+			version: RECONFIGURE_PARAMS_VER,
+			reInitEncodeParams: init,
+			// SAFETY: zeroed reserved fields and no reset/IDR request.
+			..unsafe { std::mem::zeroed() }
+		};
+		let shared = &self.shared;
+		let _current = shared.cuda.push()?;
+		let _session = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
+		// SAFETY: config and init copies remain live throughout the call.
+		unsafe {
+			shared.check(
+				shared
+					.api
+					.nvEncReconfigureEncoder
+					.ok_or(EncodeError::native("NVENC reconfigure unavailable"))?(shared.session, &mut params),
+				"live bitrate reconfigure",
+			)?;
+		}
+		*self.config = config;
+		Ok(())
+	}
+
+	pub(crate) fn next_display_order(&self) -> u64 {
+		self.submitted
+	}
+
 	pub(crate) fn request_idr(&mut self) {
 		self.idr_pending = true;
+		self.recovery.reset(self.submitted);
 	}
 
 	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) {
-		let lost = self.submitted.saturating_sub(display_order);
-		if !self.reference_invalidation || lost == 0 || lost > MAX_INVALIDATIONS {
-			self.idr_pending = true;
+		if self.idr_pending || !self.reference_invalidation {
+			self.request_idr();
 			return;
 		}
+		let (first, end) = match self.recovery.plan(display_order, self.submitted) {
+			recovery::Plan::Idr => {
+				self.request_idr();
+				return;
+			},
+			recovery::Plan::Covered => return,
+			recovery::Plan::Invalidate { first, end } => (first, end),
+		};
 		let shared = &self.shared;
 		let Some(invalidate) = shared.api.nvEncInvalidateRefFrames else {
 			self.idr_pending = true;
@@ -976,13 +1053,14 @@ impl NvencEncoder {
 			return;
 		};
 		let _session = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
-		for timestamp in display_order..self.submitted {
+		for timestamp in first..end {
 			// SAFETY: valid session; timestamps are the frames' inputTimeStamp.
 			if unsafe { invalidate(shared.session, timestamp) } != NV_ENC_SUCCESS {
 				self.idr_pending = true;
 				return;
 			}
 		}
+		self.recovery.accepted(first, end);
 	}
 
 	pub(crate) fn set_color_description(&mut self, description: ColorDescription) -> Result<(), EncodeError> {
@@ -1141,6 +1219,9 @@ impl NvencEncoder {
 			.is_err()
 		}) {
 			return Err(EncodeError::native("NVENC readback thread stopped"));
+		}
+		if self.idr_pending {
+			self.recovery.reset(self.submitted);
 		}
 		self.idr_pending = false;
 		self.submitted += 1;

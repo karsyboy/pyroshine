@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import fixture from "../api/session.fixture.json";
 import type { AudioDetails, CaptureStats, GpuStats, SessionSnapshot, StreamStats } from "../api/types";
 import { setPreference } from "../state/preferences";
-import { DashboardPage } from "./Dashboard";
+import { DesktopPanel, DashboardPage } from "./Dashboard";
 
 const daemon = vi.hoisted(() => ({
   connected: true,
@@ -425,5 +425,73 @@ describe("last stop", () => {
     expect(html).toContain("Steam crashed (SIGSEGV, core dumped), 4 s after launch.");
     expect(html).not.toContain("The application exited.");
     expect(html).toMatch(/<code[^>]*>journalctl --user -u moonshine-session.service -e<\/code>/);
+  });
+});
+
+describe("capture mode display", () => {
+  const snapshot: SessionSnapshot = { ...fixture, phase: "streaming" };
+
+  it("names Desktop Mode, the captured output and how input reaches the desktop", () => {
+    const html = render({
+      ...snapshot,
+      session: {
+        ...snapshot.session!,
+        capture: {
+          mode: "desktop",
+          mode_label: "Desktop Mode",
+          backend: "desktop",
+          render_node: "/dev/dri/renderD128",
+          dynamic_range: "SDR",
+          output: { width: 2560, height: 1440, refresh_millihertz: 144000 },
+          desktop: "gnome",
+          current_desktop: "ubuntu:GNOME",
+          input: "none",
+          consent: "restored",
+        },
+      },
+    });
+    expect(html).toContain("Desktop Mode");
+    expect(html).toContain("2560 × 1440 @ 144 Hz");
+    expect(html).toContain("ubuntu:GNOME");
+    expect(html).toContain("View-only");
+    expect(html).toContain("Saved permission offered");
+    expect(html).toContain("XDG Desktop Portal");
+  });
+
+  it("shows Game Mode without desktop rows, and nothing for older daemons", () => {
+    const game = render({
+      ...snapshot,
+      session: {
+        ...snapshot.session!,
+        capture: {
+          mode: "game",
+          mode_label: "Game Mode",
+          backend: "isolated",
+          render_node: "/dev/dri/renderD128",
+          dynamic_range: "HDR",
+        },
+      },
+    });
+    expect(game).toContain("Game Mode");
+    expect(game).not.toContain("Captured output");
+    expect(game).toContain("Isolated compositor");
+    expect(render(snapshot)).not.toContain("Capture backend");
+  });
+});
+
+
+describe("managed desktop recovery", () => {
+  it("shows exact mode, remote audio and a reconnect deadline", () => {
+    const html = renderToStaticMarkup(<DesktopPanel status={{ supported: true, desktop: "kde", phase: "grace", reason: null, mode: { width: 1920, height: 1080, refresh_millihertz: 60000 }, grace_deadline_ms: 32000, audio_remote_only: true }} busy={false} onAuthorize={() => {}} onRestore={() => {}} />);
+    expect(html).toContain("1920 × 1080 @ 60 Hz");
+    expect(html).toContain("30 seconds");
+    expect(html).toContain("Desktop sound is routed to the client");
+    expect(html).toContain("Restore desktop");
+  });
+  it("keeps recovery available when native support disappears", () => {
+    const html = renderToStaticMarkup(<DesktopPanel status={{ supported: false, desktop: "gnome", phase: "recovery_required", reason: "Reconnect the missing monitor", mode: null, grace_deadline_ms: null, audio_remote_only: false }} busy={false} onAuthorize={() => {}} onRestore={() => {}} />);
+    expect(html).toContain("Reconnect the missing monitor");
+    expect(html).toContain("Restore desktop");
+    expect(html).toMatch(/<button(?![^>]*disabled)[^>]*>Restore desktop<\/button>/);
   });
 });

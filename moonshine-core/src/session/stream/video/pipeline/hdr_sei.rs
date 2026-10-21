@@ -7,7 +7,7 @@
 //!
 //! Metadata is injected on key frames only, before the first VCL NAL unit.
 
-use crate::session::compositor::frame::HdrMetadata;
+use crate::session::capture::frame::HdrMetadata;
 use crate::session::stream::video::VideoFormat;
 
 /// Build an H.264/H.265 MDCV SEI NAL unit.

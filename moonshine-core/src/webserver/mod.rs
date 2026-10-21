@@ -27,6 +27,7 @@ use crate::{
 	ingress::Ingress,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
+		application::SessionMode,
 		failure::{Problem, SessionFailure},
 		manager::SessionManager,
 		negotiation::{self, DisplayMode},
@@ -491,13 +492,15 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.launch(params, local_address, peer_address).await
+					self.launch(params, local_address, peer_address, peer_cert_fingerprint.clone())
+						.await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.resume(params, local_address, peer_address).await
+					self.resume(params, local_address, peer_address, peer_cert_fingerprint.clone())
+						.await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
@@ -570,7 +573,9 @@ impl Webserver {
 		for entry in catalog.offered() {
 			response += "<App>";
 
-			let hdr_supported = u8::from(self.hdr_supported);
+			// Desktop Mode streams what the desktop shares, which is SDR on
+			// the desktops tested; Moonlight then does not ask for HDR.
+			let hdr_supported = u8::from(self.hdr_supported && entry.application.mode.is_game());
 			response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
 			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();
 			response += format!("<ID>{}</ID>", entry.id).as_ref();
@@ -789,6 +794,7 @@ impl Webserver {
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
+		client_identity: Option<String>,
 	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
@@ -875,6 +881,15 @@ impl Webserver {
 			},
 		};
 
+		if application.mode == SessionMode::Desktop && hdr {
+			let failure = SessionFailure::new(
+				"desktop_hdr_unsupported",
+				"Desktop Mode streams the desktop in SDR; the client asked for HDR.",
+			)
+			.with_hint("Turn HDR off in the client's settings for Desktop Mode.");
+			return self.launch_failed(&application.title, &failure);
+		}
+
 		let initialize_result = self
 			.session_manager
 			.initialize_session(SessionContext {
@@ -887,6 +902,7 @@ impl Webserver {
 				audio_channel_mask,
 				hdr,
 				client_ip: peer_address.ip(),
+				client_identity,
 				vrr_requested,
 			})
 			.await;
@@ -948,6 +964,7 @@ impl Webserver {
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
+		client_identity: Option<String>,
 	) -> Response<Full<Bytes>> {
 		// The whole request is validated before the session manager publishes
 		// keys or rotates authorization, so a malformed resume changes nothing.
@@ -959,7 +976,10 @@ impl Webserver {
 			},
 		};
 
-		let mut resume_request = crate::session::ResumeRequest::default();
+		let mut resume_request = crate::session::ResumeRequest {
+			client_identity,
+			..Default::default()
+		};
 		if let Some(mode) = params.remove("mode") {
 			match DisplayMode::parse(&mode) {
 				Ok(mode) => {

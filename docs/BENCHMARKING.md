@@ -40,6 +40,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
 | `--bitrate <N>` | `20000000` | Target bitrate in bits per second |
+| `--rate-change <seconds:bps>` | off | Repeat in time order to change a conventional encoder rate within its startup ceiling; records requested/accepted rate, outcome and first affected frame |
 | `--encrypt-video` | off | Enable the same video AES-GCM path used in streaming |
 | `--fec-mode <mode>` | `fixed` | Select `off`, `fixed`, or `auto` FEC policy |
 | `--fec-percentage <N>` | `20` | Requested parity percentage; effective layout still obeys the protocol limits |
@@ -77,6 +78,19 @@ Run a quick H.264 benchmark at 1080p60 for 30 seconds:
 ```bash
 moonshine-bench --duration 30 --codec h264 /usr/bin/vkcube
 ```
+
+Exercise live rate installation (fixed rate is otherwise unchanged):
+
+```sh
+moonshine-bench --encoder vaapi --duration 15 --warmup 0 \
+  --rate-change 3:10000000 --rate-change 7:20000000 \
+  --rate-change 11:50000000 --json live-rate.json /usr/bin/vkcube
+```
+
+The final request is clamped to the default 20 Mbps startup ceiling. The JSON's
+`rate_updates` distinguishes a staged/timeout result from successful installation;
+measured encoded bytes can remain below the target when the content is simple,
+particularly after rate-control padding is removed. This does not select ABR.
 
 Run the conventional resolution/FPS/codec matrix:
 

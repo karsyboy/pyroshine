@@ -6,6 +6,7 @@
 - [Installation](INSTALLATION.md): platform compatibility, SteamOS/portable setup, headless use, networking and upgrades.
 - [Web interface and tray](MANAGEMENT.md): sign in locally or over SSH, pair devices, manage clients, save settings, read stream status, history and updates; the desktop tray.
 - [Manage a headless host](INSTALLATION.md#manage-a-headless-host) and [pair from a terminal](INSTALLATION.md#pair-from-a-terminal): `pyroshine web setup` and `pyroshine pair`, including over SSH.
+- [Managed Desktop Mode](DESKTOP_MODE.md): existing Wayland desktop takeover, input authorization, remote audio and restoration.
 - [NixOS](NIXOS.md): declarative installation, Steam configuration and the `moonshine` service.
 
 ## Advanced configuration and troubleshooting
@@ -28,6 +29,7 @@ the guide for the area being changed:
 | Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
 | Inputtino and Pixelforge patch maintenance | [Vendored dependencies](../vendor/README.md) |
 | Web management interface, tray and management API | [Architecture](ARCHITECTURE.md#management), [web interface](../web/README.md) |
+| Capture backends, the frame contract and future capture modes | [Capture backends](CAPTURE_BACKENDS.md) |
 | Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |

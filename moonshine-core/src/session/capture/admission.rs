@@ -20,6 +20,13 @@ pub(crate) struct CaptureCredit {
 	state: Arc<AtomicU64>,
 	ticket: u64,
 }
+impl CaptureCredit {
+	/// A retained producer frame can outlive a receiver's reconnect reset.
+	/// Its pixels remain owned, but admission must be claimed for the new epoch.
+	pub(crate) fn is_current(&self) -> bool {
+		self.state.load(Ordering::Acquire) == self.ticket
+	}
+}
 impl Drop for CaptureCredit {
 	fn drop(&mut self) {
 		// An old epoch's completion must never replenish a new epoch's credit.
@@ -115,6 +122,17 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	)
 }
 impl CaptureSender {
+	/// A replacement producer shares admission, but never duplicates the loop's
+	/// demand source. The desktop worker activates only one producer at a time.
+	pub(crate) fn replacement(&self) -> Self {
+		Self {
+			context: self.context.clone(),
+			overlay_caps: self.overlay_caps.clone(),
+			tx: self.tx.clone(),
+			demand_source: None,
+			state: self.state.clone(),
+		}
+	}
 	pub(crate) fn set_context(&self, context: pixelforge::VideoContext) {
 		assert!(
 			self.context.set(context).is_ok(),
@@ -127,6 +145,11 @@ impl CaptureSender {
 		CaptureContextHold {
 			_context: self.context.clone(),
 		}
+	}
+	/// Owners of the capture context cell: both channel ends plus every hold.
+	#[cfg(test)]
+	pub(crate) fn context_owners(&self) -> usize {
+		Arc::strong_count(&self.context)
 	}
 	pub(crate) fn take_demand_source(&mut self) -> Option<PingSource> {
 		self.demand_source.take()
@@ -352,7 +375,7 @@ mod tests {
 
 	#[test]
 	fn overlay_caps_require_every_layer_kind() {
-		use crate::session::compositor::frame::{FrameOverlay, OverlayContent, OverlayFormat, OverlayImage};
+		use crate::session::capture::frame::{FrameOverlay, OverlayContent, OverlayFormat, OverlayImage};
 		let pixels = FrameOverlay {
 			content: OverlayContent::Pixels(Arc::new(OverlayImage {
 				generation: 1,
@@ -378,9 +401,12 @@ mod tests {
 		let (tx, rx) = capture_channel();
 		pending(&rx);
 		let old = tx.try_acquire().unwrap();
+		assert!(old.is_current());
 		rx.reset();
+		assert!(!old.is_current(), "retained pixels need a new epoch's credit");
 		pending(&rx);
 		let current = tx.try_acquire().unwrap();
+		assert!(current.is_current());
 		drop(old);
 		assert!(tx.occupied());
 		drop(current);

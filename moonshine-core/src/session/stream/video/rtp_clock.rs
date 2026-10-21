@@ -12,7 +12,7 @@
 //! epoch, wrap at 32 bits (about 13 hours) like any RTP clock, and restart
 //! near zero when a reconnecting client starts a new epoch.
 //!
-//! [`ExportedFrame::source_time`]: crate::session::compositor::frame::ExportedFrame
+//! [`ExportedFrame::source_time`]: crate::session::capture::frame::ExportedFrame
 
 use std::time::{Duration, Instant};
 

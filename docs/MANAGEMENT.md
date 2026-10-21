@@ -288,3 +288,17 @@ off (`[management] tray = false`) and restart the service.
 | The browser does not open | Install `xdg-desktop-portal` or `xdg-utils`, or open the address yourself. |
 
 Use `sudo journalctl` if journal access is denied.
+
+## Desktop Mode controls
+
+The Dashboard shows native Desktop Mode capability failures, the active virtual
+mode, remote audio routing and a reconnect countdown. **Authorize remote input**
+opens a consent dialog on the host without changing displays. **Restore desktop**
+restores displays/audio and ends Desktop Mode. See [Desktop Mode](DESKTOP_MODE.md)
+for setup and recovery without the daemon.
+
+The shared management contract exposes `GetDesktop`, `AuthorizeDesktop` and
+`RestoreDesktop` on D-Bus, and `GET /api/v1/desktop`,
+`POST /api/v1/desktop/authorize`, `POST /api/v1/desktop/restore` over HTTP.
+Existing same-user D-Bus authorization and web administrator/CSRF protections
+apply. Status probes native support; it does not take over displays.

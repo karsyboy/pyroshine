@@ -38,6 +38,13 @@
       "virtual_connector_strategy": "single_application",
       "vrr_capture": "auto"
     },
+    "desktop": {
+      "audio": true,
+      "disconnect_grace_secs": 30,
+      "enabled": false,
+      "input": true,
+      "title": "Desktop Mode"
+    },
     "frame_limit": {
       "fps": 60,
       "method": "proton",
@@ -926,6 +933,73 @@
       {
         "advanced": false,
         "caution": null,
+        "help": "Offer managed Desktop Mode on KDE Plasma or GNOME Wayland: use a client-sized virtual display, disable physical displays, and restore their configuration afterward. Authorize input on the host before unattended use.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Offer Desktop Mode",
+        "path": "desktop.enabled",
+        "required": false,
+        "section": "desktop"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Seconds to retain the virtual display after client loss. Reconnecting cancels restoration; zero restores immediately. Explicit Stop always restores immediately.",
+        "kind": {
+          "max": 86400.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "s"
+        },
+        "label": "Reconnect grace",
+        "path": "desktop.disconnect_grace_secs",
+        "required": false,
+        "section": "desktop"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Name of the Desktop Mode entry in Moonlight. It also derives the entry's ID.",
+        "kind": {
+          "optional": false,
+          "placeholder": "Desktop Mode",
+          "suggestions": [],
+          "type": "text"
+        },
+        "label": "Entry title",
+        "path": "desktop.title",
+        "required": false,
+        "section": "desktop"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Let the client use the desktop's keyboard and pointer. Off streams the desktop view-only.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Remote control",
+        "path": "desktop.input",
+        "required": false,
+        "section": "desktop"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Route desktop playback to a streaming sink while Desktop Mode runs, then restore its previous routing. Off leaves host audio unchanged.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Desktop audio",
+        "path": "desktop.audio",
+        "required": false,
+        "section": "desktop"
+      },
+      {
+        "advanced": false,
+        "caution": null,
         "help": "Ask launched games to render at most this many frames per second. Capture pacing is unchanged; this saves GPU time games spend on frames the stream drops. Applies only to applications Pyroshine launches, at their next launch. Applications can override it.",
         "kind": {
           "options": [
@@ -1122,6 +1196,31 @@
               "label": "Command",
               "path": "command",
               "required": true,
+              "section": "applications"
+            },
+            {
+              "advanced": false,
+              "caution": null,
+              "help": "Game Mode launches the command in Pyroshine's own isolated display; Desktop Mode streams your running desktop and launches nothing.",
+              "kind": {
+                "options": [
+                  {
+                    "description": "Launch the command in an isolated display (default).",
+                    "label": "Game Mode",
+                    "value": "game"
+                  },
+                  {
+                    "description": "Stream the running desktop; the command is not run.",
+                    "label": "Desktop Mode",
+                    "value": "desktop"
+                  }
+                ],
+                "type": "choice",
+                "unset_label": null
+              },
+              "label": "Mode",
+              "path": "mode",
+              "required": false,
               "section": "applications"
             },
             {
@@ -2197,6 +2296,11 @@
         "description": "Applications offered to clients.",
         "id": "applications",
         "title": "Applications"
+      },
+      {
+        "description": "Stream the desktop you are logged in to, with its applications, as its own entry.",
+        "id": "desktop",
+        "title": "Desktop Mode"
       },
       {
         "description": "Scanners that find installed games and keep the application list current.",

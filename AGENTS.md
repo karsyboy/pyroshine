@@ -45,6 +45,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | Area | Responsibility |
 | --- | --- |
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown; `pair.rs` and `diag.rs` subcommands |
+| `desktop/` | Independently supervised existing-desktop output/audio guard, native KDE/GNOME adapters, private lifecycle RPC, durable recovery and reconnect grace |
 | `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
 | `app_scanner/` | Application catalog: Steam, Lutris, Heroic and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
@@ -54,7 +55,8 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | `session/manager.rs`, `session/mod.rs`, `session/lifecycle.rs` | Session states, transitions, teardown ownership, worker guards and start latches |
 | `session/application.rs`, `session/inhibit.rs` | Application systemd unit and environment; logind sleep inhibition |
 | `session/authorization.rs`, `session/keys.rs`, `session/negotiation.rs` | Authorization generations; validated keys and nonce ownership; shared numeric domains |
-| `session/compositor/` | Headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, native color-management protocols, capture admission and DMA-BUF export |
+| `session/capture/` | Capture backend seam: selection, start/readiness contract (`start_capture_thread`), capabilities, output mode and pacing; the shared frame contract (`frame.rs`) and capture admission (`admission.rs`) |
+| `session/compositor/` | Isolated Game Mode capture backend, a headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, native color-management protocols, capture eligibility and DMA-BUF export |
 | `session/stream/audio/` | Embedded PulseAudio-compatible server, Opus encoding, audio FEC/encryption, UDP |
 | `session/stream/control/` | ENet control protocol, peer authorization (`peers.rs`), input decoding/routing, Inputtino devices, ownership and feedback |
 | `session/stream/video/` | Negotiated formats, stream epochs, packetization, FEC, GSO/pacing, diagnostics |
@@ -99,6 +101,8 @@ Other workspace and integration areas:
 | Build, install locally, contribute, release | `CONTRIBUTING.md`; CI commands in `.github/workflows/ci.yaml` |
 | Configuration fields, defaults or semantics | `docs/CONFIGURATION.md` and the owning Rust config/default implementations |
 | PyroWave, codec negotiation, GPU ownership, FEC or transport | `docs/PYROWAVE.md`, `docs/PYROWAVE_COMPATIBILITY.md` |
+| Capture backends, the frame contract or future capture modes | `docs/CAPTURE_BACKENDS.md` |
+| Existing Wayland desktop takeover, native outputs, remote audio or recovery | `docs/DESKTOP_MODE.md` |
 | Capture, cursor lifetime, focus, Steam surfaces/overlays or input | `docs/COMPOSITOR.md` |
 | Native presentation, HDR/color management and Wine/Proton setup | `docs/NATIVE_PRESENTATION.md` |
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
@@ -114,6 +118,10 @@ Other workspace and integration areas:
 
 ## Architectural boundaries
 
+- Managed Desktop Mode display/audio control belongs to the separately supervised
+  user guard in `desktop/`. Frames travel directly through PipeWire and capture
+  admission; never route media payloads through its administrative RPC. A desktop
+  teardown is not Idle until restoration is verified.
 - Keep protocol/session orchestration, compositor scene decisions, encoding,
   packet transport, input/control and packaging in their owning
   layers. Extend existing interfaces rather than coupling unrelated layers or

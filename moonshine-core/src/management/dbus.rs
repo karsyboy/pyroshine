@@ -78,6 +78,40 @@ impl ManagementInterface {
 		Ok(json(&self.management.op_session()))
 	}
 
+	async fn get_desktop(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<String, ManagementError> {
+		authorize(connection, &header).await?;
+		let management = self.management.clone();
+		on_runtime(&self.management, async move {
+			Ok(json(&management.op_desktop_status().await))
+		})
+		.await
+	}
+	async fn authorize_desktop(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<(), ManagementError> {
+		authorize(connection, &header).await?;
+		let management = self.management.clone();
+		on_runtime(&self.management, async move { management.op_desktop_authorize().await }).await
+	}
+	async fn restore_desktop(
+		&self,
+		#[zbus(connection)] connection: &zbus::Connection,
+		#[zbus(header)] header: Header<'_>,
+	) -> Result<String, ManagementError> {
+		authorize(connection, &header).await?;
+		let management = self.management.clone();
+		on_runtime(&self.management, async move {
+			management.op_desktop_restore().await.map(|s| json(&s))
+		})
+		.await
+	}
+
 	async fn end_session(
 		&self,
 		#[zbus(connection)] connection: &zbus::Connection,

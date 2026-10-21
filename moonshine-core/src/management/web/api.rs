@@ -283,6 +283,15 @@ pub(crate) async fn handle(context: &Context, request: Request<Incoming>, peer: 
 			audit!("restart");
 			respond(management.op_restart(&actor).map(|()| no_content()))
 		},
+		(&Method::GET, "desktop") => json(&management.op_desktop_status().await),
+		(&Method::POST, "desktop/authorize") => {
+			audit!("authorize_desktop_input");
+			respond(management.op_desktop_authorize().await.map(|()| no_content()))
+		},
+		(&Method::POST, "desktop/restore") => {
+			audit!("restore_desktop");
+			respond(management.op_desktop_restore().await.map(|status| json(&status)))
+		},
 		(&Method::GET, "session") => json(&management.op_session()),
 		(&Method::POST, "session/end") => {
 			audit!("end_session");
@@ -482,6 +491,9 @@ fn is_known(route: &str) -> bool {
 		"overview",
 		"server",
 		"server/restart",
+		"desktop",
+		"desktop/authorize",
+		"desktop/restore",
 		"session",
 		"session/end",
 		"pairing",

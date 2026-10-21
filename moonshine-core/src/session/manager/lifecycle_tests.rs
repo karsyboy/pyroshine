@@ -58,6 +58,7 @@ impl Gate {
 /// Counts live fake resources; each `Resource` is one socket/thread/GPU owner.
 #[derive(Default)]
 struct Counters {
+	desktop_cleanup_failed: AtomicBool,
 	resources: AtomicUsize,
 	workers_started: AtomicUsize,
 	unit_created: AtomicBool,
@@ -185,6 +186,13 @@ fn injected() -> SessionFailure {
 }
 
 impl SessionBackend for FakeBackend {
+	async fn verify_desktop_cleanup(&self) -> Result<(), ()> {
+		if self.counters.desktop_cleanup_failed.load(Ordering::SeqCst) {
+			Err(())
+		} else {
+			Ok(())
+		}
+	}
 	type Initialized = FakeSession;
 	type Launched = FakeSession;
 	type Active = FakeSession;
@@ -457,6 +465,7 @@ fn context() -> SessionContext {
 		audio_channel_mask: 0x3,
 		hdr: false,
 		client_ip: "127.0.0.1".parse().unwrap(),
+		client_identity: None,
 		vrr_requested: false,
 	}
 }
@@ -1939,5 +1948,98 @@ mod status {
 			Some(crate::session::status::TeardownFailure::DeadlineExceeded)
 		);
 		h.backend().worker_exit.send_replace(true);
+	}
+}
+
+/// Desktop Mode launches nothing: the manager records no application unit,
+/// so no teardown (user stop, reconnect, capture loss) ever stops one, and
+/// the desktop's own applications are not Pyroshine's to end.
+mod desktop_mode {
+	use super::*;
+	use crate::session::application::SessionMode;
+
+	fn desktop_context() -> SessionContext {
+		let mut context = context();
+		context.application.mode = SessionMode::Desktop;
+		context.application.title = "Desktop Mode".into();
+		context
+	}
+
+	#[tokio::test]
+	async fn desktop_restore_failure_blocks_idle_and_launch_without_killing_daemon() {
+		let h = Harness::new();
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		h.backend()
+			.counters
+			.desktop_cleanup_failed
+			.store(true, Ordering::SeqCst);
+		assert!(h.core.stop_session().await.is_err());
+		let status = h.core.subscribe_status();
+		assert_eq!(
+			status.borrow().last_stop.as_ref().unwrap().failure,
+			Some(TeardownFailure::DesktopNotRestored)
+		);
+		assert!(!h.core.shutdown.is_shutdown_triggered());
+		assert!(h.core.initialize_session(context()).await.is_err());
+		assert_eq!(h.backend().counters.resources.load(Ordering::SeqCst), 0);
+		assert_eq!(h.backend().counters.unit_stops.load(Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn no_application_unit_is_stopped_across_stream_reconnect_and_stop() {
+		let h = Harness::new();
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		// A reconnect at another resolution keeps the session.
+		let request = ResumeRequest {
+			resolution: Some((1280, 720)),
+			refresh_rate: Some(60),
+			..ResumeRequest::default()
+		};
+		h.core.resume_session(keys(), request, h.client).await.unwrap();
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		h.core.stop_session().await.unwrap();
+		assert_eq!(h.backend().counters.unit_stops.load(Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn a_lost_desktop_capture_tears_down_with_its_cause_and_stops_no_unit() {
+		use crate::session::failure::StopCause;
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		// The capture thread records why before its exit stops the session.
+		let cause = h.backend().session_cause.lock().unwrap().clone().unwrap();
+		cause.record(StopCause {
+			detail: "Screen sharing was stopped on the host desktop.".into(),
+			hint: None,
+			unexpected: false,
+			reported: false,
+		});
+		let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+		stop.trigger_shutdown(SessionShutdownReason::DesktopCaptureStopped)
+			.unwrap();
+		h.wait_idle().await;
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::DesktopCaptureStopped);
+		assert_eq!(
+			last.cause.map(|cause| cause.detail).as_deref(),
+			Some("Screen sharing was stopped on the host desktop.")
+		);
+		assert_eq!(h.backend().counters.unit_stops.load(Ordering::SeqCst), 0);
+		// The next session starts normally.
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		h.core.stop_session().await.unwrap();
 	}
 }

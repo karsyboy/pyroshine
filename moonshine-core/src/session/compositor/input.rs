@@ -20,109 +20,28 @@ use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 use smithay::wayland::seat::WaylandFocus;
 
+use crate::session::capture::input::CaptureInputEvent;
 use crate::session::compositor::state::MoonshineCompositor;
-
-/// Input events sent from the control stream to the compositor.
-///
-/// These are transport-level events that cross the tokio→calloop boundary.
-/// They carry input data and completion acknowledgments, and are `Send`
-/// without any Wayland object references.
-#[derive(Debug)]
-pub(crate) enum CompositorInputEvent {
-	Reset {
-		keys: Vec<u32>,
-		buttons: Vec<u32>,
-		ready: tokio::sync::oneshot::Sender<()>,
-	},
-	/// A key was pressed. `keycode` is a Linux evdev keycode.
-	KeyDown {
-		keycode: u32,
-	},
-	/// A key was released. `keycode` is a Linux evdev keycode.
-	KeyUp {
-		keycode: u32,
-	},
-	/// Absolute pointer motion. Coordinates are in pixels relative to the
-	/// Moonlight client's screen dimensions.
-	MouseMoveAbsolute {
-		x: i16,
-		y: i16,
-		screen_width: i16,
-		screen_height: i16,
-	},
-	/// Relative pointer motion in pixels.
-	MouseMoveRelative {
-		dx: i16,
-		dy: i16,
-	},
-	/// A mouse button was pressed. `button` is a Linux button code (e.g. BTN_LEFT = 0x110).
-	MouseButtonDown {
-		button: u32,
-	},
-	/// A mouse button was released.
-	MouseButtonUp {
-		button: u32,
-	},
-	/// Vertical scroll. Positive = scroll up, negative = scroll down.
-	ScrollVertical {
-		amount: i16,
-	},
-	/// Horizontal scroll.
-	ScrollHorizontal {
-		amount: i16,
-	},
-	/// Native touchscreen contact in normalized video coordinates.
-	TouchDown {
-		slot: u32,
-		x: f32,
-		y: f32,
-	},
-	TouchMove {
-		slot: u32,
-		x: f32,
-		y: f32,
-	},
-	TouchUp {
-		slot: u32,
-	},
-	TouchCancelAll,
-	/// Native pen input in normalized video coordinates.
-	Pen {
-		event_kind: u8,
-		tool_kind: u8,
-		buttons: u8,
-		x: f32,
-		y: f32,
-		pressure_or_distance: f32,
-		rotation: u16,
-		tilt: u8,
-	},
-	/// Text received from the Moonlight clipboard ("type clipboard text").
-	/// Committed to the focused client via the text-input protocol.
-	TypeText {
-		text: String,
-	},
-}
 
 /// Process an input event received from the Moonlight control stream.
 ///
 /// Called on the compositor's calloop thread when the channel source fires.
 /// Events are injected directly into the Smithay Seat — no libei needed
 /// since we *are* the compositor.
-pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
+pub(crate) fn process_input(event: CaptureInputEvent, state: &mut MoonshineCompositor) {
 	let serial = SERIAL_COUNTER.next_serial();
 	let time = InputTime::from_millis(state.clock.now().as_millis());
 
 	// Pointer use activates the fallback cursor; it never overrides an app hide.
 	match event {
-		CompositorInputEvent::Reset { .. }
-		| CompositorInputEvent::KeyDown { .. }
-		| CompositorInputEvent::KeyUp { .. }
-		| CompositorInputEvent::TypeText { .. }
-		| CompositorInputEvent::TouchDown { .. }
-		| CompositorInputEvent::TouchMove { .. }
-		| CompositorInputEvent::TouchUp { .. }
-		| CompositorInputEvent::TouchCancelAll => {},
+		CaptureInputEvent::Reset { .. }
+		| CaptureInputEvent::KeyDown { .. }
+		| CaptureInputEvent::KeyUp { .. }
+		| CaptureInputEvent::TypeText { .. }
+		| CaptureInputEvent::TouchDown { .. }
+		| CaptureInputEvent::TouchMove { .. }
+		| CaptureInputEvent::TouchUp { .. }
+		| CaptureInputEvent::TouchCancelAll => {},
 		_ => {
 			state.cursor.activate_pointer();
 			state.screen_dirty = true;
@@ -130,19 +49,19 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 	}
 
 	match event {
-		CompositorInputEvent::Reset { keys, buttons, ready } => {
+		CaptureInputEvent::Reset { keys, buttons, ready } => {
 			state.pending_text.clear();
 			for keycode in keys {
-				process_input(CompositorInputEvent::KeyUp { keycode }, state);
+				process_input(CaptureInputEvent::KeyUp { keycode }, state);
 			}
 			for button in buttons {
-				process_input(CompositorInputEvent::MouseButtonUp { button }, state);
+				process_input(CaptureInputEvent::MouseButtonUp { button }, state);
 			}
-			process_input(CompositorInputEvent::TouchCancelAll, state);
+			process_input(CaptureInputEvent::TouchCancelAll, state);
 			release_pen(state, time);
 			let _ = ready.send(());
 		},
-		CompositorInputEvent::KeyDown { keycode } => {
+		CaptureInputEvent::KeyDown { keycode } => {
 			tracing::trace!(target: "input", "Key down: {keycode}");
 
 			if let Some(keyboard) = state.seat.get_keyboard() {
@@ -156,7 +75,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				);
 			}
 		},
-		CompositorInputEvent::KeyUp { keycode } => {
+		CaptureInputEvent::KeyUp { keycode } => {
 			tracing::trace!(target: "input", "Key up: {keycode}");
 
 			if let Some(keyboard) = state.seat.get_keyboard() {
@@ -170,7 +89,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				);
 			}
 		},
-		CompositorInputEvent::TypeText { text } => {
+		CaptureInputEvent::TypeText { text } => {
 			if state.pending_text.len() < MAX_PENDING_TEXT {
 				state.pending_text.push_str(&text);
 				if state.pending_text.len() >= MAX_PENDING_TEXT {
@@ -178,7 +97,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				}
 			}
 		},
-		CompositorInputEvent::MouseMoveAbsolute {
+		CaptureInputEvent::MouseMoveAbsolute {
 			x,
 			y,
 			screen_width,
@@ -215,7 +134,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			);
 			pointer.frame(state);
 		},
-		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
+		CaptureInputEvent::MouseMoveRelative { dx, dy } => {
 			tracing::trace!(target: "input", "Mouse relative: ({dx}, {dy})");
 
 			let (rx, ry) = state.scene_input_ratio();
@@ -267,7 +186,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			);
 			pointer.frame(state);
 		},
-		CompositorInputEvent::MouseButtonDown { button } => {
+		CaptureInputEvent::MouseButtonDown { button } => {
 			tracing::trace!(target: "input", "Mouse button down: {button:#x}");
 
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
@@ -282,7 +201,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			);
 			pointer.frame(state);
 		},
-		CompositorInputEvent::MouseButtonUp { button } => {
+		CaptureInputEvent::MouseButtonUp { button } => {
 			tracing::trace!(target: "input", "Mouse button up: {button:#x}");
 
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
@@ -297,7 +216,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			);
 			pointer.frame(state);
 		},
-		CompositorInputEvent::ScrollVertical { amount } => {
+		CaptureInputEvent::ScrollVertical { amount } => {
 			tracing::trace!(target: "input", "Scroll vertical: {amount}");
 
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
@@ -309,7 +228,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			);
 			pointer.frame(state);
 		},
-		CompositorInputEvent::ScrollHorizontal { amount } => {
+		CaptureInputEvent::ScrollHorizontal { amount } => {
 			tracing::trace!(target: "input", "Scroll horizontal: {amount}");
 
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
@@ -321,7 +240,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			);
 			pointer.frame(state);
 		},
-		CompositorInputEvent::TouchDown { slot, x, y } => {
+		CaptureInputEvent::TouchDown { slot, x, y } => {
 			let location = normalized_pointer_location(state, x, y);
 			let under = find_surface_at(state, location);
 			if let Some(touch) = state.seat.get_touch() {
@@ -338,7 +257,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				touch.frame(state);
 			}
 		},
-		CompositorInputEvent::TouchMove { slot, x, y } => {
+		CaptureInputEvent::TouchMove { slot, x, y } => {
 			let location = normalized_pointer_location(state, x, y);
 			let under = find_surface_at(state, location);
 			if let Some(touch) = state.seat.get_touch() {
@@ -354,7 +273,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				touch.frame(state);
 			}
 		},
-		CompositorInputEvent::TouchUp { slot } => {
+		CaptureInputEvent::TouchUp { slot } => {
 			if let Some(touch) = state.seat.get_touch() {
 				touch.up(
 					state,
@@ -367,12 +286,12 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				touch.frame(state);
 			}
 		},
-		CompositorInputEvent::TouchCancelAll => {
+		CaptureInputEvent::TouchCancelAll => {
 			if let Some(touch) = state.seat.get_touch() {
 				touch.cancel(state);
 			}
 		},
-		CompositorInputEvent::Pen {
+		CaptureInputEvent::Pen {
 			event_kind,
 			tool_kind,
 			buttons,

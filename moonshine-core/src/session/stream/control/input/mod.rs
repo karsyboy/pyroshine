@@ -11,7 +11,7 @@ use self::gamepad::{Gamepad, GamepadConfig, GamepadEmulation, VirtualGamepad, Vi
 use self::ownership::FeedbackRoute;
 use self::remap::{HoldToHome, HoldTransition};
 use self::touch::{Pen, PointerEventKind, Touch};
-use crate::session::compositor::input::CompositorInputEvent;
+use crate::session::capture::input::CaptureInputEvent;
 use crate::session::manager::SessionShutdownReason;
 
 use self::{
@@ -153,13 +153,13 @@ enum GamepadCommand {
 pub(crate) struct InputHandler {
 	keys: std::collections::BTreeSet<u32>,
 	buttons: std::collections::BTreeSet<u32>,
-	input_tx: calloop::channel::Sender<CompositorInputEvent>,
+	input_tx: calloop::channel::Sender<CaptureInputEvent>,
 	gamepad_tx: mpsc::Sender<GamepadCommand>,
 }
 
 impl InputHandler {
 	pub fn new(
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		input_tx: calloop::channel::Sender<CaptureInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
@@ -167,7 +167,7 @@ impl InputHandler {
 	}
 
 	fn with_gamepads<D, F>(
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		input_tx: calloop::channel::Sender<CaptureInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 		create_gamepad: F,
@@ -218,19 +218,19 @@ impl InputHandler {
 				if let Some(keycode) = key.to_linux_keycode() {
 					self.keys.insert(keycode);
 					tracing::trace!("Pressing key: {key:?} (keycode: {keycode})");
-					let _ = self.input_tx.send(CompositorInputEvent::KeyDown { keycode });
+					let _ = self.input_tx.send(CaptureInputEvent::KeyDown { keycode });
 				}
 			},
 			InputEvent::KeyUp(key) => {
 				if let Some(keycode) = key.to_linux_keycode() {
 					self.keys.remove(&keycode);
 					tracing::trace!("Releasing key: {key:?} (keycode: {keycode})");
-					let _ = self.input_tx.send(CompositorInputEvent::KeyUp { keycode });
+					let _ = self.input_tx.send(CaptureInputEvent::KeyUp { keycode });
 				}
 			},
 			InputEvent::MouseMoveAbsolute(event) => {
 				tracing::trace!("Absolute mouse movement: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveAbsolute {
+				let _ = self.input_tx.send(CaptureInputEvent::MouseMoveAbsolute {
 					x: event.x,
 					y: event.y,
 					screen_width: event.screen_width,
@@ -239,7 +239,7 @@ impl InputHandler {
 			},
 			InputEvent::MouseMoveRelative(event) => {
 				tracing::trace!("Moving mouse relative: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveRelative {
+				let _ = self.input_tx.send(CaptureInputEvent::MouseMoveRelative {
 					dx: event.x,
 					dy: event.y,
 				});
@@ -250,7 +250,7 @@ impl InputHandler {
 				self.buttons.insert(button_code);
 				let _ = self
 					.input_tx
-					.send(CompositorInputEvent::MouseButtonDown { button: button_code });
+					.send(CaptureInputEvent::MouseButtonDown { button: button_code });
 			},
 			InputEvent::MouseButtonUp(button) => {
 				tracing::trace!("Releasing mouse button: {button:?}");
@@ -258,37 +258,37 @@ impl InputHandler {
 				self.buttons.remove(&button_code);
 				let _ = self
 					.input_tx
-					.send(CompositorInputEvent::MouseButtonUp { button: button_code });
+					.send(CaptureInputEvent::MouseButtonUp { button: button_code });
 			},
 			InputEvent::MouseScrollVertical(event) => {
 				tracing::trace!("Scrolling vertically: {event:?}");
 				let _ = self
 					.input_tx
-					.send(CompositorInputEvent::ScrollVertical { amount: event.amount });
+					.send(CaptureInputEvent::ScrollVertical { amount: event.amount });
 			},
 			InputEvent::MouseScrollHorizontal(event) => {
 				tracing::trace!("Scrolling horizontally: {event:?}");
 				let _ = self
 					.input_tx
-					.send(CompositorInputEvent::ScrollHorizontal { amount: event.amount });
+					.send(CaptureInputEvent::ScrollHorizontal { amount: event.amount });
 			},
 			InputEvent::Touch(event) => {
 				tracing::trace!("Touch input: {event:?}");
 				let compositor_event = match event.event_kind {
-					PointerEventKind::Down => Some(CompositorInputEvent::TouchDown {
+					PointerEventKind::Down => Some(CaptureInputEvent::TouchDown {
 						slot: event.pointer_id,
 						x: event.x,
 						y: event.y,
 					}),
-					PointerEventKind::Move => Some(CompositorInputEvent::TouchMove {
+					PointerEventKind::Move => Some(CaptureInputEvent::TouchMove {
 						slot: event.pointer_id,
 						x: event.x,
 						y: event.y,
 					}),
 					PointerEventKind::Up | PointerEventKind::Cancel => {
-						Some(CompositorInputEvent::TouchUp { slot: event.pointer_id })
+						Some(CaptureInputEvent::TouchUp { slot: event.pointer_id })
 					},
-					PointerEventKind::CancelAll => Some(CompositorInputEvent::TouchCancelAll),
+					PointerEventKind::CancelAll => Some(CaptureInputEvent::TouchCancelAll),
 					PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => None,
 				};
 				if let Some(event) = compositor_event {
@@ -297,7 +297,7 @@ impl InputHandler {
 			},
 			InputEvent::Pen(event) => {
 				tracing::trace!("Pen input: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::Pen {
+				let _ = self.input_tx.send(CaptureInputEvent::Pen {
 					event_kind: event.event_kind as u8,
 					tool_kind: event.tool_kind as u8,
 					buttons: event.buttons,
@@ -310,7 +310,7 @@ impl InputHandler {
 			},
 			InputEvent::Utf8Text(text) => {
 				tracing::debug!("Typing clipboard text.");
-				let _ = self.input_tx.send(CompositorInputEvent::TypeText { text });
+				let _ = self.input_tx.send(CaptureInputEvent::TypeText { text });
 			},
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
@@ -330,7 +330,7 @@ impl InputHandler {
 	pub async fn reset(&mut self) -> Result<(), ()> {
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		self.input_tx
-			.send(CompositorInputEvent::Reset {
+			.send(CaptureInputEvent::Reset {
 				keys: std::mem::take(&mut self.keys).into_iter().collect(),
 				buttons: std::mem::take(&mut self.buttons).into_iter().collect(),
 				ready,
@@ -829,7 +829,7 @@ mod tests {
 			handler
 		});
 		let ready = loop {
-			if let Ok(CompositorInputEvent::Reset { keys, buttons, ready }) = rx.try_recv() {
+			if let Ok(CaptureInputEvent::Reset { keys, buttons, ready }) = rx.try_recv() {
 				assert_eq!(keys, vec![29, 30]);
 				assert_eq!(buttons, vec![0x110]);
 				break ready;
@@ -945,7 +945,7 @@ mod tests {
 
 		struct Harness {
 			handler: InputHandler,
-			compositor: calloop::channel::Channel<CompositorInputEvent>,
+			compositor: calloop::channel::Channel<CaptureInputEvent>,
 			log: fake::Log,
 			stop: ShutdownManager<SessionShutdownReason>,
 		}
@@ -986,7 +986,7 @@ mod tests {
 				let compositor = &self.compositor;
 				let ack = async {
 					loop {
-						if let Ok(CompositorInputEvent::Reset { ready, .. }) = compositor.try_recv() {
+						if let Ok(CaptureInputEvent::Reset { ready, .. }) = compositor.try_recv() {
 							ready.send(()).unwrap();
 							break;
 						}
