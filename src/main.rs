@@ -163,7 +163,8 @@ async fn main() -> Result<(), ()> {
 	// Pairing talks to the running server; it must not load/create a config,
 	// probe the GPU, or acquire the daemon's state lock.
 	if let Some(Command::Pair { name }) = &args.command {
-		return pair::run(name.as_deref().unwrap_or("")).await.map_err(|error| {
+		let bus = std::env::var("MOONSHINE_MANAGEMENT_BUS").ok();
+		return pair::run(name.as_deref().unwrap_or(""), bus).await.map_err(|error| {
 			eprintln!("Pairing failed: {error}");
 		});
 	}

@@ -800,9 +800,10 @@ a reset code replaces it. Sensitive actions are logged under `pyroshine::audit`.
 and every method also checks the caller's Unix user. zbus serves methods on its
 own executor; work that needs Tokio is handed to the server runtime. The
 interface is optional: without a bus name the server and its web interface run
-unchanged. `pyroshine pair` pins the current unique bus owner and matches
-completion by client ID and request token; PIN submission alone never reports
-success. The tray's bus name (`io.github.karsyboy.PyroshineUi`) marks it
+unchanged. The `pyroshine pair`, `web` and `diag` commands follow
+`MOONSHINE_MANAGEMENT_BUS` too when it is set. `pyroshine pair` pins the
+current unique bus owner and matches completion by client ID and request
+token; PIN submission alone never reports success. The tray's bus name (`io.github.karsyboy.PyroshineUi`) marks it
 present, which hands pairing notifications to it.
 
 **Session status.** `SessionManager` publishes a `ManagerStatus` snapshot when
