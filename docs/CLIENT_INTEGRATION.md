@@ -92,6 +92,21 @@ management interface's problem log):
 | `session_busy` | Another session is starting or stopping. |
 | `launch_timeout` | The application did not reach an active state in time. |
 
+## Conditional application cancellation
+
+Paired clients may add `expectedAppId=ID` to `/cancel`. The server compares the
+positive GameStream application ID while holding the session lifecycle lock,
+then begins teardown under that same lock. If no live session matches, the
+request returns GameStream status 409 and preserves the current application.
+Malformed/non-positive IDs return 400. Requests without this parameter retain
+standard GameStream cancellation behavior, with the same paired HTTPS
+certificate requirement. There is no new listener or management credential.
+
+This protects an integration's explicit End Remote Game action when a different
+application replaced its selected game. It identifies the application, not two
+successive sessions of the same application. Client disconnect/resume and
+stream reconfiguration never use this operation.
+
 ## Validation
 
 Automated:

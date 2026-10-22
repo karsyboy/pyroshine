@@ -506,7 +506,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.cancel().await
+					self.cancel(params).await
 				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
@@ -1037,8 +1037,23 @@ impl Webserver {
 		response
 	}
 
-	async fn cancel(&self) -> Response<Full<Bytes>> {
-		if self.session_manager.stop_session().await.is_err() {
+	async fn cancel(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
+		let stopped = if let Some(expected) = params.get("expectedAppId") {
+			let Ok(expected) = expected.parse::<i32>() else {
+				return xml_error(400, "Invalid expectedAppId");
+			};
+			if expected <= 0 {
+				return xml_error(400, "Invalid expectedAppId");
+			}
+			match self.session_manager.stop_session_if_application(expected).await {
+				Ok(false) => return xml_error(409, "The running application changed"),
+				Ok(true) => Ok(()),
+				Err(()) => Err(()),
+			}
+		} else {
+			self.session_manager.stop_session().await
+		};
+		if stopped.is_err() {
 			let message = "Failed to stop session".to_string();
 			tracing::warn!("{message}");
 			return bad_request(message);

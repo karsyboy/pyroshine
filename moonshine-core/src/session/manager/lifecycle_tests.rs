@@ -2043,3 +2043,16 @@ mod desktop_mode {
 		h.core.stop_session().await.unwrap();
 	}
 }
+
+#[tokio::test]
+async fn conditional_stop_preserves_an_unrelated_application() {
+	let h = Harness::new();
+	h.active().await;
+	assert!(!h.core.stop_session_if_application(99).await.unwrap());
+	assert_eq!(h.core.get_session_context().await.unwrap().application_id, 1);
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 0);
+	assert!(h.core.stop_session_if_application(1).await.unwrap());
+	h.assert_released().await;
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 1);
+	assert!(!h.core.stop_session_if_application(1).await.unwrap());
+}

@@ -940,6 +940,22 @@ impl<B: SessionBackend> SessionCore<B> {
 		self.stop(SessionShutdownReason::UserStopped).await
 	}
 
+	/// Compare and stop under the lifecycle lock. An integration's stale End
+	/// Game action cannot tear down a different application that replaced it.
+	pub(crate) async fn stop_session_if_application(&self, expected_id: i32) -> Result<bool, ()> {
+		let waiter = {
+			let mut guard = self.lock().await;
+			if !matches!(&guard.lifecycle, Lifecycle::Live(live) if live.record.context.application_id == expected_id) {
+				return Ok(false);
+			}
+			self.begin_teardown(&mut guard, None, SessionShutdownReason::UserStopped)
+		};
+		if let Some(waiter) = waiter {
+			waiter.wait().await?;
+		}
+		Ok(true)
+	}
+
 	/// End a failed transition: the session cannot be left half-changed, so it
 	/// is torn down deterministically. `state` is whatever the transition still
 	/// owns; teardown stops its application before its workers.
@@ -1896,6 +1912,10 @@ impl SessionManager {
 	/// application unit and every session worker have been released.
 	pub async fn stop_session(&self) -> Result<(), ()> {
 		self.core.stop_session().await
+	}
+
+	pub(crate) async fn stop_session_if_application(&self, expected_id: i32) -> Result<bool, ()> {
+		self.core.stop_session_if_application(expected_id).await
 	}
 
 	/// Update keys and retain authenticated session-level resume parameters.
