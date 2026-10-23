@@ -674,7 +674,8 @@ launcher metadata ──inotify / periodic fingerprint──► library thread
 ```
 
 **Units and failures.** A scanner reports results per unit (a Steam library
-folder, a Heroic library file, a desktop-entry directory, the Lutris database).
+folder, the installation's user shortcuts, a Heroic library file, a desktop-entry
+directory, the Lutris database).
 A unit that cannot be read keeps its previous entries, marked stale, for up to
 seven days; a source that cannot list its units keeps all of them; a single
 unreadable Steam manifest keeps that game. Units are dropped only when the
@@ -704,6 +705,14 @@ renames, reinstalls, reordering and restarts keep it. An ID of a removed game is
 not reused for another title; at most 10,000 records are kept, removed visible
 entries first. A file written by a newer version is used but never rewritten; a
 corrupt one is moved aside.
+
+Steam non-Steam shortcuts come from `userdata/*/config/shortcuts.vdf`. Their
+identity is `steam:<64-bit rungameid>`: the saved 32-bit shortcut app ID shifted
+left by 32 bits, with `0x02000000` in the low word. The saved ID is authoritative;
+it must not be recalculated from the executable and title. Scanner commands
+substitute that full launch ID into `{game_id}`, while custom grid art and
+Steam's game-state logs use the saved 32-bit ID. Store games retain their
+existing identities. Steam owns shortcut launch options and Proton setup.
 
 **Reconciliation** (`catalog.rs`): manual entries first; a discovered entry
 with a manual entry's title is shadowed by it; a launcher shortcut to an entry

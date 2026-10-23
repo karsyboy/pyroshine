@@ -52,7 +52,7 @@ const LIBRARY_CACHE_ART: [(&str, bool); 4] = [
 	("header.jpg", false),
 ];
 
-/// Scan every library folder Steam lists, one unit per folder.
+/// Scan every library folder and the installation's non-Steam shortcuts.
 pub(crate) fn scan(config: &SteamApplicationScannerConfig) -> SourceScan {
 	let Some(root) = expand_path(&config.library) else {
 		return SourceScan::failed(UnitError::Unavailable(format!(
@@ -82,7 +82,7 @@ pub(crate) fn scan(config: &SteamApplicationScannerConfig) -> SourceScan {
 	};
 	let art = ArtLocations::new(&root);
 
-	let units = library_paths
+	let mut units: Vec<Unit> = library_paths
 		.iter()
 		.map(|path| {
 			let key = path.display().to_string();
@@ -116,39 +116,82 @@ pub(crate) fn scan(config: &SteamApplicationScannerConfig) -> SourceScan {
 				if TOOL_PREFIXES.iter().any(|prefix| title.starts_with(prefix)) {
 					continue;
 				}
-				let application = ApplicationConfig {
-					title,
-					mode: crate::session::application::SessionMode::Game,
-					pre_command: config.pre_command.clone(),
-					post_command: config.post_command.clone(),
-					command: config
-						.command
-						.iter()
-						.map(|cmd| cmd.replace("{game_id}", &app.app_id.to_string()))
-						.collect(),
-					output_scale: None,
-					boxart: None,
-					stdout: config.stdout.clone(),
-					stderr: config.stderr.clone(),
-					launch_timeout_secs: config.launch_timeout_secs,
-					frame_limit: config.frame_limit.clone(),
-				};
-				let (candidates, origin) = art.find(app.app_id);
-				if candidates.is_empty() {
-					tracing::debug!("No boxart found for Steam app '{}'.", application.title);
-				}
-				entries.push(Discovered::new(app.app_id.to_string(), application).with_artwork(candidates, origin));
+				entries.push(discovered(config, title, app.app_id.to_string(), app.app_id, &art));
 			}
 			entries.sort_by(|a, b| a.native_id.cmp(&b.native_id));
 			unit.result = Ok(entries);
 			unit
 		})
 		.collect();
+	if let Some(unit) = scan_shortcuts(config, &steam_dir, &art) {
+		units.push(unit);
+	}
 
 	SourceScan { units, failure: None }
 }
 
-/// `libraryfolders.vdf` and every library's manifests, plus art locations
+fn discovered(
+	config: &SteamApplicationScannerConfig,
+	title: String,
+	game_id: String,
+	art_id: u32,
+	art: &ArtLocations,
+) -> Discovered {
+	let application = ApplicationConfig {
+		title,
+		mode: crate::session::application::SessionMode::Game,
+		pre_command: config.pre_command.clone(),
+		post_command: config.post_command.clone(),
+		command: config
+			.command
+			.iter()
+			.map(|cmd| cmd.replace("{game_id}", &game_id))
+			.collect(),
+		output_scale: None,
+		boxart: None,
+		stdout: config.stdout.clone(),
+		stderr: config.stderr.clone(),
+		launch_timeout_secs: config.launch_timeout_secs,
+		frame_limit: config.frame_limit.clone(),
+	};
+	let (candidates, origin) = art.find(art_id);
+	Discovered::new(game_id, application).with_artwork(candidates, origin)
+}
+
+fn scan_shortcuts(config: &SteamApplicationScannerConfig, steam_dir: &SteamDir, art: &ArtLocations) -> Option<Unit> {
+	let userdata = steam_dir.path().join("userdata");
+	let key = userdata.display().to_string();
+	match userdata.try_exists() {
+		Ok(false) => return None, // Steam has not created any user profiles yet.
+		Err(error) => return Some(Unit::failed(key, UnitError::Unavailable(error.to_string()))),
+		Ok(true) => {},
+	}
+	let entries = (|| {
+		let mut entries = Vec::new();
+		for shortcut in steam_dir.shortcuts()? {
+			let shortcut = shortcut?;
+			if shortcut.app_name.trim().is_empty() || shortcut.app_id < 0x8000_0000 {
+				continue;
+			}
+			// Modern Steam assigns shortcut app IDs independently of the name
+			// and executable. Use the saved ID, not Shortcut::steam_id()'s CRC.
+			// The low word marks a shortcut; Steam retains its launch options,
+			// working directory and Proton configuration when it launches it.
+			let game_id = ((u64::from(shortcut.app_id) << 32) | 0x0200_0000).to_string();
+			entries.push(discovered(config, shortcut.app_name, game_id, shortcut.app_id, art));
+		}
+		entries.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+		Ok::<_, steamlocate::Error>(entries)
+	})();
+	Some(match entries {
+		Ok(entries) => Unit::ok(key, entries),
+		// Keep the previous shortcut catalog during a failed/partial rewrite;
+		// installed Steam games are independent units and still refresh.
+		Err(error) => Unit::failed(key, UnitError::Corrupt(format!("Cannot read Steam shortcuts: {error}"))),
+	})
+}
+
+/// `libraryfolders.vdf`, every library's manifests and user shortcuts, plus art locations
 /// for the periodic check.
 pub(crate) fn watch_targets(config: &SteamApplicationScannerConfig) -> Vec<WatchTarget> {
 	let Some(root) = expand_path(&config.library) else {
@@ -164,6 +207,20 @@ pub(crate) fn watch_targets(config: &SteamApplicationScannerConfig) -> Vec<Watch
 			if steamapps != root.join("steamapps") {
 				targets.push(WatchTarget::directory(steamapps, Filter::Suffix(".acf")));
 			}
+		}
+	}
+	let userdata = root.join("userdata");
+	targets.push(WatchTarget::directory(root.clone(), Filter::Names(&["userdata"])));
+	targets.push(WatchTarget::directory(userdata.clone(), Filter::Names(&[])).with_subdirectories());
+	if let Ok(users) = std::fs::read_dir(userdata) {
+		let mut users: Vec<_> = users.flatten().map(|user| user.path()).collect();
+		users.sort();
+		for user in users {
+			targets.push(WatchTarget::directory(user.clone(), Filter::Names(&["config"])));
+			targets.push(WatchTarget::directory(
+				user.join("config"),
+				Filter::Names(&["shortcuts.vdf"]),
+			));
 		}
 	}
 	// Steam downloads art when the library first shows a game; the periodic
@@ -303,6 +360,104 @@ pub(crate) mod tests {
 			launch_timeout_secs: 2,
 			frame_limit: Default::default(),
 		}
+	}
+
+	/// Binary KeyValues, including fields Steam handles when launching.
+	pub(crate) fn shortcuts(root: &Path, user: &str, apps: &[(u32, &str)]) -> PathBuf {
+		let path = root.join("userdata").join(user).join("config/shortcuts.vdf");
+		fs::create_dir_all(path.parent().unwrap()).unwrap();
+		let mut bytes = b"\x00shortcuts\x00".to_vec();
+		for (index, (app_id, name)) in apps.iter().enumerate() {
+			bytes.extend_from_slice(format!("\x00{index}\x00\x02appid\x00").as_bytes());
+			bytes.extend_from_slice(&app_id.to_le_bytes());
+			for (key, value) in [
+				("AppName", *name),
+				("Exe", "\"/games/My Game.exe\""),
+				("StartDir", "\"/games\""),
+				("LaunchOptions", "--custom-option"),
+			] {
+				bytes.extend_from_slice(format!("\x01{key}\x00{value}\x00").as_bytes());
+			}
+			bytes.extend_from_slice(b"\x00tags\x00\x01\x30\x00Favorites\x00\x08\x08");
+		}
+		bytes.extend_from_slice(b"\x08\x08");
+		fs::write(&path, bytes).unwrap();
+		path
+	}
+
+	#[test]
+	fn non_steam_shortcuts_use_saved_ids_and_the_scanners_steam_command() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		steam_root(&root, &[&root]);
+		install(&root, 620, "Portal 2");
+		shortcuts(
+			&root,
+			"1234",
+			&[(0xf123_4567, "Non-Steam Game"), (0xf123_4568, "Proton custom app")],
+		);
+		shortcuts(
+			&root,
+			"5678",
+			&[(0xf123_4569, "Another user's game"), (0xf123_456a, " ")],
+		);
+		let grid = root.join("userdata/1234/config/grid");
+		fs::create_dir_all(&grid).unwrap();
+		let cover = grid.join(format!("{}p.png", 0xf123_4567_u32));
+		fs::write(&cover, "png").unwrap();
+		let mut config = config(&root);
+		config.command = vec![
+			"flatpak".into(),
+			"run".into(),
+			"com.valvesoftware.Steam".into(),
+			"steam://rungameid/{game_id}".into(),
+		];
+		config.pre_command = vec![vec!["prepare".into()]];
+		let result = scan(&config);
+		let apps = result.applications();
+		assert_eq!(apps.len(), 4);
+		let entries = result.units.last().unwrap().result.as_ref().unwrap();
+		let entry = entries
+			.iter()
+			.find(|entry| entry.application.title == "Non-Steam Game")
+			.unwrap();
+		let game_id = (0xf123_4567_u64 << 32) | 0x0200_0000;
+		assert_eq!(entry.native_id, game_id.to_string());
+		assert_eq!(
+			entry.application.command.last().unwrap(),
+			&format!("steam://rungameid/{game_id}")
+		);
+		assert_eq!(entry.application.pre_command, config.pre_command);
+		assert_eq!(entry.application.boxart, Some(cover));
+		assert_eq!(
+			super::super::launcher_target(&entry.application.command),
+			Some(format!("steam:{game_id}"))
+		);
+	}
+
+	#[test]
+	fn shortcut_watch_targets_notice_profile_creation_edits_and_removal() {
+		use super::super::watch::fingerprint;
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		steam_root(&root, &[&root]);
+		let config = config(&root);
+		let initial = watch_targets(&config);
+		let before = fingerprint(&initial);
+		let path = shortcuts(&root, "1234", &[(0xf123_4567, "Game")]);
+		assert_ne!(fingerprint(&initial), before);
+		let targets = watch_targets(&config);
+		assert!(
+			targets.iter().any(|target| target.path == path.parent().unwrap()
+				&& target.filter == Some(Filter::Names(&["shortcuts.vdf"])))
+		);
+		let before = fingerprint(&targets);
+		shortcuts(&root, "1234", &[(0xf123_4567, "Renamed Game")]);
+		assert_ne!(fingerprint(&targets), before);
+		let before = fingerprint(&targets);
+		fs::remove_file(&path).unwrap();
+		assert_ne!(fingerprint(&targets), before);
+		assert!(scan(&config).units.last().unwrap().result.as_ref().unwrap().is_empty());
 	}
 
 	#[test]

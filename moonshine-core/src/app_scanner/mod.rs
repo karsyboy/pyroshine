@@ -44,7 +44,7 @@ pub use self::service::{Library, LibraryConfig, LibraryView, SourceHealth, Sourc
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationScannerConfig {
-	/// Scans a 'libraryfolders.vdf' file from a Steam library directory.
+	/// Scans installed games and user non-Steam shortcuts in a Steam installation.
 	Steam(SteamApplicationScannerConfig),
 
 	/// Scans directories containing freedesktop .desktop launchers.

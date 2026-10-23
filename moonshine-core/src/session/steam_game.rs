@@ -39,11 +39,16 @@ const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// The Steam app a command launches, from `steam://rungameid/<id>`.
 pub(crate) fn steam_app_id(command: &[String]) -> Option<u32> {
-	crate::app_scanner::launcher_target(command)?
-		.strip_prefix("steam:")?
-		.parse()
-		.ok()
-		.filter(|id| *id > 0)
+	let target = crate::app_scanner::launcher_target(command)?;
+	let id = target.strip_prefix("steam:")?.parse::<u64>().ok()?;
+	// Non-Steam shortcuts use a packed 64-bit rungameid, but Steam's logs
+	// report their saved 32-bit app ID just like a store game's app ID.
+	let app_id = if id & 0xffff_ffff == 0x0200_0000 && id >> 32 >= 0x8000_0000 {
+		(id >> 32) as u32
+	} else {
+		u32::try_from(id).ok()?
+	};
+	(app_id > 0).then_some(app_id)
 }
 
 /// Where the Steam client that `command` starts writes its logs.
@@ -317,6 +322,15 @@ mod tests {
 
 	#[test]
 	fn steam_games_are_recognized_by_their_launch_url() {
+		let shortcut = (0xf123_4567_u64 << 32) | 0x0200_0000;
+		assert_eq!(
+			steam_app_id(&command(&["steam", &format!("steam://rungameid/{shortcut}")])),
+			Some(0xf123_4567)
+		);
+		assert_eq!(
+			steam_app_id(&command(&["steam", "steam://rungameid/18446744073709551615"])),
+			None
+		);
 		assert_eq!(
 			steam_app_id(&command(&["/usr/bin/steam", "-bigpicture", "steam://rungameid/892970"])),
 			Some(892970)

@@ -455,7 +455,7 @@ Those values are copied to each discovered application. Scanners do not accept
 
 | `type` | Source setting | Launch setting | Discovery |
 | --- | --- | --- | --- |
-| `steam` | `library`: required path string | `command`: required array; `{game_id}` is replaced in each argument | Installed games in the Steam installation and its libraries. |
+| `steam` | `library`: required path string | `command`: required array; `{game_id}` is replaced in each argument | Installed Steam games and non-Steam shortcuts added to the host's Steam Library. |
 | `lutris` | `pga_db`: path string, defaults to the user's data directory + `/lutris/pga.db` (usually `~/.local/share/lutris/pga.db`) | `command`: required array; `{slug}` is replaced | Installed entries from the Lutris database. |
 | `heroic` | `config_dir`: path string, defaults to native Heroic config when present, otherwise an existing Flatpak Heroic config, otherwise the native path | `command`: required array; `{app_name}` and `{runner}` are replaced | Installed games across Heroic stores and sideloaded apps; excludes DLC. Native config is usually `~/.config/heroic`; Flatpak config is `~/.var/app/com.heroicgameslauncher.hgl/config/heroic`. |
 | `desktop` | `directories`: required array of path strings | No `command` field; uses the desktop entry's `Exec` | Recursively scan `.desktop` files in the supplied directories. |
@@ -463,6 +463,16 @@ Those values are copied to each discovered application. Scanners do not accept
 Scanner source paths support `~` and environment-variable expansion. Placeholder
 substitution applies to scanner `command` arguments, not pre/post-command hooks.
 Scanner launchers must be installed separately.
+
+The Steam scanner also reads `userdata/*/config/shortcuts.vdf` in the configured
+Steam installation. Add a non-Steam game to Steam on the host, then refresh the
+client's app list after Steam saves the shortcut. If it has not appeared, exit
+Steam normally to save it and use **Rescan** in Pyroshine's web interface.
+Shortcuts launch through Steam, preserving their launch options, working
+directory and Steam Play/Proton settings. They must be available to the Steam
+account used for streaming. `{game_id}` is the full 64-bit launch ID for these
+entries; keep it intact in `steam://rungameid/{game_id}` commands. Native and
+Flatpak installations use the same scanner behavior.
 
 Box art comes from local files only, best first: for Steam, art you set in
 Steam (`userdata/*/config/grid`), then the portrait, capsule and header art
@@ -529,7 +539,7 @@ running, and clients see the change in their app list.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests and library folders, the Lutris database, Heroic library files, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
+| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests, library folders and non-Steam shortcuts, the Lutris database, Heroic library files, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
 | `poll_interval_secs` | integer, `300`; `30`–`86400` | Seconds between checks for changes that file notifications cannot report, such as network file systems, a drive that is mounted later or an exhausted inotify watch limit. A check compares file metadata only; a launcher is rescanned only when it changed. |
 
 A launcher location that cannot be read (an unmounted drive holding a Steam

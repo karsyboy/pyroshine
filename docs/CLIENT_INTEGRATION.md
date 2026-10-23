@@ -29,10 +29,16 @@ Identities are the catalog keys described in the
 
 | Kind | Native ID | Example |
 | --- | --- | --- |
-| `steam` | Steam app ID (decimal) | `steam:892970` |
+| `steam` | Steam app ID or a non-Steam shortcut's 64-bit launch ID (decimal) | `steam:892970`, `steam:17375808096043008000` |
 | `heroic` | store and app name | `heroic:legendary/Fortnite` |
 | `lutris` | game slug | `lutris:quake` |
 | `desktop` | desktop file ID | `desktop:org.prismlauncher.PrismLauncher.desktop` |
+
+Keep native IDs as strings. Steam store app IDs are below `0x80000000`;
+non-Steam shortcuts use `(saved_app_id << 32) | 0x02000000`, which exceeds
+JavaScript's exact integer range. Such a shortcut is a remote application, not
+a Steam store game for local-library matching or Steam CDN artwork. Its
+GameStream application ID remains the normal positive 32-bit catalog ID.
 
 Which application reports an identity:
 
@@ -118,6 +124,9 @@ cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_insta
 - `catalog::tests::launcher_identities_*`: own keys, manual overrides, equal
   titles, hidden entries.
 - `webserver::app_list_tests`: the `/applist` document.
+- `app_scanner::steam::tests` and `app_scanner::service::tests::steam_shortcuts_*`:
+  saved shortcut launch IDs, custom art, profile/file watches, catalog refresh,
+  rename stability and retention during failed reads.
 - `webserver::security_tests::serverinfo_advertises_the_app_sources_version`.
 - `session::steam_game::tests`: log parsing from real Steam lines, the state
   machine, tailing across partial writes and rotation, read bounds, and the

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::app_scanner::heroic::HeroicApplicationScannerConfig;
-use crate::app_scanner::steam::tests::{config as steam_config, install, steam_root};
+use crate::app_scanner::steam::tests::{config as steam_config, install, shortcuts, steam_root};
 use crate::app_scanner::{EntryState, legacy_id};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -86,6 +86,43 @@ fn id_of(library: &Library, title: &str) -> i32 {
 		.find(|entry| entry.application.title == title)
 		.unwrap_or_else(|| panic!("{title} offered"))
 		.id
+}
+
+#[tokio::test]
+async fn steam_shortcuts_refresh_keep_ids_and_survive_a_partial_rewrite() {
+	let directory = tempfile::tempdir().unwrap();
+	let root = directory.path().join("Steam");
+	steam_root(&root, &[&root]);
+	install(&root, 620, "Portal 2");
+	let library = start(directory.path(), vec![steam(&root)], LibraryConfig::default());
+	assert!(library.ready(WAIT).await);
+	let path = shortcuts(&root, "1234", &[(0xf123_4567, "Non-Steam Game")]);
+	until_offered(&library, &["Steam", "Portal 2", "Non-Steam Game"]).await;
+	let id = id_of(&library, "Non-Steam Game");
+	shortcuts(&root, "1234", &[(0xf123_4567, "Renamed Game")]);
+	until_offered(&library, &["Steam", "Portal 2", "Renamed Game"]).await;
+	assert_eq!(id_of(&library, "Renamed Game"), id);
+
+	let complete = std::fs::read(&path).unwrap();
+	std::fs::write(&path, &complete[..40]).unwrap();
+	install(&root, 400, "Portal");
+	until(&library, "a partial shortcut scan", |view| {
+		view.sources[0].health == SourceHealth::Partial && !view.scanning
+	})
+	.await;
+	assert_eq!(offered(&library), vec!["Portal", "Portal 2", "Renamed Game", "Steam"]);
+	assert!(matches!(
+		library.catalog().find(id).unwrap().state,
+		EntryState::Stale { .. }
+	));
+	std::fs::write(&path, complete).unwrap();
+	until(&library, "shortcut recovery", |view| {
+		view.sources[0].health == SourceHealth::Ok && !view.scanning
+	})
+	.await;
+	assert_eq!(library.catalog().find(id).unwrap().state, EntryState::Available);
+	std::fs::remove_file(path).unwrap();
+	until_offered(&library, &["Steam", "Portal 2", "Portal"]).await;
 }
 
 #[tokio::test]
