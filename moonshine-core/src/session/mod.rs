@@ -537,7 +537,7 @@ impl LaunchedSession {
 	) -> Result<(), ()> {
 		self.capture.set_scaling_fit(video.format.codec != VideoCodec::PyroWave);
 		let effective_hdr = self.capture.reconfigure(video.output_mode(capture_pacing)).await?;
-		if effective_hdr != video.format.hdr {
+		if !hdr_state_acceptable(video.format.hdr, effective_hdr, self.capture.capabilities().hdr()) {
 			tracing::warn!(
 				requested_hdr = video.format.hdr,
 				effective_hdr,
@@ -678,7 +678,7 @@ impl ActiveSession {
 		self.capture
 			.set_scaling_fit(context.format.codec != VideoCodec::PyroWave);
 		let effective_hdr = self.capture.reconfigure(context.output_mode(capture_pacing)).await?;
-		if effective_hdr != context.format.hdr {
+		if !hdr_state_acceptable(context.format.hdr, effective_hdr, self.capture.capabilities().hdr()) {
 			tracing::warn!(
 				requested_hdr = context.format.hdr,
 				effective_hdr,
@@ -704,6 +704,30 @@ impl ActiveSession {
 			.await?;
 		self.audio_context = context;
 		Ok(())
+	}
+}
+
+/// Whether a stream may run with the capture's effective HDR state.
+///
+/// A backend that can never produce HDR (Desktop Mode's SDR virtual output)
+/// falls back to SDR content inside a negotiated HDR format, since the client
+/// already set up its decoder for it: conventional encoders tag those frames
+/// BT.709 and tell the client HDR is off, and PyroWave maps them into its HDR10
+/// wire format. A backend that can produce HDR but did not apply it is an error.
+fn hdr_state_acceptable(requested: bool, effective: bool, capture_supports_hdr: bool) -> bool {
+	requested == effective || (requested && !capture_supports_hdr)
+}
+
+#[cfg(test)]
+mod hdr_fallback_tests {
+	#[test]
+	fn only_sdr_only_backends_fall_back_from_hdr() {
+		use super::hdr_state_acceptable as ok;
+		assert!(ok(true, true, true));
+		assert!(ok(false, false, false));
+		assert!(ok(true, false, false), "Desktop Mode streams SDR for an HDR client");
+		assert!(!ok(true, false, true), "an HDR-capable compositor must apply HDR");
+		assert!(!ok(false, true, true));
 	}
 }
 

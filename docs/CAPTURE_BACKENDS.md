@@ -54,7 +54,9 @@ Lifecycle:
    `CaptureCapabilities::hdr` is set.
 4. PLAY and reconnects call `LiveCapture::reconfigure` with the negotiated
    `OutputMode`. An unchanged mode is not sent to the thread. The effective HDR
-   state is returned; the session refuses a stream whose HDR state differs.
+   state is returned; the session refuses a stream whose HDR state differs,
+   except that a backend without HDR (`CaptureCapabilities::hdr` unset) streams
+   its SDR frames inside a negotiated HDR format.
 5. The session stop ends the event loop. The compositor closes its helpers,
    terminates XWayland, drops its state and returns; completion is released
    after the thread has fully exited.

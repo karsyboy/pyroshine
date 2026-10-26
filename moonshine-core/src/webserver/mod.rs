@@ -876,12 +876,10 @@ impl Webserver {
 		};
 
 		if application.mode == SessionMode::Desktop && hdr {
-			let failure = SessionFailure::new(
-				"desktop_hdr_unsupported",
-				"Desktop Mode streams the desktop in SDR; the client asked for HDR.",
-			)
-			.with_hint("Turn HDR off in the client's settings for Desktop Mode.");
-			return self.launch_failed(&application.title, &failure);
+			// The client negotiates its codec profile before it launches. The
+			// stream keeps that format and carries the desktop's SDR frames
+			// (see `LaunchedSession::apply_output_mode`).
+			tracing::info!("Desktop Mode streams SDR content; the client's HDR request falls back to SDR");
 		}
 
 		let initialize_result = self
@@ -1137,7 +1135,8 @@ fn app_list_xml(catalog: &crate::app_scanner::CatalogSnapshot, hdr_supported: bo
 		response += "<App>";
 
 		// Desktop Mode streams what the desktop shares, which is SDR on
-		// the desktops tested; Moonlight then does not ask for HDR.
+		// the desktops tested. Moonlight clients ignore this and may still
+		// ask for HDR; such a stream falls back to SDR content.
 		let hdr_supported = u8::from(hdr_supported && entry.application.mode.is_game());
 		response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
 		response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();

@@ -282,13 +282,29 @@ impl Kde {
 		configuration.set_custom_modes(&proxy, &list);
 		self.apply_config(configuration)?;
 		list.destroy();
+		// KWin generates the custom mode with CVT reduced blanking, whose
+		// 0.25 MHz pixel-clock step moves the refresh rate (2560x1440 at
+		// 116 Hz becomes 115.886 Hz). Select the mode KWin actually created.
+		let generated = self
+			.state
+			.devices
+			.values()
+			.find(|d| d.name == format!("Virtual-{name}"))
+			.map(|d| d.modes.iter().filter_map(|m| self.state.modes.get(m)).map(|m| m.1))
+			.and_then(|modes| generated_mode(modes, requested))
+			.ok_or_else(|| {
+				format!(
+					"KWin did not create a {}x{} mode near {} mHz for the virtual output",
+					requested.width, requested.height, requested.refresh_millihertz
+				)
+			})?;
 		let mut snapshot = self.snapshot()?;
 		let output = snapshot
 			.outputs
 			.iter_mut()
 			.find(|o| o.name == format!("Virtual-{name}"))
 			.ok_or("Virtual output disappeared")?;
-		output.mode = requested;
+		output.mode = generated;
 		let output_key = output.key.clone();
 		self.apply(&snapshot)?;
 		let observed = self
@@ -297,11 +313,11 @@ impl Kde {
 			.into_iter()
 			.find(|o| o.key == output_key)
 			.ok_or("Virtual output disappeared after mode apply")?;
-		if observed.mode.width != requested.width
-			|| observed.mode.height != requested.height
-			|| observed.mode.refresh_millihertz.abs_diff(requested.refresh_millihertz) > 100
+		if observed.mode.width != generated.width
+			|| observed.mode.height != generated.height
+			|| observed.mode.refresh_millihertz.abs_diff(generated.refresh_millihertz) > 100
 		{
-			return Err("KWin did not apply the exact requested output mode".into());
+			return Err("KWin did not apply the requested output mode".into());
 		}
 		let stream = &self.state.streams[id];
 		Ok(Target {
@@ -310,7 +326,9 @@ impl Kde {
 			serial: stream.serial,
 			observed_mode: Some(observed.mode),
 			output: output_key,
-			mode: requested,
+			// The output's real mode: takeover, verification and the capture
+			// format check all compare against it.
+			mode: observed.mode,
 		})
 	}
 	pub fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
@@ -386,6 +404,17 @@ impl Kde {
 		self.synchronize()
 	}
 }
+/// The mode of exactly `requested`'s size whose refresh is nearest to it,
+/// within the rounding of a CVT-generated custom mode (1%, at least 100 mHz).
+fn generated_mode(modes: impl IntoIterator<Item = Mode>, requested: Mode) -> Option<Mode> {
+	let tolerance = (requested.refresh_millihertz / 100).max(100);
+	modes
+		.into_iter()
+		.filter(|m| m.width == requested.width && m.height == requested.height)
+		.min_by_key(|m| m.refresh_millihertz.abs_diff(requested.refresh_millihertz))
+		.filter(|m| m.refresh_millihertz.abs_diff(requested.refresh_millihertz) <= tolerance)
+}
+
 /// Every property we mutate is available at management version 18; devices
 /// need 18 as well so priority and custom-mode state can be observed on restore.
 fn supported_management(version: u32) -> Option<u32> {
@@ -621,6 +650,36 @@ delegate_noop!(State: ignore cast_manager::ZkdeScreencastUnstableV1);
 
 #[cfg(test)]
 mod tests {
+	/// CVT reduced blanking rounds the refresh by more than 100 mHz for
+	/// common stream modes (libxcvt 0.1.3 values, as KWin 6.8 generates them).
+	#[test]
+	fn selects_the_cvt_rounded_custom_mode() {
+		let mode = |width, height, refresh_millihertz| super::Mode {
+			width,
+			height,
+			refresh_millihertz,
+		};
+		// The virtual output starts with a 60 Hz mode of the same size.
+		let modes = [mode(2560, 1440, 60000), mode(2560, 1440, 115886)];
+		assert_eq!(
+			super::generated_mode(modes, mode(2560, 1440, 116000)),
+			Some(mode(2560, 1440, 115886))
+		);
+		assert_eq!(
+			super::generated_mode([mode(1280, 720, 59745)], mode(1280, 720, 60000)),
+			Some(mode(1280, 720, 59745))
+		);
+		// Another size, or a refresh KWin did not generate, is not a match.
+		assert_eq!(
+			super::generated_mode([mode(2560, 1440, 60000)], mode(2560, 1440, 116000)),
+			None
+		);
+		assert_eq!(
+			super::generated_mode([mode(2560, 1600, 115936)], mode(2560, 1440, 116000)),
+			None
+		);
+	}
+
 	#[test]
 	fn compatibility_floor_covers_every_required_request_and_observation() {
 		assert_eq!(super::supported_management(17), None);
@@ -648,15 +707,25 @@ mod tests {
 		let baseline = native.snapshot().unwrap();
 		let baseline_modes = native.state.modes.len();
 		let id = uuid::Uuid::new_v4().to_string();
-		let result = (|| -> Result<()> {
-			let target = native.prepare(
-				&id,
+		// MOONSHINE_TEST_DESKTOP_MODE=2560x1440@116 tests another client mode.
+		let requested = std::env::var("MOONSHINE_TEST_DESKTOP_MODE").map_or(
+			Mode {
+				width: 2880,
+				height: 1920,
+				refresh_millihertz: 120000,
+			},
+			|mode| {
+				let (size, rate) = mode.split_once('@').expect("<width>x<height>@<hz>");
+				let (width, height) = size.split_once('x').expect("<width>x<height>@<hz>");
 				Mode {
-					width: 2880,
-					height: 1920,
-					refresh_millihertz: 120000,
-				},
-			)?;
+					width: width.parse().unwrap(),
+					height: height.parse().unwrap(),
+					refresh_millihertz: rate.parse::<u32>().unwrap() * 1000,
+				}
+			},
+		);
+		let result = (|| -> Result<()> {
+			let target = native.prepare(&id, requested)?;
 			let state = native.snapshot()?;
 			let output = state
 				.outputs
@@ -664,7 +733,10 @@ mod tests {
 				.find(|o| o.key == target.output)
 				.ok_or("Virtual output missing")?;
 			assert!(!output.can_disable, "KWin virtual outputs are owner-closed");
-			assert!(output.mode.refresh_millihertz.abs_diff(120000) <= 100);
+			assert!(
+				output.mode.refresh_millihertz.abs_diff(requested.refresh_millihertz)
+					<= requested.refresh_millihertz / 100
+			);
 			let device = crate::session::capture::portal::device::compositor_main_device(&desktop.wayland_socket)?
 				.ok_or("Missing compositor GPU identity")?;
 			let node = crate::session::capture::portal::device::render_node(device).ok_or("Missing render node")?;
@@ -730,7 +802,7 @@ mod tests {
 					&target,
 					async_shutdown::ShutdownManager::new(),
 				)?;
-				if (scaled_format.width, scaled_format.height) != (2880, 1920) {
+				if (scaled_format.width, scaled_format.height) != (requested.width, requested.height) {
 					return Err("UI scale changed the capture pixel resolution".into());
 				}
 				eprintln!(

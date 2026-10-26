@@ -14,6 +14,13 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix corrupted audio after reconnecting with a different audio configuration. A client switching from surround to stereo announces `x-nv-audio.surround.enable=0`, and Pyroshine then reused the previous stream's surround layout while the client decoded stereo. The stated channel count is now used; a client that states none gets the layout of its current launch or resume request.
+- Stop games stuttering on every key typed on Steam's on-screen keyboard. The isolated compositor now provides gamescope's input-method protocol, which Steam uses when it runs under a gamescope-compatible compositor. Steam previously fell back to XTest and remapped a key for each character, and every remap made Wine rebuild its keyboard tables. Characters are typed with the keys of the session's keyboard layout; only characters the layout lacks use a temporary keymap.
+- Fall back to SDR when a client asks for HDR in Desktop Mode instead of refusing the launch. The stream keeps the format the client negotiated and carries the desktop's SDR image: H.264, HEVC and AV1 frames are marked BT.709 and the client is told HDR is off; PyroWave maps them into its HDR10 format.
+- Fix Desktop Mode on KDE failing with "KWin does not expose requested mode" for stream modes such as 2560×1440 at 116 Hz. KWin generates custom modes with CVT reduced blanking, which can move the refresh rate by more than the 0.1 Hz Pyroshine accepted (115.886 Hz here). Pyroshine now uses the mode KWin created when it is within 1 % of the requested rate.
+
 ## [v0.18.0-prerelease.1] - 2026-10-26
 
 ### Added

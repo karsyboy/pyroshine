@@ -635,35 +635,20 @@ impl RtspServer {
 			},
 		};
 
-		// Parse surround audio attributes from SDP.
-		let surround_channels: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.numChannels").unwrap_or(2);
-		let surround_mask: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.channelMask").unwrap_or(0x3);
-		let surround_enable: u8 = get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.enable").unwrap_or(0);
 		let audio_quality: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.AudioQuality").unwrap_or(1);
-
-		let (channels, channel_mask) = if surround_enable != 0 {
-			match negotiation::audio_channels(surround_channels) {
-				Ok(channels) => (channels, surround_mask),
-				Err(reason) => {
-					tracing::warn!(reason, "Rejecting invalid audio negotiation");
-					self.report_rejection(
-						"audio_settings_invalid",
-						format!("The client's audio settings were rejected: {reason}."),
-						"Choose stereo, 5.1 or 7.1 audio in the client.",
-					);
-					return bad_request(cseq, request.version(), &reason);
-				},
-			}
-		} else {
-			// Fall back to the values from the HTTP launch request.
-			let ctx = self.session_manager.get_session_context().await;
-			match ctx {
-				Ok(Some(session_ctx)) => (session_ctx.audio_channels, session_ctx.audio_channel_mask),
-				_ => (AudioChannels::Stereo, 0x3),
-			}
+		let requested_layout = self.session_manager.requested_audio_layout().await;
+		let (channels, channel_mask) = match negotiated_audio_layout(&sdp_session, requested_layout) {
+			Ok(layout) => layout,
+			Err(reason) => {
+				tracing::warn!(reason, "Rejecting invalid audio negotiation");
+				self.report_rejection(
+					"audio_settings_invalid",
+					format!("The client's audio settings were rejected: {reason}."),
+					"Choose stereo, 5.1 or 7.1 audio in the client.",
+				);
+				return bad_request(cseq, request.version(), &reason);
+			},
 		};
 		let high_quality = audio_quality != 0;
 		// Pyrolight requests a bitrate level; other clients get the configured default.
@@ -1048,6 +1033,28 @@ fn negotiated_pyrowave_dialect(
 	.map(Some)
 }
 
+/// The channel layout an ANNOUNCE asks for.
+///
+/// Moonlight states its layout in `x-nv-audio.surround.numChannels` and
+/// `channelMask` on every ANNOUNCE (with `enable=0` for stereo). Only a client
+/// that states no channel count falls back to `requested`, the layout of the
+/// current HTTP launch/resume: the live session's context holds the previous
+/// epoch's layout, and reusing it on a reconnect that switched from surround
+/// to stereo kept encoding surround for a stereo decoder.
+fn negotiated_audio_layout(
+	session: &sdp_types::Session,
+	requested: Option<(AudioChannels, u32)>,
+) -> Result<(AudioChannels, u32), String> {
+	let mask = get_optional_sdp_attribute(session, "x-nv-audio.surround.channelMask").unwrap_or(0x3);
+	match get_optional_sdp_attribute::<u32>(session, "x-nv-audio.surround.numChannels") {
+		Some(count) => Ok((negotiation::audio_channels(count)?, mask)),
+		None if get_optional_sdp_attribute::<u8>(session, "x-nv-audio.surround.enable").unwrap_or(0) != 0 => {
+			Ok((AudioChannels::Stereo, mask))
+		},
+		None => Ok(requested.unwrap_or((AudioChannels::Stereo, 0x3))),
+	}
+}
+
 /// The audio quality level a Pyrolight client requested, if any.
 fn negotiated_audio_quality(session: &sdp_types::Session) -> Result<Option<AudioQuality>, &'static str> {
 	unique_sdp_attribute(session, "x-moonshine-audio.quality")?
@@ -1317,6 +1324,41 @@ mod tests {
 	/// Review 2026-10-05 CFG-001: SETUP advertises configured listener ports.
 	/// A configuration that passes startup validation must not make it hand a
 	/// client port 0: either validation rejects ephemeral advertised ports or
+	mod audio_layout {
+		use super::super::*;
+
+		fn layout(attributes: &str, requested: Option<(AudioChannels, u32)>) -> Result<(AudioChannels, u32), String> {
+			let body = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n{attributes}");
+			negotiated_audio_layout(&parse_sdp(body.as_bytes()).unwrap(), requested)
+		}
+
+		/// A reconnect that switches from 5.1 to stereo announces `enable=0`.
+		/// It must select stereo, not the surround layout of the live epoch
+		/// or launch, or the client decodes 6-channel Opus as stereo.
+		#[test]
+		fn stated_stereo_overrides_the_previous_surround_layout() {
+			let surround = Some((AudioChannels::Surround51, 0x3f));
+			let stereo = "a=x-nv-audio.surround.numChannels:2\r\na=x-nv-audio.surround.channelMask:3\r\na=x-nv-audio.surround.enable:0\r\n";
+			assert_eq!(layout(stereo, surround), Ok((AudioChannels::Stereo, 0x3)));
+			let surround71 = "a=x-nv-audio.surround.numChannels:8\r\na=x-nv-audio.surround.channelMask:1599\r\na=x-nv-audio.surround.enable:1\r\n";
+			assert_eq!(
+				layout(surround71, Some((AudioChannels::Stereo, 0x3))),
+				Ok((AudioChannels::Surround71, 1599))
+			);
+			assert!(layout("a=x-nv-audio.surround.numChannels:4\r\n", None).is_err());
+		}
+
+		/// Clients that state no layout keep the current launch/resume request's.
+		#[test]
+		fn unstated_layout_uses_the_http_request() {
+			assert_eq!(
+				layout("", Some((AudioChannels::Surround51, 0x3f))),
+				Ok((AudioChannels::Surround51, 0x3f))
+			);
+			assert_eq!(layout("", None), Ok((AudioChannels::Stereo, 0x3)));
+		}
+	}
+
 	/// SETUP reports the ports actually bound.
 	mod advertised_ports {
 		use super::super::*;

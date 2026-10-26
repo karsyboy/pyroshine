@@ -315,10 +315,9 @@ impl LaunchedPortal {
 	}
 
 	/// Reconfigure the owned native output, never simulate a mode with scaling.
+	/// The managed output is always SDR, so a request for HDR yields SDR (the
+	/// returned effective state) rather than failing the stream.
 	pub(crate) async fn reconfigure(&mut self, mode: OutputMode) -> Result<bool, ()> {
-		if mode.hdr {
-			return Err(());
-		}
 		let mode = crate::desktop::Mode {
 			width: mode.width,
 			height: mode.height,

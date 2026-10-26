@@ -722,6 +722,24 @@ impl<B: SessionBackend> SessionCore<B> {
 		guard.live().map(|live| live.record.context.clone())
 	}
 
+	/// Audio layout the current launch or resume request asked for over HTTP,
+	/// for an ANNOUNCE that does not state one. A pending `/resume` wins over
+	/// the live context, which holds the previous epoch's negotiated layout.
+	pub(crate) async fn requested_audio_layout(&self) -> Option<(crate::session::stream::audio::AudioChannels, u32)> {
+		let mut guard = self.lock().await;
+		let resumed = guard
+			.resume_request
+			.as_ref()
+			.and_then(|request| request.audio_channels.zip(request.audio_channel_mask));
+		let context = guard.live().map(|live| {
+			(
+				live.record.context.audio_channels,
+				live.record.context.audio_channel_mask,
+			)
+		});
+		resumed.or(context)
+	}
+
 	/// Open every stream start latch of the live session (bench/external start).
 	pub(crate) async fn trigger_streams_start(&self) {
 		let mut guard = self.lock().await;
@@ -1886,6 +1904,11 @@ impl SessionManager {
 	/// stopping is not reported.
 	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
 		Ok(self.core.get_session_context().await)
+	}
+
+	/// Audio layout the current launch or resume request asked for over HTTP.
+	pub(crate) async fn requested_audio_layout(&self) -> Option<(crate::session::stream::audio::AudioChannels, u32)> {
+		self.core.requested_audio_layout().await
 	}
 
 	/// Initialize a new session with the provided context.

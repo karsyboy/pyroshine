@@ -97,6 +97,11 @@ requires = ["render-node", "xwayland"]
 timeout = 120
 
 [[test]]
+name = "session::compositor::xwayland_tests::steam_input_method_types_without_keymap_changes"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
 name = "session::compositor::xwayland_tests::live_output_reconfiguration_resizes_windows_held_at_output_size"
 requires = ["render-node", "xwayland"]
 timeout = 120

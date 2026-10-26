@@ -45,7 +45,11 @@ Select **Desktop Mode** in the streaming client. Games selected from the library
 continue to use their isolated Game Mode session. A Desktop Mode launch does
 not execute application commands or hooks. The first implementation uses SDR,
 fixed refresh, a per-client UI scale (initially 100%), an embedded cursor and
-direct PipeWire DMA-BUF capture.
+direct PipeWire DMA-BUF capture. A client that asks for HDR still connects: the
+stream keeps its negotiated HDR format and carries the desktop's SDR image.
+KWin creates the client's mode with CVT reduced blanking, so the virtual output
+can run slightly off the requested rate (for example 115.886 Hz for 116 Hz);
+Pyroshine accepts KWin's mode within 1 % of the requested rate.
 It refuses incompatible modes or buffers rather than scaling a physical monitor.
 The compositor chooses how existing windows migrate to the remaining output.
 

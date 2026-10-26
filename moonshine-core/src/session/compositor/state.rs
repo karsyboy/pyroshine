@@ -297,6 +297,8 @@ pub(crate) struct MoonshineCompositor {
 	/// Clipboard text queued by `TypeText` events, typed in bounded batches on
 	/// successive frame ticks. See [`crate::session::compositor::input`].
 	pub pending_text: String,
+	/// Steam's on-screen keyboard text (gamescope input-method protocol).
+	pub input_method: super::input_method::InputMethodState,
 
 	// -- Cursor --
 	pub cursor_position: Point<f64, Logical>,
@@ -893,6 +895,7 @@ impl MoonshineCompositor {
 
 		// Native color descriptions remain available for SDR sessions too.
 		let color_management = Some(super::color_management::ColorManagementState::new(&display_handle, hdr));
+		let input_method = super::input_method::InputMethodState::new(&display_handle);
 
 		Ok((
 			Self {
@@ -931,6 +934,7 @@ impl MoonshineCompositor {
 				content_changed_at: None,
 				seat,
 				pending_text: String::new(),
+				input_method,
 				cursor_position: initial_cursor_position,
 				cursor: Default::default(),
 				pointer_element,

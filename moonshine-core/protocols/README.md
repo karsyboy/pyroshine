@@ -13,6 +13,11 @@ capabilities are refused before mutation. Compatibility of a specific Plasma
 version still requires the documented hardware acceptance matrix.
 No KDE implementation code is imported.
 
+`gamescope-input-method.xml` is copied from `ValveSoftware/gamescope` at
+`d175688ad4ec490dc7b0695c5c62f8807684a1f1` and retains its license. The isolated
+compositor generates server bindings from it for Steam's on-screen keyboard
+(see [the compositor guide](../../docs/COMPOSITOR.md#steam-classification-and-input)).
+
 The GNOME adapter uses the private Mutter ScreenCast and DisplayConfig D-Bus
 interfaces. It probes native virtual-monitor and configuration capabilities
 and verifies applied modes; API presence alone does not establish hardware

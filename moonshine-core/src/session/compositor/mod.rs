@@ -16,6 +16,7 @@ mod foreground;
 mod gpu_timing;
 mod handlers;
 pub(crate) mod input;
+mod input_method;
 mod scaling;
 mod state;
 mod x11_focus;
@@ -1466,6 +1467,165 @@ mod xwayland_tests {
 			let _ = focus.drain_events();
 		}
 		drop(focus);
+		drop(conn);
+		shut_down(stop);
+	}
+
+	#[allow(dead_code, unused_imports, non_upper_case_globals, clippy::all)]
+	mod input_method_client {
+		use wayland_client;
+		use wayland_client::protocol::*;
+		pub mod __interfaces {
+			use wayland_client::backend as wayland_backend;
+			use wayland_client::protocol::__interfaces::*;
+			wayland_scanner::generate_interfaces!("protocols/gamescope-input-method.xml");
+		}
+		use self::__interfaces::*;
+		wayland_scanner::generate_client_code!("protocols/gamescope-input-method.xml");
+	}
+
+	/// Steam's on-screen keyboard commits text through the gamescope input
+	/// method. It must arrive as key presses of the seat's keymap without
+	/// a single `MappingNotify`, which makes Wine rebuild its keyboard tables
+	/// (the per-key game stutter of Steam's XTest fallback).
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn steam_input_method_types_without_keymap_changes() {
+		use input_method_client::gamescope_input_method::{self as ime, GamescopeInputMethod};
+		use input_method_client::gamescope_input_method_manager::GamescopeInputMethodManager;
+		use wayland_client::protocol::{wl_registry, wl_seat};
+		use x11rb::protocol::Event;
+		use x11rb::protocol::xproto::ChangeWindowAttributesAux;
+
+		#[derive(Default)]
+		struct Client {
+			manager: Option<GamescopeInputMethodManager>,
+			seat: Option<wl_seat::WlSeat>,
+			serial: Option<u32>,
+		}
+		impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for Client {
+			fn event(
+				state: &mut Self,
+				registry: &wl_registry::WlRegistry,
+				event: wl_registry::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				qh: &wayland_client::QueueHandle<Self>,
+			) {
+				if let wl_registry::Event::Global {
+					name,
+					interface,
+					version,
+				} = event
+				{
+					match interface.as_str() {
+						"gamescope_input_method_manager" => {
+							state.manager = Some(registry.bind(name, version.min(2), qh, ()));
+						},
+						"wl_seat" => state.seat = Some(registry.bind(name, 1, qh, ())),
+						_ => {},
+					}
+				}
+			}
+		}
+		impl wayland_client::Dispatch<GamescopeInputMethod, ()> for Client {
+			fn event(
+				state: &mut Self,
+				_: &GamescopeInputMethod,
+				event: ime::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let ime::Event::Done { serial } = event {
+					state.serial = Some(serial);
+				}
+			}
+		}
+		wayland_client::delegate_noop!(Client: ignore wl_seat::WlSeat);
+		wayland_client::delegate_noop!(Client: ignore GamescopeInputMethodManager);
+
+		let (stop, handles, launched) = launch();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", 219990)]);
+		conn.change_window_attributes(game, &ChangeWindowAttributesAux::new().event_mask(EventMask::KEY_PRESS))
+			.unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(
+			|| conn.get_input_focus().unwrap().reply().unwrap().focus == game
+		));
+
+		let socket = std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap())
+			.join(&launched.ready().display.wayland_display);
+		let wayland =
+			wayland_client::Connection::from_socket(std::os::unix::net::UnixStream::connect(socket).unwrap()).unwrap();
+		let mut queue = wayland.new_event_queue();
+		let qh = queue.handle();
+		wayland.display().get_registry(&qh, ());
+		let mut client = Client::default();
+		queue.roundtrip(&mut client).unwrap();
+		let manager = client
+			.manager
+			.clone()
+			.expect("gamescope_input_method_manager is advertised");
+		let input_method = manager.create_input_method(client.seat.as_ref().unwrap(), &qh, ());
+		queue.roundtrip(&mut client).unwrap();
+		let serial = client.serial.expect("done serial");
+		// Xwayland remaps its core keyboard once, on the first key it receives
+		// from any source. Type one ordinary key first; only the commit is measured.
+		let drain = |millis: u64| {
+			let until = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+			while std::time::Instant::now() < until {
+				if conn.poll_for_event().unwrap().is_none() {
+					std::thread::sleep(std::time::Duration::from_millis(10));
+				}
+			}
+		};
+		for event in [
+			crate::session::capture::input::CaptureInputEvent::KeyDown { keycode: 2 },
+			crate::session::capture::input::CaptureInputEvent::KeyUp { keycode: 2 },
+		] {
+			handles.input.send(event).unwrap();
+		}
+		drain(500);
+		input_method.set_string("aZ".into());
+		input_method.set_action(ime::Action::DeleteLeft);
+		input_method.commit(serial);
+		queue.roundtrip(&mut client).unwrap();
+
+		let min_keycode = conn.setup().min_keycode;
+		let max_keycode = conn.setup().max_keycode;
+		let mapping = conn
+			.get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1)
+			.unwrap()
+			.reply()
+			.unwrap();
+		let keysym = |keycode: u8, shifted: bool| {
+			let per = usize::from(mapping.keysyms_per_keycode);
+			mapping.keysyms[usize::from(keycode - min_keycode) * per + usize::from(shifted)]
+		};
+		let mut typed = Vec::new();
+		let mut mapping_notifies = 0;
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+		// X keycode of Shift_L (evdev 42 + 8), pressed around the capital.
+		const SHIFT: u8 = 50;
+		while std::time::Instant::now() < deadline && typed.len() < 3 {
+			match conn.poll_for_event().unwrap() {
+				Some(Event::KeyPress(press)) if press.detail == SHIFT => {},
+				Some(Event::KeyPress(press)) => {
+					let shifted = u16::from(press.state) & u16::from(x11rb::protocol::xproto::KeyButMask::SHIFT) != 0;
+					typed.push(keysym(press.detail, shifted));
+				},
+				Some(Event::MappingNotify(_)) => mapping_notifies += 1,
+				Some(_) => {},
+				None => std::thread::sleep(std::time::Duration::from_millis(10)),
+			}
+		}
+		// a, Z (Shift held), BackSpace.
+		assert_eq!(typed, [0x61, 0x5a, 0xff08], "typed keysyms");
+		assert_eq!(mapping_notifies, 0, "the input method must not change the keymap");
+		drop(input_method);
 		drop(conn);
 		shut_down(stop);
 	}

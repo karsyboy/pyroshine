@@ -282,6 +282,18 @@ Steam hides overlays and notifications by clearing `STEAM_OVERLAY` and
 the opacity change as its own property kind rather than as a raw atom; both
 refresh the cached classification.
 
+Steam's on-screen keyboard sends text through gamescope's private
+`gamescope_input_method_manager` protocol (`compositor/input_method.rs`), which
+Steam binds on `GAMESCOPE_WAYLAND_DISPLAY`. Each committed character is typed on
+the seat keyboard with the key, and Shift when needed, that produces it in the
+session's own keymap; editing actions are Enter, Backspace, Delete and the arrow
+keys. A character the layout lacks is typed through a temporary keymap. Without
+the protocol Steam falls back to XTest and remaps a keycode
+(`XChangeKeyboardMapping`) for every character; each remap reaches every X
+client as `MappingNotify`, and Wine rebuilds its keyboard tables on it, which
+made the game hitch on every key. The global is offered at version 2, so
+Steam does not send version 3's pointer requests.
+
 Controller Guide shortcuts are described in
 [configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
 Guide or the explicit Back+Start policy so games receive real Select holds.
