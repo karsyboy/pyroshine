@@ -6,7 +6,7 @@ use crate::encoder::codec::{
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
 use crate::encoder::{ColorDescription, EncodeConfig};
-use crate::error::Result;
+use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -15,12 +15,15 @@ use tracing::{debug, info};
 impl H264 {
     /// Create a new H.264 encoder.
     pub fn create(context: VideoContext, config: EncodeConfig) -> Result<CodecEncoder<Self>> {
-        // B-frames are not yet supported.
-        assert!(
-            config.b_frame_count == 0,
-            "B-frame encoding is not yet supported; set b_frame_count=0 (got {})",
-            config.b_frame_count
-        );
+        // B-frames are not yet supported. `with_b_frames` is public and accepts
+        // any count, so this is reachable from safe caller code: report it
+        // rather than panicking inside the library.
+        if config.b_frame_count != 0 {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "H.264 encode: B-frames are not yet supported; set b_frame_count = 0 (got {})",
+                config.b_frame_count
+            )));
+        }
 
         info!(
             "Creating H.264 encoder: {}x{}, pixel_format={:?}",

@@ -1,9 +1,11 @@
 # Local Pixelforge patches
 
 Base: https://github.com/hgaiser/pixelforge, the revision recorded in
-`../pixelforge-patches/UPSTREAM` (v0.9.1, `2ee4d7ac6e470cc34270e48d6e9d6f3fc1d7c379`).
+`../pixelforge-patches/UPSTREAM` (v0.10.0, `4f3ff5e963a733e4036fd0bcb62df33daeb4ca94`).
 The crate files Pyroshine builds (`Cargo.toml`, `src/`, `shader/`, license, README,
-changelog) are copied with their BSD-2-Clause license. This directory is generated:
+changelog) are copied with their BSD-2-Clause license, with `benches/` and `tests/`
+so the crate builds and tests on its own: the manifest names a bench target and
+the decoder's unit tests embed the H.264 samples in `tests/data`. This directory is generated:
 it is exactly that revision plus the numbered patches in `../pixelforge-patches/`.
 
 `moonshine-core` keeps depending on the upstream Git tag; the workspace `[patch]` in
@@ -21,12 +23,16 @@ source of `pixelforge`. Nix builds it as part of the source tree.
 | `0005-select-capture-device-by-drm-and-pci-identity.patch` | Add a DRM/PCI selector to context construction and clean up the instance on failed setup. | Select the opened capture GPU, with no fallback to another GPU when support or identity is unavailable. Pyroshine independently verifies the resulting device. |
 | `0006-encoder-allocate-DPB-images-at-the-input-image-width.patch` | DPB images use the 64-aligned input-image width; pictures keep the coded extent. | NVIDIA writes reconstructed 8-bit 4:4:4 chroma with the same mis-computed pitch as patch 0001. At coded width the writes overran the DPB image: reference corruption growing over P frames (chroma errors of ~200 codes at 1440x768 H.264 4:4:4) and, when the overrun reached unmapped memory, an NVENC MMU fault (Xid 31) and `ERROR_DEVICE_LOST`. Verified on an RTX 3080 (driver 615.78). |
 | `0007-av1-code-frames-on-the-coded-picture-grid.patch` | AV1 `max_frame_*` and picture `codedExtent` use the requested size rounded up to `codedPictureAlignment` (within the coded extent); `render_size` keeps the requested size. Exposes `EncoderCapabilities::av1_frame_extent`. | Implementations code AV1 on that grid but read the source only within `codedExtent`. RADV (8x2) coded 1365x767 as 1368x768 with a black last row, which clients that ignore `render_size` display. |
-| `0008-encoder-order-reconstructed-writes-after-DPB-setup-barrier.patch` | The setup slot's DPB barrier makes prior writes available and the transition visible to later reads and writes. | Its empty access masks left the reconstructed-picture write unordered after the layout transition and the slot's previous encode (`SYNC-HAZARD-WRITE-AFTER-WRITE` on RADV and NVIDIA). |
-| `0009-context-compute-only-selected-device-without-encode.patch` | Encode support requires `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` as well as a video encode queue family; each unsupported codec keeps a reason (`encode_unsupported_reason`); `allow_without_encode()` builds a compute/transfer-only context on the selected device; the video queue extension is enabled only with an encode queue. | Intel Xe2/Xe3 (verified: Arc B390, Mesa 26.2.4) expose no Vulkan Video encode, so Pyroshine could not start there even for PyroWave, which encodes with compute. With `ANV_DEBUG=video-encode` ANV reports an encode queue family without the extensions, and device creation failed with `ERROR_EXTENSION_NOT_PRESENT`. |
-| `0010-encoder-validate-rate-control-capabilities.patch` | `EncoderCapabilities` carries the profile's `rateControlModes` and `maxBitrate`; `check_rate_control()` rejects an unsupported mode or a bitrate above the maximum, and encoder creation applies it. | Both are valid-usage requirements drivers do not report. ANV's Gen12 encoder (UHD 730, `ANV_DEBUG=video-encode`) offers only disabled rate control, yet a CBR encoder was created; an RTX 3080 limits H.264 and HEVC to 120 Mbps, and higher client bitrates were passed through. |
-| `0011-context-enable-queue-family-foreign-when-available.patch` | Enable `VK_EXT_queue_family_foreign` when the device offers it and report it through `has_queue_family_foreign()`; it stays optional. | VA-API surfaces come from another driver than the Vulkan device that writes them. Their ownership transfers must use `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity. |
-| `0012-converter-acquire-dmabuf-sources-from-the-foreign-queue-family.patch` | The color converter acquires a DMA-BUF source on first use from `VK_QUEUE_FAMILY_FOREIGN_EXT` when the context enabled it, else from `VK_QUEUE_FAMILY_EXTERNAL` as before. | Imported sources are written by other drivers (GL or Vulkan clients, compositors), the case the foreign queue family describes. Pyroshine's own converter applies the same rule to captured buffers. |
-| `0013-live-cbr-controls-preserve-session-and-dpb.patch` | Stage bounded CBR changes, distinguish current BeginVideoCoding state from the next control state, issue ENCODE_RATE_CONTROL without RESET, and expose the next actual display order. | Live rate changes preserve the profile/session/DPB and remain within startup storage/level and `maxBitrate`; failed attempts can consume display order. Continuous decoded Vulkan fixtures exercise decreases/restores/clamps without extra keyframes on AMD and NVIDIA. |
+| `0008-context-compute-only-selected-device-without-encode.patch` | Encode support requires `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` as well as a video encode queue family; each unsupported codec keeps a reason (`encode_unsupported_reason`); `allow_without_encode()` builds a compute/transfer-only context on the selected device; the video queue extension is enabled only with an encode or decode queue. | Intel Xe2/Xe3 (verified: Arc B390, Mesa 26.2.4) expose no Vulkan Video encode, so Pyroshine could not start there even for PyroWave, which encodes with compute. With `ANV_DEBUG=video-encode` ANV reports an encode queue family without the extensions, and device creation failed with `ERROR_EXTENSION_NOT_PRESENT`. |
+| `0009-encoder-validate-rate-control-capabilities.patch` | `EncoderCapabilities` carries the profile's `rateControlModes` and `maxBitrate`; `check_rate_control()` rejects an unsupported mode or a bitrate above the maximum, and encoder creation applies it. | Both are valid-usage requirements drivers do not report. ANV's Gen12 encoder (UHD 730, `ANV_DEBUG=video-encode`) offers only disabled rate control, yet a CBR encoder was created; an RTX 3080 limits H.264 and HEVC to 120 Mbps, and higher client bitrates were passed through. |
+| `0010-context-enable-queue-family-foreign-when-available.patch` | Enable `VK_EXT_queue_family_foreign` when the device offers it and report it through `has_queue_family_foreign()`; it stays optional. | VA-API surfaces come from another driver than the Vulkan device that writes them. Their ownership transfers must use `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity. |
+| `0011-converter-acquire-dmabuf-sources-from-the-foreign-queue-family.patch` | The color converter acquires a DMA-BUF source on first use from `VK_QUEUE_FAMILY_FOREIGN_EXT` when the context enabled it, else from `VK_QUEUE_FAMILY_EXTERNAL` as before. | Imported sources are written by other drivers (GL or Vulkan clients, compositors), the case the foreign queue family describes. Pyroshine's own converter applies the same rule to captured buffers. |
+| `0012-live-cbr-controls-preserve-session-and-dpb.patch` | Stage bounded CBR changes, distinguish current BeginVideoCoding state from the next control state, issue ENCODE_RATE_CONTROL without RESET, and expose the next actual display order. | Live rate changes preserve the profile/session/DPB and remain within startup storage/level and `maxBitrate`; failed attempts can consume display order. Continuous decoded Vulkan fixtures exercise decreases/restores/clamps without extra keyframes on AMD and NVIDIA. |
+| `0013-context-keep-a-graphics-queue-beside-compute.patch` | A context that creates its own device also creates a queue on the first graphics-and-compute family, exposes it as `graphics_queue_family()`/`graphics_queue()`, and shares encoder input images with it. Adopted devices report their compute family. | Upstream selects a compute family without graphics when the device has one (RADV, NVIDIA), which left no graphics queue. Pyroshine's `conversion_queue = "graphics"` converts there to avoid compute-queue starvation under a GPU-bound game. |
+
+Upstream v0.10.0 provides the former DPB setup-barrier patch: its
+`record_dpb_barriers` orders the setup slot's transition and reconstructed-picture
+write with synchronization2 video-encode stages and access flags (beab874).
 
 ## Updating
 
@@ -64,7 +70,7 @@ a hardware failure with software fallback. Check both 8-bit and 10-bit, and
 repeat 4:2:0, initial connection and reconnect in Pyrolight/Moonlight. See
 [the pipeline validation guide](../../docs/PIPELINE_OPTIMIZATION.md#measurement-and-changes-needing-more-proof).
 
-Patch 0010's rate-control check is covered by the unit test
+Patch 0009's rate-control check is covered by the unit test
 `unsupported_rate_control_and_excess_bitrate_are_rejected`; on hardware, the
 capability probe (`moonshine-bench --capabilities`) of a UHD 730 with
 `ANV_DEBUG=video-encode` must report its profiles as lacking constant-bitrate
@@ -86,7 +92,7 @@ create a cross-device capture path.
 
 On a multi-GPU host where one adapter lacks Vulkan Video encode, verify that
 requesting it fails without selecting the encoding adapter, and that the
-compute-only context patch 0009 allows is built on that same adapter:
+compute-only context patch 0008 allows is built on that same adapter:
 
 ```sh
 MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE=/dev/dri/renderD129 \

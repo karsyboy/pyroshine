@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 12 Oct 2026 18:19:57 -0400
-Subject: [PATCH 2/2] av1: code the frame on the implementation's picture grid
+Subject: [PATCH] av1: code the frame on the implementation's picture grid
 
 Implementations code AV1 pictures on their codedPictureAlignment grid but
 read the source image only within the picture resource's codedExtent and
@@ -23,10 +23,10 @@ extent as EncoderCapabilities::av1_frame_extent.
  5 files changed, 71 insertions(+), 6 deletions(-)
 
 diff --git a/src/encoder/av1/init.rs b/src/encoder/av1/init.rs
-index 3ef765d..9df63e8 100644
+index f797d53..2df1aa0 100644
 --- a/src/encoder/av1/init.rs
 +++ b/src/encoder/av1/init.rs
-@@ -49,6 +49,9 @@ impl Av1 {
+@@ -52,6 +52,9 @@ impl Av1 {
          })?;
          let active_reference_count = init.active_reference_count;
          let common = init.common;
@@ -36,7 +36,7 @@ index 3ef765d..9df63e8 100644
  
          let codec = Av1 {
              frame_num: 0,
-@@ -56,6 +59,7 @@ impl Av1 {
+@@ -59,6 +62,7 @@ impl Av1 {
              header_data: None,
              references: Vec::new(),
              active_reference_count,
@@ -59,7 +59,7 @@ index 2dbdc08..6426341 100644
  
  impl VideoCodec for Av1 {
 diff --git a/src/encoder/av1/record.rs b/src/encoder/av1/record.rs
-index d89292a..d7bc9b5 100644
+index 85f5b2b..1283cd1 100644
 --- a/src/encoder/av1/record.rs
 +++ b/src/encoder/av1/record.rs
 @@ -80,10 +80,15 @@ impl Av1 {
@@ -98,10 +98,10 @@ index b5307c5..6e892f5 100644
          let frame_width_bits = 32 - (width - 1).leading_zeros();
          let frame_height_bits = 32 - (height - 1).leading_zeros();
 diff --git a/src/encoder/capabilities.rs b/src/encoder/capabilities.rs
-index 7293a5c..2558749 100644
+index 6f829b0..e3abe85 100644
 --- a/src/encoder/capabilities.rs
 +++ b/src/encoder/capabilities.rs
-@@ -93,6 +93,32 @@ impl EncoderCapabilities {
+@@ -94,6 +94,32 @@ impl EncoderCapabilities {
          Ok(extent)
      }
  
@@ -134,7 +134,7 @@ index 7293a5c..2558749 100644
      /// Allocated input-image extent, including the maintained NVIDIA width
      /// padding. This can be wider than the coded picture; it never exceeds max.
      pub fn input_image_extent(
-@@ -234,6 +260,33 @@ mod tests {
+@@ -238,6 +264,33 @@ mod tests {
          );
      }
  
@@ -168,6 +168,3 @@ index 7293a5c..2558749 100644
      #[test]
      fn rejects_zero_overflow_and_aligned_extent_past_maximum() {
          let limits = caps((1, 1), (1, 1), 8192);
--- 
-2.56.0
-

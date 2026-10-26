@@ -1,33 +1,33 @@
-From 89bb089ce082f056e69e29e55aebf39e886bf8d8 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 12 Oct 2026 16:43:18 -0400
 Subject: [PATCH] Select the capture device by DRM identity with PCI fallback
 
 ---
  src/lib.rs    |   2 +-
- src/vulkan.rs | 152 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 153 insertions(+), 1 deletion(-)
+ src/vulkan.rs | 160 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 161 insertions(+), 1 deletion(-)
 
 diff --git a/src/lib.rs b/src/lib.rs
-index 9c18f1d..4716aa9 100644
+index 2a55629..9d42459 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -213,7 +213,7 @@ pub use encoder::{
- };
+@@ -378,7 +378,7 @@ pub use encoder::{
  pub use error::PixelForgeError;
  pub use image::InputImage;
+ pub use sync::TimelinePoint;
 -pub use vulkan::VideoContextBuilder;
 +pub use vulkan::{DeviceSelector, VideoContextBuilder};
  
  /// Re-export VideoContext for convenience.
  pub use vulkan::VideoContext;
 diff --git a/src/vulkan.rs b/src/vulkan.rs
-index 452595c..c6dcc12 100644
+index 685e30a..b4d1bc3 100644
 --- a/src/vulkan.rs
 +++ b/src/vulkan.rs
-@@ -7,6 +7,83 @@ use std::ffi::{CStr, CString};
- use std::os::raw::c_char;
- use tracing::{debug, info, warn};
+@@ -53,6 +53,89 @@ unsafe extern "system" fn debug_utils_callback(
+     vk::FALSE
+ }
  
 +/// Select a physical device by its capture DRM render node, with PCI fallback.
 +///
@@ -89,17 +89,23 @@ index 452595c..c6dcc12 100644
 +    }
 +}
 +
-+/// Destroy the instance if context initialization fails before ownership transfers.
++/// Destroy the instance, and its validation messenger, if context
++/// initialization fails before ownership transfers.
 +struct InstanceGuard<'a> {
 +    instance: &'a ash::Instance,
++    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 +    armed: bool,
 +}
 +impl Drop for InstanceGuard<'_> {
 +    fn drop(&mut self) {
 +        if self.armed {
-+            // SAFETY: initialization owns this instance; no logical device was
-+            // created on failure, and the guard is disarmed on success.
++            // SAFETY: initialization owns this instance and messenger; no logical
++            // device was created on failure, and the guard is disarmed on success.
++            // A messenger must be destroyed before its instance.
 +            unsafe {
++                if let Some((debug_utils, messenger)) = self.debug_messenger.take() {
++                    debug_utils.destroy_debug_utils_messenger(messenger, None);
++                }
 +                self.instance.destroy_instance(None);
 +            }
 +        }
@@ -109,23 +115,23 @@ index 452595c..c6dcc12 100644
  /// Builder for creating a VideoContext.
  #[must_use]
  pub struct VideoContextBuilder {
-@@ -14,6 +91,7 @@ pub struct VideoContextBuilder {
-     app_version: (u32, u32, u32),
-     enable_validation: bool,
-     required_encode_codecs: Vec<Codec>,
+@@ -66,6 +149,7 @@ pub struct VideoContextBuilder {
+     /// that adopts a caller's device assumes they were not enabled.
+     unified_image_layouts: Option<bool>,
+     queues: QueueOverrides,
 +    device_selector: Option<DeviceSelector>,
  }
  
  impl Default for VideoContextBuilder {
-@@ -30,6 +108,7 @@ impl VideoContextBuilder {
-             app_version: (1, 0, 0),
-             enable_validation: false,
-             required_encode_codecs: Vec::new(),
+@@ -85,6 +169,7 @@ impl VideoContextBuilder {
+             required_decode_codecs: Vec::new(),
+             unified_image_layouts: None,
+             queues: QueueOverrides::default(),
 +            device_selector: None,
          }
      }
  
-@@ -57,6 +136,15 @@ impl VideoContextBuilder {
+@@ -164,6 +249,15 @@ impl VideoContextBuilder {
          self
      }
  
@@ -141,19 +147,28 @@ index 452595c..c6dcc12 100644
      /// Build the VideoContext.
      pub fn build(self) -> Result<VideoContext> {
          VideoContext::new(self)
-@@ -242,6 +330,11 @@ impl VideoContext {
+@@ -861,6 +955,12 @@ impl VideoContext {
          let instance = unsafe { entry.create_instance(&create_info, None) }
              .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
  
 +        let mut instance_guard = InstanceGuard {
 +            instance: &instance,
++            debug_messenger: None,
 +            armed: true,
 +        };
 +
          info!("Created Vulkan instance");
  
-         // Find physical device with video support.
-@@ -320,6 +413,13 @@ impl VideoContext {
+         let debug_messenger = if has_debug_utils {
+@@ -880,6 +980,7 @@ impl VideoContext {
+             let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
+                 .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+             info!("Validation layer messages are routed to tracing");
++            instance_guard.debug_messenger = Some((debug_utils.clone(), messenger));
+             Some((debug_utils, messenger))
+         } else {
+             None
+@@ -991,6 +1092,13 @@ impl VideoContext {
                  }
              };
  
@@ -167,7 +182,7 @@ index 452595c..c6dcc12 100644
              // Check codec support for encoding.
              let mut encode_codecs = Vec::new();
              if let Some(eq) = encode_queue {
-@@ -391,6 +491,11 @@ impl VideoContext {
+@@ -1097,6 +1205,11 @@ impl VideoContext {
          }
  
          let physical_device = selected_device.ok_or_else(|| {
@@ -179,7 +194,7 @@ index 452595c..c6dcc12 100644
              PixelForgeError::NoSuitableDevice(
                  "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
              )
-@@ -595,6 +700,8 @@ impl VideoContext {
+@@ -1332,6 +1445,8 @@ impl VideoContext {
          info!("Compute queue family: {}", compute_queue_family);
          info!("Created Vulkan device with video support");
  
@@ -188,8 +203,8 @@ index 452595c..c6dcc12 100644
          Ok(Self {
              inner: std::sync::Arc::new(VideoContextInner {
                  entry,
-@@ -816,3 +923,48 @@ impl VideoContext {
-         })
+@@ -1763,3 +1878,48 @@ mod tests {
+         }
      }
  }
 +
@@ -237,5 +252,3 @@ index 452595c..c6dcc12 100644
 +        );
 +    }
 +}
--- 
-2.56.0

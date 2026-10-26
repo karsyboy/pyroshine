@@ -56,6 +56,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Explain the GPU's codec support. The health check's **Vulkan** line names the driver and its Vulkan Video encode support, and **Codecs** lists every profile that is not offered with the reason (no encoder on this GPU, a missing driver extension, an unsupported chroma format or bit depth, no constant-bitrate rate control). `moonshine-bench --capabilities` reports the same per profile. See [GPU compatibility](GPU_COMPATIBILITY.md).
 - Scan faster at startup. The initial scan runs while the host checks run, and icon lookups no longer walk symlinked theme directories or theme contexts that hold no application icons. With Steam (52 games) and desktop-entry (138 entries) scanners, a scan on a CachyOS/KDE host fell from 1.2–1.7 s to under 40 ms of CPU, with the same box art for every entry; a 2,000-game Steam library scans in about 40 ms.
 
+- Update the vendored Pixelforge to v0.10.0 (ash `f4c2ca3`) and rebase the local patch series onto it; upstream now provides the DPB setup-slot barrier fix, so that patch is gone. Pixelforge now creates a dedicated compute queue where the GPU has one, which the H.264/HEVC/AV1 conversion uses for `conversion_queue = "auto"` and `"compute"`; a local patch keeps the graphics queue for `"graphics"`.
+
 ### Fixed
 
 - Make `pyroshine pair` use `MOONSHINE_MANAGEMENT_BUS` when it is set, like `pyroshine web` and `diag`. A pairing command started for a test instance on its own bus previously reached the live service on the session bus instead.

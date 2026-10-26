@@ -1,5 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Mon, 26 Oct 2026 10:06:50 -0400
+Subject: [PATCH] live CBR controls preserve session and DPB
+
+---
+ src/encoder/av1/record.rs  |  23 +++++++-
+ src/encoder/codec.rs       | 104 +++++++++++++++++++++++++++++++++++++
+ src/encoder/h264/record.rs |  23 +++++++-
+ src/encoder/h265/record.rs |  22 +++++++-
+ src/encoder/mod.rs         |  22 ++++++++
+ 5 files changed, 191 insertions(+), 3 deletions(-)
+
 diff --git a/src/encoder/av1/record.rs b/src/encoder/av1/record.rs
-index d7bc9b5..7dee457 100644
+index 1283cd1..e972883 100644
 --- a/src/encoder/av1/record.rs
 +++ b/src/encoder/av1/record.rs
 @@ -308,6 +308,11 @@ impl Av1 {
@@ -47,10 +60,10 @@ index d7bc9b5..7dee457 100644
              .coded_offset(vk::Offset2D { x: 0, y: 0 })
              .coded_extent(frame_extent)
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index 1be94c4..028343f 100644
+index ce303a3..def421d 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -35,6 +35,10 @@ use crate::vulkan::VideoContext;
+@@ -36,6 +36,10 @@ use crate::vulkan::VideoContext;
  pub(crate) struct EncoderCommon {
      pub context: VideoContext,
      pub config: EncodeConfig,
@@ -61,7 +74,7 @@ index 1be94c4..028343f 100644
  
      pub video_queue_fn: ash::khr::video_queue::Device,
      pub video_encode_fn: ash::khr::video_encode_queue::Device,
-@@ -77,6 +81,10 @@ pub(crate) struct EncoderCommon {
+@@ -81,6 +85,10 @@ pub(crate) struct EncoderCommon {
  }
  
  impl EncoderCommon {
@@ -72,7 +85,7 @@ index 1be94c4..028343f 100644
      /// Prologue: wait until the slot we are about to record over has been read
      /// back, pull the next GOP position, and snapshot the counters this frame
      /// will encode with.
-@@ -292,6 +300,33 @@ pub(crate) trait VideoCodec: Sized + Send {
+@@ -302,6 +310,33 @@ pub(crate) trait VideoCodec: Sized + Send {
      fn invalidate_header_cache(&mut self);
  }
  
@@ -106,7 +119,7 @@ index 1be94c4..028343f 100644
  /// The codec-generic encoder: shared state plus a codec.
  ///
  /// This owns the entire public encode flow; the codec only supplies its
-@@ -331,12 +366,27 @@ impl<C: VideoCodec> CodecEncoder<C> {
+@@ -348,12 +383,27 @@ impl<C: VideoCodec> CodecEncoder<C> {
          });
  
          let future = self.codec.record_picture(&mut self.common, &plan)?;
@@ -134,7 +147,7 @@ index 1be94c4..028343f 100644
      /// End-of-stream barrier: wait for all in-flight frames to be read back.
      pub fn flush(&mut self) -> Result<()> {
          self.common.pipeline.flush();
-@@ -716,6 +766,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+@@ -745,6 +795,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
      let common = EncoderCommon {
          context: context.clone(),
          config: config.clone(),
@@ -143,7 +156,7 @@ index 1be94c4..028343f 100644
          video_queue_fn,
          video_encode_fn,
          session,
-@@ -747,3 +799,55 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+@@ -777,3 +829,55 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
          active_reference_count: max_active_reference_pictures as u32,
      })
  }
@@ -200,7 +213,7 @@ index 1be94c4..028343f 100644
 +    }
 +}
 diff --git a/src/encoder/h264/record.rs b/src/encoder/h264/record.rs
-index 37f8b3a..02cf860 100644
+index 6c2bc67..c62e1ed 100644
 --- a/src/encoder/h264/record.rs
 +++ b/src/encoder/h264/record.rs
 @@ -454,6 +454,11 @@ impl H264 {
@@ -255,7 +268,7 @@ index 37f8b3a..02cf860 100644
              let device = common.device();
              device.cmd_begin_query(
 diff --git a/src/encoder/h265/record.rs b/src/encoder/h265/record.rs
-index 528ef0b..f6b9a27 100644
+index 2b47aad..8b83b44 100644
 --- a/src/encoder/h265/record.rs
 +++ b/src/encoder/h265/record.rs
 @@ -426,6 +426,11 @@ impl H265 {
@@ -309,19 +322,19 @@ index 528ef0b..f6b9a27 100644
              .flags(vk::VideoEncodeFlagsKHR::empty())
              .src_picture_resource(src_picture_resource)
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index 4c74e57..f892627 100644
+index 7ae20ff..c0b72f8 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
-@@ -569,6 +569,8 @@ trait EncoderApi: Send {
-     fn input_image(&self) -> vk::Image;
-     fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
+@@ -585,6 +585,8 @@ trait EncoderApi: Send {
+         wait: &[TimelinePoint],
+     ) -> Result<EncodeFuture>;
      fn flush(&mut self) -> Result<()>;
 +    fn set_bitrate(&mut self, requested: u32) -> Result<u32>;
 +    fn next_display_order(&self) -> u64;
      fn request_idr(&mut self);
      fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
      fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
-@@ -597,6 +599,12 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
+@@ -617,6 +619,12 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
      fn flush(&mut self) -> Result<()> {
          codec::CodecEncoder::flush(self)
      }
@@ -334,7 +347,7 @@ index 4c74e57..f892627 100644
      fn request_idr(&mut self) {
          codec::CodecEncoder::request_idr(self)
      }
-@@ -699,6 +707,20 @@ impl Encoder {
+@@ -741,6 +749,20 @@ impl Encoder {
          self.0.flush()
      }
  

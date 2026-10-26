@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use ash::vk;
-use pixelforge::{Codec, ColorSpace, VideoContext};
+use pixelforge::{Codec, VideoContext};
 
 use super::dmabuf::CachedImport;
 use crate::session::capture::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
@@ -233,6 +233,35 @@ fn format_info(format: ConvertFormat) -> FormatInfo {
 		ConvertFormat::Xyuv => info(5, 4, 0, false),
 		ConvertFormat::Y410 => info(6, 4, 0, false),
 	}
+}
+
+/// Color conversion the shader applies, selecting the RGB to YCbCr matrix and,
+/// for HDR streams, the transfer from the captured buffer's color space.
+///
+/// Pixelforge's converter replaced its equivalent mode list with separate
+/// source and target color specifications; the shader here keeps one mode per
+/// supported capture-to-stream pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ColorSpace {
+	/// BT.709 SDR: the captured sRGB buffer is converted without transfer changes.
+	#[default]
+	Bt709,
+	/// BT.2020: the captured buffer is already wide gamut and PQ encoded (HDR10).
+	Bt2020,
+	/// sRGB input to BT.2020 + PQ: SDR content in an HDR stream. Applies the
+	/// inverse sRGB EOTF, BT.709 to BT.2020 gamut mapping and the PQ OETF.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "shader mode verified by the reference tests; no capture path selects it"
+		)
+	)]
+	SrgbToBt2020Pq,
+	/// scRGB input (linear BT.709, FP16) to BT.2020 + PQ, for
+	/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` content. The input is already
+	/// linear, so only gamut mapping and the PQ OETF apply.
+	Bt709LinearToBt2020Pq,
 }
 
 fn color_space_code(color_space: ColorSpace) -> u32 {
@@ -524,8 +553,7 @@ impl Layout {
 /// replicate its nearest edge pixel. Arithmetic is in f64, so the GPU (f32)
 /// may differ by one code where a value lies on a rounding boundary.
 pub(crate) mod reference {
-	use super::ConvertFormat;
-	use pixelforge::ColorSpace;
+	use super::{ColorSpace, ConvertFormat};
 
 	/// Color conversion parameters of one frame.
 	#[derive(Clone, Copy, Debug)]
@@ -1062,22 +1090,25 @@ impl InputConverter {
 				.instance()
 				.get_physical_device_queue_family_properties(context.physical_device())
 		};
-		let dedicated = context.transfer_queue_family();
-		let dedicated_compute = dedicated != context.compute_queue_family()
-			&& families.get(dedicated as usize).is_some_and(|family| {
-				family.queue_flags.contains(vk::QueueFlags::COMPUTE)
-					&& !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-			});
+		// Pixelforge's compute family is one without graphics when the device
+		// has one; its graphics family is the graphics-and-compute family and
+		// equals the compute family on devices without a dedicated one.
+		let compute = context.compute_queue_family();
+		let dedicated_compute = families.get(compute as usize).is_some_and(|family| {
+			family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+				&& !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+		});
 		let use_dedicated = dedicated_compute && mode != ConversionQueueMode::Graphics;
 		if mode == ConversionQueueMode::Compute && !dedicated_compute && !readback {
 			tracing::warn!("No dedicated compute queue family is available; converting on the graphics family");
 		}
 		// The encoder input image is shared CONCURRENTLY by Pixelforge between
-		// its encode, transfer and compute families, so either family may write it.
+		// its encode, transfer, compute and graphics families, so either
+		// conversion family may write it.
 		let (queue_family, queue) = if use_dedicated {
-			(dedicated, context.transfer_queue())
+			(compute, context.compute_queue())
 		} else {
-			(context.compute_queue_family(), context.compute_queue())
+			(context.graphics_queue_family(), context.graphics_queue())
 		};
 		let timestamps = families
 			.get(queue_family as usize)

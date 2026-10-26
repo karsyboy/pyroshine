@@ -24,6 +24,7 @@ use crate::encoder::resources::{
 };
 use crate::encoder::{ColorDescription, EncodeConfig, FrameType, RateControlMode};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 
 /// Per-encoder state shared by every codec.
@@ -78,6 +79,9 @@ pub(crate) struct EncoderCommon {
     pub upload_command_pool: vk::CommandPool,
     pub upload_command_buffer: vk::CommandBuffer,
     pub upload_fence: vk::Fence,
+    /// Caller work this frame's first submission must wait for. The upload
+    /// takes them when it copies, otherwise the encode submission does.
+    pub pending_waits: Vec<TimelinePoint>,
 }
 
 impl EncoderCommon {
@@ -110,6 +114,7 @@ impl EncoderCommon {
         if src_image == dst_image {
             return Ok(());
         }
+        let waits = std::mem::take(&mut self.pending_waits);
 
         let params = UploadParams {
             upload_command_buffer: self.upload_command_buffer,
@@ -121,6 +126,7 @@ impl EncoderCommon {
             pixel_format: self.config.pixel_format,
             input_image_layout,
             upload_queue: self.context.transfer_queue(),
+            waits: &waits,
         };
         upload_image_to_input(&self.context, &params)?;
         self.pipeline.current_mut().input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
@@ -138,9 +144,13 @@ impl EncoderCommon {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
-        let future = self
-            .pipeline
-            .submit_current(self.context.device(), encode_queue)?;
+        let waits = std::mem::take(&mut self.pending_waits);
+        let future = self.pipeline.submit_current(
+            self.context.device(),
+            self.context.sync2(),
+            encode_queue,
+            &waits,
+        )?;
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
         Ok(future)
     }
@@ -349,9 +359,16 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.pipeline.input_image()
     }
 
-    /// Encode one frame, returning a future for its packet. See [`crate::Encoder::encode`].
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
+    /// Encode one frame once `wait` is reached, returning a future for its
+    /// packet. See [`crate::Encoder::encode_after`].
+    pub fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
         let plan = self.common.begin_frame();
+        self.common.pending_waits.clear();
+        self.common.pending_waits.extend_from_slice(wait);
         self.common.upload(src_image)?;
 
         let setup = self.codec.begin_picture(&mut self.common, &plan)?;
@@ -504,6 +521,25 @@ pub(crate) struct DeviceVideoCaps {
     pub max_bitrate: u64,
 }
 
+/// Call `vkGetPhysicalDeviceVideoCapabilitiesKHR` and return its raw result.
+pub(crate) fn query_video_capabilities(
+    context: &VideoContext,
+    profile_info: &vk::VideoProfileInfoKHR,
+    capabilities: &mut vk::VideoCapabilitiesKHR,
+) -> vk::Result {
+    let video_queue_instance =
+        ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+    unsafe {
+        (video_queue_instance
+            .fp()
+            .get_physical_device_video_capabilities_khr)(
+            context.physical_device(),
+            profile_info,
+            capabilities,
+        )
+    }
+}
+
 /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
 /// generic init needs.
 ///
@@ -529,17 +565,7 @@ pub(crate) fn query_video_caps(
             ));
         }
     };
-    let video_queue_instance =
-        ash::khr::video_queue::Instance::load(context.entry(), context.instance());
-    let result = unsafe {
-        (video_queue_instance
-            .fp()
-            .get_physical_device_video_capabilities_khr)(
-            context.physical_device(),
-            profile_info,
-            &mut capabilities,
-        )
-    };
+    let result = query_video_capabilities(context, profile_info, &mut capabilities);
     if result != vk::Result::SUCCESS {
         return Err(PixelForgeError::vulkan(
             "query Vulkan Video encode capabilities",
@@ -648,7 +674,10 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
             "No supported Vulkan Video DPB formats for this profile".to_string(),
         ));
     }
-    if !supported_src_formats.contains(&preferred_src_format) {
+    if !supported_src_formats
+        .iter()
+        .any(|f| f.format == preferred_src_format)
+    {
         return Err(PixelForgeError::NoSuitableDevice(format!(
             "Preferred input format {:?} is not supported for VIDEO_ENCODE_SRC_KHR. Supported: {:?}",
             preferred_src_format, supported_src_formats
@@ -657,9 +686,9 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
     let picture_format = preferred_src_format;
     let reference_picture_format = supported_dpb_formats
         .iter()
-        .copied()
+        .map(|f| f.format)
         .find(|f| *f == picture_format)
-        .unwrap_or(supported_dpb_formats[0]);
+        .unwrap_or(supported_dpb_formats[0].format);
 
     // Negotiate DPB slots and active references.
     let max_dpb_slots_supported = capabilities.max_dpb_slots as usize;
@@ -792,6 +821,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
         upload_command_pool: cmd.upload_command_pool,
         upload_command_buffer: cmd.upload_command_buffer,
         upload_fence: cmd.upload_fence,
+        pending_waits: Vec::new(),
     };
 
     Ok(CommonInit {

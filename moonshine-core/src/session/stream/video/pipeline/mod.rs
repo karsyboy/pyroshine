@@ -45,13 +45,12 @@ use crate::session::stream::video::{
 use backend::{ConventionalEncoder, EncodeError, EncoderInput, PacketFuture};
 pub use backend::{EncoderBackend, EncoderPreference, EncoderTable};
 pub use convert::ConversionQueueMode;
-use convert::{ConvertFormat, InputConverter, Target};
+use convert::{ColorSpace, ConvertFormat, InputConverter, Target};
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
 use pixelforge::{
-	Codec, ColorDescription, ColorSpace, EncodeConfig, Encoder, EncoderTuningMode, PixelFormat, RateControlMode,
-	VideoContext,
+	Codec, ColorDescription, EncodeConfig, Encoder, EncoderTuningMode, PixelFormat, RateControlMode, VideoContext,
 };
 
 /// Useful-work credits of the conventional pipeline: frames submitted to the

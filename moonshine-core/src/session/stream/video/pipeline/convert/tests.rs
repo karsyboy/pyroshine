@@ -486,7 +486,7 @@ fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
 /// Each codec's 8-bit 4:2:0 profile on this GPU: an encoder is created at
 /// exactly the profile's maximum bitrate, one above it is rejected before the
 /// driver sees it, and a profile without constant-bitrate rate control
-/// cannot create the stream's CBR encoder (Pixelforge patch 0010).
+/// cannot create the stream's CBR encoder (Pixelforge patch 0009).
 /// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encoder_rate_control_limits -- --ignored --nocapture`
 #[test]
 #[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]

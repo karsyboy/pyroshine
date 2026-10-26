@@ -7,7 +7,7 @@ edition = "2024"
 aes = "0.9.3"
 aes-gcm = "0.11.1"
 async-shutdown = "0.2.2"
-ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
+ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
 aws-lc-rs = "1.18.2"
 bitflags = "2.13.2"
 byteorder = "1.5.0"
@@ -38,7 +38,7 @@ network-interface = "2.0.5"
 notify-rust = "4.18.2"
 opus = "0.4.0"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.9.1", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.10.0", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.10"
 regex = "1.13.1"

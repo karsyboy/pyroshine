@@ -19,7 +19,7 @@ class VendorDependencyTests(unittest.TestCase):
         (self.root / "scripts").mkdir()
         for name in ("vendor-dependency.sh", "vendor-pixelforge.sh", "check-vendor-pins.py"):
             shutil.copy2(SCRIPTS / name, self.root / "scripts" / name)
-        for name in ("src", "shader"):
+        for name in ("benches", "src", "shader", "tests"):
             (self.upstream / name).mkdir()
             (self.upstream / name / "file").write_text("upstream\n")
         (self.upstream / "Cargo.toml").write_text('[package]\nname = "pixelforge"\nversion = "0.9.1"\n')

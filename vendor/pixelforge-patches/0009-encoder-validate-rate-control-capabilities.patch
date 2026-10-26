@@ -16,19 +16,19 @@ RTX 3080.
  2 files changed, 88 insertions(+), 1 deletion(-)
 
 diff --git a/src/encoder/capabilities.rs b/src/encoder/capabilities.rs
-index 2558749..f560904 100644
+index e3abe85..cf7e374 100644
 --- a/src/encoder/capabilities.rs
 +++ b/src/encoder/capabilities.rs
 @@ -4,7 +4,7 @@ use ash::vk::TaggedStructure;
  
  use super::codec::{DeviceVideoCaps, input_image_width, query_video_caps};
- use super::resources::gcd;
--use super::{BitDepth, Codec, EncodeConfig, PixelFormat};
-+use super::{BitDepth, Codec, EncodeConfig, PixelFormat, RateControlMode};
+ use super::profile::{av1_profile, h264_profile_idc, h265_profile_idc};
+-use super::{Codec, EncodeConfig};
++use super::{Codec, EncodeConfig, RateControlMode};
  use crate::VideoContext;
  use crate::error::{PixelForgeError, Result};
- 
-@@ -28,6 +28,10 @@ pub struct EncoderCapabilities {
+ use crate::video::gcd;
+@@ -29,6 +29,10 @@ pub struct EncoderCapabilities {
      pub picture_access_granularity: vk::Extent2D,
      /// AV1's picture grid. Other codecs crop directly to the requested frame.
      pub av1_coded_picture_alignment: Option<vk::Extent2D>,
@@ -39,7 +39,7 @@ index 2558749..f560904 100644
  }
  
  impl EncoderCapabilities {
-@@ -45,9 +49,46 @@ impl EncoderCapabilities {
+@@ -46,9 +50,46 @@ impl EncoderCapabilities {
              max_coded_extent: caps.max_coded_extent,
              picture_access_granularity: caps.picture_access_granularity,
              av1_coded_picture_alignment: caps.av1_coded_picture_alignment,
@@ -86,7 +86,7 @@ index 2558749..f560904 100644
      /// Align to both codec blocks and device granularity, clamp to the minimum
      /// and re-align. Reject zero dimensions, overflow and extents above the max.
      pub fn coded_extent(&self, codec: Codec, width: u32, height: u32) -> Result<vk::Extent2D> {
-@@ -215,9 +256,50 @@ mod tests {
+@@ -219,9 +260,50 @@ mod tests {
                  height: granularity.1,
              },
              av1_coded_picture_alignment: None,
@@ -138,10 +138,10 @@ index 2558749..f560904 100644
      fn coded_and_allocated_extents_are_distinct() {
          let limits = caps((1, 1), (1, 1), 8192);
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index a3e751a..1be94c4 100644
+index a73b56c..ce303a3 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -450,6 +450,8 @@ pub(crate) struct DeviceVideoCaps {
+@@ -467,6 +467,8 @@ pub(crate) struct DeviceVideoCaps {
      pub flags: vk::VideoCapabilityFlagsKHR,
      pub std_header_version: vk::ExtensionProperties,
      pub av1_coded_picture_alignment: Option<vk::Extent2D>,
@@ -149,8 +149,8 @@ index a3e751a..1be94c4 100644
 +    pub max_bitrate: u64,
  }
  
- /// Run `vkGetPhysicalDeviceVideoCapabilitiesKHR` and resolve the fields the
-@@ -505,6 +507,8 @@ pub(crate) fn query_video_caps(
+ /// Call `vkGetPhysicalDeviceVideoCapabilitiesKHR` and return its raw result.
+@@ -531,6 +533,8 @@ pub(crate) fn query_video_caps(
          av1_coded_picture_alignment: (profile_info.video_codec_operation
              == vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
              .then_some(av1.coded_picture_alignment),
@@ -159,7 +159,7 @@ index a3e751a..1be94c4 100644
      })
  }
  
-@@ -553,6 +557,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+@@ -579,6 +583,7 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
      let capabilities = req.caps;
  
      let public_caps = super::EncoderCapabilities::from_caps(capabilities);
@@ -167,6 +167,3 @@ index a3e751a..1be94c4 100644
      let coded_extent = public_caps.coded_extent(config.codec, width, height)?;
      let input_image_extent = public_caps.input_image_extent(config.codec, width, height)?;
      let aligned_width = coded_extent.width;
--- 
-2.56.0
-

@@ -50,7 +50,7 @@ impl Av1 {
         let ref_dpb_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
-                common.device(),
+                common.context.sync2(),
                 command_buffer,
                 &common.dpb_images,
                 common.use_layered_dpb,

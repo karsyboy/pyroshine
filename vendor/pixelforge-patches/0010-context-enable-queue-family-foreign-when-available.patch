@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Tue, 20 Oct 2026 11:01:26 -0400
+Subject: [PATCH] Enable VK_EXT_queue_family_foreign when available
+
+Media APIs such as VA-API export DMA-BUF surfaces from a different driver
+than the Vulkan device that writes them. Ownership transfers of such
+resources use VK_QUEUE_FAMILY_FOREIGN_EXT, which requires this extension.
+Enable it when the device offers it and report it through
+VideoContext::has_queue_family_foreign; it stays optional for every other
+context.
+---
+ src/vulkan.rs               | 21 +++++++++++++++++++++
+ src/vulkan/encode_device.rs |  1 +
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/vulkan.rs b/src/vulkan.rs
+index 865e228..60aaf71 100644
+--- a/src/vulkan.rs
++++ b/src/vulkan.rs
+@@ -754,6 +754,9 @@ struct VideoContextInner {
+     /// Validation message sink, present only when validation is enabled and the
+     /// instance is ours. Destroyed before the instance it belongs to.
+     debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
++    /// Whether `VK_EXT_queue_family_foreign` is enabled. Only a context that
++    /// creates its own device enables it; an adopted device reports false.
++    has_queue_family_foreign: bool,
+ }
+ 
+ impl Drop for VideoContextInner {
+@@ -897,6 +900,13 @@ impl VideoContext {
+     pub fn has_unified_image_layouts(&self) -> bool {
+         self.inner.has_unified_image_layouts
+     }
++
++    /// Returns true if `VK_EXT_queue_family_foreign` is enabled, so resources
++    /// shared with another driver (for example a media API's DMA-BUF
++    /// surfaces) can be transferred to and from `VK_QUEUE_FAMILY_FOREIGN_EXT`.
++    pub fn has_queue_family_foreign(&self) -> bool {
++        self.inner.has_queue_family_foreign
++    }
+ }
+ 
+ impl VideoContext {
+@@ -1034,6 +1044,7 @@ impl VideoContext {
+         let mut supported_encode_codecs = Vec::new();
+         let mut encode_unsupported = Vec::new();
+         let mut supported_decode_codecs = Vec::new();
++        let mut has_queue_family_foreign_ext = false;
+ 
+         let has_extension =
+             |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
+@@ -1147,6 +1158,9 @@ impl VideoContext {
+                 encode_queue = None;
+             }
+ 
++            has_queue_family_foreign_ext =
++                has_extension(&available_extensions, ash::ext::queue_family_foreign::NAME);
++
+             // Check codec support for encoding, keeping why each codec is unusable.
+             let mut encode_codecs = Vec::new();
+             let mut device_unsupported = Vec::new();
+@@ -1384,6 +1398,11 @@ impl VideoContext {
+             }
+         }
+ 
++        // Optional: ownership transfers with other drivers' external memory.
++        if has_queue_family_foreign_ext {
++            push_ext(ash::ext::queue_family_foreign::NAME.as_ptr());
++        }
++
+         // The colour converter binds its two descriptors with push descriptors.
+         let has_push_descriptor = selected_device_exts
+             .as_ref()
+@@ -1567,6 +1586,7 @@ impl VideoContext {
+                 owns_device: true,
+                 retired_semaphores: Default::default(),
+                 debug_messenger,
++                has_queue_family_foreign: has_queue_family_foreign_ext,
+             }),
+         })
+     }
+@@ -1666,6 +1686,7 @@ impl VideoContext {
+                 device_properties,
+                 supported_encode_codecs: Vec::new(),
+                 encode_unsupported: Vec::new(),
++                has_queue_family_foreign: false,
+                 supported_decode_codecs,
+                 has_push_descriptor: false,
+                 has_unified_image_layouts: declared_unified_image_layouts,
+diff --git a/src/vulkan/encode_device.rs b/src/vulkan/encode_device.rs
+index 53d2abc..f16240e 100644
+--- a/src/vulkan/encode_device.rs
++++ b/src/vulkan/encode_device.rs
+@@ -339,6 +339,7 @@ impl VideoContext {
+                 device_properties,
+                 supported_encode_codecs: plan.codecs.clone(),
+                 encode_unsupported: Vec::new(),
++                has_queue_family_foreign: false,
+                 supported_decode_codecs: Vec::new(),
+                 has_push_descriptor: plan.push_descriptor,
+                 has_unified_image_layouts: false,

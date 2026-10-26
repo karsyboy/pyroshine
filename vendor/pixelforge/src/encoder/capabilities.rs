@@ -3,10 +3,11 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 
 use super::codec::{DeviceVideoCaps, input_image_width, query_video_caps};
-use super::resources::gcd;
-use super::{BitDepth, Codec, EncodeConfig, PixelFormat, RateControlMode};
+use super::profile::{av1_profile, h264_profile_idc, h265_profile_idc};
+use super::{Codec, EncodeConfig, RateControlMode};
 use crate::VideoContext;
 use crate::error::{PixelForgeError, Result};
+use crate::video::gcd;
 
 /// Codec syntax block used when aligning coded pictures.
 pub const fn codec_block_size(codec: Codec) -> u32 {
@@ -191,16 +192,18 @@ pub(crate) struct EncodeProfile {
 
 impl EncodeProfile {
     pub(crate) fn new(config: &EncodeConfig) -> Result<Self> {
-        let profile_idc = match (config.codec, config.pixel_format, config.bit_depth) {
-            (Codec::H264, PixelFormat::Yuv444, _) => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE,
-            (Codec::H264, _, _) => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
-            (Codec::H265, PixelFormat::Yuv420, BitDepth::Eight) => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
-            (Codec::H265, PixelFormat::Yuv420, BitDepth::Ten) => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10,
-            (Codec::H265, PixelFormat::Yuv444, _) => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS,
-            (Codec::H265, _, _) => return Err(PixelForgeError::InvalidInput(format!(
-                "Unsupported pixel format / bit depth for H.265: {:?} / {:?}", config.pixel_format, config.bit_depth))),
-            (Codec::AV1, PixelFormat::Yuv420, _) => vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
-            (Codec::AV1, _, _) => vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
+        // Profile choice stays in `profile.rs`, shared with `supports_encode_format`.
+        let profile_idc = match config.codec {
+            Codec::H264 => h264_profile_idc(config.pixel_format),
+            Codec::H265 => {
+                h265_profile_idc(config.pixel_format, config.bit_depth).ok_or_else(|| {
+                    PixelForgeError::InvalidInput(format!(
+                        "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
+                        config.pixel_format, config.bit_depth
+                    ))
+                })?
+            }
+            Codec::AV1 => av1_profile(config.pixel_format),
         };
         Ok(Self {
             codec: config.codec,
@@ -239,6 +242,7 @@ impl EncodeProfile {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{BitDepth, PixelFormat};
     use super::*;
 
     fn caps(minimum: (u32, u32), granularity: (u32, u32), max_width: u32) -> EncoderCapabilities {

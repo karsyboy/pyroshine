@@ -15,8 +15,10 @@ pub mod gop;
 pub mod h264;
 pub mod h265;
 pub(crate) mod pipeline;
+pub(crate) mod profile;
 pub mod reorder;
 pub mod resources;
+pub(crate) mod support;
 
 use ash::vk;
 
@@ -44,6 +46,7 @@ pub const DEFAULT_H265_QP: u32 = 28;
 pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
 
 use crate::error::Result;
+use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 
 /// Video codec types.
@@ -87,6 +90,15 @@ impl PixelFormat {
             PixelFormat::Yuv420 => luma_size * 3 / 2, // Y + U/4 + V/4
             PixelFormat::Yuv422 => luma_size * 2,     // Y + U/2 + V/2
             PixelFormat::Yuv444 => luma_size * 3,     // Y + U + V
+        }
+    }
+
+    /// Returns chroma divisor (horizontal, vertical) for the pixel format.
+    pub fn chroma_div(&self) -> (u32, u32) {
+        match self {
+            PixelFormat::Yuv444 => (1, 1),
+            PixelFormat::Yuv422 => (2, 1),
+            PixelFormat::Yuv420 => (2, 2),
         }
     }
 }
@@ -567,7 +579,11 @@ trait EncoderApi: Send {
     fn coded_extent(&self) -> vk::Extent2D;
     fn input_image_extent(&self) -> vk::Extent2D;
     fn input_image(&self) -> vk::Image;
-    fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture>;
+    fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture>;
     fn flush(&mut self) -> Result<()>;
     fn set_bitrate(&mut self, requested: u32) -> Result<u32>;
     fn next_display_order(&self) -> u64;
@@ -593,8 +609,12 @@ impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
     fn input_image(&self) -> vk::Image {
         codec::CodecEncoder::input_image(self)
     }
-    fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        codec::CodecEncoder::encode(self, src_image)
+    fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
+        codec::CodecEncoder::encode_after(self, src_image, wait)
     }
     fn flush(&mut self) -> Result<()> {
         codec::CodecEncoder::flush(self)
@@ -695,7 +715,29 @@ impl Encoder {
     /// # }
     /// ```
     pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        self.0.encode(src_image)
+        self.0.encode_after(src_image, &[])
+    }
+
+    /// Encode a frame once GPU work the caller submitted has finished.
+    ///
+    /// Like [`Self::encode`], but the frame's first GPU submission waits for
+    /// every point in `wait` before touching `src_image`. Pass the point
+    /// returned by [`ColorConverter::convert_async`](crate::ColorConverter::convert_async)
+    /// to encode what it converted without waiting for the conversion on the
+    /// CPU, or a point the caller's own rendering signals.
+    ///
+    /// Only a `src_image` that is [`Self::input_image`] avoids the CPU
+    /// entirely. Any other image is first copied into the input image, and
+    /// that copy is waited for on the CPU before the encode is recorded, so
+    /// this call then blocks until the points in `wait` are reached and the
+    /// copy is done. Render or convert into [`Self::input_image`] to keep the
+    /// whole handover on the GPU.
+    pub fn encode_after(
+        &mut self,
+        src_image: vk::Image,
+        wait: &[TimelinePoint],
+    ) -> Result<EncodeFuture> {
+        self.0.encode_after(src_image, wait)
     }
 
     /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).

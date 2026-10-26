@@ -9,7 +9,7 @@ shift
 case "${dependency}" in
   pixelforge)
     upstream="https://github.com/hgaiser/pixelforge"
-    files=(Cargo.toml LICENSE README.md CHANGELOG.md src shader)
+    files=(Cargo.toml LICENSE README.md CHANGELOG.md benches src shader tests)
     ;;
   inputtino)
     upstream="https://github.com/games-on-whales/inputtino"
