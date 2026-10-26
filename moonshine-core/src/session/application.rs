@@ -1077,10 +1077,25 @@ async fn wait_for_unit_terminal_state(conn: &Connection, unit_name: &str, watch:
 					.deserialize()
 					.map_err(|e| tracing::error!("Failed to deserialize UnitRemoved signal: {e}"))?;
 				if id == unit_name {
-					return Ok("removed".to_string());
+					if let Some(state) = unit_removed_state(&query_activity(conn, unit_name).await) {
+						return Ok(state.to_string());
+					}
+					tracing::debug!(unit = unit_name, "Application unit is still running after UnitRemoved (systemd reload)");
 				}
 			},
 		}
+	}
+}
+
+/// What a `UnitRemoved` signal for the application unit establishes, given
+/// the unit's state queried after it: the terminal state, or `None` while the
+/// unit still runs. Reloading systemd (`systemctl daemon-reload`) emits
+/// `UnitRemoved` for running units too. Without an answer the signal itself
+/// is systemd's, so the unit counts as removed.
+fn unit_removed_state(activity: &Result<Activity, String>) -> Option<&'static str> {
+	match activity {
+		Ok(Activity::State(state)) => terminal_state(state),
+		Ok(Activity::Absent) | Err(_) => Some("removed"),
 	}
 }
 
@@ -1944,6 +1959,23 @@ mod tests {
 		for error in ["GetUnit failed: timeout", "unexpected ActiveState reply: signature"] {
 			assert_eq!(exit_confirmed(&Err(error.into())), None, "{error}");
 		}
+	}
+
+	/// A reload's `UnitRemoved` for a running unit must not end the session.
+	#[test]
+	fn unit_removed_during_reload_keeps_a_running_unit() {
+		use super::{Activity, unit_removed_state};
+		for state in ["active", "activating", "deactivating", "reloading"] {
+			assert_eq!(unit_removed_state(&Ok(Activity::State(state.into()))), None, "{state}");
+		}
+		for state in ["inactive", "failed"] {
+			assert_eq!(unit_removed_state(&Ok(Activity::State(state.into()))), Some(state));
+		}
+		assert_eq!(unit_removed_state(&Ok(Activity::Absent)), Some("removed"));
+		assert_eq!(
+			unit_removed_state(&Err("GetUnit failed: timeout".into())),
+			Some("removed")
+		);
 	}
 
 	#[test]

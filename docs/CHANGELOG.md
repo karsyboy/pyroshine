@@ -60,6 +60,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Keep a streamed application running through `systemctl daemon-reload`. systemd reports running units as removed while it reloads, which ended the session; the unit's state is now checked first (from Moonshine).
 - Make `pyroshine pair` use `MOONSHINE_MANAGEMENT_BUS` when it is set, like `pyroshine web` and `diag`. A pairing command started for a test instance on its own bus previously reached the live service on the session bus instead.
 
 - Stop a session promptly when it ends while its video pipeline is still preparing FEC encoders, for example when the client disconnects right after a launch and the game is then ended. Teardown waited for every encoder to be built (about 17 s in a debug build), long enough for Moonlight's and Pyrolight's quit request to time out and report a failure although the host stopped. Encoders not yet built are built on first use, as before.
