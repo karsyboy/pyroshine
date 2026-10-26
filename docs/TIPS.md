@@ -140,6 +140,7 @@ changes. See the [reference](CONFIGURATION.md) for command fields and scanners.
 - [Gamescope resolution](#use-gamescope-with-the-clients-resolution)
 - [Game fullscreen resolution](#match-a-games-fullscreen-resolution-to-the-stream)
 - [Flatpak Steam](#run-flatpak-steam-inside-pyroshines-compositor)
+- [Flatpak Bottles](#run-flatpak-bottles-inside-pyroshines-compositor)
 - [A full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Application logs](#debug-a-failing-application)
 
@@ -281,6 +282,28 @@ command = [
 The separate D-Bus session prevents host portals from redirecting Flatpak to the
 physical desktop. It keeps Pyroshine's display and audio environment effective.
 Quit any existing Flatpak Steam before launching the stream.
+
+## Run Flatpak Bottles inside Pyroshine's compositor
+
+Wrap the Bottles scanner's commands the same way:
+
+```toml
+[[application_scanner]]
+type = "bottles"
+command = [
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+    "run", "-b", "{bottle}", "--program-id", "{program_id}",
+]
+umu_command = [
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+    "umu", "run", "--game", "{umu_game}",
+]
+```
+
+As with Flatpak Steam, the separate D-Bus session keeps the host portal from
+moving the game to the physical desktop.
 
 ## Run a desktop environment for a full remote desktop
 

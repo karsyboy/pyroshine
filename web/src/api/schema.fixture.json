@@ -1995,6 +1995,214 @@
               "label": "Heroic Games Launcher"
             },
             {
+              "description": "Programs added to the Bottles Library, and its UMU games once they are ready.",
+              "fields": [
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Defaults to the native data directory when it holds a library, otherwise the Flatpak one (~/.var/app/com.usebottles.bottles/data/bottles).",
+                  "kind": {
+                    "directory": true,
+                    "expands": true,
+                    "optional": false,
+                    "type": "path"
+                  },
+                  "label": "Bottles data directory",
+                  "path": "data_dir",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Command used for each discovered application; placeholders are replaced in every argument.",
+                  "kind": {
+                    "placeholders": [
+                      "{bottle}",
+                      "{program_id}",
+                      "{name}"
+                    ],
+                    "type": "command"
+                  },
+                  "label": "Launch command",
+                  "path": "command",
+                  "required": true,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": false,
+                  "caution": null,
+                  "help": "Command for Library entries managed through Bottles' UMU integration. Without it, those entries are not offered.",
+                  "kind": {
+                    "placeholders": [
+                      "{umu_game}",
+                      "{name}"
+                    ],
+                    "type": "command"
+                  },
+                  "label": "UMU launch command",
+                  "path": "umu_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run in order before launching each discovered application (systemd ExecStartPre). A failing command can prevent launch.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "Before launch",
+                  "path": "pre_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Commands run after each discovered application stops (systemd ExecStopPost). Useful for cleanup.",
+                  "kind": {
+                    "type": "command_list"
+                  },
+                  "label": "After session",
+                  "path": "post_command",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardOutput destination. Unset discards output (\"null\").",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard output",
+                  "path": "stdout",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "systemd StandardError destination. Use \"journal\" to capture errors.",
+                  "kind": {
+                    "optional": true,
+                    "placeholder": "null",
+                    "suggestions": [
+                      "null",
+                      "journal",
+                      "inherit",
+                      "file:/path/to/log",
+                      "append:/path/to/log"
+                    ],
+                    "type": "text"
+                  },
+                  "label": "Standard error",
+                  "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
+                  "kind": {
+                    "max": 3600.0,
+                    "min": 0.0,
+                    "optional": false,
+                    "type": "integer",
+                    "unit": "s"
+                  },
+                  "label": "Launch timeout",
+                  "path": "launch_timeout_secs",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame limiting for each discovered application. Unset uses the global frame limit setting. Takes effect at the next launch.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Launch applications unchanged.",
+                        "label": "Off",
+                        "value": "off"
+                      },
+                      {
+                        "description": "Limit to the frame rate of the stream that launches the application.",
+                        "label": "Match stream FPS",
+                        "value": "stream"
+                      },
+                      {
+                        "description": "Limit to the frame rate set below.",
+                        "label": "Custom FPS",
+                        "value": "custom"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limit",
+                  "path": "frame_limit_mode",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Frame rate for a custom frame limit. Unset uses the global value.",
+                  "kind": {
+                    "max": 1000.0,
+                    "min": 10.0,
+                    "optional": true,
+                    "type": "integer",
+                    "unit": "FPS"
+                  },
+                  "label": "Frame limit FPS",
+                  "path": "frame_limit_fps",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Limiter used for this application. Unset uses the global limiter.",
+                  "kind": {
+                    "options": [
+                      {
+                        "description": "Direct3D games under Proton or Wine. Native Linux games are not limited.",
+                        "label": "Proton (DXVK, vkd3d-proton)",
+                        "value": "proton"
+                      },
+                      {
+                        "description": "Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+                        "label": "MangoHud",
+                        "value": "mangohud"
+                      }
+                    ],
+                    "type": "choice",
+                    "unset_label": "Global setting"
+                  },
+                  "label": "Frame limiter",
+                  "path": "frame_limit_method",
+                  "required": false,
+                  "section": "scanners"
+                }
+              ],
+              "id": "bottles",
+              "label": "Bottles"
+            },
+            {
               "description": "Recursively scan .desktop launchers; each entry's Exec line is its command.",
               "fields": [
                 {

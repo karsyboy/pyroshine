@@ -70,7 +70,7 @@ flowchart LR
 | --- | --- | --- |
 | `src/main.rs` | Load config, start the application library, wait for the user D-Bus session, run host checks, construct services, handle SIGTERM/SIGINT | Session state |
 | `config.rs` | Deserialize `config.toml` | Runtime reconfiguration |
-| `app_scanner/` | The application catalog: discover Steam, Lutris, Heroic and desktop-entry applications, follow their changes, keep stable IDs and visibility choices, render box art | Sessions (a launch copies its entry) |
+| `app_scanner/` | The application catalog: discover Steam, Lutris, Heroic, Bottles and desktop-entry applications, follow their changes, keep stable IDs and visibility choices, render box art | Sessions (a launch copies its entry) |
 | `healthcheck.rs`, `gpu.rs` | Probe GPU, Vulkan, DMA-BUF and encoder profiles; verify the capture and encode devices are the same GPU | Encoding |
 | `discovery.rs` | Advertise `_nvstream._tcp` over mDNS | — |
 | `tls.rs`, `clients.rs`, `state.rs`, `durable.rs` | Server identity, paired-client trust, durable `state.toml` | Session authorization |
@@ -675,7 +675,7 @@ launcher metadata ──inotify / periodic fingerprint──► library thread
 
 **Units and failures.** A scanner reports results per unit (a Steam library
 folder, the installation's user shortcuts, a Heroic library file, a desktop-entry
-directory, the Lutris database).
+directory, the Lutris database, the Bottles Library).
 A unit that cannot be read keeps its previous entries, marked stale, for up to
 seven days; a source that cannot list its units keeps all of them; a single
 unreadable Steam manifest keeps that game. Units are dropped only when the
@@ -697,7 +697,7 @@ everything at once.
 **Identity.** Manual entries keep the ID earlier releases derived from the title
 (SipHash-1-3 of the title, implemented in `identity.rs` so a toolchain update
 cannot renumber them). Discovered entries are keyed by launcher identity
-(`steam:620`, `heroic:legendary/Fortnite`, `lutris:<slug>`, desktop file ID); a
+(`steam:620`, `heroic:legendary/Fortnite`, `lutris:<slug>`, `bottles:<program ID>`, desktop file ID); a
 new key takes the title-derived ID when it is free, so the first run after an
 upgrade reports the IDs clients already know, and a collision gets a
 SHA-256-derived ID instead. The assignment is recorded in `library.toml`, so

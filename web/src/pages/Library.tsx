@@ -349,7 +349,7 @@ export function LibraryContent({
       ) : (
         <Alert severity="info" sx={{ mb: 3 }}>
           <AlertTitle>No launchers are scanned</AlertTitle>
-          Add Steam, Lutris, Heroic or desktop entries with Add launcher to offer installed games automatically.
+          Add Steam, Lutris, Heroic, Bottles or desktop entries with Add launcher to offer installed games automatically.
         </Alert>
       )}
 

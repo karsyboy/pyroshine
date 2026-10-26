@@ -47,7 +47,7 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown; `pair.rs` and `diag.rs` subcommands |
 | `desktop/` | Independently supervised existing-desktop output/audio guard, native KDE/GNOME adapters, private lifecycle RPC, durable recovery and reconnect grace |
 | `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
-| `app_scanner/` | Application catalog: Steam, Lutris, Heroic and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
+| `app_scanner/` | Application catalog: Steam, Lutris, Heroic, Bottles and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
 | `webserver/` (`mod.rs`, `pairing.rs`, `bandwidth.rs`) | GameStream HTTP/HTTPS API, operator pairing, PyroWave bandwidth probe |
 | `calibration/` | Authenticated UDP bandwidth calibration: plan, wire format, run sender, recommendation, reference receiver; video-port arbitration with sessions |

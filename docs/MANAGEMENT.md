@@ -92,7 +92,7 @@ For certificate details and terminal revocation, see
 
 **Applications** lists every application clients can be offered, with the box
 art clients show: your own (manual) entries and the games Pyroshine discovered through its scanners
-(Steam, Lutris, Heroic and desktop entries). Installed, removed and renamed
+(Steam, Lutris, Heroic, Bottles and desktop entries). Installed, removed and renamed
 games appear here, and in clients' app lists, within seconds without a restart;
 an active stream is never interrupted, even when its game is removed or hidden.
 
@@ -120,7 +120,7 @@ cannot be read, for example a Steam library on a drive that is not mounted, the
 card says why and what to do, and its games stay offered from the last
 successful scan (marked *Offline library*) until the drive is back.
 
-- **Add launcher** adds a Steam, Lutris, Heroic or desktop-entry scanner with
+- **Add launcher** adds a Steam, Lutris, Heroic, Bottles or desktop-entry scanner with
   its usual paths and launch command filled in; **Edit** on a card changes its
   library location, launch command and options, or removes it.
 - **Discovery options** turns automatic updates on or off and sets the

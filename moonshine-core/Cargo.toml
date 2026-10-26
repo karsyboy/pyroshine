@@ -81,6 +81,7 @@ uuid = { version = "1.28.0", features = ["v4"] }
 walkdir = "2.5.0"
 which = "8.0.6"
 x509-parser = "0.18.1"
+yaml_serde = "0.10"
 xcursor = "0.3.11"
 # Desktop Mode: the desktop compositor's DMA-BUF main device.
 wayland-client = "0.31"

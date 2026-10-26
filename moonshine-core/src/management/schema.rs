@@ -504,6 +504,32 @@ fn scanner_variants() -> Vec<ScannerVariant> {
 			],
 		),
 		variant(
+			"bottles",
+			"Bottles",
+			"Programs added to the Bottles Library, and its UMU games once they are ready.",
+			vec![
+				Field::new(
+					"data_dir",
+					section,
+					"Bottles data directory",
+					"Defaults to the native data directory when it holds a library, otherwise the Flatpak one (~/.var/app/com.usebottles.bottles/data/bottles).",
+					path(false, true, true),
+				)
+				.0,
+				scanner_command(&["{bottle}", "{program_id}", "{name}"]),
+				Field::new(
+					"umu_command",
+					section,
+					"UMU launch command",
+					"Command for Library entries managed through Bottles' UMU integration. Without it, those entries are not offered.",
+					FieldKind::Command {
+						placeholders: vec!["{umu_game}".into(), "{name}".into()],
+					},
+				)
+				.0,
+			],
+		),
+		variant(
 			"desktop",
 			"Desktop entries",
 			"Recursively scan .desktop launchers; each entry's Exec line is its command.",
@@ -1186,6 +1212,7 @@ pub(crate) mod tests {
 			json!({"type": "steam", "library": "~/.steam", "command": ["steam"]}),
 			json!({"type": "lutris", "pga_db": "/tmp/pga.db", "command": ["lutris"]}),
 			json!({"type": "heroic", "config_dir": "/tmp/heroic", "command": ["heroic"]}),
+			json!({"type": "bottles", "data_dir": "/tmp/bottles", "command": ["bottles-cli"], "umu_command": ["bottles-cli", "umu"]}),
 			json!({"type": "desktop", "directories": ["/tmp"], "include_terminal": true, "resolve_icons": false}),
 		];
 		config["application_scanner"] = Value::Array(

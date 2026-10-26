@@ -132,6 +132,10 @@ export const scannerPresets: Record<string, Item> = {
   steam: { library: "$HOME/.local/share/Steam", command: ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"] },
   lutris: { command: ["/usr/bin/lutris", "lutris:rungame/{slug}"] },
   heroic: { command: ["/usr/bin/heroic", "heroic://launch?appName={app_name}&runner={runner}"] },
+  bottles: {
+    command: ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"],
+    umu_command: ["bottles-cli", "umu", "run", "--game", "{umu_game}"],
+  },
   desktop: { directories: ["$HOME/.local/share/applications", "/usr/share/applications"], include_terminal: false, resolve_icons: true },
 };
 

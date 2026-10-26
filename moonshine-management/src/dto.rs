@@ -745,7 +745,7 @@ pub struct LibrarySnapshot {
 pub struct LibrarySource {
 	/// Position among the configured scanners.
 	pub scanner: u32,
-	/// `steam`, `lutris`, `heroic` or `desktop`.
+	/// `steam`, `lutris`, `heroic`, `bottles` or `desktop`.
 	pub kind: String,
 	pub label: String,
 	/// The configured location it reads.
@@ -775,7 +775,7 @@ pub struct LibraryApplication {
 	pub id: i32,
 	/// Title as clients see it.
 	pub title: String,
-	/// `manual`, `steam`, `lutris`, `heroic` or `desktop`.
+	/// `manual`, `steam`, `lutris`, `heroic`, `bottles` or `desktop`.
 	pub source: String,
 	pub source_label: String,
 	pub manual: bool,

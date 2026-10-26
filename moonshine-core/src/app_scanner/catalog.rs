@@ -493,6 +493,40 @@ mod tests {
 	}
 
 	#[test]
+	fn a_bottles_desktop_shortcut_is_offered_once() {
+		let mut identity = IdentityStore::in_memory();
+		let mut hades = found("abc-123", "Hades");
+		hades
+			.aliases
+			.push(super::super::bottles::program_alias("Gaming", "Hades"));
+		let mut shortcut = found("Gaming--Hades.desktop", "Hades");
+		shortcut.launches = super::super::launcher_target(&[
+			"bottles-cli".into(),
+			"run".into(),
+			"-p".into(),
+			"Hades".into(),
+			"-b".into(),
+			"Gaming".into(),
+		]);
+		let snapshot = catalog(
+			&[],
+			&[
+				(ScannerKind::Bottles, vec![hades]),
+				(ScannerKind::Desktop, vec![shortcut]),
+			],
+			&mut identity,
+		);
+		let offered: Vec<_> = snapshot.offered().map(|entry| entry.key.as_str()).collect();
+		assert_eq!(offered, vec!["bottles:abc-123"]);
+		assert_eq!(
+			snapshot.find_key("desktop:Gaming--Hades.desktop").unwrap().state,
+			EntryState::Duplicate {
+				of: "bottles:abc-123".into()
+			}
+		);
+	}
+
+	#[test]
 	fn equal_titles_from_different_launchers_are_told_apart_with_distinct_ids() {
 		let mut identity = IdentityStore::in_memory();
 		let snapshot = catalog(

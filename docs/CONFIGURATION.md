@@ -458,6 +458,7 @@ Those values are copied to each discovered application. Scanners do not accept
 | `steam` | `library`: required path string | `command`: required array; `{game_id}` is replaced in each argument | Installed Steam games and non-Steam shortcuts added to the host's Steam Library. |
 | `lutris` | `pga_db`: path string, defaults to the user's data directory + `/lutris/pga.db` (usually `~/.local/share/lutris/pga.db`) | `command`: required array; `{slug}` is replaced | Installed entries from the Lutris database. |
 | `heroic` | `config_dir`: path string, defaults to native Heroic config when present, otherwise an existing Flatpak Heroic config, otherwise the native path | `command`: required array; `{app_name}` and `{runner}` are replaced | Installed games across Heroic stores and sideloaded apps; excludes DLC. Native config is usually `~/.config/heroic`; Flatpak config is `~/.var/app/com.heroicgameslauncher.hgl/config/heroic`. |
+| `bottles` | `data_dir`: path string, defaults to the first of `~/.local/share/bottles` and `~/.var/app/com.usebottles.bottles/data/bottles` that holds a `library.yml` | `command`: required array; `{bottle}`, `{program_id}` and `{name}` are replaced. `umu_command`: optional array for UMU entries; `{umu_game}` and `{name}` are replaced | Programs added to the Bottles Library ("Add to Library"), not every program Bottles finds. UMU entries appear once Bottles reports them ready, and only with `umu_command`; entries Bottles starts through Steam are left to the Steam scanner. |
 | `desktop` | `directories`: required array of path strings | No `command` field; uses the desktop entry's `Exec` | Recursively scan `.desktop` files in the supplied directories. |
 
 Scanner source paths support `~` and environment-variable expansion. Placeholder
@@ -478,14 +479,15 @@ Box art comes from local files only, best first: for Steam, art you set in
 Steam (`userdata/*/config/grid`), then the portrait, capsule and header art
 Steam caches in `appcache/librarycache`, then the icon of a Steam desktop
 shortcut; for Lutris, cover art, banners and its shortcut icon; for Heroic, the
-cover art it cached; for desktop entries, the entry's icon. If an image cannot
+cover art it cached; for Bottles, the grid art it downloaded, then the
+program's icon; for desktop entries, the entry's icon. If an image cannot
 be read or decoded, the next one is used; clients show a placeholder when none
 works. Nothing is downloaded.
 
 Each discovered game keeps its client-facing ID across rescans, renames,
 reinstalls and restarts (see [Applications](MANAGEMENT.md#applications)). The
 catalog leaves out what clients do not need twice: a desktop shortcut that
-starts a Steam, Lutris or Heroic game already in the catalog, the same game
+starts a Steam, Lutris, Heroic or Bottles game already in the catalog, the same game
 found by two scanners of one launcher, Steam's Proton and runtime tools, and
 DLC. Games with equal titles from different launchers get the launcher in their
 title, for example `Hades (Steam)` and `Hades (Heroic)`. Individual games can be
@@ -522,13 +524,23 @@ type = "heroic"
 command = ["/usr/bin/heroic", "heroic://launch?appName={app_name}&runner={runner}"]
 
 [[application_scanner]]
+type = "bottles"
+command = ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"]
+umu_command = ["bottles-cli", "umu", "run", "--game", "{umu_game}"]
+
+[[application_scanner]]
 type = "desktop"
 directories = ["$HOME/.local/share/applications", "/usr/share/applications"]
 include_terminal = false
 resolve_icons = true
 ```
 
-For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-inside-pyroshines-compositor).
+For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-inside-pyroshines-compositor);
+Flatpak Bottles uses [the same wrapper](TIPS.md#run-flatpak-bottles-inside-pyroshines-compositor).
+A bare `bottles-cli` only works for a natively installed Bottles. Bottles starts
+programs that live outside the bottle (for example on a separate game drive)
+through `wine start`, which exits at once, so the session ends shortly after
+launch; games installed inside the bottle are unaffected.
 
 ## `[library]`
 
@@ -539,7 +551,7 @@ running, and clients see the change in their app list.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests, library folders and non-Steam shortcuts, the Lutris database, Heroic library files, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
+| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests, library folders and non-Steam shortcuts, the Lutris database, Heroic library files, the Bottles Library, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
 | `poll_interval_secs` | integer, `300`; `30`–`86400` | Seconds between checks for changes that file notifications cannot report, such as network file systems, a drive that is mounted later or an exhausted inotify watch limit. A check compares file metadata only; a launcher is rescanned only when it changed. |
 
 A launcher location that cannot be read (an unmounted drive holding a Steam

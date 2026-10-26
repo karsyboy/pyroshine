@@ -16,6 +16,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Added
 
+- Discover games in the Bottles Library with a new `bottles` application scanner, natively installed or as a Flatpak, including UMU games once Bottles reports them ready. Games keep stable `bottles:` identities, use the grid art Bottles downloaded, follow Library changes automatically, and Bottles' own desktop shortcuts are not offered twice. See [application scanners](CONFIGURATION.md#application_scanner) (from Moonshine).
+
 - Discover non-Steam games added to the host's Steam Library and offer them to clients alongside installed Steam games. Launch them through Steam with their saved launch options and Proton settings, follow saved shortcut changes automatically, and use their custom Steam grid artwork. See [application scanners](CONFIGURATION.md#application_scanner).
 
 - Add optional paired-client `expectedAppId` cancellation for PyroDeck. Compare the selected GameStream application under the lifecycle lock before teardown; stale requests for a different game return a conflict. Standard GameStream cancellation is unchanged. See [Client integration](CLIENT_INTEGRATION.md#conditional-application-cancellation).

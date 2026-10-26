@@ -1,8 +1,9 @@
 //! Application discovery and the managed application catalog.
 //!
-//! Scanners (`steam`, `lutris`, `heroic`, `desktop`) read launcher metadata
+//! Scanners (`steam`, `lutris`, `heroic`, `bottles`, `desktop`) read launcher metadata
 //! and report what they found per *unit*: a Steam library folder, a Heroic
-//! library file, a desktop-entry directory, the Lutris database. A unit that
+//! library file, a desktop-entry directory, the Lutris database, the Bottles
+//! Library. A unit that
 //! cannot be read reports an error instead of an empty list, so the catalog
 //! keeps its last known-good entries rather than dropping a library that is
 //! briefly unavailable or half-written.
@@ -17,12 +18,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use bottles::BottlesApplicationScannerConfig;
 use desktop::DesktopApplicationScannerConfig;
 use heroic::HeroicApplicationScannerConfig;
 use lutris::LutrisApplicationScannerConfig;
 use steam::SteamApplicationScannerConfig;
 
 pub(crate) mod artwork;
+pub mod bottles;
 pub mod catalog;
 pub mod desktop;
 pub mod heroic;
@@ -55,6 +58,9 @@ pub enum ApplicationScannerConfig {
 
 	/// Scans the Heroic Games Launcher library caches.
 	Heroic(HeroicApplicationScannerConfig),
+
+	/// Scans the Bottles Library.
+	Bottles(BottlesApplicationScannerConfig),
 }
 
 /// Launcher a scanner reads.
@@ -65,6 +71,7 @@ pub enum ScannerKind {
 	Desktop,
 	Lutris,
 	Heroic,
+	Bottles,
 }
 
 impl ScannerKind {
@@ -75,6 +82,7 @@ impl ScannerKind {
 			Self::Desktop => "desktop",
 			Self::Lutris => "lutris",
 			Self::Heroic => "heroic",
+			Self::Bottles => "bottles",
 		}
 	}
 
@@ -84,6 +92,7 @@ impl ScannerKind {
 			Self::Desktop => "Desktop entries",
 			Self::Lutris => "Lutris",
 			Self::Heroic => "Heroic",
+			Self::Bottles => "Bottles",
 		}
 	}
 
@@ -103,6 +112,7 @@ impl ApplicationScannerConfig {
 			Self::Desktop(_) => ScannerKind::Desktop,
 			Self::Lutris(_) => ScannerKind::Lutris,
 			Self::Heroic(_) => ScannerKind::Heroic,
+			Self::Bottles(_) => ScannerKind::Bottles,
 		}
 	}
 
@@ -113,6 +123,7 @@ impl ApplicationScannerConfig {
 			Self::Desktop(config) => &config.frame_limit,
 			Self::Lutris(config) => &config.frame_limit,
 			Self::Heroic(config) => &config.frame_limit,
+			Self::Bottles(config) => &config.frame_limit,
 		}
 	}
 
@@ -122,6 +133,7 @@ impl ApplicationScannerConfig {
 			Self::Steam(config) => config.library.display().to_string(),
 			Self::Lutris(config) => config.pga_db.display().to_string(),
 			Self::Heroic(config) => config.config_dir.display().to_string(),
+			Self::Bottles(config) => config.data_dir.display().to_string(),
 			Self::Desktop(config) => config
 				.directories
 				.iter()
@@ -138,6 +150,7 @@ impl ApplicationScannerConfig {
 			Self::Desktop(config) => desktop::scan(config, icons),
 			Self::Lutris(config) => lutris::scan(config),
 			Self::Heroic(config) => heroic::scan(config),
+			Self::Bottles(config) => bottles::scan(config),
 		}
 	}
 
@@ -148,6 +161,7 @@ impl ApplicationScannerConfig {
 			Self::Desktop(config) => desktop::watch_targets(config),
 			Self::Lutris(config) => lutris::watch_targets(config),
 			Self::Heroic(config) => heroic::watch_targets(config),
+			Self::Bottles(config) => bottles::watch_targets(config),
 		}
 	}
 
@@ -165,7 +179,7 @@ impl ApplicationScannerConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Discovered {
 	/// Launcher-native identity, unique per launcher: Steam app ID, Lutris
-	/// slug, Heroic `runner/app_name`, desktop file ID.
+	/// slug, Heroic `runner/app_name`, Bottles program ID, desktop file ID.
 	pub native_id: String,
 	pub application: ApplicationConfig,
 	/// Further images to try, in order, when `application.boxart` is missing
@@ -305,8 +319,12 @@ pub(crate) fn expand_path(path: &std::path::Path) -> Option<PathBuf> {
 /// Identity a launcher command starts, when it is a shortcut to an
 /// application another scanner owns: `steam://rungameid/<id>`,
 /// `lutris:rungameid/<id>`, `lutris:rungame/<slug>`,
-/// `heroic://launch/<runner>/<app>` or `heroic://launch?appName=..&runner=..`.
+/// `heroic://launch/<runner>/<app>`, `heroic://launch?appName=..&runner=..`
+/// or `bottles-cli run -b <bottle> -p <program>`.
 pub(crate) fn launcher_target(command: &[String]) -> Option<String> {
+	if let Some(target) = bottles_shortcut_target(command) {
+		return Some(target);
+	}
 	for argument in command {
 		let argument = argument.trim();
 		if let Some(rest) = argument.split("steam://rungameid/").nth(1) {
@@ -348,6 +366,27 @@ pub(crate) fn launcher_target(command: &[String]) -> Option<String> {
 	None
 }
 
+/// The program a Bottles desktop shortcut runs. Bottles writes them as
+/// `bottles-cli run -p <program> -b <bottle>`, through `flatpak run
+/// --command=bottles-cli com.usebottles.bottles` for the Flatpak.
+fn bottles_shortcut_target(command: &[String]) -> Option<String> {
+	let cli = command
+		.iter()
+		.position(|argument| argument.ends_with("bottles-cli") || argument == "--command=bottles-cli")?;
+	let mut arguments = command[cli + 1..].iter().map(String::as_str);
+	arguments.find(|argument| *argument == "run")?;
+	let (mut bottle, mut program) = (None, None);
+	while let Some(argument) = arguments.next() {
+		match argument {
+			"-b" | "--bottle" => bottle = arguments.next(),
+			"-p" | "--program" => program = arguments.next(),
+			"--" => break,
+			_ => {},
+		}
+	}
+	Some(bottles::program_alias(bottle?, program?))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -373,6 +412,25 @@ mod tests {
 			target(&["heroic", "heroic://launch?appName=abc&runner=gog"]),
 			Some("heroic:gog/abc".into())
 		);
+		assert_eq!(
+			target(&["bottles-cli", "run", "-p", "Hades", "-b", "Gaming", "--", "%u"]),
+			Some("bottles:program:Gaming/Hades".into())
+		);
+		assert_eq!(
+			target(&[
+				"flatpak",
+				"run",
+				"--command=bottles-cli",
+				"com.usebottles.bottles",
+				"run",
+				"-b",
+				"Gaming",
+				"-p",
+				"Hades"
+			]),
+			Some("bottles:program:Gaming/Hades".into())
+		);
+		assert_eq!(target(&["bottles-cli", "run", "-b", "Gaming"]), None);
 		assert_eq!(target(&["/usr/bin/firefox", "%u"]), None);
 		assert_eq!(target(&["steam", "steam://open/bigpicture"]), None);
 	}
