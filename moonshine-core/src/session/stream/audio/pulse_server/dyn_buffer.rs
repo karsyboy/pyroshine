@@ -10,12 +10,17 @@ pub(super) enum DynPlaybackBuffer {
 }
 
 impl DynPlaybackBuffer {
-	pub fn new(sample_spec: pulse::SampleSpec, channel_map: pulse::ChannelMap, output_spec: pulse::SampleSpec) -> Self {
-		match output_spec.channels {
-			6 => Self::Surround51(Box::new(PlaybackBuffer::new(sample_spec, channel_map, output_spec))),
-			8 => Self::Surround71(Box::new(PlaybackBuffer::new(sample_spec, channel_map, output_spec))),
-			_ => Self::Stereo(Box::new(PlaybackBuffer::new(sample_spec, channel_map, output_spec))),
-		}
+	/// Fails when the stream's rate cannot be resampled to the output rate.
+	pub fn new(
+		sample_spec: pulse::SampleSpec,
+		channel_map: pulse::ChannelMap,
+		output_spec: pulse::SampleSpec,
+	) -> Result<Self, String> {
+		Ok(match output_spec.channels {
+			6 => Self::Surround51(Box::new(PlaybackBuffer::new(sample_spec, channel_map, output_spec)?)),
+			8 => Self::Surround71(Box::new(PlaybackBuffer::new(sample_spec, channel_map, output_spec)?)),
+			_ => Self::Stereo(Box::new(PlaybackBuffer::new(sample_spec, channel_map, output_spec)?)),
+		})
 	}
 
 	pub fn reconfigure_output(&mut self, output_spec: pulse::SampleSpec) {
@@ -24,7 +29,14 @@ impl DynPlaybackBuffer {
 			Self::Surround51(b) => (b.buffer().sample_spec, b.buffer().channel_map),
 			Self::Surround71(b) => (b.buffer().sample_spec, b.buffer().channel_map),
 		};
-		*self = Self::new(sample_spec, channel_map, output_spec);
+		// Only the channel layout changes; the rates were accepted with the stream.
+		match Self::new(sample_spec, channel_map, output_spec) {
+			Ok(buffer) => *self = buffer,
+			Err(err) => {
+				tracing::error!("Failed to rebuild a playback buffer for the new output layout: {err}");
+				self.clear();
+			},
+		}
 	}
 
 	pub fn len_bytes(&self) -> usize {
@@ -74,9 +86,9 @@ impl DynPlaybackBuffer {
 	/// rest of `output` is left silent.
 	pub fn drain_and_mix(&mut self, num_frames: usize, output: &mut [f32], vol: &[f32], tail: bool) -> bool {
 		match self {
-			Self::Stereo(b) => drain_mix_impl(b, num_frames, output, vol, tail),
-			Self::Surround51(b) => drain_mix_impl(b, num_frames, output, vol, tail),
-			Self::Surround71(b) => drain_mix_impl(b, num_frames, output, vol, tail),
+			Self::Stereo(b) => b.drain_and_mix(num_frames, output, vol, tail),
+			Self::Surround51(b) => b.drain_and_mix(num_frames, output, vol, tail),
+			Self::Surround71(b) => b.drain_and_mix(num_frames, output, vol, tail),
 		}
 	}
 
@@ -90,33 +102,6 @@ impl DynPlaybackBuffer {
 	}
 }
 
-fn drain_mix_impl<F: dasp::Frame<Sample = f32>>(
-	buffer: &mut PlaybackBuffer<F>,
-	num_frames: usize,
-	output: &mut [f32],
-	vol: &[f32],
-	tail: bool,
-) -> bool {
-	let num_frames = if tail {
-		num_frames.min(buffer.available_frames())
-	} else {
-		num_frames
-	};
-	let Some(frames) = buffer.drain(num_frames) else {
-		return false;
-	};
-	let resampled = dasp::Signal::into_interleaved_samples(frames).into_iter();
-	for (i, (sample, s)) in output
-		.iter_mut()
-		.zip(resampled)
-		.take(num_frames * F::CHANNELS)
-		.enumerate()
-	{
-		*sample += s * vol[i % vol.len()];
-	}
-	true
-}
-
 #[cfg(test)]
 mod epoch_tests {
 	use super::*;
@@ -127,7 +112,7 @@ mod epoch_tests {
 			channels: 2,
 			sample_rate: 48_000,
 		};
-		let mut buffer = DynPlaybackBuffer::new(spec, pulse::ChannelMap::stereo(), spec);
+		let mut buffer = DynPlaybackBuffer::new(spec, pulse::ChannelMap::stereo(), spec).unwrap();
 		for channels in [6, 8, 2] {
 			buffer.write(&0.8f32.to_le_bytes().repeat(20));
 			buffer.reconfigure_output(pulse::SampleSpec { channels, ..spec });

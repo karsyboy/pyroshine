@@ -1,57 +1,89 @@
 use std::{collections::VecDeque, io};
 
 use byteorder::{BigEndian as BE, LittleEndian as LE, ReadBytesExt as _};
-use dasp::{interpolate::sinc::Sinc, ring_buffer, signal::interpolate::Converter};
 use pulseaudio::protocol::{self as pulse, ChannelPosition};
+use rubato::Resampler as _;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
-/// Raw bytes go in, (optionally) resampled frames come out.
+/// Output frames per resampler call until the first drain sets the clock's
+/// tick size: 5 ms at the 48 kHz sink rate.
+const INITIAL_RESAMPLE_FRAMES: usize = 240;
+
+/// Raw bytes go in; frames in the sink's speaker layout, at the sink's rate,
+/// come out.
 pub(crate) enum PlaybackBuffer<F>
 where
 	F: dasp::Frame<Sample = f32>,
 {
 	Passthrough(Buffer<F>),
-	Resampling {
-		converter: Converter<Buffer<F>, Sinc<[F; 32]>>,
-		output_rate: u32,
-	},
+	Resampling(Box<Resampling<F>>),
+}
+
+/// A stream at another rate than the sink: its frames are routed to the
+/// sink's speakers first, then converted with rubato's asynchronous sinc
+/// resampler. (dasp's 32-tap sinc converter, used before, reached only about
+/// 21 dB SNR for a 44.1 kHz stream, which made dialog sound robotic.)
+pub(crate) struct Resampling<F>
+where
+	F: dasp::Frame<Sample = f32>,
+{
+	buffer: Buffer<F>,
+	output_rate: u32,
+	resampler: rubato::Async<f32>,
+	/// Interleaved scratch reused by every call: remixed input and resampled output.
+	input: Vec<f32>,
+	output: Vec<f32>,
 }
 
 impl<F> PlaybackBuffer<F>
 where
 	F: dasp::Frame<Sample = f32>,
 {
-	pub fn new(sample_spec: pulse::SampleSpec, channel_map: pulse::ChannelMap, output_spec: pulse::SampleSpec) -> Self {
+	/// Fails when rubato cannot convert between the two rates, so the stream
+	/// can be refused instead of the audio thread failing later.
+	pub fn new(
+		sample_spec: pulse::SampleSpec,
+		channel_map: pulse::ChannelMap,
+		output_spec: pulse::SampleSpec,
+	) -> Result<Self, String> {
 		assert_eq!(output_spec.channels as usize, F::CHANNELS);
 
 		let buffer = Buffer::new(sample_spec, channel_map);
 		if sample_spec.sample_rate == output_spec.sample_rate {
-			Self::Passthrough(buffer)
-		} else {
-			let ringbuf = ring_buffer::Fixed::from([F::EQUILIBRIUM; 32]);
-			let interpolator = Sinc::new(ringbuf);
-			Self::Resampling {
-				converter: dasp::Signal::from_hz_to_hz(
-					buffer,
-					interpolator,
-					sample_spec.sample_rate as f64,
-					output_spec.sample_rate as f64,
-				),
-				output_rate: output_spec.sample_rate,
-			}
+			return Ok(Self::Passthrough(buffer));
 		}
+		let resampler = new_resampler(
+			sample_spec.sample_rate,
+			output_spec.sample_rate,
+			INITIAL_RESAMPLE_FRAMES,
+			F::CHANNELS,
+		)
+		.map_err(|e| {
+			format!(
+				"cannot resample {} Hz to {} Hz: {e}",
+				sample_spec.sample_rate, output_spec.sample_rate
+			)
+		})?;
+		Ok(Self::Resampling(Box::new(Resampling {
+			buffer,
+			output_rate: output_spec.sample_rate,
+			resampler,
+			input: Vec::new(),
+			output: Vec::new(),
+		})))
 	}
 
 	pub fn buffer(&self) -> &Buffer<F> {
 		match self {
 			PlaybackBuffer::Passthrough(buffer) => buffer,
-			PlaybackBuffer::Resampling { converter, .. } => converter.source(),
+			PlaybackBuffer::Resampling(resampling) => &resampling.buffer,
 		}
 	}
 
 	fn buffer_mut(&mut self) -> &mut Buffer<F> {
 		match self {
 			PlaybackBuffer::Passthrough(buffer) => buffer,
-			PlaybackBuffer::Resampling { converter, .. } => converter.source_mut(),
+			PlaybackBuffer::Resampling(resampling) => &mut resampling.buffer,
 		}
 	}
 
@@ -68,9 +100,9 @@ where
 	pub fn available_frames(&self) -> usize {
 		match self {
 			PlaybackBuffer::Passthrough(buffer) => buffer.len_frames(),
-			PlaybackBuffer::Resampling { converter, output_rate } => {
-				let buffer = converter.source();
-				buffer.len_frames() * *output_rate as usize / buffer.sample_spec.sample_rate as usize
+			PlaybackBuffer::Resampling(resampling) => {
+				let buffer = &resampling.buffer;
+				buffer.len_frames() * resampling.output_rate as usize / buffer.sample_spec.sample_rate as usize
 			},
 		}
 	}
@@ -79,75 +111,117 @@ where
 		let _ = io::Write::write_all(&mut self.buffer_mut().inner, payload);
 	}
 
-	/// Reads data from the buffer at the output sample rate, returning
-	/// `num_frames` at that rate, or None if there's insufficient data.
-	///
-	/// Dropping the returned signal removes the remaining unread data.
-	pub fn drain(&mut self, num_frames: usize) -> Option<impl dasp::Signal<Frame = F> + '_> {
-		match self {
-			PlaybackBuffer::Passthrough(buffer) => buffer.drain(num_frames).map(EitherSignal::Left),
-			PlaybackBuffer::Resampling { converter, output_rate } => {
-				let buffer = converter.source();
-				let needed_frames =
-					(buffer.sample_spec.sample_rate as usize * num_frames).div_ceil(*output_rate as usize);
-
-				if buffer.len_frames() < needed_frames {
-					return None;
-				}
-
-				Some(EitherSignal::Right(Drain {
-					signal: converter,
-					remaining: num_frames,
-				}))
-			},
-		}
-	}
-
-	pub fn clear(&mut self) {
-		let buffer = self.buffer();
-		let sample_spec = buffer.sample_spec;
-		let channel_map = buffer.channel_map;
-		let sample_rate = match self {
-			Self::Passthrough(_) => sample_spec.sample_rate,
-			Self::Resampling { output_rate, .. } => *output_rate,
+	/// Mix `num_frames` frames at the output rate into the interleaved
+	/// `output`, scaled by the per-channel `vol`. Returns `false` on underrun,
+	/// leaving the buffer untouched. With `tail`, fewer frames (or none) are
+	/// mixed if that is all there is; the rest of `output` is left silent.
+	pub fn drain_and_mix(&mut self, num_frames: usize, output: &mut [f32], vol: &[f32], tail: bool) -> bool {
+		let mix = if tail {
+			num_frames.min(self.available_frames())
+		} else {
+			num_frames
 		};
-		*self = Self::new(
-			sample_spec,
-			channel_map,
-			pulse::SampleSpec {
-				channels: F::CHANNELS as u8,
-				sample_rate,
-				format: pulse::SampleFormat::Float32Le,
+		match self {
+			PlaybackBuffer::Passthrough(buffer) => {
+				if buffer.len_frames() < mix {
+					return false;
+				}
+				for out_frame in output.chunks_exact_mut(F::CHANNELS).take(mix) {
+					let frame = buffer.read_frame().unwrap_or(F::EQUILIBRIUM);
+					for (ch, (out, sample)) in out_frame.iter_mut().zip(frame.channels()).enumerate() {
+						*out += sample * vol[ch % vol.len()];
+					}
+				}
+				true
 			},
-		);
+			PlaybackBuffer::Resampling(resampling) => resampling.drain_and_mix(num_frames, mix, output, vol, tail),
+		}
+	}
+
+	/// Drop all queued audio, including what the resampler's filter still holds.
+	pub fn clear(&mut self) {
+		self.buffer_mut().inner.clear();
+		if let PlaybackBuffer::Resampling(resampling) = self {
+			resampling.resampler.reset();
+		}
 	}
 }
 
-enum EitherSignal<L, R> {
-	Left(L),
-	Right(R),
-}
-
-impl<L, R> dasp::Signal for EitherSignal<L, R>
+impl<F> Resampling<F>
 where
-	L: dasp::Signal,
-	R: dasp::Signal<Frame = L::Frame>,
+	F: dasp::Frame<Sample = f32>,
 {
-	type Frame = L::Frame;
-
-	fn next(&mut self) -> Self::Frame {
-		match self {
-			EitherSignal::Left(s) => s.next(),
-			EitherSignal::Right(s) => s.next(),
+	/// Resample one tick of `num_frames` output frames and mix the first `mix`.
+	///
+	/// The resampler yields exactly `num_frames` per call, consuming a varying
+	/// number of input frames (220 or 221 for a 44.1 kHz stream at 240). A
+	/// tail call feeds what is left and lets rubato pad it with silence.
+	fn drain_and_mix(&mut self, num_frames: usize, mix: usize, output: &mut [f32], vol: &[f32], tail: bool) -> bool {
+		let channels = F::CHANNELS;
+		if num_frames == 0 || mix == 0 {
+			return tail || num_frames == 0;
 		}
-	}
-
-	fn is_exhausted(&self) -> bool {
-		match self {
-			EitherSignal::Left(s) => s.is_exhausted(),
-			EitherSignal::Right(s) => s.is_exhausted(),
+		if self.resampler.output_frames_max() != num_frames {
+			// The clock's tick size, fixed for a stream unless the packet duration changes.
+			match new_resampler(
+				self.buffer.sample_spec.sample_rate,
+				self.output_rate,
+				num_frames,
+				channels,
+			) {
+				Ok(resampler) => self.resampler = resampler,
+				Err(err) => {
+					tracing::error!("Failed to rebuild the audio resampler: {err}");
+					return false;
+				},
+			}
 		}
+
+		let needed = self.resampler.input_frames_next();
+		let available = self.buffer.len_frames();
+		if available < needed && !tail {
+			return false;
+		}
+		let read = needed.min(available);
+		self.input.resize(needed * channels, 0.0);
+		self.output.resize(num_frames * channels, 0.0);
+		for frame_input in self.input.chunks_exact_mut(channels).take(read) {
+			let frame = self.buffer.read_frame().unwrap_or(F::EQUILIBRIUM);
+			for (sample, value) in frame_input.iter_mut().zip(frame.channels()) {
+				*sample = value;
+			}
+		}
+
+		let input = InterleavedSlice::new(self.input.as_slice(), channels, needed).expect("input sized above");
+		let mut out =
+			InterleavedSlice::new_mut(self.output.as_mut_slice(), channels, num_frames).expect("output sized above");
+		let indexing = (read < needed).then(|| rubato::Indexing::new().partial_len(read));
+		if let Err(err) = self.resampler.process_into_buffer(&input, &mut out, indexing.as_ref()) {
+			tracing::error!("Failed to resample audio: {err}");
+			return false;
+		}
+
+		for (i, (out, sample)) in output.iter_mut().zip(&self.output).take(mix * channels).enumerate() {
+			*out += sample * vol[(i % channels) % vol.len()];
+		}
+		true
 	}
+}
+
+fn new_resampler(
+	input_rate: u32,
+	output_rate: u32,
+	output_frames: usize,
+	channels: usize,
+) -> Result<rubato::Async<f32>, rubato::ResamplerConstructionError> {
+	rubato::Async::<f32>::new_sinc(
+		f64::from(output_rate) / f64::from(input_rate),
+		1.0, // The ratio never changes.
+		&rubato::SincInterpolationParameters::default(),
+		output_frames,
+		channels,
+		rubato::FixedAsync::Output,
+	)
 }
 
 pub(crate) struct Buffer<F>
@@ -221,67 +295,6 @@ where
 			pulse::SampleFormat::S24Le => self.inner.read_i24::<LE>().ok().map(Sample::from_sample),
 			pulse::SampleFormat::S24Be => self.inner.read_i24::<BE>().ok().map(Sample::from_sample),
 			_ => unreachable!("unsupported sample format {:?}", self.sample_spec.format),
-		}
-	}
-}
-
-impl<F> Buffer<F>
-where
-	F: dasp::Frame<Sample = f32>,
-{
-	fn drain(&mut self, num_frames: usize) -> Option<Drain<'_, Self>> {
-		if self.len_frames() < num_frames {
-			return None;
-		}
-
-		Some(Drain {
-			signal: self,
-			remaining: num_frames,
-		})
-	}
-}
-
-impl<F> dasp::Signal for Buffer<F>
-where
-	F: dasp::Frame<Sample = f32>,
-{
-	type Frame = F;
-
-	fn next(&mut self) -> Self::Frame {
-		self.read_frame().unwrap_or(<Self::Frame as dasp::Frame>::EQUILIBRIUM)
-	}
-}
-
-struct Drain<'a, S: dasp::Signal> {
-	signal: &'a mut S,
-	remaining: usize,
-}
-
-impl<S: dasp::Signal> dasp::Signal for Drain<'_, S> {
-	type Frame = S::Frame;
-
-	fn is_exhausted(&self) -> bool {
-		self.remaining == 0
-	}
-
-	fn next(&mut self) -> Self::Frame {
-		if self.remaining == 0 {
-			<Self::Frame as dasp::Frame>::EQUILIBRIUM
-		} else {
-			self.remaining -= 1;
-			dasp::Signal::next(&mut self.signal)
-		}
-	}
-}
-
-impl<S: dasp::Signal> Drop for Drain<'_, S> {
-	fn drop(&mut self) {
-		for _ in 0..self.remaining {
-			if self.signal.is_exhausted() {
-				break;
-			}
-
-			let _ = dasp::Signal::next(&mut self.signal);
 		}
 	}
 }
@@ -425,28 +438,143 @@ fn stereo_gains(position: ChannelPosition) -> (f32, f32) {
 #[cfg(test)]
 mod epoch_tests {
 	use super::*;
+
+	fn spec(format: pulse::SampleFormat, sample_rate: u32) -> pulse::SampleSpec {
+		pulse::SampleSpec {
+			format,
+			channels: 2,
+			sample_rate,
+		}
+	}
+
+	fn stereo(sample_rate: u32) -> PlaybackBuffer<[f32; 2]> {
+		PlaybackBuffer::new(
+			spec(pulse::SampleFormat::Float32Le, sample_rate),
+			pulse::ChannelMap::stereo(),
+			spec(pulse::SampleFormat::Float32Le, 48_000),
+		)
+		.unwrap()
+	}
+
+	/// Single-tone SNR of the left channel in dB; higher is cleaner.
+	fn snr_db(interleaved: &[f32], freq: f64, rate: f64) -> f64 {
+		let left: Vec<f64> = interleaved.iter().step_by(2).map(|&x| f64::from(x)).collect();
+		let n = left.len() as f64;
+		let (mut re, mut im) = (0.0f64, 0.0f64);
+		for (i, &s) in left.iter().enumerate() {
+			let phase = 2.0 * std::f64::consts::PI * freq * (i as f64) / rate;
+			re += s * phase.cos();
+			im += s * phase.sin();
+		}
+		let fundamental = 2.0 * (re * re + im * im) / (n * n);
+		let total = left.iter().map(|&s| s * s).sum::<f64>() / n;
+		10.0 * (fundamental / (total - fundamental).max(1e-12)).log10()
+	}
+
 	#[test]
 	fn clearing_pcm_also_clears_resampler_history() {
 		for rate in [48_000, 44_100] {
-			let spec = pulse::SampleSpec {
-				format: pulse::SampleFormat::Float32Le,
-				channels: 2,
-				sample_rate: rate,
-			};
-			let out = pulse::SampleSpec {
-				sample_rate: 48_000,
-				..spec
-			};
-			let mut buffer = PlaybackBuffer::<[f32; 2]>::new(spec, pulse::ChannelMap::stereo(), out);
-			buffer.write(&0.8f32.to_le_bytes().repeat(1000));
-			let _ = dasp::Signal::next(&mut buffer.drain(100).unwrap());
+			let mut buffer = stereo(rate);
+			buffer.write(&0.8f32.to_le_bytes().repeat(2000));
+			let mut out = vec![0.0f32; 240 * 2];
+			assert!(buffer.drain_and_mix(240, &mut out, &[1.0, 1.0], false));
 			buffer.clear();
 			assert!(buffer.is_empty());
-			buffer.write(&0.0f32.to_le_bytes().repeat(1000));
-			let mut samples = buffer.drain(100).unwrap();
-			for _ in 0..100 {
-				assert_eq!(dasp::Signal::next(&mut samples), [0.0, 0.0]);
+			buffer.write(&0.0f32.to_le_bytes().repeat(2000));
+			out.fill(0.0);
+			assert!(buffer.drain_and_mix(240, &mut out, &[1.0, 1.0], false));
+			assert!(
+				out.iter().all(|s| s.abs() < 1e-6),
+				"{rate} Hz: audio from before the flush leaked through: {:?}",
+				&out[..8]
+			);
+		}
+	}
+
+	/// Resampling 44.1 kHz to 48 kHz stays high fidelity. dasp's sinc
+	/// converter reached about 21 dB SNR here, which sounded robotic.
+	#[test]
+	fn resampling_is_high_fidelity() {
+		let rate = 44_100;
+		let mut buffer = PlaybackBuffer::<[f32; 2]>::new(
+			spec(pulse::SampleFormat::S16Le, rate),
+			pulse::ChannelMap::stereo(),
+			spec(pulse::SampleFormat::Float32Le, 48_000),
+		)
+		.unwrap();
+		let mut bytes = Vec::new();
+		for i in 0..rate * 2 {
+			let x = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / rate as f32).sin() * 0.6;
+			for _ in 0..2 {
+				bytes.extend_from_slice(&((x * 32767.0) as i16).to_le_bytes());
 			}
+		}
+		buffer.write(&bytes);
+		let mut tick = vec![0.0f32; 240 * 2];
+		let mut out = Vec::new();
+		loop {
+			tick.fill(0.0);
+			if !buffer.drain_and_mix(240, &mut tick, &[1.0, 1.0], false) {
+				break;
+			}
+			out.extend_from_slice(&tick);
+		}
+		assert!(out.len() > 20_000 * 2, "not enough output produced");
+		// Skip the resampler's startup delay before measuring.
+		let snr = snr_db(&out[9600 * 2..], 1000.0, 48_000.0);
+		assert!(snr > 60.0, "resampled SNR too low: {snr:.1} dB");
+	}
+
+	/// Over a long run, a tick consumes the input its duration covers.
+	#[test]
+	fn resampling_consumes_input_at_the_stream_rate() {
+		let mut buffer = stereo(44_100);
+		buffer.write(&0.25f32.to_le_bytes().repeat(44_100 * 2));
+		let before = buffer.len_bytes();
+		let mut tick = vec![0.0f32; 240 * 2];
+		for _ in 0..100 {
+			assert!(buffer.drain_and_mix(240, &mut tick, &[1.0, 1.0], false));
+		}
+		// 100 ticks of 5 ms are 0.5 s, 22050 frames of 8 bytes, give or take
+		// the frames the resampler holds back for its filter.
+		let consumed = (before - buffer.len_bytes()) / 8;
+		assert!((22_050..22_050 + 512).contains(&consumed), "consumed {consumed} frames");
+	}
+
+	/// A tail drain plays what is left of a short final write, then nothing
+	/// output-rate frame remains to be played.
+	#[test]
+	fn a_tail_drain_plays_the_rest_of_a_resampled_stream() {
+		let mut buffer = stereo(44_100);
+		buffer.write(&0.5f32.to_le_bytes().repeat(100 * 2));
+		let mut tick = vec![0.0f32; 240 * 2];
+		assert!(
+			!buffer.drain_and_mix(240, &mut tick, &[1.0, 1.0], false),
+			"short of a full tick"
+		);
+		assert!(buffer.drain_and_mix(240, &mut tick, &[1.0, 1.0], true));
+		assert_eq!(buffer.available_frames(), 0);
+		assert!(
+			tick[108 * 2..].iter().all(|s| *s == 0.0),
+			"only the tail's frames are mixed"
+		);
+		assert!(buffer.drain_and_mix(240, &mut tick, &[1.0, 1.0], true));
+	}
+
+	/// Every rate the Pulse server accepts (1 Hz to `PA_RATE_MAX`) can be
+	/// resampled, so validated streams are never refused here.
+	#[test]
+	fn accepted_stream_rates_build_a_resampler() {
+		for rate in [1, 8_000, 44_100, 96_000, 48_000 * 16] {
+			assert!(
+				PlaybackBuffer::<[f32; 2]>::new(
+					spec(pulse::SampleFormat::Float32Le, rate),
+					pulse::ChannelMap::stereo(),
+					spec(pulse::SampleFormat::Float32Le, 48_000),
+				)
+				.is_ok(),
+				"{rate} Hz"
+			);
 		}
 	}
 }
@@ -468,10 +596,13 @@ mod channel_map_tests {
 			channels: F::CHANNELS as u8,
 			..spec
 		};
-		let mut buffer = PlaybackBuffer::<F>::new(spec, pulse::ChannelMap::new(positions.iter().copied()), output);
+		let mut buffer =
+			PlaybackBuffer::<F>::new(spec, pulse::ChannelMap::new(positions.iter().copied()), output).unwrap();
 		let bytes: Vec<u8> = (1..=positions.len()).flat_map(|v| (v as f32).to_le_bytes()).collect();
 		buffer.write(&bytes);
-		dasp::Signal::next(&mut buffer.drain(1).unwrap())
+		let mut out = vec![0.0f32; F::CHANNELS];
+		assert!(buffer.drain_and_mix(1, &mut out, &vec![1.0; F::CHANNELS], false));
+		F::from_samples(&mut out.into_iter()).unwrap()
 	}
 
 	const G: f32 = GAIN_CENTER;

@@ -156,6 +156,19 @@ pub(super) fn handle_command(
 				return Ok(());
 			}
 
+			let buffer = match DynPlaybackBuffer::new(stream_spec, stream_channel_map, server.capture_spec) {
+				Ok(buffer) => buffer,
+				Err(reason) => {
+					tracing::warn!("rejecting playback stream: {reason}");
+					pulse::write_error(
+						&mut ClientWriter(&mut client.outgoing),
+						seq,
+						&pulse::PulseError::NotSupported,
+					)?;
+					return Ok(());
+				},
+			};
+
 			let mut buffer_attr = params.buffer_attr;
 			configure_buffer(&mut buffer_attr, &stream_spec);
 
@@ -172,7 +185,7 @@ pub(super) fn handle_command(
 				stream_index: server.next_stream_index,
 				state: StreamState::Prebuffering(buffer_attr.pre_buffering as u64),
 				buffer_attr,
-				buffer: DynPlaybackBuffer::new(stream_spec, stream_channel_map, server.capture_spec),
+				buffer,
 				volume,
 				muted,
 				// Mirrors pa_memblockq_set_tlength: seed missing = tlength so the first

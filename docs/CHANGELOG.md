@@ -60,6 +60,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Resample applications that play at 44.1 kHz (or any rate other than 48 kHz) cleanly. The previous sinc converter reached about 21 dB signal-to-noise on a 44.1 kHz stream, which made game dialog sound robotic; rubato's resampler keeps it above 60 dB and is several times faster. A stream rate that cannot be resampled is refused when the stream opens (from Moonshine).
 - Keep a streamed application running through `systemctl daemon-reload`. systemd reports running units as removed while it reloads, which ended the session; the unit's state is now checked first (from Moonshine).
 - Make `pyroshine pair` use `MOONSHINE_MANAGEMENT_BUS` when it is set, like `pyroshine web` and `diag`. A pairing command started for a test instance on its own bus previously reached the live service on the session bus instead.
 
