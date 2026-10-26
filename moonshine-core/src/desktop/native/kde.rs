@@ -352,7 +352,20 @@ impl Kde {
 						&& mode.refresh_millihertz.abs_diff(output.mode.refresh_millihertz) <= 100
 				});
 			if output.enabled && selected.is_none() {
-				return Err(format!("KWin does not expose requested mode for {}", output.name));
+				let exposed: Vec<_> = device
+					.modes
+					.iter()
+					.filter_map(|id| self.state.modes.get(id))
+					.map(|(_, m)| format!("{}x{}@{}", m.width, m.height, m.refresh_millihertz))
+					.collect();
+				return Err(format!(
+					"KWin does not expose requested mode {}x{} at {} mHz for {} (exposed: {})",
+					output.mode.width,
+					output.mode.height,
+					output.mode.refresh_millihertz,
+					output.name,
+					exposed.join(", ")
+				));
 			}
 			resolved.push((
 				device.proxy.clone().ok_or("Output proxy missing")?,

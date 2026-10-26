@@ -92,7 +92,7 @@ fn load(path: &std::path::Path) -> Result<Option<Journal>> {
 	}
 	Ok(Some(journal))
 }
-fn peer(stream: &UnixStream) -> Result<libc::ucred> {
+pub(super) fn peer(stream: &UnixStream) -> Result<libc::ucred> {
 	let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
 	let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
 	// SAFETY: pointers and length describe the initialized ucred output buffer.

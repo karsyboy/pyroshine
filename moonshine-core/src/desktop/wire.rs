@@ -73,7 +73,13 @@ pub(super) fn write_message<T: Serialize>(stream: &mut UnixStream, value: &T) ->
 	stream.write_all(&bytes).map_err(|e| e.to_string())
 }
 pub(super) fn request(request: &Request) -> Result<Reply> {
+	exchange(request).map(|(reply, _)| reply)
+}
+/// Send `request` and return the reply with the process ID of the guard that
+/// answered, when the socket reports one for this user.
+fn exchange(request: &Request) -> Result<(Reply, Option<i32>)> {
 	let mut stream = UnixStream::connect(socket_path()?).map_err(|e| format!("Desktop guard unavailable: {e}"))?;
+	let pid = super::guard::peer(&stream).ok().map(|credentials| credentials.pid);
 	stream
 		.set_read_timeout(Some(Duration::from_secs(20)))
 		.map_err(|e| e.to_string())?;
@@ -85,7 +91,14 @@ pub(super) fn request(request: &Request) -> Result<Reply> {
 	if let Some(error) = &reply.error {
 		return Err(error.clone());
 	}
-	Ok(reply)
+	Ok((reply, pid))
+}
+/// Whether process `pid` runs an executable that was replaced on disk after it
+/// started, as a package upgrade does: the kernel then reports it deleted.
+fn executable_replaced(pid: i32) -> bool {
+	use std::os::unix::ffi::OsStrExt;
+	std::fs::read_link(format!("/proc/{pid}/exe"))
+		.is_ok_and(|path| path.as_os_str().as_bytes().ends_with(b" (deleted)"))
 }
 fn wait_command(mut command: std::process::Command) -> Result<()> {
 	command
@@ -111,8 +124,21 @@ fn wait_command(mut command: std::process::Command) -> Result<()> {
 	}
 }
 pub(crate) fn ensure() -> Result<()> {
-	if request(&Request::Status).is_ok() {
-		return Ok(());
+	match exchange(&Request::Status) {
+		// The guard owns the native desktop code but runs in the user session,
+		// so upgrading and restarting the server leaves it on the old binary.
+		// Replace it only while it holds no lease: then nothing needs recovery.
+		Ok((reply, Some(pid))) if reply.lease.is_none() && executable_replaced(pid) => {
+			tracing::info!(pid, "Restarting the idle desktop guard: its executable was upgraded");
+			let mut stop = std::process::Command::new("systemctl");
+			stop.args(["--user", "stop", "pyroshine-desktop-guard.service"]);
+			if let Err(error) = wait_command(stop) {
+				tracing::warn!(%error, "Keeping the outdated desktop guard; it could not be stopped");
+				return Ok(());
+			}
+		},
+		Ok(_) => return Ok(()),
+		Err(_) => {},
 	}
 	let mut start = std::process::Command::new("systemctl");
 	start.args(["--user", "start", "pyroshine-desktop-guard.service"]);
@@ -236,6 +262,20 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+	/// An upgrade deletes the running guard's executable; the current one is not.
+	#[test]
+	fn detects_a_process_whose_executable_was_replaced() {
+		assert!(!super::executable_replaced(std::process::id() as i32));
+		let directory = tempfile::tempdir().unwrap();
+		let copy = directory.path().join("sleep");
+		std::fs::copy("/usr/bin/sleep", &copy).unwrap();
+		let mut child = std::process::Command::new(&copy).arg("30").spawn().unwrap();
+		assert!(!super::executable_replaced(child.id() as i32));
+		std::fs::remove_file(&copy).unwrap();
+		assert!(super::executable_replaced(child.id() as i32));
+		child.kill().unwrap();
+		child.wait().unwrap();
+	}
 	use super::*;
 	#[test]
 	fn bounded_protocol_rejects_truncation_and_oversized_requests() {

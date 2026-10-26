@@ -116,8 +116,10 @@ systemctl --user status pyroshine-desktop-guard.service
 journalctl --user -u pyroshine-desktop-guard.service -b
 ```
 
-Restart the guard after changing compositor capabilities or updating its
-executable. Stopping it attempts restoration first. During compositor logout or
+Restart the guard after changing compositor capabilities. After an upgrade
+the server restarts an idle guard (one holding no Desktop Mode lease) still
+running the replaced executable when Desktop Mode next starts; a guard with a
+lease keeps running until its session ends. Stopping it attempts restoration first. During compositor logout or
 a compositor crash, its virtual outputs may disappear before restoration can
 run; the next graphical login uses the desktop's persisted display settings.
 A journal from another login is retained and reported, never blindly applied.
