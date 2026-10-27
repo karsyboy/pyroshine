@@ -83,8 +83,37 @@ function SectionNav({
   changed: Set<string>;
   issues: Set<string>;
 }) {
+  const nav = useRef<HTMLElement>(null);
+  // Keep the selected section visible in the phone strip. Only the strip
+  // scrolls: scrollIntoView would also move the page while editing.
+  useEffect(() => {
+    const strip = nav.current;
+    const selected = strip?.querySelector<HTMLElement>("[aria-current=page]");
+    if (!strip || !selected || strip.scrollWidth <= strip.clientWidth) return;
+    const left = selected.offsetLeft - strip.offsetLeft;
+    if (left < strip.scrollLeft || left + selected.offsetWidth > strip.scrollLeft + strip.clientWidth) {
+      strip.scrollLeft = left - (strip.clientWidth - selected.offsetWidth) / 2;
+    }
+  }, [section]);
   return (
-    <Stack component="nav" aria-label="Settings sections" sx={{ width: 220, flexShrink: 0, gap: 0.5, position: "sticky", top: 0, alignSelf: "flex-start" }}>
+    // Below md the list becomes a horizontally scrolling strip above the
+    // fields, so it does not take half of a phone's width.
+    <Stack
+      ref={nav}
+      component="nav"
+      aria-label="Settings sections"
+      direction={{ xs: "row", md: "column" }}
+      sx={{
+        width: { xs: "100%", md: 220 },
+        flexShrink: 0,
+        gap: 0.5,
+        position: { md: "sticky" },
+        top: 0,
+        alignSelf: "flex-start",
+        overflowX: { xs: "auto", md: "visible" },
+        scrollbarWidth: "none",
+      }}
+    >
       {schema.sections.map((candidate) => {
         const selected = candidate.id === section;
         const fields = schema.fields.filter((field) => field.section === candidate.id);
@@ -96,6 +125,9 @@ function SectionNav({
             onClick={() => setSection(candidate.id)}
             aria-current={selected ? "page" : undefined}
             sx={{
+              flexShrink: 0,
+              gap: 1,
+              whiteSpace: "nowrap",
               justifyContent: "space-between",
               px: 2,
               py: 1.25,
@@ -263,7 +295,7 @@ export function SettingsPage() {
         </Alert>
       )}
 
-      <Stack direction="row" sx={{ gap: 3, alignItems: "flex-start" }}>
+      <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: { xs: 2, md: 3 }, alignItems: "flex-start" }}>
         <SectionNav schema={sections} section={current.id} setSection={setSection} changed={changed} issues={issueFields} />
         <Box sx={{ flex: 1, minWidth: 0 }}>
           <Typography variant="h5">{current.title}</Typography>

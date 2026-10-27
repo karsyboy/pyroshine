@@ -157,7 +157,7 @@ export function Facts({ rows }: { rows: [string, ReactNode][] }) {
           <Typography component="dt" variant="body2" color="text.secondary">
             {label}
           </Typography>
-          <Typography component="dd" variant="body2" sx={{ m: 0, wordBreak: "break-word" }}>
+          <Typography component="dd" variant="body2" sx={{ m: 0, minWidth: 0, overflowWrap: "anywhere" }}>
             {value}
           </Typography>
         </Box>

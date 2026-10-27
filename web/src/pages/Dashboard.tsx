@@ -599,8 +599,10 @@ function captureRows(capture: SessionDetails["capture"]): [string, string][] {
 
 function StreamDetails({ session }: { session: SessionDetails }) {
   const video = session.video;
+  // Always a wrapping row: in a column the cards' 300px flex basis becomes
+  // their height, and Card's overflow: hidden clipped the facts on phones.
   return (
-    <Stack direction={{ xs: "column", md: "row" }} sx={{ gap: 2, flexWrap: "wrap" }}>
+    <Stack direction="row" sx={{ gap: 2, flexWrap: "wrap" }}>
       <Card sx={{ flex: "1 1 300px" }}>
         <CardContent>
           <Typography variant="h6" sx={{ mb: 2 }}>
