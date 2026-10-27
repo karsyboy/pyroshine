@@ -12,6 +12,8 @@ Pyroshine is a Linux game-streaming server based on
 [Moonlight](https://moonlight-stream.org/) and
 [Pyrolight](https://github.com/karsyboy/pyrolight) in a separate session,
 so your local desktop stays usable. A monitor or desktop login is optional.
+On a Steam Deck, [PyroDeck](https://github.com/karsyboy/pyrodeck) launches
+streams from your Steam library.
 
 - Hardware H.264, HEVC, and AV1 encoding for Moonlight-compatible clients.
 - GPU PyroWave encoding in 4:2:0 and 4:4:4, SDR and HDR10, for Pyrolight.
@@ -35,11 +37,11 @@ standard codecs.
   **x86_64 and glibc 2.39 or later**; see
   [platform compatibility](docs/INSTALLATION.md#platform-compatibility).
 - A GPU and driver with EGL/GBM capture and Vulkan DMA-BUF import on the same
-  GPU. H.264, HEVC, and AV1 also need a hardware encoder the host can use:
-  Vulkan Video, or VA-API (Intel GPUs need Intel's media driver,
-  `intel-media-driver`) or NVENC; a GPU without one streams PyroWave to
-  Pyrolight only. Run the healthcheck below to verify your setup, and see
-  [GPU compatibility](docs/GPU_COMPATIBILITY.md).
+  GPU. See [GPU compatibility](docs/GPU_COMPATIBILITY.md); the healthcheck
+  below verifies your setup.
+- For H.264, HEVC, and AV1, a hardware encoder: Vulkan Video, VA-API (Intel
+  GPUs need `intel-media-driver`), or NVENC. Without one, the host streams
+  PyroWave to Pyrolight only.
 - Native Steam at `/usr/bin/steam` for the default applications. Install Steam
   and your games separately; other launchers and Flatpak Steam need
   [configuration](docs/TIPS.md#steam-or-games-are-missing).
@@ -78,7 +80,8 @@ skips it. Nothing needs GTK, WebKitGTK or Node.js.
   releases. Check the glibc baseline above before installing.
 - Each release includes `SHA256SUMS` for checking downloads.
 - To upgrade, install the newer release the same way, or run `sudo pacman -Syu`
-  with the repository, then restart the service; this ends active streams. See [upgrades](docs/INSTALLATION.md#upgrades-and-configuration).
+  with the repository, then restart the service; this ends active streams. See
+  [upgrades](docs/INSTALLATION.md#upgrades-and-configuration).
 
 ## Quick start
 
@@ -243,8 +246,8 @@ Pyroshine is an independent community fork of
 [Moonshine](https://github.com/hgaiser/moonshine), which builds on the Moonlight
 ecosystem and work pioneered by [Sunshine](https://github.com/LizardByte/Sunshine).
 It retains Moonshine's internal names and paths for compatibility. The client fork is
-[Pyrolight](https://github.com/karsyboy/pyrolight), and
-the codec is [PyroWave](https://github.com/Themaister/pyrowave), vendored with a
+[Pyrolight](https://github.com/karsyboy/pyrolight), the Steam Deck plugin is
+[PyroDeck](https://github.com/karsyboy/pyrodeck), and the codec is [PyroWave](https://github.com/Themaister/pyrowave), vendored with a
 small patch series (`vendor/pyrowave-patches/`).
 
 VRR streaming is based on [Nonary](https://github.com/Nonary)'s idea and
