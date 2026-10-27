@@ -61,6 +61,12 @@ const FORMATS: [(u32, u32); 8] = [
 /// gated behind a libspa version feature; its value is protocol.
 const DONT_FIXATE: PropertyFlags = PropertyFlags::from_bits_retain(spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE);
 
+/// `SPA_VIDEO_TRANSFER_SMPTE2084` and `SPA_VIDEO_TRANSFER_BT601`. PipeWire
+/// 1.0 headers end the transfer enum at ADOBERGB, so bindgen omits these;
+/// their values are protocol.
+const TRANSFER_SMPTE2084: u32 = 14;
+const TRANSFER_BT601: u32 = 16;
+
 /// How long a buffer's producer fence may stay unsignaled before capture
 /// fails. Compositors queue buffers after rendering, so this is
 /// normally already signaled.
@@ -124,14 +130,12 @@ impl DeclaredColor {
 		let sdr = match self.transfer {
 			spa_sys::SPA_VIDEO_TRANSFER_UNKNOWN | spa_sys::SPA_VIDEO_TRANSFER_SRGB => Some(FrameColorSpace::Srgb),
 			spa_sys::SPA_VIDEO_TRANSFER_GAMMA22 => Some(FrameColorSpace::Gamma22),
-			spa_sys::SPA_VIDEO_TRANSFER_BT709 | spa_sys::SPA_VIDEO_TRANSFER_BT601 => Some(FrameColorSpace::Bt1886),
+			spa_sys::SPA_VIDEO_TRANSFER_BT709 | TRANSFER_BT601 => Some(FrameColorSpace::Bt1886),
 			_ => None,
 		};
 		if let Some(sdr) = sdr.filter(|_| bt709) {
 			Some(sdr)
-		} else if self.transfer == spa_sys::SPA_VIDEO_TRANSFER_SMPTE2084
-			&& self.primaries == spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020
-		{
+		} else if self.transfer == TRANSFER_SMPTE2084 && self.primaries == spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020 {
 			Some(FrameColorSpace::Bt2020Pq)
 		} else {
 			None
@@ -1340,10 +1344,7 @@ mod tests {
 			Some(FrameColorSpace::Srgb)
 		);
 		assert_eq!(
-			declared(
-				spa_sys::SPA_VIDEO_TRANSFER_SMPTE2084,
-				spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020
-			),
+			declared(TRANSFER_SMPTE2084, spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020),
 			Some(FrameColorSpace::Bt2020Pq)
 		);
 		// SDR transfers keep their identity for the encoder to normalize.
@@ -1358,17 +1359,11 @@ mod tests {
 			declared(spa_sys::SPA_VIDEO_TRANSFER_BT709, 0),
 			Some(FrameColorSpace::Bt1886)
 		);
-		assert_eq!(
-			declared(spa_sys::SPA_VIDEO_TRANSFER_BT601, 0),
-			Some(FrameColorSpace::Bt1886)
-		);
+		assert_eq!(declared(TRANSFER_BT601, 0), Some(FrameColorSpace::Bt1886));
 		// PQ with BT.709 primaries, or BT.2020 with sRGB transfer, would be
 		// streamed with the wrong colors.
 		assert_eq!(
-			declared(
-				spa_sys::SPA_VIDEO_TRANSFER_SMPTE2084,
-				spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT709
-			),
+			declared(TRANSFER_SMPTE2084, spa_sys::SPA_VIDEO_COLOR_PRIMARIES_BT709),
 			None
 		);
 		assert_eq!(
