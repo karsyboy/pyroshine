@@ -199,7 +199,7 @@ pub struct VideoDetails {
 	pub bit_depth: u8,
 	/// `SDR` or `HDR10`.
 	pub dynamic_range: String,
-	/// `BT.709` or `PQ`.
+	/// `sRGB` or `PQ`.
 	pub transfer: String,
 	/// `BT.709` or `BT.2020`.
 	pub primaries: String,

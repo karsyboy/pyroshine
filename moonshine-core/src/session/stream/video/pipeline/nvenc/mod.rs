@@ -788,6 +788,13 @@ impl NvencEncoder {
 	fn apply_codec_config(&mut self, chroma: ChromaFormat, depth: BitDepth, color: ColorDescription) {
 		let chroma_idc = if chroma == ChromaFormat::Yuv444 { 3 } else { 1 };
 		let depth_minus8 = u32::from(depth.bits()) - 8;
+		// Chroma position is defined for 4:2:0 only.
+		let chroma_location = if chroma == ChromaFormat::Yuv420 {
+			color.chroma_location
+		} else {
+			pixelforge::ChromaLocation::Unspecified
+		};
+		let loc_type = chroma_location.h26x_loc_type();
 		let vui = NV_ENC_CONFIG_H264_VUI_PARAMETERS {
 			videoSignalTypePresentFlag: 1,
 			videoFormat: NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED,
@@ -797,6 +804,9 @@ impl NvencEncoder {
 			colourPrimaries: u32::from(color.color_primaries) as _,
 			transferCharacteristics: u32::from(color.transfer_characteristics) as _,
 			colourMatrix: u32::from(color.matrix_coefficients) as _,
+			chromaSampleLocationFlag: u32::from(loc_type.is_some()),
+			chromaSampleLocationTop: u32::from(loc_type.unwrap_or(0)),
+			chromaSampleLocationBot: u32::from(loc_type.unwrap_or(0)),
 			bitstreamRestrictionFlag: 1,
 			..Default::default()
 		};
@@ -833,6 +843,7 @@ impl NvencEncoder {
 					av1.transferCharacteristics = vui.transferCharacteristics;
 					av1.matrixCoefficients = vui.colourMatrix;
 					av1.colorRange = u32::from(color.full_range);
+					av1.chromaSamplePosition = u32::from(chroma_location.av1_sample_position());
 				},
 				VideoCodec::PyroWave => {},
 			}
@@ -1360,7 +1371,7 @@ pub(crate) fn probe(
 			height: PROBE_EXTENT.1,
 			fps: 60,
 			bitrate: 10_000_000,
-			color: ColorDescription::bt709(),
+			color: ColorDescription::srgb(),
 		},
 	)?;
 	let target = encoder.input_target().map_err(|e| e.to_string())?;

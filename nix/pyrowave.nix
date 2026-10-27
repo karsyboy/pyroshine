@@ -37,8 +37,13 @@ stdenv.mkDerivation {
   version = "1.1.0-${builtins.substring 0 8 sourceRevision}";
   inherit src;
 
-  # Granite patches in the fork's order; the fork applies the same files.
-  patches = [ ./patches/granite-sdr-normalization.patch ./patches/granite-scaler-overlay.patch ];
+  # Granite patches in the fork's order (the fork applies the same first two
+  # files), then Pyroshine's own change on top of them.
+  patches = [
+    ./patches/granite-sdr-normalization.patch
+    ./patches/granite-scaler-overlay.patch
+    ./patches/granite-sdr-reference-white-203.patch
+  ];
 
   nativeBuildInputs = [
     cmake

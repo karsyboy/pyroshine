@@ -250,12 +250,56 @@ pub struct Dimensions {
 pub struct ColorDescription {
     /// Color primaries (1=BT.709, 9=BT.2020).
     pub color_primaries: u8,
-    /// Transfer characteristics (1=BT.709, 16=ST2084/PQ).
+    /// Transfer characteristics (1=BT.709, 13=sRGB, 16=ST2084/PQ).
     pub transfer_characteristics: u8,
     /// Matrix coefficients (1=BT.709, 9=BT.2020 NCL).
     pub matrix_coefficients: u8,
     /// Full range (true) or limited/TV range (false).
     pub full_range: bool,
+    /// Where the producer placed 4:2:0 chroma samples; ignored for 4:4:4.
+    pub chroma_location: ChromaLocation,
+}
+
+/// Position of 4:2:0 chroma samples relative to the luma grid.
+///
+/// Decoders that receive no position assume [`ChromaLocation::Left`] (the
+/// H.264/H.265 default and libplacebo's/FFmpeg's assumption for AV1), so a
+/// producer that samples elsewhere must say so or reconstruct a shifted image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChromaLocation {
+    /// Not signaled.
+    #[default]
+    Unspecified,
+    /// Horizontally co-sited with even luma columns, vertically between rows
+    /// (H.273 chroma_sample_loc_type 0, AV1 CSP_VERTICAL).
+    Left,
+    /// Centered in each 2x2 luma block, as a box filter produces
+    /// (chroma_sample_loc_type 1). AV1 has no code for it.
+    Center,
+    /// Co-sited with the top-left luma sample (chroma_sample_loc_type 2,
+    /// AV1 CSP_COLOCATED).
+    TopLeft,
+}
+
+impl ChromaLocation {
+    /// H.264/H.265 `chroma_sample_loc_type`, or `None` when not signaled.
+    pub fn h26x_loc_type(self) -> Option<u8> {
+        match self {
+            Self::Unspecified => None,
+            Self::Left => Some(0),
+            Self::Center => Some(1),
+            Self::TopLeft => Some(2),
+        }
+    }
+
+    /// AV1 `chroma_sample_position`: 0 unknown, 1 vertical, 2 co-located.
+    pub fn av1_sample_position(self) -> u8 {
+        match self {
+            Self::Left => 1,
+            Self::TopLeft => 2,
+            Self::Unspecified | Self::Center => 0,
+        }
+    }
 }
 
 impl ColorDescription {
@@ -263,6 +307,7 @@ impl ColorDescription {
     const PRIMARIES_BT709: u8 = 1;
     const PRIMARIES_BT2020: u8 = 9;
     const TRANSFER_BT709: u8 = 1;
+    const TRANSFER_SRGB: u8 = 13;
     const TRANSFER_ST2084_PQ: u8 = 16;
     const MATRIX_BT709: u8 = 1;
     const MATRIX_BT2020_NCL: u8 = 9;
@@ -274,6 +319,24 @@ impl ColorDescription {
             transfer_characteristics: Self::TRANSFER_BT709,
             matrix_coefficients: Self::MATRIX_BT709,
             full_range: false,
+            chroma_location: ChromaLocation::Unspecified,
+        }
+    }
+
+    /// sRGB: BT.709 primaries and matrix with the IEC 61966-2-1 transfer
+    /// function (limited range).
+    ///
+    /// Desktop and game framebuffers are sRGB-encoded. Converted to YCbCr
+    /// without a transfer conversion they must be signaled as sRGB: decoders
+    /// interpret the BT.709 transfer as BT.1886, which renders the same
+    /// samples darker and with more contrast.
+    pub fn srgb() -> Self {
+        Self {
+            color_primaries: Self::PRIMARIES_BT709,
+            transfer_characteristics: Self::TRANSFER_SRGB,
+            matrix_coefficients: Self::MATRIX_BT709,
+            full_range: false,
+            chroma_location: ChromaLocation::Unspecified,
         }
     }
 
@@ -284,12 +347,19 @@ impl ColorDescription {
             transfer_characteristics: Self::TRANSFER_ST2084_PQ,
             matrix_coefficients: Self::MATRIX_BT2020_NCL,
             full_range: false,
+            chroma_location: ChromaLocation::Unspecified,
         }
     }
 
     /// Set full range (0-255) rather than limited/TV range (16-235).
     pub fn with_full_range(mut self, full_range: bool) -> Self {
         self.full_range = full_range;
+        self
+    }
+
+    /// Set the 4:2:0 chroma sample position the producer generates.
+    pub fn with_chroma_location(mut self, chroma_location: ChromaLocation) -> Self {
+        self.chroma_location = chroma_location;
         self
     }
 
@@ -1117,6 +1187,16 @@ mod tests {
         }
 
         #[test]
+        fn test_srgb() {
+            let cd = ColorDescription::srgb();
+            assert_eq!(cd.color_primaries, 1);
+            assert_eq!(cd.transfer_characteristics, 13);
+            assert_eq!(cd.matrix_coefficients, 1);
+            assert!(!cd.full_range);
+            assert!(!cd.is_hdr());
+        }
+
+        #[test]
         fn test_bt2020_pq() {
             let cd = ColorDescription::bt2020_pq();
             assert_eq!(cd.color_primaries, 9);
@@ -1131,6 +1211,20 @@ mod tests {
             assert!(cd.full_range);
             // Only the range changes; the preset stays intact.
             assert_eq!(cd.with_full_range(false), ColorDescription::bt709());
+        }
+
+        #[test]
+        fn test_chroma_location_codes() {
+            assert_eq!(ColorDescription::bt709().chroma_location, ChromaLocation::Unspecified);
+            assert_eq!(ChromaLocation::Unspecified.h26x_loc_type(), None);
+            assert_eq!(ChromaLocation::Left.h26x_loc_type(), Some(0));
+            assert_eq!(ChromaLocation::Center.h26x_loc_type(), Some(1));
+            assert_eq!(ChromaLocation::TopLeft.h26x_loc_type(), Some(2));
+            assert_eq!(ChromaLocation::Left.av1_sample_position(), 1);
+            assert_eq!(ChromaLocation::TopLeft.av1_sample_position(), 2);
+            assert_eq!(ChromaLocation::Center.av1_sample_position(), 0);
+            let cd = ColorDescription::srgb().with_chroma_location(ChromaLocation::Center);
+            assert_eq!(cd.with_chroma_location(ChromaLocation::Unspecified), ColorDescription::srgb());
         }
 
         #[test]

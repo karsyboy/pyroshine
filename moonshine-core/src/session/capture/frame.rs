@@ -67,6 +67,14 @@ pub(crate) enum FrameColorSpace {
 	/// sRGB (BT.709 primaries, sRGB EOTF, BT.709 matrix).
 	#[default]
 	Srgb,
+	/// SDR with BT.709 primaries and a pure gamma 2.2 transfer, as Mutter
+	/// declares its screencasts. The conventional encoders re-encode it with
+	/// the sRGB transfer the stream signals; the isolated compositor composes
+	/// such surfaces instead of exporting them.
+	Gamma22,
+	/// SDR with BT.709 primaries encoded with the BT.709/BT.601 video
+	/// transfer, displayed per BT.1886 (gamma 2.4); re-encoded as sRGB.
+	Bt1886,
 	/// HDR10 (BT.2020 primaries, PQ EOTF, BT.2020 NCL matrix).
 	///
 	/// The pixel data is already BT.2020+PQ encoded; the encoder converts it
@@ -82,9 +90,16 @@ pub(crate) enum FrameColorSpace {
 	ScrgbLinear,
 }
 
-/// Static HDR metadata (HDR10).
+impl FrameColorSpace {
+	/// Whether the frame holds HDR content (PQ or extended-range linear).
+	pub(crate) fn is_hdr(self) -> bool {
+		matches!(self, Self::Bt2020Pq | Self::ScrgbLinear)
+	}
+}
+
+/// Mastering display color volume (SMPTE ST 2086).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HdrMetadata {
+pub(crate) struct MasteringDisplay {
 	/// Mastering display color primaries (CIE 1931 xy, in 0.00002 units).
 	pub display_primaries: [(u16, u16); 3],
 	/// White point (CIE 1931 xy, in 0.00002 units).
@@ -93,10 +108,73 @@ pub(crate) struct HdrMetadata {
 	pub max_luminance: u32,
 	/// Minimum luminance in 0.0001 cd/m² units.
 	pub min_luminance: u32,
+}
+
+impl MasteringDisplay {
+	/// HDR10 compatibility values written when the source declares no
+	/// mastering display: BT.2020 primaries, D65 white and a 1000-nit peak.
+	///
+	/// This is a rendering policy, not a fact about the source. Clients
+	/// tone-map on these fields, and without any the common decoders assume a
+	/// 10000-nit master and compress highlights; 1000 nits matches typical
+	/// HDR10 grading. It is used only at the wire boundary
+	/// ([`Hdr10Metadata::for_stream`]); [`HdrMetadata`] keeps the
+	/// declaration's own presence.
+	pub const HDR10_FALLBACK: Self = Self {
+		// BT.2020 display primaries in 0.00002 units.
+		display_primaries: [
+			(35400, 14600), // Red:   0.708, 0.292
+			(8500, 39850),  // Green: 0.170, 0.797
+			(6550, 2300),   // Blue:  0.131, 0.046
+		],
+		// D65 white point in 0.00002 units.
+		white_point: (15635, 16450), // 0.3127, 0.3290
+		// 1000 nits max luminance in 0.0001 cd/m².
+		max_luminance: 10_000_000,
+		// 0.001 nits min luminance in 0.0001 cd/m².
+		min_luminance: 10,
+	};
+}
+
+/// Static HDR metadata as the source declared it.
+///
+/// Each group is present only when the source declared it: a source that
+/// supplies content light levels but no mastering display has `mastering:
+/// None`, never a substituted peak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HdrMetadata {
+	pub mastering: Option<MasteringDisplay>,
 	/// Maximum content light level in cd/m² (nits).
-	pub max_cll: u16,
+	pub max_cll: Option<u16>,
 	/// Maximum frame-average light level in cd/m² (nits).
+	pub max_fall: Option<u16>,
+}
+
+/// HDR10 static metadata in the complete form the bitstream (MDCV/CLL) and
+/// the control stream carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Hdr10Metadata {
+	pub mastering: MasteringDisplay,
+	/// Maximum content light level in nits; 0 means unknown (CTA-861.3,
+	/// H.265 D.3.35).
+	pub max_cll: u16,
+	/// Maximum frame-average light level in nits; 0 means unknown.
 	pub max_fall: u16,
+}
+
+impl Hdr10Metadata {
+	/// The metadata sent for an HDR10 frame whose source declared `source`.
+	/// Absent content light levels are written as unknown (0); an absent
+	/// mastering display uses [`MasteringDisplay::HDR10_FALLBACK`].
+	pub fn for_stream(source: Option<&HdrMetadata>) -> Self {
+		Self {
+			mastering: source
+				.and_then(|m| m.mastering)
+				.unwrap_or(MasteringDisplay::HDR10_FALLBACK),
+			max_cll: source.and_then(|m| m.max_cll).unwrap_or(0),
+			max_fall: source.and_then(|m| m.max_fall).unwrap_or(0),
+		}
+	}
 }
 
 /// HDR mode state sent from the video pipeline to the control stream.
@@ -119,31 +197,6 @@ impl HdrModeState {
 		Self {
 			enabled,
 			metadata: None,
-		}
-	}
-}
-
-impl HdrMetadata {
-	/// Reasonable fallback metadata for HDR10 when applications don't provide
-	/// their own. Uses BT.2020 primaries, D65 white point, and a conservative
-	/// 1000 nit peak luminance.
-	pub fn fallback() -> Self {
-		Self {
-			// BT.2020 display primaries in 0.00002 units.
-			display_primaries: [
-				(35400, 14600), // Red:   0.708, 0.292
-				(8500, 39850),  // Green: 0.170, 0.797
-				(6550, 2300),   // Blue:  0.131, 0.046
-			],
-			// D65 white point in 0.00002 units.
-			white_point: (15635, 16450), // 0.3127, 0.3290
-			// 1000 nits max luminance in 0.0001 cd/m².
-			max_luminance: 10_000_000,
-			// 0.001 nits min luminance in 0.0001 cd/m².
-			min_luminance: 10,
-			// Unknown content light levels.
-			max_cll: 0,
-			max_fall: 0,
 		}
 	}
 }
@@ -580,9 +633,39 @@ mod tests {
 
 	#[test]
 	fn fallback_mastering_gamut_is_bt2020() {
-		let m = HdrMetadata::fallback();
+		let m = MasteringDisplay::HDR10_FALLBACK;
 		assert_eq!(m.display_primaries, [(35400, 14600), (8500, 39850), (6550, 2300)]);
 		assert_eq!(m.white_point, (15635, 16450));
 		assert_eq!(m.max_luminance, 1000 * 10000);
+	}
+
+	#[test]
+	fn stream_metadata_keeps_declared_groups_and_one_fallback() {
+		let declared = MasteringDisplay {
+			display_primaries: [(34000, 16000), (13250, 34500), (7500, 3000)],
+			white_point: (15635, 16450),
+			max_luminance: 4000 * 10000,
+			min_luminance: 50,
+		};
+		// No metadata, CLL only and mastering only: an absent mastering
+		// display always becomes the same documented fallback, so adding
+		// content light levels never changes the reported peak.
+		let none = Hdr10Metadata::for_stream(None);
+		let cll_only = Hdr10Metadata::for_stream(Some(&HdrMetadata {
+			mastering: None,
+			max_cll: Some(800),
+			max_fall: None,
+		}));
+		let complete = Hdr10Metadata::for_stream(Some(&HdrMetadata {
+			mastering: Some(declared),
+			max_cll: Some(800),
+			max_fall: Some(200),
+		}));
+		assert_eq!(none.mastering, MasteringDisplay::HDR10_FALLBACK);
+		assert_eq!((none.max_cll, none.max_fall), (0, 0));
+		assert_eq!(cll_only.mastering, none.mastering);
+		assert_eq!((cll_only.max_cll, cll_only.max_fall), (800, 0));
+		assert_eq!(complete.mastering, declared);
+		assert_eq!((complete.max_cll, complete.max_fall), (800, 200));
 	}
 }

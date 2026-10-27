@@ -239,6 +239,10 @@ impl FrameStats {
 pub struct VideoStreamContext {
 	/// Explicit setup-time PyroWave dialect; conventional codecs use None.
 	pub pyrowave_dialect: Option<pyrowave_protocol::PyroWaveDialect>,
+	/// A record-framed client that presents by the control stream's HDR mode
+	/// (see [`pyrowave_protocol::record_client_follows_hdr_mode`]): SDR frames
+	/// of an HDR10 PyroWave stream are encoded as SDR with HDR mode off.
+	pub pyrowave_sdr_as_sdr: bool,
 	/// Width of the video stream in pixels.
 	pub width: u32,
 
@@ -358,6 +362,7 @@ impl VideoStreamContext {
 			};
 		}
 		changed!(pyrowave_dialect, "PyroWave dialect");
+		changed!(pyrowave_sdr_as_sdr, "PyroWave SDR presentation");
 		changed!(width, "width");
 		changed!(height, "height");
 		changed!(fps, "fps");
@@ -1851,6 +1856,13 @@ mod tests {
 		};
 		assert_eq!(active.changed_fields(&records), vec!["PyroWave dialect"]);
 		assert_eq!(records.changed_fields(&active), vec!["PyroWave dialect"]);
+		// A Nightjar reconnect onto another record client's epoch rebuilds the
+		// encoder, whose SDR handling differs.
+		let nightjar = VideoStreamContext {
+			pyrowave_sdr_as_sdr: true,
+			..records.clone()
+		};
+		assert_eq!(records.changed_fields(&nightjar), vec!["PyroWave SDR presentation"]);
 	}
 
 	#[test]

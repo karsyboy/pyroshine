@@ -409,7 +409,7 @@ describe("diagnosis and capture path", () => {
           chroma: "4:2:0",
           bit_depth: 8,
           dynamic_range: "SDR",
-          transfer: "BT.709",
+          transfer: "sRGB",
           primaries: "BT.709",
           matrix: "BT.709",
           range: "limited",

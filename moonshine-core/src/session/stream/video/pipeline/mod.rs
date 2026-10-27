@@ -25,7 +25,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::session::SessionKeysReceiver;
 use crate::session::capture::admission::OverlayCaps;
 use crate::session::capture::frame::{
-	CaptureOrigin, FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
+	CaptureOrigin, FrameColorSpace, FrameOverlay, Hdr10Metadata, HdrMetadata, HdrModeState, MAX_OVERLAYS,
+	OverlayContent,
 };
 use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
@@ -45,7 +46,7 @@ use crate::session::stream::video::{
 use backend::{ConventionalEncoder, EncodeError, EncoderInput, PacketFuture};
 pub use backend::{EncoderBackend, EncoderPreference, EncoderTable};
 pub use convert::ConversionQueueMode;
-use convert::{ColorSpace, ConvertFormat, InputConverter, Target};
+use convert::{ChromaSiting, ColorSpace, ConvertFormat, InputConverter, Target};
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
@@ -308,11 +309,35 @@ fn encoder_stop_cause(codec: VideoCodec, error: &EncoderError) -> crate::session
 
 fn color_description_for(format: NegotiatedVideoFormat) -> Result<ColorDescription, String> {
 	let description = match (format.primaries, format.transfer) {
-		(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
+		(ColorPrimaries::Bt709, TransferFunction::Srgb) => ColorDescription::srgb(),
 		(ColorPrimaries::Bt2020, TransferFunction::Pq) => ColorDescription::bt2020_pq(),
 		_ => return Err(format!("Unsupported color description: {format:?}")),
 	};
-	Ok(description.with_full_range(format.range == ColorRange::Full))
+	Ok(signaled(description, format))
+}
+
+/// `description` with the stream's range and the converter's chroma
+/// position, so every description the encoder signals (initial and per
+/// frame) describes the samples the converter writes.
+fn signaled(description: ColorDescription, format: NegotiatedVideoFormat) -> ColorDescription {
+	let location = if format.chroma == ChromaFormat::Yuv420 {
+		chroma_siting_for(format).location()
+	} else {
+		pixelforge::ChromaLocation::Unspecified
+	};
+	description
+		.with_full_range(format.range == ColorRange::Full)
+		.with_chroma_location(location)
+}
+
+/// Where the converter places 4:2:0 chroma: centered (the 2x2 mean) where the
+/// codec can signal it, left-sited for AV1, whose sequence header has no
+/// code for centered chroma.
+fn chroma_siting_for(format: NegotiatedVideoFormat) -> ChromaSiting {
+	match format.codec {
+		VideoCodec::Av1 => ChromaSiting::Left,
+		_ => ChromaSiting::Center,
+	}
 }
 
 pub(crate) struct VideoPipeline {}
@@ -601,12 +626,11 @@ async fn run_packet_consumer(
 		}
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
-		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
+		// encoding as BT.2020+PQ. SDR frames encoded as sRGB carry no HDR SEI.
+		// The values match the control-stream HDR metadata, including the
+		// documented fallback for an undeclared mastering display.
 		if packet.is_key_frame && frame_context.inject_hdr {
-			// Fall back to default HDR10 metadata when the content provides none
-			// (e.g. scRGB swapchains carry no mastering metadata), staying
-			// consistent with the control-stream HDR metadata.
-			let m = frame_context.hdr_metadata.unwrap_or_else(HdrMetadata::fallback);
+			let m = Hdr10Metadata::for_stream(frame_context.hdr_metadata.as_ref());
 			packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.format.codec);
 		}
 
@@ -1130,6 +1154,10 @@ impl VideoPipelineInner {
 			},
 			ctx.format.range == ColorRange::Full,
 		)
+		.map(|mut converter| {
+			converter.set_chroma_siting(chroma_siting_for(ctx.format));
+			converter
+		})
 		.map_err(|error| match error {
 			convert::ConverterError::Create(error) => {
 				EncoderError::Setup(format!("Failed to create the YCbCr converter: {error}"))
@@ -1358,10 +1386,11 @@ impl VideoPipelineInner {
 			ctx.fps,
 			self.config.pyrowave_queue,
 		)?;
-		encoder.set_sdr_content_as_sdr(
-			ctx.pyrowave_dialect == Some(super::pyrowave_protocol::PyroWaveDialect::RecordFramed),
-		);
-		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
+		encoder.set_sdr_content_as_sdr(ctx.pyrowave_sdr_as_sdr);
+		// Until a frame says otherwise, assume the SDR desktop or launcher a
+		// session starts on: announcing HDR first would switch a client that
+		// presents by HDR mode into HDR and straight back at every start.
+		let _ = hdr_metadata_tx.send(HdrModeState::new(encoder.encodes_as_hdr(FrameColorSpace::Srgb)));
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 		let quality_reference_bytes =
 			quality_reference_frame_bytes(ctx.width, ctx.height, ctx.format.chroma, ctx.format.bit_depth);
@@ -1543,7 +1572,10 @@ impl VideoPipelineInner {
 					frame.consumed.store(true, Ordering::Release);
 					if ctx.format.hdr {
 						// The client is told whether this frame is HDR10 or the
-						// 10-bit BT.709 SDR of a record-framed stream.
+						// 10-bit sRGB SDR sent to a client that presents by HDR
+						// mode. The mode travels on the control stream, apart
+						// from the frame, so such a client may convert a frame
+						// or two around a switch with the previous mode.
 						let enabled = encoder.encodes_as_hdr(frame.color_space);
 						let state = HdrModeState {
 							enabled,
@@ -1554,7 +1586,7 @@ impl VideoPipelineInner {
 								if current.enabled != state.enabled {
 									tracing::info!(
 										"PyroWave content switched to {}",
-										if enabled { "HDR (BT.2020/PQ)" } else { "SDR (BT.709)" }
+										if enabled { "HDR (BT.2020/PQ)" } else { "SDR (sRGB)" }
 									);
 								}
 								*current = state;
@@ -1856,6 +1888,7 @@ impl VideoPipelineInner {
 			enabled: ctx.format.hdr,
 			metadata: None,
 		};
+		let mut metadata_refresh = hdr_sei::MetadataRefresh::default();
 
 		// Track the encoder's current VUI color description, initialized
 		// to match what the encoder was created with. When the required
@@ -2189,35 +2222,42 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// In HDR mode, select per-frame color space and encoder VUI
-				// based on the frame's actual color space. SDR frames are
-				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
-				// dynamic VUI switching in the encoder.
-				let mut frame_color = None;
-				if ctx.format.hdr {
+				// Select the per-frame conversion. In HDR mode the encoder VUI
+				// also follows the frame: SDR frames are encoded as sRGB and HDR
+				// frames as BT.2020+PQ, with dynamic VUI switching in the
+				// encoder. Gamma 2.2 frames are re-encoded as the sRGB the
+				// stream signals, in SDR and HDR sessions alike.
+				let full_range = ctx.format.range == ColorRange::Full;
+				let (frame_space, frame_white_nits) = if ctx.format.hdr {
 					let frame_cs = frame.color_space;
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
 					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
-					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
-						FrameColorSpace::Srgb => (
-							ColorSpace::Bt709,
-							ctx.format.range == ColorRange::Full,
-							ColorDescription::bt709().with_full_range(ctx.format.range == ColorRange::Full),
+					let (cs, color_desc, sdr_white_nits) = match frame_cs {
+						FrameColorSpace::Srgb => {
+							(ColorSpace::Bt709, ColorDescription::srgb(), BT2408_SDR_REFERENCE_NITS)
+						},
+						FrameColorSpace::Gamma22 => (
+							ColorSpace::Gamma22ToSrgb,
+							ColorDescription::srgb(),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::Bt1886 => (
+							ColorSpace::Bt1886ToSrgb,
+							ColorDescription::srgb(),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::Bt2020Pq => (
 							ColorSpace::Bt2020,
-							ctx.format.range == ColorRange::Full,
-							ColorDescription::bt2020_pq().with_full_range(ctx.format.range == ColorRange::Full),
+							ColorDescription::bt2020_pq(),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
-							ctx.format.range == ColorRange::Full,
-							ColorDescription::bt2020_pq().with_full_range(ctx.format.range == ColorRange::Full),
+							ColorDescription::bt2020_pq(),
 							SCRGB_REFERENCE_WHITE_NITS,
 						),
 					};
+					let color_desc = signaled(color_desc, ctx.format);
 
 					// Switch encoder VUI first. The converter's color space is
 					// updated below only after the encoder accepted the switch,
@@ -2231,12 +2271,19 @@ impl VideoPipelineInner {
 							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
 						}
 					}
-					frame_color = Some((cs, full_range, sdr_white_nits));
-				}
+					(cs, sdr_white_nits)
+				} else {
+					// SDR sessions keep the sRGB VUI; the compositor composes
+					// HDR-declared surfaces before they reach an SDR stream.
+					let cs = match frame.color_space {
+						FrameColorSpace::Gamma22 => ColorSpace::Gamma22ToSrgb,
+						FrameColorSpace::Bt1886 => ColorSpace::Bt1886ToSrgb,
+						_ => ColorSpace::Bt709,
+					};
+					(cs, BT2408_SDR_REFERENCE_NITS)
+				};
+				input_converter.set_color(frame_space, full_range, frame_white_nits);
 
-				if let Some((cs, full_range, sdr_white_nits)) = frame_color {
-					input_converter.set_color(cs, full_range, sdr_white_nits);
-				}
 				// DMA-BUF layers go through the same identity-checked import
 				// cache as the game source; the `Arc`s pin them for the call.
 				let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
@@ -2375,25 +2422,40 @@ impl VideoPipelineInner {
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
-				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
+				// frame is encoded as BT.2020+PQ (true) or sRGB (false).
+				let mut metadata_key_frame = false;
 				if ctx.format.hdr {
 					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
 						metadata: frame.hdr_metadata,
 					};
+					// Metadata-only changes keep the PQ color description, so
+					// nothing else makes the next frame a key frame carrying it.
+					if hdr_enabled {
+						let changed = last_hdr_state.enabled && new_state.metadata != last_hdr_state.metadata;
+						if metadata_refresh.due(changed, t2_imported) {
+							tracing::debug!("HDR metadata changed; encoding a key frame to carry it");
+							encoder.request_idr();
+							pending_idr = true;
+							metadata_key_frame = true;
+						}
+					} else {
+						metadata_refresh.cancel();
+					}
 					if new_state != last_hdr_state {
 						if new_state.enabled {
 							match new_state.metadata {
 								Some(m) => tracing::info!(
-									"Content switched to HDR (BT.2020/PQ): maxCLL {} nits, maxFALL {} nits",
-									m.max_cll,
-									m.max_fall
+									max_cll = ?m.max_cll,
+									max_fall = ?m.max_fall,
+									mastering_peak_nits = ?m.mastering.map(|d| d.max_luminance / 10_000),
+									"Content switched to HDR (BT.2020/PQ)"
 								),
 								None => tracing::info!("Content switched to HDR (BT.2020/PQ)"),
 							}
 						} else {
-							tracing::info!("Content switched to SDR (BT.709)");
+							tracing::info!("Content switched to SDR (sRGB)");
 						}
 						last_hdr_state = new_state.clone();
 						let _ = hdr_metadata_tx.send(new_state);
@@ -2462,6 +2524,9 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
+						if metadata_key_frame {
+							metadata_refresh.failed();
+						}
 						if let Some(rate) = pending_rate.take() {
 							rate.finish(super::rate::RateState::Failed, None, Some(e.to_string()));
 							encoder.set_bitrate(installed_rate).map_err(|error| error.to_string())?;

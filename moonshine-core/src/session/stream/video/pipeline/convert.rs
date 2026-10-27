@@ -87,7 +87,8 @@ struct PushConstants {
 	blocks_x: u32,
 	blocks_y: u32,
 	scaled: u32,
-	_padding: [u32; 2],
+	chroma_siting: u32,
+	_padding: u32,
 	layer_rect: [[i32; 4]; MAX_OVERLAYS],
 	layer_opacity: [f32; MAX_OVERLAYS],
 	layer_opaque: [u32; MAX_OVERLAYS],
@@ -262,6 +263,14 @@ pub(crate) enum ColorSpace {
 	/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` content. The input is already
 	/// linear, so only gamut mapping and the PQ OETF apply.
 	Bt709LinearToBt2020Pq,
+	/// Gamma 2.2 input (BT.709 primaries) re-encoded with the sRGB transfer:
+	/// the stream signals sRGB, and a gamma 2.2 buffer passed through would
+	/// be decoded with the wrong curve (most visibly near black). This is the
+	/// conversion the compositor applies when it composes such a surface.
+	Gamma22ToSrgb,
+	/// BT.709/BT.601 video-transfer input (BT.709 primaries), decoded per
+	/// BT.1886 (gamma 2.4) and re-encoded with the sRGB transfer.
+	Bt1886ToSrgb,
 }
 
 fn color_space_code(color_space: ColorSpace) -> u32 {
@@ -270,6 +279,41 @@ fn color_space_code(color_space: ColorSpace) -> u32 {
 		ColorSpace::Bt2020 => 1,
 		ColorSpace::SrgbToBt2020Pq => 2,
 		ColorSpace::Bt709LinearToBt2020Pq => 3,
+		ColorSpace::Gamma22ToSrgb => 4,
+		ColorSpace::Bt1886ToSrgb => 5,
+	}
+}
+
+/// Where 4:2:0 chroma samples sit relative to the luma grid. The encoder
+/// signals the same position (see [`ChromaSiting::location`]); decoders that
+/// assume another one shift chroma by half a luma pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChromaSiting {
+	/// Centered in each 2x2 block: the mean of its four pixels. H.264 and
+	/// HEVC signal it as chroma_sample_loc_type 1.
+	#[default]
+	Center,
+	/// Horizontally co-sited with the even column and vertically centered:
+	/// a [1 2 1]/4 filter across the column and its neighbors, averaged over
+	/// both rows. AV1 cannot signal centered chroma, so it uses this
+	/// position (CSP_VERTICAL), which is also what decoders assume.
+	Left,
+}
+
+impl ChromaSiting {
+	fn code(self) -> u32 {
+		match self {
+			Self::Center => 0,
+			Self::Left => 1,
+		}
+	}
+
+	/// The position the encoder signals for this siting.
+	pub(crate) fn location(self) -> pixelforge::ChromaLocation {
+		match self {
+			Self::Center => pixelforge::ChromaLocation::Center,
+			Self::Left => pixelforge::ChromaLocation::Left,
+		}
 	}
 }
 
@@ -549,11 +593,13 @@ impl Layout {
 /// scaled B-Y and R-Y differences, SMPTE ST 2084 (PQ), the IEC 61966-2-1 sRGB
 /// decoding function, the Rec. ITU-R BT.2087 primaries conversion, and the
 /// Rec. ITU-R BT.2100 / ITU-T H.273 quantization with round-to-nearest. 4:2:0
-/// chroma is the mean of the 2x2 co-sited pixels; pixels past the frame
+/// chroma is the mean of the 2x2 co-sited pixels ([`ChromaSiting::Center`])
+/// or, left-sited, the [1 2 1]/4 horizontal filter around the even column
+/// averaged over both rows; pixels past the frame (also left of it)
 /// replicate its nearest edge pixel. Arithmetic is in f64, so the GPU (f32)
 /// may differ by one code where a value lies on a rounding boundary.
 pub(crate) mod reference {
-	use super::{ColorSpace, ConvertFormat};
+	use super::{ChromaSiting, ColorSpace, ConvertFormat};
 
 	/// Color conversion parameters of one frame.
 	#[derive(Clone, Copy, Debug)]
@@ -562,6 +608,8 @@ pub(crate) mod reference {
 		pub full_range: bool,
 		/// Nits of the SDR/scRGB reference white in the PQ conversions.
 		pub sdr_white_nits: f32,
+		/// 4:2:0 chroma position; ignored for 4:4:4.
+		pub siting: ChromaSiting,
 	}
 
 	/// Code values of both planes over an extent. 10-bit samples are stored
@@ -605,6 +653,15 @@ pub(crate) mod reference {
 		}
 	}
 
+	fn linear_to_srgb(value: f64) -> f64 {
+		let value = value.clamp(0.0, 1.0);
+		if value <= 0.003_130_8 {
+			value * 12.92
+		} else {
+			1.055 * value.powf(1.0 / 2.4) - 0.055
+		}
+	}
+
 	fn bt709_to_bt2020([r, g, b]: [f64; 3]) -> [f64; 3] {
 		[
 			0.6274 * r + 0.3293 * g + 0.0433 * b,
@@ -622,9 +679,11 @@ pub(crate) mod reference {
 			ColorSpace::Bt709 | ColorSpace::Bt2020 => rgb,
 			ColorSpace::SrgbToBt2020Pq => bt709_to_bt2020(rgb.map(srgb_to_linear)).map(|c| pq(c * scale)),
 			ColorSpace::Bt709LinearToBt2020Pq => bt709_to_bt2020(rgb).map(|c| pq(c * scale)),
+			ColorSpace::Gamma22ToSrgb => rgb.map(|c| linear_to_srgb(c.clamp(0.0, 1.0).powf(2.2))),
+			ColorSpace::Bt1886ToSrgb => rgb.map(|c| linear_to_srgb(c.clamp(0.0, 1.0).powf(2.4))),
 		};
 		let (kr, kb) = match color.space {
-			ColorSpace::Bt709 => (0.2126, 0.0722),
+			ColorSpace::Bt709 | ColorSpace::Gamma22ToSrgb | ColorSpace::Bt1886ToSrgb => (0.2126, 0.0722),
 			_ => (0.2627, 0.0593),
 		};
 		let [r, g, b] = signal;
@@ -698,14 +757,21 @@ pub(crate) mod reference {
 						chroma_code(cr, bits, color.full_range),
 					];
 				} else if y % 2 == 0 && x % 2 == 0 {
+					// (column, weight) taps on both rows, and the weight sum.
+					let (taps, total): (&[(u32, f64)], f64) = match color.siting {
+						ChromaSiting::Center => (&[(x, 1.0), (x + 1, 1.0)], 4.0),
+						ChromaSiting::Left => (&[(x.saturating_sub(1), 1.0), (x, 2.0), (x + 1, 1.0)], 8.0),
+					};
 					let mut sum = [0.0; 2];
-					for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-						let [_, cb, cr] = at(x + dx, y + dy);
-						sum[0] += cb;
-						sum[1] += cr;
+					for dy in 0..2 {
+						for &(tx, weight) in taps {
+							let [_, cb, cr] = at(tx, y + dy);
+							sum[0] += weight * cb;
+							sum[1] += weight * cr;
+						}
 					}
 					let index = (y / 2) as usize * chroma_extent.0 as usize + (x / 2) as usize;
-					planes.chroma[index] = sum.map(|s| chroma_code(s / 4.0, bits, color.full_range));
+					planes.chroma[index] = sum.map(|s| chroma_code(s / total, bits, color.full_range));
 				}
 			}
 		}
@@ -981,6 +1047,7 @@ pub(crate) struct InputConverter {
 	color_space: ColorSpace,
 	full_range: bool,
 	sdr_white_nits: f32,
+	chroma_siting: ChromaSiting,
 	set_layout: vk::DescriptorSetLayout,
 	pipeline_layout: vk::PipelineLayout,
 	pipeline: vk::Pipeline,
@@ -1125,6 +1192,7 @@ impl InputConverter {
 			color_space,
 			full_range,
 			sdr_white_nits: 203.0,
+			chroma_siting: ChromaSiting::Center,
 			set_layout: vk::DescriptorSetLayout::null(),
 			pipeline_layout: vk::PipelineLayout::null(),
 			pipeline: vk::Pipeline::null(),
@@ -1355,6 +1423,12 @@ impl InputConverter {
 		self.color_space = color_space;
 		self.full_range = full_range;
 		self.sdr_white_nits = sdr_white_nits;
+	}
+
+	/// Select the 4:2:0 chroma position (ignored for 4:4:4 output). Both
+	/// positions are verified by the creation-time self-check.
+	pub(crate) fn set_chroma_siting(&mut self, siting: ChromaSiting) {
+		self.chroma_siting = siting;
 	}
 
 	/// (Re)allocate a slot's upload texture and staging buffer for `width` x `height`.
@@ -1629,7 +1703,8 @@ impl InputConverter {
 			blocks_x: layout.blocks.0,
 			blocks_y: layout.blocks.1,
 			scaled: u32::from(source.scaled),
-			_padding: [0; 2],
+			chroma_siting: self.chroma_siting.code(),
+			_padding: 0,
 			layer_rect: [[0; 4]; MAX_OVERLAYS],
 			layer_opacity: [0.0; MAX_OVERLAYS],
 			layer_opaque: [0; MAX_OVERLAYS],
@@ -2322,37 +2397,50 @@ fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: C
 		.flat_map(|y| (0..frame.0).flat_map(move |x| self_check_pixel(x, y)))
 		.collect();
 	let source = SelfCheckSource::new(&converter, frame, &pixels)?;
-	converter
-		.dispatch(
-			&SourceBinding {
-				image: source.image,
-				view: source.view,
-				extent: frame,
-				scaled: false,
-				first_use: false,
-			},
-			&[None, None],
-			None,
-		)
-		.map_err(|e| format!("conversion failed: {e}"))?;
-	let actual = converter.layout().read_planes(converter.readback())?;
 	let rgb = |x: u32, y: u32| {
 		let [r, g, b, _] = self_check_pixel(x, y);
 		[r, g, b].map(|c| f32::from(c) / 255.0)
 	};
-	let expected = reference::convert(
-		format,
-		reference::Color {
-			space: ColorSpace::Bt709,
-			full_range: false,
-			sdr_white_nits: 203.0,
-		},
-		frame,
-		extent,
-		&rgb,
-		&|_| true,
-	);
-	reference::compare(&expected, &actual, 1, &|_| true).map(|_| ())
+	// The encoder selects the chroma position by codec after creation;
+	// verify every position this format can use.
+	let sitings: &[ChromaSiting] = if subsampled {
+		&[ChromaSiting::Center, ChromaSiting::Left]
+	} else {
+		&[ChromaSiting::Center]
+	};
+	for &siting in sitings {
+		converter.set_chroma_siting(siting);
+		converter
+			.dispatch(
+				&SourceBinding {
+					image: source.image,
+					view: source.view,
+					extent: frame,
+					scaled: false,
+					first_use: false,
+				},
+				&[None, None],
+				None,
+			)
+			.map_err(|e| format!("conversion failed: {e}"))?;
+		let actual = converter.layout().read_planes(converter.readback())?;
+		let expected = reference::convert(
+			format,
+			reference::Color {
+				space: ColorSpace::Bt709,
+				full_range: false,
+				sdr_white_nits: 203.0,
+				siting,
+			},
+			frame,
+			extent,
+			&rgb,
+			&|_| true,
+		);
+		reference::compare(&expected, &actual, 1, &|_| true)
+			.map_err(|detail| format!("{siting:?} chroma: {detail}"))?;
+	}
+	Ok(())
 }
 
 /// The self-check's source image (RGBA8, GENERAL layout) and view, freed on

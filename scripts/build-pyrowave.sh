@@ -19,8 +19,17 @@ fi
 git -C "${src}" fetch origin "${SOURCE_REVISION}"
 git -C "${src}" checkout --detach "${SOURCE_REVISION}"
 
+# The fork's helper and the loop below patch Granite in place on every run.
+# A reused work directory keeps the previous run's patched files, on which
+# the fork's patches may neither apply nor reverse once a host patch changed
+# them; start from the pinned Granite files each time.
+if [[ -d "${src}/Granite/.git" ]]; then
+  git -C "${src}/Granite" checkout -- .
+fi
+
 # This fork-owned helper checks out only Granite plus the two submodules used
-# by the standalone library. Verify every transitive revision after it runs.
+# by the standalone library and applies the fork's Granite patches. Verify
+# every transitive revision after it runs.
 (cd "${src}" && ./checkout_granite.sh)
 [[ "$(git -C "${src}" rev-parse HEAD)" == "${SOURCE_REVISION}" ]]
 [[ "$(git -C "${src}/Granite" rev-parse HEAD)" == "${GRANITE_REVISION}" ]]
@@ -29,8 +38,10 @@ git -C "${src}" checkout --detach "${SOURCE_REVISION}"
 
 # Apply the audited, wire-compatible fixes to the pinned dependency.
 patch_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../nix/patches" && pwd)"
+# The fork already applied the shared ones; only a patch that neither applies
+# nor reverses is an error, reported by the reverse check.
 for patch in "$patch_dir"/*.patch; do
-  if git -C "${src}" apply --check "$patch"; then
+  if git -C "${src}" apply --check "$patch" 2>/dev/null; then
     git -C "${src}" apply "$patch"
   else
     git -C "${src}" apply --reverse --check "$patch"

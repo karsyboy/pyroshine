@@ -1310,12 +1310,14 @@ impl MoonshineCompositor {
 		{
 			return Err(DirectReject::SurfaceTree);
 		}
-		if !self.hdr
-			&& self
-				.color_management
-				.as_ref()
-				.is_some_and(|cm| cm.surface_color_space(&source) != FrameColorSpace::Srgb)
-		{
+		// Composition converts what the stream cannot carry as is: HDR into
+		// an SDR output, and gamma 2.2 into the sRGB every SDR stream signals
+		// (PyroWave's scaler has no gamma 2.2 input, and the conversion is
+		// the compositor's shader either way).
+		if self.color_management.as_ref().is_some_and(|cm| {
+			let color_space = cm.surface_color_space(&source);
+			color_space == FrameColorSpace::Gamma22 || (!self.hdr && color_space.is_hdr())
+		}) {
 			return Err(DirectReject::ForcedComposition);
 		}
 		self.surface_is_complete_output(&source)

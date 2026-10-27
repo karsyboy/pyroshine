@@ -1783,7 +1783,7 @@ pub(crate) fn probe(
 		height: PROBE_EXTENT.1,
 		fps: 60,
 		bitrate: 10_000_000,
-		color: ColorDescription::bt709(),
+		color: ColorDescription::srgb(),
 	};
 	// Each entry point must encode a frame; streams then use the one that did.
 	let encoder = VaapiEncoder::create(context, format, encode_key_frame)?;

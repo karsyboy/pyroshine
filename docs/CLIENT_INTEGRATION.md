@@ -139,7 +139,7 @@ a client that sends `60`). Like Apollo, a value of 1000 or more is millihertz.
 | --- | --- | --- | --- |
 | `0` or absent | absent | any | 8-bit SDR |
 | `1` | absent | `1` or absent | HDR10 (10-bit, BT.2020/PQ) |
-| `1` | absent | `0` | 10-bit SDR (BT.709), H.264/HEVC/AV1 only |
+| `1` | absent | `0` | 10-bit SDR (sRGB, BT.709 primaries), H.264/HEVC/AV1 only |
 | either | `8` or `10` | any | that depth, SDR or HDR10 as `dynamicRangeMode` says |
 
 Moonlight clients send `hdrMode=1` with HDR and nothing otherwise. Sunshine

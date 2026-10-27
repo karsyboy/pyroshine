@@ -318,7 +318,20 @@ impl Hevc {
 		w.u(8, u32::from(setup.color.color_primaries));
 		w.u(8, u32::from(setup.color.transfer_characteristics));
 		w.u(8, u32::from(setup.color.matrix_coefficients));
-		w.flag(false); // chroma_loc_info_present_flag
+		// Chroma position is defined for 4:2:0 (ChromaArrayType 1) only.
+		match setup
+			.color
+			.chroma_location
+			.h26x_loc_type()
+			.filter(|_| !setup.chroma_444)
+		{
+			Some(loc_type) => {
+				w.flag(true); // chroma_loc_info_present_flag
+				w.ue(u32::from(loc_type)); // chroma_sample_loc_type_top_field
+				w.ue(u32::from(loc_type)); // chroma_sample_loc_type_bottom_field
+			},
+			None => w.flag(false), // chroma_loc_info_present_flag
+		}
 		w.flag(false); // neutral_chroma_indication_flag
 		w.flag(false); // field_seq_flag
 		w.flag(false); // frame_field_info_present_flag

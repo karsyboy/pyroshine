@@ -31,7 +31,8 @@ layout(push_constant) uniform PushConstants {
     uint source_max_x;
     uint source_max_y;
     uint output_format;  // 0=NV12, 2=YUV444, 3=P010, 4=YUV444P10, 5=XYUV, 6=Y410
-    uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB->BT.2020+PQ, 3=scRGB linear->BT.2020+PQ
+    uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB->BT.2020+PQ, 3=scRGB linear->BT.2020+PQ,
+                         // 4=gamma 2.2->sRGB, 5=BT.1886 (gamma 2.4)->sRGB
     uint full_range;
     float sdr_white_nits;
     // Plane layout in 32-bit words.
@@ -44,6 +45,10 @@ layout(push_constant) uniform PushConstants {
     // Non-zero: the whole source is scaled onto the logical frame (Desktop
     // Mode, whose output size is not the stream's); zero samples 1:1.
     uint scaled;
+    // 4:2:0 chroma position: 0 centered in the 2x2 block (H.264/HEVC
+    // chroma_sample_loc_type 1), 1 horizontally co-sited with the even
+    // column (type 0, AV1 CSP_VERTICAL).
+    uint chroma_siting;
     // Layer rectangles in output pixels (x, y, width, height), bottom to top;
     // width 0 disables a layer.
     ivec4 layer_rect[2];
@@ -82,6 +87,15 @@ vec3 linear_to_pq(vec3 L) {
     L = max(L, vec3(0.0));
     vec3 Lm1 = pow(L, vec3(PQ_M1));
     return pow((PQ_C1 + PQ_C2 * Lm1) / (1.0 + PQ_C3 * Lm1), vec3(PQ_M2));
+}
+
+vec3 linear_to_srgb(vec3 linear) {
+    linear = clamp(linear, 0.0, 1.0);
+    return mix(
+        1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
+        linear * 12.92,
+        lessThanEqual(linear, vec3(0.0031308))
+    );
 }
 
 vec3 srgb_to_linear(vec3 srgb) {
@@ -162,13 +176,18 @@ vec3 read_rgb(ivec2 coord) {
         vec3 linear_2020 = bt709_to_bt2020(rgb);
         return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
     }
+    if (params.color_space >= 4u) {
+        float gamma = params.color_space == 4u ? 2.2 : 2.4;
+        return linear_to_srgb(pow(clamp(rgb, 0.0, 1.0), vec3(gamma)));
+    }
     return rgb;
 }
 
 // Normalized (Y, Cb + 0.5, Cr + 0.5), each clamped to [0, 1].
 vec3 rgb_to_yuv(vec3 rgb) {
-    float kr = params.color_space >= 1u ? BT2020_KR : BT709_KR;
-    float kb = params.color_space >= 1u ? BT2020_KB : BT709_KB;
+    bool bt2020 = params.color_space >= 1u && params.color_space <= 3u;
+    float kr = bt2020 ? BT2020_KR : BT709_KR;
+    float kb = bt2020 ? BT2020_KB : BT709_KB;
     float y = kr * rgb.r + (1.0 - kr - kb) * rgb.g + kb * rgb.b;
     float u = (rgb.b - y) * (0.5 / (1.0 - kb)) + 0.5;
     float v = (rgb.r - y) * (0.5 / (1.0 - kr)) + 0.5;
@@ -208,6 +227,12 @@ uint q10_c(float c) {
 // 2x2 box filter for 4:2:0 chroma, summed in the order (00, 10, 01, 11).
 vec2 chroma_420(vec3 p00, vec3 p10, vec3 p01, vec3 p11) {
     return (p00.yz + p10.yz + p01.yz + p11.yz) / 4.0;
+}
+
+// Left-sited 4:2:0 chroma: [1 2 1]/4 across the even column (c) and its
+// neighbors (l, r), averaged over both rows.
+vec2 chroma_420_left(vec3 l0, vec3 c0, vec3 r0, vec3 l1, vec3 c1, vec3 r1) {
+    return (l0.yz + 2.0 * c0.yz + r0.yz + l1.yz + 2.0 * c1.yz + r1.yz) / 8.0;
 }
 
 uint pack_y8(vec3 p0, vec3 p1, vec3 p2, vec3 p3) {
@@ -256,12 +281,30 @@ void main() {
     uint row_a = y0 * params.luma_pitch;
     uint row_b = row_a + params.luma_pitch;
 
+    // The block's two 4:2:0 chroma samples (unused for 4:4:4). Left siting
+    // also reads the column before the block, which replicates the frame's
+    // left edge for the first block.
+    vec2 c0;
+    vec2 c1;
+    if (params.output_format == 0u || params.output_format == 3u) {
+        if (params.chroma_siting == 0u) {
+            c0 = chroma_420(a0, a1, b0, b1);
+            c1 = chroma_420(a2, a3, b2, b3);
+        } else {
+            uint xl = x0 == 0u ? 0u : x0 - 1u;
+            vec3 al = pixel(xl, y0);
+            vec3 bl = pixel(xl, y0 + 1u);
+            c0 = chroma_420_left(al, a0, a1, bl, b0, b1);
+            c1 = chroma_420_left(a1, a2, a3, b1, b2, b3);
+        }
+    }
+
     if (params.output_format == 0u) {
         // NV12: 8-bit luma; one UVUV word per block on chroma row `by`.
         output_data[row_a + bx] = pack_y8(a0, a1, a2, a3);
         output_data[row_b + bx] = pack_y8(b0, b1, b2, b3);
         uint c = params.chroma_offset + by * params.chroma_pitch + bx;
-        output_data[c] = pack_c8(chroma_420(a0, a1, b0, b1), chroma_420(a2, a3, b2, b3));
+        output_data[c] = pack_c8(c0, c1);
     } else if (params.output_format == 3u) {
         // P010: 16-bit luma; one UV word per chroma sample on chroma row `by`.
         output_data[row_a + 2u * bx] = pack_y10(a0, a1);
@@ -269,8 +312,8 @@ void main() {
         output_data[row_b + 2u * bx] = pack_y10(b0, b1);
         output_data[row_b + 2u * bx + 1u] = pack_y10(b2, b3);
         uint c = params.chroma_offset + by * params.chroma_pitch + 2u * bx;
-        output_data[c] = pack_c10(chroma_420(a0, a1, b0, b1));
-        output_data[c + 1u] = pack_c10(chroma_420(a2, a3, b2, b3));
+        output_data[c] = pack_c10(c0);
+        output_data[c + 1u] = pack_c10(c1);
     } else if (params.output_format == 2u) {
         // YUV444 8-bit: 8-bit luma; interleaved UV per pixel, two pixels per word.
         output_data[row_a + bx] = pack_y8(a0, a1, a2, a3);

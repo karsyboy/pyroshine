@@ -272,7 +272,7 @@ impl Av1 {
 		w.u(8, u32::from(setup.color.transfer_characteristics));
 		w.u(8, u32::from(setup.color.matrix_coefficients));
 		w.flag(setup.color.full_range); // color_range
-		w.u(2, 0); // chroma_sample_position: unknown
+		w.u(2, u32::from(setup.color.chroma_location.av1_sample_position())); // chroma_sample_position
 		w.flag(false); // separate_uv_delta_q
 		w.flag(false); // film_grain_params_present
 		w.trailing_bits();

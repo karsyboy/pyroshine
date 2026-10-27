@@ -897,7 +897,7 @@ fn capture(
 	};
 	wait_input_devices(&mainloop, &mut input, stop.clone())
 		.map_err(|e| capture_failure("desktop_input_unavailable", e))?;
-	if format.color.color_space() != Some(crate::session::capture::frame::FrameColorSpace::Srgb) {
+	if format.color.color_space().is_none_or(|color| color.is_hdr()) {
 		return Err(capture_failure(
 			"desktop_hdr_unsupported",
 			"The prepared virtual output is not SDR",
@@ -911,7 +911,7 @@ fn capture(
 	wait_input(&mainloop, &mut input, stop.clone()).map_err(|e| capture_failure("desktop_input_unavailable", e))?;
 	input.set_view(live.view.clone());
 	let color = format.color.color_space().expect("checked at negotiation");
-	let hdr = color != crate::session::capture::frame::FrameColorSpace::Srgb;
+	let hdr = color.is_hdr();
 	if hdr {
 		return Err(capture_failure(
 			"desktop_hdr_unsupported",
@@ -1284,7 +1284,7 @@ pub(crate) fn wait_format(
 				}
 				continue;
 			}
-			if format.color.color_space() != Some(crate::session::capture::frame::FrameColorSpace::Srgb) {
+			if format.color.color_space().is_none_or(|color| color.is_hdr()) {
 				return Err("Managed Desktop Mode requires an SDR virtual output".into());
 			}
 			if stream.validate_frame()? {

@@ -50,8 +50,8 @@ struct Args {
 	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
-	/// Use PyroWave's record-framed dialect (Nightjar): SDR frames of an HDR
-	/// stream are encoded as 10-bit BT.709 SDR.
+	/// Use PyroWave's record-framed dialect as Nightjar does: SDR frames of an
+	/// HDR stream are encoded as 10-bit sRGB SDR (BT.709 primaries and matrix).
 	#[arg(long)]
 	pyrowave_record: bool,
 	/// Transport measurement controls; encoding bitrate/quality remains unchanged.
@@ -1227,6 +1227,8 @@ async fn run_benchmark(
 		} else {
 			moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1
 		}),
+		// `--pyrowave-record` emulates Nightjar, which presents by HDR mode.
+		pyrowave_sdr_as_sdr: args.pyrowave_record,
 		width,
 		height,
 		fps: target_fps,

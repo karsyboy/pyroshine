@@ -821,7 +821,7 @@ fn session_details(view: SessionView, gpu: &str, video_config: &VideoStreamConfi
 				bit_depth: format.bit_depth.bits(),
 				dynamic_range: if format.hdr { "HDR10" } else { "SDR" }.into(),
 				transfer: match format.transfer {
-					TransferFunction::Bt709 => "BT.709",
+					TransferFunction::Srgb => "sRGB",
 					TransferFunction::Pq => "PQ",
 				}
 				.into(),

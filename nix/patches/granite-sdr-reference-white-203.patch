@@ -1,0 +1,24 @@
+diff --git a/Granite/video/scaler.cpp b/Granite/video/scaler.cpp
+index eb581d9c..335b4259 100644
+--- a/Granite/video/scaler.cpp
++++ b/Granite/video/scaler.cpp
+@@ -430,15 +430,16 @@ void VideoScaler::rescale(CommandBuffer &cmd, const RescaleInfo &info)
+ 
+ 		float sdr_scale = 1.0f;
+ 		if (info.input_color_space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+-			sdr_scale = 200.0f;
++			// BT.2408 reference white, as Pyroshine's compositor and converter use.
++			sdr_scale = 203.0f;
+ 		else if (info.input_color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
+ 			sdr_scale = 80.0f;
+ 
+ 		if (info.output_color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
+ 			sdr_scale /= 80.0f;
+ 		else if (info.output_color_space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+-			// PQ is in nits; SDR linear RGB is relative to 200-nit white.
+-			sdr_scale /= 200.0f;
++			// PQ is in nits; SDR linear RGB is relative to 203-nit white.
++			sdr_scale /= 203.0f;
+ 
+ 		ubo->primary_transform[0] = vec4(sdr_scale * conv[0], 0.0f);
+ 		ubo->primary_transform[1] = vec4(sdr_scale * conv[1], 0.0f);

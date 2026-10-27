@@ -17,7 +17,7 @@ use smithay::reexports::wayland_protocols::wp::color_representation::v1::server:
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use crate::session::capture::frame::{FrameColorSpace, HdrMetadata};
+use crate::session::capture::frame::{FrameColorSpace, HdrMetadata, MasteringDisplay};
 use crate::session::compositor::state::MoonshineCompositor;
 
 fn send_ready(resource: &wp_image_description_v1::WpImageDescriptionV1) {
@@ -126,6 +126,7 @@ impl ImageDescription {
 		match (self.primaries, self.transfer_function) {
 			(Primaries::Bt2020, TransferFunction::St2084Pq) => FrameColorSpace::Bt2020Pq,
 			(Primaries::Srgb, TransferFunction::ScrgbLinear) => FrameColorSpace::ScrgbLinear,
+			(Primaries::Srgb, TransferFunction::Gamma22) => FrameColorSpace::Gamma22,
 			_ => FrameColorSpace::Srgb,
 		}
 	}
@@ -329,8 +330,16 @@ impl ColorManagementState {
 		Self::description_hdr_metadata(self.surface_description(surface)?)
 	}
 
+	/// Static metadata of an HDR description, keeping each group's presence.
+	///
+	/// The mastering display is reported only when the client declared its
+	/// luminance range: the protocol's implied default (the primary
+	/// luminance range, 10000 nits for PQ) and scRGB's 80-nit reference
+	/// white describe the encoding, not a mastering display. Declared
+	/// luminance without primaries uses the description's own primaries and
+	/// D65, as the protocol defines.
 	fn description_hdr_metadata(desc: ImageDescription) -> Option<HdrMetadata> {
-		if desc.to_frame_color_space() == FrameColorSpace::Srgb
+		if !desc.to_frame_color_space().is_hdr()
 			|| (desc.max_cll.is_none()
 				&& desc.max_fall.is_none()
 				&& desc.mastering_luminance.is_none()
@@ -341,36 +350,31 @@ impl ColorManagementState {
 		// Clamp u32 protocol values to u16 range for the Moonlight HDR metadata.
 		// Well-behaved clients stay within range; clamp rather than truncate.
 		let sat = |v: u32| -> u16 { u16::try_from(v).unwrap_or(u16::MAX) };
+		let mastering = desc
+			.mastering_luminance
+			.map(|(min_luminance, max_luminance)| MasteringDisplay {
+				display_primaries: desc.mastering_primaries.map_or(
+					if desc.primaries == Primaries::Bt2020 {
+						[(35400, 14600), (8500, 39850), (6550, 2300)]
+					} else {
+						[(32000, 16500), (15000, 30000), (7500, 3000)]
+					},
+					|p| {
+						[
+							(sat(p[0].0), sat(p[0].1)),
+							(sat(p[1].0), sat(p[1].1)),
+							(sat(p[2].0), sat(p[2].1)),
+						]
+					},
+				),
+				white_point: desc.white_point.map_or((15635, 16450), |(x, y)| (sat(x), sat(y))),
+				max_luminance,
+				min_luminance,
+			});
 		Some(HdrMetadata {
-			display_primaries: desc.mastering_primaries.map_or(
-				if desc.primaries == Primaries::Bt2020 {
-					[(35400, 14600), (8500, 39850), (6550, 2300)]
-				} else {
-					[(32000, 16500), (15000, 30000), (7500, 3000)]
-				},
-				|p| {
-					[
-						(sat(p[0].0), sat(p[0].1)),
-						(sat(p[1].0), sat(p[1].1)),
-						(sat(p[2].0), sat(p[2].1)),
-					]
-				},
-			),
-			white_point: desc.white_point.map_or((15635, 16450), |(x, y)| (sat(x), sat(y))),
-			max_luminance: desc.mastering_luminance.map_or(
-				if desc.transfer_function == TransferFunction::St2084Pq {
-					100_000_000
-				} else {
-					// The 80-nit scRGB unit is reference white, not peak
-					// mastering luminance. Keep the existing HDR10 fallback
-					// when a partial declaration supplies no mastering range.
-					HdrMetadata::fallback().max_luminance
-				},
-				|(_, max)| max,
-			),
-			min_luminance: desc.mastering_luminance.map_or(0, |(min, _)| min),
-			max_cll: sat(desc.max_cll.unwrap_or(0)),
-			max_fall: sat(desc.max_fall.unwrap_or(0)),
+			mastering,
+			max_cll: desc.max_cll.map(sat),
+			max_fall: desc.max_fall.map(sat),
 		})
 	}
 
@@ -382,7 +386,7 @@ impl ColorManagementState {
 		root: &WlSurface,
 	) -> Option<WlSurface> {
 		let surface = self.declared.get(id)?;
-		if self.surface_color_space(surface) == FrameColorSpace::Srgb {
+		if !self.surface_color_space(surface).is_hdr() {
 			return None;
 		}
 		let mut ancestor = Some(surface.clone());
@@ -1463,15 +1467,16 @@ mod tests {
 		h.commit(0);
 		assert_eq!(cm.surface_color_space(&a), FrameColorSpace::Bt2020Pq);
 		let metadata = cm.surface_hdr_metadata(&a).unwrap();
-		assert_eq!(metadata.max_cll, 2000);
-		assert_eq!(metadata.max_fall, 500);
-		assert_eq!(metadata.max_luminance, 12_000_000);
-		assert_eq!(metadata.min_luminance, 10);
+		assert_eq!(metadata.max_cll, Some(2000));
+		assert_eq!(metadata.max_fall, Some(500));
+		let mastering = metadata.mastering.unwrap();
+		assert_eq!(mastering.max_luminance, 12_000_000);
+		assert_eq!(mastering.min_luminance, 10);
 		assert_eq!(
-			metadata.display_primaries,
+			mastering.display_primaries,
 			[(35400, 14600), (8500, 39850), (6550, 2300)]
 		);
-		assert_eq!(metadata.white_point, (15635, 16450));
+		assert_eq!(mastering.white_point, (15635, 16450));
 		assert_eq!(cm.surface_color_space(&b), FrameColorSpace::Srgb);
 		assert!(cm.surface_hdr_metadata(&b).is_none());
 		cm.set_pending(&b, ImageDescription::scrgb_linear());
@@ -1530,10 +1535,43 @@ mod tests {
 			..ImageDescription::scrgb_linear()
 		};
 		let metadata = ColorManagementState::description_hdr_metadata(desc).unwrap();
-		assert_eq!(metadata.max_cll, 2000);
-		assert_eq!(metadata.max_fall, 500);
-		assert_eq!(metadata.max_luminance, HdrMetadata::fallback().max_luminance);
-		assert_ne!(metadata.max_luminance, 80 * 10000);
+		assert_eq!(metadata.max_cll, Some(2000));
+		assert_eq!(metadata.max_fall, Some(500));
+		// The 80-nit unit is not a mastering peak; none was declared.
+		assert_eq!(metadata.mastering, None);
+	}
+
+	#[test]
+	fn content_light_levels_alone_do_not_invent_a_mastering_display() {
+		// PQ with only MaxCLL: the protocol's implied 10000-nit primary range
+		// is not reported as the mastering display.
+		let cll_only = ImageDescription {
+			max_cll: Some(1500),
+			..ImageDescription::bt2020_pq()
+		};
+		let metadata = ColorManagementState::description_hdr_metadata(cll_only).unwrap();
+		assert_eq!(metadata.mastering, None);
+		assert_eq!((metadata.max_cll, metadata.max_fall), (Some(1500), None));
+
+		// Declared luminance without primaries uses the container primaries.
+		let luminance_only = ImageDescription {
+			mastering_luminance: Some((50, 6_000_000)),
+			..ImageDescription::bt2020_pq()
+		};
+		let mastering = ColorManagementState::description_hdr_metadata(luminance_only)
+			.unwrap()
+			.mastering
+			.unwrap();
+		assert_eq!(mastering.max_luminance, 6_000_000);
+		assert_eq!(mastering.min_luminance, 50);
+		assert_eq!(
+			mastering.display_primaries,
+			[(35400, 14600), (8500, 39850), (6550, 2300)]
+		);
+		assert_eq!(
+			ColorManagementState::description_hdr_metadata(ImageDescription::bt2020_pq()),
+			None
+		);
 	}
 
 	#[test]

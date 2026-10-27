@@ -119,6 +119,11 @@ impl H265 {
             ),
         };
 
+        // Chroma position is defined for 4:2:0 (ChromaArrayType 1) only.
+        let chroma_loc_type = desc
+            .chroma_location
+            .h26x_loc_type()
+            .filter(|_| config.pixel_format == PixelFormat::Yuv420);
         let vui_flags = ash::vk::native::StdVideoH265SpsVuiFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoH265SpsVuiFlags::new_bitfield_1(
@@ -128,7 +133,7 @@ impl H265 {
                 1,
                 if desc.full_range { 1 } else { 0 },
                 1,
-                0,
+                u32::from(chroma_loc_type.is_some()),
                 0,
                 0,
                 0,
@@ -154,8 +159,8 @@ impl H265 {
             colour_primaries: desc.color_primaries,
             transfer_characteristics: desc.transfer_characteristics,
             matrix_coeffs: desc.matrix_coefficients,
-            chroma_sample_loc_type_top_field: 0,
-            chroma_sample_loc_type_bottom_field: 0,
+            chroma_sample_loc_type_top_field: chroma_loc_type.unwrap_or(0),
+            chroma_sample_loc_type_bottom_field: chroma_loc_type.unwrap_or(0),
             reserved1: 0,
             reserved2: 0,
             def_disp_win_left_offset: 0,

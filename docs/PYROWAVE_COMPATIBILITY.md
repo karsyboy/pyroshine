@@ -76,17 +76,30 @@ the client asks; contradictory depth or chroma requests are rejected. SDR uses
 BT.709/sRGB; HDR uses BT.2020/PQ.
 
 An HDR10 stream follows its content per frame, as the conventional codecs do,
-in the record-framed dialect only. Record clients (Nightjar, after the
-Rubylight host) switch their presentation with the control stream's HDR mode
-and convert the planes by it, not by the sequence header: SDR frames are
-encoded as 10-bit BT.709 with HDR mode off, HDR frames as BT.2020/PQ with it
-on. Native wire-v1 keeps every frame in HDR10, SDR frames mapped with their
-white at 200 nits, because Pyrolight reads the sequence header.
+only for a record client that presents by the control stream's HDR mode:
+Nightjar, after the Rubylight host, which converts the planes by that mode,
+not by the sequence header. Pyroshine recognizes it by its record ANNOUNCE:
+feature bit 1 with neither an explicit `x-ss-pyrowave.dialect` echo nor the
+Nonary adaptive FEC/bitrate attributes. For it, SDR frames are encoded as
+10-bit SDR (sRGB transfer, BT.709 primaries and matrix) with HDR mode off, and
+HDR frames as BT.2020/PQ with it on. Every frame's sequence header states its
+own encoding. HDR mode travels on the control stream, separately from the
+video, so a frame or two around a switch can be converted with the previous
+mode; nothing in the record contract orders the two.
+
+Every other HDR10 PyroWave stream keeps every frame in HDR10, SDR frames
+mapped with their white at the 203-nit BT.2408 reference white (the same scale
+as composition and the conventional converter): native wire-v1, because
+Pyrolight reads the sequence header, and the other record clients, because
+they normalize zero header color bits to the negotiated format.
 
 Nonary's scaled encoder leaves sequence-header color bits at zero, including
-HDR. Record sessions therefore normalize default metadata from negotiated SDP
-before native validation. Already matching metadata is accepted; conflicting
-metadata is rejected. Native metadata is never rewritten.
+HDR. Record sessions in Pyrolight therefore normalize default metadata from
+negotiated SDP before native validation. Already matching metadata is
+accepted; conflicting metadata is rejected. Native metadata is never
+rewritten. Zero color bits mean BT.709/sRGB in a Pyroshine sequence header, so
+a client that normalizes them must not be sent SDR frames in an HDR10 stream,
+which is why only Nightjar's form receives them.
 
 ## Authenticated calibration
 

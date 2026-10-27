@@ -1,4 +1,4 @@
-use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect};
+use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect, record_client_follows_hdr_mode};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
@@ -475,6 +475,7 @@ impl RtspServer {
 					.build(format!("PyroWave ANNOUNCE rejected: {reason}").into_bytes());
 			},
 		};
+		let pyrowave_sdr_as_sdr = negotiated_pyrowave_sdr_as_sdr(pyrowave_dialect, &sdp_session);
 
 		let requested_hdr_mode = self.session_manager.requested_hdr_mode().await;
 		let (dynamic_range, chroma_sampling_type, bit_depth) =
@@ -584,6 +585,7 @@ impl RtspServer {
 			height,
 			fps,
 			pyrowave_dialect = ?pyrowave_dialect,
+			pyrowave_sdr_as_sdr,
 			pyrowave_bitstream = BITSTREAM_ID,
 			packet_size,
 			"Selected video mode"
@@ -591,6 +593,7 @@ impl RtspServer {
 
 		let video_stream_context = VideoStreamContext {
 			pyrowave_dialect,
+			pyrowave_sdr_as_sdr,
 			width,
 			height,
 			fps,
@@ -1034,6 +1037,19 @@ fn negotiated_pyrowave_dialect(
 		unique_sdp_attribute(session, "x-ss-video[0].pyrowaveAdaptiveFec")?,
 	)
 	.map(Some)
+}
+
+/// Whether a record-framed PyroWave client presents by the control stream's
+/// HDR mode (see [`record_client_follows_hdr_mode`]). A repeated attribute
+/// counts as present, which keeps the conservative HDR10 behavior.
+fn negotiated_pyrowave_sdr_as_sdr(dialect: Option<PyroWaveDialect>, session: &sdp_types::Session) -> bool {
+	let attribute = |name| unique_sdp_attribute(session, name).unwrap_or(Some(""));
+	dialect == Some(PyroWaveDialect::RecordFramed)
+		&& record_client_follows_hdr_mode(
+			attribute("x-ss-pyrowave.dialect"),
+			attribute("x-ss-video[0].pyrowaveAdaptiveFec"),
+			attribute("x-ss-video[0].pyrowaveAdaptiveBitrate"),
+		)
 }
 
 /// The channel layout an ANNOUNCE asks for.
@@ -1814,6 +1830,60 @@ mod tests {
 			pyrowave_profiles(CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR),
 			"444-sdr8 444-hdr10"
 		);
+	}
+
+	/// Only a record client that presents by HDR mode (Nightjar: feature bit 1
+	/// alone) gets SDR frames as SDR. Clients that normalize zero header color
+	/// bits to the negotiated format keep every frame in HDR10: Pyrolight's
+	/// record mode (explicit dialect echo), Nonary builds with the adaptive
+	/// attributes, native clients and the conventional codecs.
+	#[test]
+	fn only_hdr_mode_record_clients_receive_sdr_frames_as_sdr() {
+		use super::*;
+		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fixture\r\nt=0 0\r\n";
+		let pyrolight_record = format!(
+			"{base}a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-pyrowave.dialect:record-framed\r\na=x-ss-pyrowave.bitstream:186f0393\r\n"
+		);
+		let nonary_bitrate_only =
+			format!("{base}a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-video[0].pyrowaveAdaptiveBitrate:1\r\n");
+		let repeated_marker = format!(
+			"{base}a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-video[0].pyrowaveAdaptiveBitrate:1\r\na=x-ss-video[0].pyrowaveAdaptiveBitrate:1\r\n"
+		);
+		let nightjar_without_hints = format!("{base}a=x-ss-video[0].pyrowaveFeatures:1\r\n");
+		for (attributes, codec, expected) in [
+			(
+				include_str!("../tests/protocol/nightjar-announce.sdp"),
+				VideoCodec::PyroWave,
+				true,
+			),
+			(nightjar_without_hints.as_str(), VideoCodec::PyroWave, true),
+			(
+				include_str!("../tests/protocol/nonary-announce.sdp"),
+				VideoCodec::PyroWave,
+				false,
+			),
+			(nonary_bitrate_only.as_str(), VideoCodec::PyroWave, false),
+			(repeated_marker.as_str(), VideoCodec::PyroWave, false),
+			(pyrolight_record.as_str(), VideoCodec::PyroWave, false),
+			(
+				include_str!("../tests/protocol/native-announce.sdp"),
+				VideoCodec::PyroWave,
+				false,
+			),
+			(
+				include_str!("../tests/protocol/nightjar-announce.sdp"),
+				VideoCodec::Hevc,
+				false,
+			),
+		] {
+			let session = sdp_types::Session::parse(attributes.as_bytes()).unwrap();
+			let dialect = negotiated_pyrowave_dialect(codec, &session).unwrap();
+			assert_eq!(
+				negotiated_pyrowave_sdr_as_sdr(dialect, &session),
+				expected,
+				"{codec:?} {attributes}"
+			);
+		}
 	}
 
 	#[test]

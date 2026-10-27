@@ -135,6 +135,7 @@ impl Settings {
 		let (width, height) = self.resolution();
 		VideoStreamContext {
 			pyrowave_dialect: pyrowave.then_some(PyroWaveDialect::NativeWireV1),
+			pyrowave_sdr_as_sdr: false,
 			width,
 			height,
 			fps: self.fps(),

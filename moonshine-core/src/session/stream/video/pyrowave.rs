@@ -680,16 +680,18 @@ pub(crate) struct PyroWaveEncoder {
 	consecutive_near_limit_frames: u32,
 	last_limit_warning: Option<std::time::Instant>,
 	scaling_logged: bool,
+	transfer_logged: bool,
 	/// See [`PyroWaveEncoder::set_sdr_content_as_sdr`].
 	sdr_content_as_sdr: bool,
 }
 
 /// Whether a frame of `color_space` is encoded as HDR10 in a stream whose
-/// negotiated format is `format_hdr`. With `sdr_content_as_sdr`, sRGB frames
-/// of an HDR10 stream are encoded as 10-bit BT.709 SDR instead, as the
-/// conventional codecs do; otherwise PyroWave maps them into HDR10.
+/// negotiated format is `format_hdr`. With `sdr_content_as_sdr`, SDR frames
+/// of an HDR10 stream are encoded as 10-bit SDR instead (sRGB transfer,
+/// BT.709 primaries and matrix), as the conventional codecs do; otherwise
+/// PyroWave maps them into HDR10.
 pub(crate) fn encodes_as_hdr(format_hdr: bool, sdr_content_as_sdr: bool, color_space: FrameColorSpace) -> bool {
-	format_hdr && !(sdr_content_as_sdr && color_space == FrameColorSpace::Srgb)
+	format_hdr && !(sdr_content_as_sdr && !color_space.is_hdr())
 }
 
 impl PyroWaveEncoder {
@@ -803,6 +805,7 @@ impl PyroWaveEncoder {
 			consecutive_near_limit_frames: 0,
 			last_limit_warning: None,
 			scaling_logged: false,
+			transfer_logged: false,
 			sdr_content_as_sdr: false,
 		})
 	}
@@ -945,14 +948,16 @@ impl PyroWaveEncoder {
 		Ok(view)
 	}
 
-	/// Encode sRGB frames of an HDR10 stream as 10-bit BT.709 SDR.
+	/// Encode SDR frames of an HDR10 stream as 10-bit SDR: the sRGB samples
+	/// are kept, with the BT.709 matrix, and the sequence header says so.
 	///
-	/// Record-framed clients (Nightjar, after the Rubylight host) switch their
-	/// PyroWave presentation with the control stream's HDR mode and convert
-	/// the planes by it rather than by the sequence header: HDR-off shows
-	/// 10-bit BT.709 on an SDR surface. Mapped into HDR10 instead, SDR white
-	/// sits at the scaler's 200 nits and looks dim beside the device's SDR
-	/// brightness. Pyrolight reads the sequence header and keeps HDR10.
+	/// Only for a record client that presents by the control stream's HDR
+	/// mode (Nightjar, after the Rubylight host; see
+	/// `pyrowave_protocol::record_client_follows_hdr_mode`): it converts the
+	/// planes by that mode rather than by the sequence header, and HDR-off
+	/// shows them on an sRGB surface. Mapped into HDR10 instead, SDR white
+	/// sits at the 203-nit reference white and looks dim beside the device's
+	/// SDR brightness. Pyrolight reads the sequence header and keeps HDR10.
 	pub(crate) fn set_sdr_content_as_sdr(&mut self, enabled: bool) {
 		self.sdr_content_as_sdr = enabled;
 	}
@@ -999,6 +1004,21 @@ impl PyroWaveEncoder {
 		let imported = std::time::Instant::now();
 		let input_color_space = match frame.color_space {
 			FrameColorSpace::Srgb => vk::ColorSpaceKHR::SRGB_NONLINEAR,
+			FrameColorSpace::Gamma22 | FrameColorSpace::Bt1886 => {
+				// The pinned scaler decodes only sRGB, PQ and linear input.
+				// The isolated compositor composes such surfaces, so only a
+				// desktop capture (Mutter declares gamma 2.2) reaches here;
+				// read as sRGB, near-black differs slightly from the source.
+				if !self.transfer_logged {
+					tracing::warn!(
+						color_space = ?frame.color_space,
+						"PyroWave reads this desktop's SDR transfer as sRGB; the darkest shades \
+						 are slightly brighter than on the host. The conventional codecs convert it exactly."
+					);
+					self.transfer_logged = true;
+				}
+				vk::ColorSpaceKHR::SRGB_NONLINEAR
+			},
 			FrameColorSpace::Bt2020Pq => vk::ColorSpaceKHR::HDR10_ST2084_EXT,
 			FrameColorSpace::ScrgbLinear => vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
 		};
@@ -1276,8 +1296,8 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 mod tests {
 	use super::*;
 
-	/// Record-framed HDR10 streams (Nightjar) carry SDR frames as 10-bit
-	/// BT.709; native streams (Pyrolight) and SDR streams are unchanged.
+	/// Nightjar's HDR10 streams carry SDR frames as 10-bit sRGB SDR; other
+	/// HDR10 streams (Pyrolight) and SDR streams are unchanged.
 	#[test]
 	fn only_record_framed_hdr_streams_carry_sdr_frames_as_sdr() {
 		use FrameColorSpace::{Bt2020Pq, ScrgbLinear, Srgb};

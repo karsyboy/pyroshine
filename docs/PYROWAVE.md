@@ -43,7 +43,13 @@ the library must expose exactly C API 1.1.0.
 Both build paths apply the maintained patches in `nix/patches/`: the Granite
 scaler's SDR normalization and its two-layer 1:1 overlay support, in that order. The fork
 carries the same files and its generated `shaders/slangmosh_scaler.hpp` is
-built from them. When updating
+built from them; never change those two copies on the host alone, since the
+fork's `checkout_granite.sh` applies its own. Host-only changes are separate
+patches applied after them: `granite-sdr-reference-white-203.patch` moves the
+scaler's SDR reference white from 200 to the 203 nits composition and the
+conventional converter use (a uniform value, so the generated shader is
+unchanged). `scripts/build-pyrowave.sh` restores Granite's pinned files before
+patching, so a reused work directory builds the same tree. When updating
 pins, review whether each patch remains needed, keep the script/Nix patch sets
 aligned, and run packet validation plus the explicit C API load test documented
 in [CONTRIBUTING.md](../CONTRIBUTING.md#validation). A library load test does not
@@ -89,8 +95,8 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 | `x-ss-pyrowave.version` | `1` |
 
 Wire v1 uses an 8-bit intermediate for SDR and a 10-bit intermediate for HDR10.
-A record-framed HDR10 stream encodes SDR content as 10-bit BT.709 and reports
-HDR mode off for it (see
+An HDR10 stream to Nightjar encodes SDR content as 10-bit SDR (sRGB transfer,
+BT.709 primaries and matrix) and reports HDR mode off for it (see
 [color capability translation](PYROWAVE_COMPATIBILITY.md#color-capability-translation)).
 The optional Pyroshine bit-depth attribute remains available to conventional
 codecs, but contradictory or unsupported PyroWave combinations are rejected;

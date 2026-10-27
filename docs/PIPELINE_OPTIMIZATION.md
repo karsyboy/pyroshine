@@ -149,6 +149,14 @@ path of H.264, HEVC and AV1: one compute dispatch writes NV12, P010, 4:4:4 or
 invocation, no atomics or buffer clear), optionally compositing the cursor and
 a notification, then one buffer-to-image copy fills the encoder input slot.
 
+4:2:0 chroma is generated where the encoder signals it. H.264 and HEVC use
+the 2x2 mean, centered in the block, and signal `chroma_sample_loc_type` 1.
+AV1 has no code for centered chroma, so it uses left siting (a [1 2 1]/4 filter
+across the even column, averaged over both rows; one extra source column per
+4x2 block) and signals `CSP_VERTICAL`. Decoders that ignore the signaling
+assume left siting, which AV1 now matches. The creation-time self-check
+verifies both positions on every subsampled format.
+
 The converter keeps three extents apart. The *frame* is the negotiated stream
 size. The *conversion extent* rounds it up to the codec's block size
 (macroblock, CTB or superblock); it always fits Pixelforge's input image, whose

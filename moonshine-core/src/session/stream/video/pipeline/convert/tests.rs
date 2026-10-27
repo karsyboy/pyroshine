@@ -276,6 +276,7 @@ const BT709_LIMITED: Color = Color {
 	space: ColorSpace::Bt709,
 	full_range: false,
 	sdr_white_nits: 203.0,
+	siting: ChromaSiting::Center,
 };
 
 #[test]
@@ -311,6 +312,89 @@ fn reference_matches_published_code_values() {
 	let [y, cb, cr] = code([1.0; 3], pq, 10);
 	assert!((570..=580).contains(&y), "PQ reference white {y}");
 	assert_eq!((cb, cr), (512, 512));
+}
+
+/// A gamma 2.2 source is re-encoded with the sRGB transfer the stream
+/// signals: mid-grey and near-black land where the compositor's gamma 2.2
+/// decode puts them, not where a pass-through would.
+#[test]
+fn gamma22_sources_are_reencoded_as_srgb() {
+	let gamma22 = Color {
+		space: ColorSpace::Gamma22ToSrgb,
+		..BT709_LIMITED
+	};
+	let srgb_encode = |linear: f64| {
+		if linear <= 0.003_130_8 {
+			linear * 12.92
+		} else {
+			1.055 * linear.powf(1.0 / 2.4) - 0.055
+		}
+	};
+	for signal in [0.02f32, 0.1, 0.5, 0.9] {
+		let [y, cb, cr] = reference::ycbcr([signal; 3], gamma22);
+		let expected = srgb_encode(f64::from(signal).powf(2.2));
+		assert!((y - expected).abs() < 1e-9, "signal {signal}: {y} vs {expected}");
+		assert!((cb - 0.5).abs() < 1e-9 && (cr - 0.5).abs() < 1e-9);
+	}
+	// Near black differs strongly from a pass-through: gamma 2.2 0.02 is
+	// 0.000183 linear, which sRGB encodes as about 0.0024, not 0.02.
+	let [y, _, _] = reference::ycbcr([0.02; 3], gamma22);
+	assert!(y < 0.003, "{y}");
+	// Black and white are fixed points.
+	assert_eq!(reference::ycbcr([0.0; 3], gamma22)[0], 0.0);
+	assert!((reference::ycbcr([1.0; 3], gamma22)[0] - 1.0).abs() < 1e-12);
+	// BT.1886 (gamma 2.4) video transfer, likewise.
+	let bt1886 = Color {
+		space: ColorSpace::Bt1886ToSrgb,
+		..BT709_LIMITED
+	};
+	let [y, _, _] = reference::ycbcr([0.5; 3], bt1886);
+	assert!((y - srgb_encode(0.5f64.powf(2.4))).abs() < 1e-9, "{y}");
+}
+
+/// Centered chroma is the 2x2 mean; left-sited chroma is centered on the even
+/// column. A one-pixel vertical line in an odd column shows where each puts
+/// its weight.
+#[test]
+fn chroma_siting_places_samples_where_signaled() {
+	let frame = (16, 4);
+	let rgb = |x: u32, _y: u32| if x == 7 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+	let neutral = reference::chroma_code(0.5, 8, false);
+	let cr = |siting| {
+		let color = Color {
+			siting,
+			..BT709_LIMITED
+		};
+		let planes = reference::convert(ConvertFormat::Nv12, color, frame, frame, &rgb, &|_| true);
+		(0..frame.0 / 2)
+			.map(|cx| i32::from(planes.chroma[cx as usize][1]) - i32::from(neutral))
+			.collect::<Vec<_>>()
+	};
+	// Centered: only the block holding the line (columns 6-7).
+	let center = cr(ChromaSiting::Center);
+	assert!(
+		center[3] > 0 && center.iter().enumerate().all(|(i, &v)| i == 3 || v == 0),
+		"{center:?}"
+	);
+	// Left: the samples at columns 6 and 8 each take a quarter of the line,
+	// so the reconstructed centroid stays on column 7.
+	let left = cr(ChromaSiting::Left);
+	assert!(left[3] > 0 && (left[3] - left[4]).abs() <= 1, "{left:?}");
+	assert!(
+		left.iter().enumerate().all(|(i, &v)| i == 3 || i == 4 || v == 0),
+		"{left:?}"
+	);
+	// The first left-sited sample replicates the frame's left edge: a frame
+	// whose first column is the only colored one weighs it 3/4.
+	let edge = |x: u32, _y: u32| if x == 0 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+	let color = Color {
+		siting: ChromaSiting::Left,
+		..BT709_LIMITED
+	};
+	let planes = reference::convert(ConvertFormat::Nv12, color, frame, frame, &edge, &|_| true);
+	let [_, red_cb, red_cr] = reference::ycbcr([1.0, 0.0, 0.0], BT709_LIMITED);
+	let expected = [red_cb, red_cr].map(|c| reference::chroma_code(0.5 + (c - 0.5) * 0.75, 8, false));
+	assert_eq!(planes.chroma[0], expected);
 }
 
 /// The comparison must flag the exact corruption the NVIDIA report showed:
@@ -983,6 +1067,7 @@ mod gpu {
 			true,
 		)?;
 		converter.set_color(case.color.space, case.color.full_range, case.color.sdr_white_nits);
+		converter.set_chroma_siting(case.color.siting);
 		// SAFETY: host-coherent mapping of the whole buffer; no GPU work uses it.
 		unsafe { std::ptr::write_bytes(converter.readback.cast_mut(), 0xa5, converter.layout.size as usize) };
 		let view = converter.source_view(source, case.source_format)?;
@@ -1148,30 +1233,39 @@ mod gpu {
 					ColorSpace::Bt2020,
 					ColorSpace::SrgbToBt2020Pq,
 					ColorSpace::Bt709LinearToBt2020Pq,
+					ColorSpace::Gamma22ToSrgb,
+					ColorSpace::Bt1886ToSrgb,
 				] {
 					for full_range in [false, true] {
-						let case = Case {
-							format,
-							frame,
-							extent: tight_extent(format, frame),
-							color: Color {
-								space,
-								full_range,
-								sdr_white_nits: if space == ColorSpace::Bt709LinearToBt2020Pq {
-									80.0
-								} else {
-									203.0
+						for siting in [ChromaSiting::Center, ChromaSiting::Left] {
+							if siting == ChromaSiting::Left && !format.subsampled() {
+								continue;
+							}
+							let case = Case {
+								format,
+								frame,
+								extent: tight_extent(format, frame),
+								color: Color {
+									space,
+									full_range,
+									sdr_white_nits: if space == ColorSpace::Bt709LinearToBt2020Pq {
+										80.0
+									} else {
+										203.0
+									},
+									siting,
 								},
-							},
-							source_format,
-							source_extent: frame,
-						};
-						let label = format!("{format:?} {source_format:?} {space:?} full={full_range}");
-						assert_agreement(
-							&label,
-							check(&context, &case, &image, &source, (&[None, None], &[])),
-							&mut failures,
-						);
+								source_format,
+								source_extent: frame,
+							};
+							let label =
+								format!("{format:?} {source_format:?} {space:?} full={full_range} {siting:?} chroma");
+							assert_agreement(
+								&label,
+								check(&context, &case, &image, &source, (&[None, None], &[])),
+								&mut failures,
+							);
+						}
 					}
 				}
 			}

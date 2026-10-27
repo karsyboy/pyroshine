@@ -602,6 +602,7 @@ async fn foreground_changes_are_session_scoped_and_survive_reconnect() {
 fn video() -> VideoStreamContext {
 	VideoStreamContext {
 		pyrowave_dialect: None,
+		pyrowave_sdr_as_sdr: false,
 		width: 1920,
 		height: 1080,
 		fps: 60,
@@ -1464,6 +1465,7 @@ impl Matrix {
 		VideoStreamContext {
 			pyrowave_dialect: (codec == VideoCodec::PyroWave)
 				.then_some(crate::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1),
+			pyrowave_sdr_as_sdr: false,
 			width,
 			height,
 			fps: self.fps(),

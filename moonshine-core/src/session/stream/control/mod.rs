@@ -12,7 +12,7 @@ use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
-use crate::session::capture::frame::{HdrMetadata, HdrModeState};
+use crate::session::capture::frame::{Hdr10Metadata, HdrModeState};
 use crate::session::capture::input::CaptureInputEvent;
 use crate::session::keys::ActiveKeys;
 use crate::session::lifecycle::WorkerGuard;
@@ -452,7 +452,7 @@ impl ControlStream {
 /// - SS_HDR_METADATA: 30 bytes (15 x u16 LE fields: display primaries,
 ///   white point, luminance, content light levels, padding). Populated
 ///   from the provided metadata, or zeroed when `metadata` is `None`.
-fn build_hdr_mode_payload(enabled: bool, metadata: Option<&HdrMetadata>) -> Vec<u8> {
+fn build_hdr_mode_payload(enabled: bool, metadata: Option<&Hdr10Metadata>) -> Vec<u8> {
 	let metadata_size = 30u16; // SS_HDR_METADATA: 15 x u16 fields
 	let payload_len = 1 + metadata_size; // enabled byte + metadata
 	let mut buf = Vec::with_capacity(4 + payload_len as usize);
@@ -462,17 +462,17 @@ fn build_hdr_mode_payload(enabled: bool, metadata: Option<&HdrMetadata>) -> Vec<
 
 	if let Some(m) = metadata {
 		// Display primaries (RGB order).
-		for &(x, y) in &m.display_primaries {
+		for &(x, y) in &m.mastering.display_primaries {
 			buf.extend(x.to_le_bytes());
 			buf.extend(y.to_le_bytes());
 		}
 		// White point.
-		buf.extend(m.white_point.0.to_le_bytes());
-		buf.extend(m.white_point.1.to_le_bytes());
+		buf.extend(m.mastering.white_point.0.to_le_bytes());
+		buf.extend(m.mastering.white_point.1.to_le_bytes());
 		// Max display luminance (convert from 0.0001 cd/m² to nits).
-		buf.extend(((m.max_luminance / 10000).min(u16::MAX as u32) as u16).to_le_bytes());
+		buf.extend(((m.mastering.max_luminance / 10000).min(u16::MAX as u32) as u16).to_le_bytes());
 		// Min display luminance (0.0001 cd/m² maps to 1/10000th nit).
-		buf.extend((m.min_luminance.min(u16::MAX as u32) as u16).to_le_bytes());
+		buf.extend((m.mastering.min_luminance.min(u16::MAX as u32) as u16).to_le_bytes());
 		// Content light levels (direct copy, already in nits).
 		buf.extend(m.max_cll.to_le_bytes());
 		buf.extend(m.max_fall.to_le_bytes());
@@ -526,11 +526,11 @@ fn send_to_peer(host: &mut Host, peer_id: tokio_enet::PeerId, keys: &ActiveKeys,
 
 /// Build and send an HDR mode control message, then advance `sequence_number`.
 fn send_hdr_state(host: &mut Host, peer_id: tokio_enet::PeerId, state: &HdrModeState, keys: &ActiveKeys, label: &str) {
-	let metadata = if state.enabled {
-		Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
-	} else {
-		None
-	};
+	// Same values as the bitstream metadata of the frame (see
+	// `Hdr10Metadata::for_stream`).
+	let metadata = state
+		.enabled
+		.then(|| Hdr10Metadata::for_stream(state.metadata.as_ref()));
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
 	send_to_peer(host, peer_id, keys, &payload, label);
 	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
