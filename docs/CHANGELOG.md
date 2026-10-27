@@ -14,14 +14,6 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-### Added
-
-- `/serverinfo` advertises conditional cancellation as `<PyroshineConditionalCancel>1</PyroshineConditionalCancel>`, so clients such as Pyrolight and PyroDeck can tell that `/cancel?expectedAppId=` is checked before they rely on it. See [Client integration](CLIENT_INTEGRATION.md#conditional-application-cancellation).
-
-### Changed
-
-- CI now runs on pushes and pull requests to `version-*` release branches as well as `main`.
-
 ## [v0.18.0-prerelease.1] - 2026-10-27
 
 ### Added
@@ -37,7 +29,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - **Live bitrate changes.** Clients can change their stream's bitrate without reconnecting (`GET /bitrate`), as Vibepollo and Foundation Sunshine define. Nightjar's stream menu and automatic bitrate now work. See [Client integration](CLIENT_INTEGRATION.md#live-bitrate).
 - **Nightjar support** for VRR, live bitrate and fractional refresh rates through the Vibepollo extensions; launching a different application asks the client to confirm instead of failing. See [Client integration](CLIENT_INTEGRATION.md#vibepollo-extensions).
 - **Optional frame limiting** of launched games (`[frame_limit]`, off by default) to the stream's or a fixed frame rate, through Proton's limiters or MangoHud, globally or per application. See [`[frame_limit]`](CONFIGURATION.md#frame_limit).
-- **PyroDeck support.** The app list reports each game's launcher identity (such as `steam:892970`), `/serverinfo` reports what Steam says about a streamed game (launching, updating, running or exited), and cancellation can name the expected application. See [Client integration](CLIENT_INTEGRATION.md).
+- **PyroDeck support.** The app list reports each game's launcher identity (such as `steam:892970`), `/serverinfo` reports what Steam says about a streamed game (launching, updating, running or exited), and cancellation can name the expected application; `/serverinfo` advertises that check as `<PyroshineConditionalCancel>1</PyroshineConditionalCancel>` so clients never send it to a host that would ignore it. See [Client integration](CLIENT_INTEGRATION.md#conditional-application-cancellation).
 - **Developer tools.** `moonshine-library` reports what each launcher scan finds; `moonshine-bench --json`, `--capabilities` and `--encoder`, `scripts/bench_results.py` and `scripts/hardware_tests.py` record and compare hardware results. See [testing](TESTING.md).
 
 ### Changed
@@ -51,6 +43,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - The health check explains every codec profile it does not offer and names the encoder in use. See [GPU compatibility](GPU_COMPATIBILITY.md).
 - PyroWave is built from upstream [Themaister/pyrowave](https://github.com/Themaister/pyrowave) with a vendored patch series. Upstream rate-control fixes keep low-bitrate streams from losing color. The bitstream and C API are unchanged. See [PyroWave](PYROWAVE.md#pinned-dependency).
 - Pixelforge is updated to v0.10.0; H.264, HEVC and AV1 conversion uses a dedicated compute queue where available.
+- CI also runs on pushes and pull requests to `version-*` release branches.
 
 ### Fixed
 
