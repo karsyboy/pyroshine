@@ -1632,16 +1632,25 @@ impl<B: SessionBackend> SessionCore<B> {
 		client_ip: IpAddr,
 	) -> Result<(), ()> {
 		let mut guard = self.lock().await;
-		let streaming = match guard.live() {
+		let resumable = match guard.live() {
 			Some(live) if live.record.stop.is_shutdown_triggered() => {
 				tracing::warn!("Session is shutting down; rejecting resume key update.");
 				return Err(());
 			},
-			Some(live) => live.record.streams.is_some(),
+			// A reconnect: the resuming client's PLAY resumes the streams.
+			Some(live) if live.record.streams.is_some() => true,
+			// Launched (or launching), but the client gave up before its first
+			// ANNOUNCE/PLAY. Clients resume because the host reports the game as
+			// running; the resuming client's ANNOUNCE/PLAY starts the streams.
+			// An initialized session or a first PLAY in progress is refused.
+			Some(live) => matches!(
+				(&live.state, live.transition.map(|transition| transition.kind)),
+				(Some(SessionState::Launched(_)), None) | (None, Some(TransitionKind::Launch))
+			),
 			None => false,
 		};
-		if !streaming {
-			tracing::warn!("No active streaming session to update keys for.");
+		if !resumable {
+			tracing::warn!("No launched session to update keys for.");
 			return Err(());
 		}
 		if guard.keys_tx.is_none() {

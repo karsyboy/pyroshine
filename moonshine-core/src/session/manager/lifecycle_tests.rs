@@ -895,7 +895,8 @@ async fn retained_session_reports_current_authorized_client() {
 #[tokio::test]
 async fn rejected_resume_preserves_reported_client_and_authorization() {
 	let h = Harness::new();
-	h.launched().await;
+	// Initialized, not yet launched: there is nothing to resume.
+	h.initialize().await.unwrap();
 	let grant = h.grant().await;
 	let original = h.core.session_view().await.unwrap();
 	let mut status = h.core.subscribe_status();
@@ -912,6 +913,60 @@ async fn rejected_resume_preserves_reported_client_and_authorization() {
 	let view = h.core.session_view().await.unwrap();
 	assert_eq!(view.client_ip, original.client_ip);
 	assert_eq!(view.epoch, original.epoch);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// A client that gives up while connecting leaves the session launched with
+/// no ANNOUNCE/PLAY. Its next attempt resumes, because the host reports the
+/// game as running; the resume's ANNOUNCE/PLAY starts the streams with the
+/// resume's keys, and the abandoned attempt can no longer start them.
+#[tokio::test]
+async fn resume_starts_a_launched_session_whose_client_gave_up() {
+	let h = Harness::new();
+	h.launched().await;
+	let abandoned = h.grant().await;
+	h.core
+		.resume_session(keys_with_id(7), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	let grant = h.grant().await;
+	assert!(grant.generation() > abandoned.generation());
+	assert!(
+		h.announce(&abandoned).await.is_err(),
+		"the abandoned attempt was replaced"
+	);
+	assert_eq!(h.phase().await, "launched");
+	let published = h.core.inner.lock().await.keys_tx.as_ref().unwrap().borrow().clone();
+	assert_eq!(published.key_id().get(), 7);
+
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.phase().await, "active");
+	assert_eq!(h.calls(Op::Start), 1);
+	assert_eq!(h.calls(Op::Resume), 0);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// The same while the application is still launching: the launch commits and
+/// the resuming client starts the streams.
+#[tokio::test]
+async fn resume_during_launch_is_accepted() {
+	let h = Harness::new();
+	let launch = hold_at(&h, Op::Launch).await;
+	let abandoned = h.grant().await;
+	h.core
+		.resume_session(keys(), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	h.release(Op::Launch);
+	launch.await.unwrap().unwrap();
+	let grant = h.grant().await;
+	assert!(grant.generation() > abandoned.generation());
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.phase().await, "active");
 	h.core.stop_session().await.unwrap();
 	h.assert_released().await;
 }
