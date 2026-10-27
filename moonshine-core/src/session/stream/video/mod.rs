@@ -442,6 +442,10 @@ pub(super) enum VideoPacketMessage {
 		generation: u64,
 		ready: tokio::sync::oneshot::Sender<()>,
 	},
+	/// A live PyroWave bitrate, ordered before the first batch encoded with
+	/// it: frames are paced over their bytes at the bitrate they were encoded
+	/// for. The next `BeginEpoch` restores the negotiated rate.
+	PacingBitrate(u64),
 }
 
 impl VideoStreamHandle {
@@ -796,6 +800,11 @@ fn spawn_handle_video_packets(
 							let tos = if context.qos { 160 } else { 0 };
 							let _ = socket.set_tos_v4(tos);
 							let _ = ready.send(());
+						},
+						Ok(Some(VideoPacketMessage::PacingBitrate(bitrate_bps))) => {
+							if let Some(pacing) = pacing.as_mut() {
+								pacing.bitrate_bps = bitrate_bps;
+							}
 						},
 						Ok(Some(VideoPacketMessage::Batch(mut batch))) => {
 							let current = authorization.borrow().generation();

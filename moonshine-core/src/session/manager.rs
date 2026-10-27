@@ -97,6 +97,28 @@ fn reconnect_decision(
 	}
 }
 
+/// Why a live bitrate request was not staged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LiveBitrateRefusal {
+	/// No video is streaming, or the requesting peer does not hold the
+	/// current stream authorization.
+	NoStream,
+	/// A reconnect or reconfiguration is in progress.
+	Transition,
+	/// The video epoch's rate control refused it.
+	Refused(String),
+}
+
+impl std::fmt::Display for LiveBitrateRefusal {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::NoStream => f.write_str("no active stream for this client"),
+			Self::Transition => f.write_str("session transition in progress"),
+			Self::Refused(reason) => f.write_str(reason),
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionShutdownReason {
 	/// Session manager is shutting down.
@@ -738,6 +760,13 @@ impl<B: SessionBackend> SessionCore<B> {
 			)
 		});
 		resumed.or(context)
+	}
+
+	/// The current launch or resume request's explicit `hdrMode`, if it sent one.
+	pub(crate) async fn requested_hdr_mode(&self) -> Option<bool> {
+		let mut guard = self.lock().await;
+		let resumed = guard.resume_request.as_ref().and_then(|request| request.hdr);
+		resumed.or_else(|| guard.live().and_then(|live| live.record.context.hdr_mode))
 	}
 
 	/// Open every stream start latch of the live session (bench/external start).
@@ -1810,28 +1839,70 @@ impl SessionManager {
 		self.core.session_view().await
 	}
 
-	/// Stage a conventional encoder bitrate for this authorization generation.
-	/// Benchmark only: no operator setting, network command or ABR policy.
+	/// Stage an encoder bitrate for this authorization generation.
+	/// Benchmark entry: any peer, no operator setting or ABR policy.
 	/// The reply identifies the first submitted picture or the terminal failure.
 	pub async fn bench_set_bitrate(
 		&self,
 		bitrate: u32,
 	) -> Result<tokio::sync::oneshot::Receiver<super::stream::video::rate::RateUpdate>, String> {
+		self.request_live_bitrate(None, bitrate)
+			.await
+			.map_err(|refusal| refusal.to_string())
+	}
+
+	/// Stage an encoder bitrate requested by the streaming client
+	/// itself (`GET /bitrate`). Only the peer holding the current authorization
+	/// may change it, and only for that generation: a reconnect renegotiates
+	/// the bitrate in its own ANNOUNCE and makes an unapplied request stale.
+	pub(crate) async fn client_set_bitrate(
+		&self,
+		peer: IpAddr,
+		bitrate: u32,
+	) -> Result<tokio::sync::oneshot::Receiver<super::stream::video::rate::RateUpdate>, LiveBitrateRefusal> {
+		self.request_live_bitrate(Some(peer), bitrate).await
+	}
+
+	async fn request_live_bitrate(
+		&self,
+		peer: Option<IpAddr>,
+		bitrate: u32,
+	) -> Result<tokio::sync::oneshot::Receiver<super::stream::video::rate::RateUpdate>, LiveBitrateRefusal> {
 		let mut guard = self.core.lock().await;
-		let generation = guard
-			.authorization_tx
-			.as_ref()
-			.ok_or("no live authorization")?
-			.borrow()
-			.generation();
-		let live = guard.live().ok_or("no live session")?;
+		let generation = {
+			let authorization = guard
+				.authorization_tx
+				.as_ref()
+				.ok_or(LiveBitrateRefusal::NoStream)?
+				.borrow();
+			if peer.is_some_and(|peer| !authorization.admits_peer(peer)) {
+				return Err(LiveBitrateRefusal::NoStream);
+			}
+			authorization.generation()
+		};
+		let live = guard.live().ok_or(LiveBitrateRefusal::NoStream)?;
 		if live.transition.is_some() {
-			return Err("session transition in progress".into());
+			return Err(LiveBitrateRefusal::Transition);
 		}
 		let Some(SessionState::Active(active)) = &live.state else {
-			return Err("video is not active".into());
+			return Err(LiveBitrateRefusal::NoStream);
 		};
-		active.rate_control().request(generation, bitrate)
+		active
+			.rate_control()
+			.request(generation, bitrate)
+			.map_err(LiveBitrateRefusal::Refused)
+	}
+
+	/// Encoder bitrate of the streaming video as (current, negotiated) bits
+	/// per second: a live request may have replaced the negotiated rate.
+	pub(crate) async fn video_bitrate(&self) -> Option<(u32, u32)> {
+		let mut guard = self.core.lock().await;
+		let live = guard.live()?;
+		let Some(SessionState::Active(active)) = &live.state else {
+			return None;
+		};
+		let negotiated = u32::try_from(live.record.streams.as_ref()?.0.bitrate).unwrap_or(u32::MAX);
+		Some((active.rate_control().applied().unwrap_or(negotiated), negotiated))
 	}
 
 	/// Last rate request for diagnostics; a staged rate is not yet installed.
@@ -1909,6 +1980,10 @@ impl SessionManager {
 	/// Audio layout the current launch or resume request asked for over HTTP.
 	pub(crate) async fn requested_audio_layout(&self) -> Option<(crate::session::stream::audio::AudioChannels, u32)> {
 		self.core.requested_audio_layout().await
+	}
+
+	pub(crate) async fn requested_hdr_mode(&self) -> Option<bool> {
+		self.core.requested_hdr_mode().await
 	}
 
 	/// Initialize a new session with the provided context.

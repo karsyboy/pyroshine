@@ -35,6 +35,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--composited` | off | Force the GLES fallback, independent of fullscreen direct-export eligibility |
 | `--cursor <mode>` | off | Emulate client pointer use so the compositor cursor is visible: `static` (one motion) or `moving` (motion every refresh tick). Also applies to `--cycles` and `--reconnect-cycles` |
 | `--conversion-queue <mode>` | `auto` | H.264/HEVC/AV1 conversion queue: `auto`/`compute` (dedicated compute family when present) or `graphics` |
+| `--pyrowave-record` | off | Use PyroWave's record-framed dialect (Nightjar): SDR frames of an HDR stream are encoded as 10-bit BT.709 SDR |
 | `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto` (graphics), `graphics`, or explicit `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
@@ -49,7 +50,8 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, `av1`, or `pyrowave` |
 | `--chroma <mode>` | `420` | Chroma sampling: `420` or `444`, subject to codec support |
 | `--bit-depth <N>` | `8` (SDR), `10` (HDR) | Select `8` or `10` bits; incompatible formats are rejected |
-| `--full-range` | off | Use full-range YCbCr; PyroWave always uses full range |
+| `--full-range` | off | Use full-range YCbCr (PyroWave's default, as Pyrolight requests) |
+| `--limited-range` | off | Use limited-range YCbCr, also for PyroWave (the default of Moonlight clients such as Nightjar) |
 | `--duration <N>` | `0` | Seconds to run before stopping (`0` = run until Ctrl+C) |
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |

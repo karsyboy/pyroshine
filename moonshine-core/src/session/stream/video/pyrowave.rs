@@ -680,6 +680,16 @@ pub(crate) struct PyroWaveEncoder {
 	consecutive_near_limit_frames: u32,
 	last_limit_warning: Option<std::time::Instant>,
 	scaling_logged: bool,
+	/// See [`PyroWaveEncoder::set_sdr_content_as_sdr`].
+	sdr_content_as_sdr: bool,
+}
+
+/// Whether a frame of `color_space` is encoded as HDR10 in a stream whose
+/// negotiated format is `format_hdr`. With `sdr_content_as_sdr`, sRGB frames
+/// of an HDR10 stream are encoded as 10-bit BT.709 SDR instead, as the
+/// conventional codecs do; otherwise PyroWave maps them into HDR10.
+pub(crate) fn encodes_as_hdr(format_hdr: bool, sdr_content_as_sdr: bool, color_space: FrameColorSpace) -> bool {
+	format_hdr && !(sdr_content_as_sdr && color_space == FrameColorSpace::Srgb)
 }
 
 impl PyroWaveEncoder {
@@ -738,9 +748,6 @@ impl PyroWaveEncoder {
 		fps: u32,
 		queue_mode: PyroWaveQueueMode,
 	) -> Result<Self, String> {
-		if format.range != ColorRange::Full {
-			return Err("PyroWave's scaled RGB path currently supports full-range output only".to_string());
-		}
 		let maximum_frame_bytes = wire_v1_frame_budget(bitrate, fps).ok_or_else(|| {
 			let bytes = bitrate
 				.checked_div((fps as usize).saturating_mul(8))
@@ -796,6 +803,7 @@ impl PyroWaveEncoder {
 			consecutive_near_limit_frames: 0,
 			last_limit_warning: None,
 			scaling_logged: false,
+			sdr_content_as_sdr: false,
 		})
 	}
 
@@ -937,6 +945,23 @@ impl PyroWaveEncoder {
 		Ok(view)
 	}
 
+	/// Encode sRGB frames of an HDR10 stream as 10-bit BT.709 SDR.
+	///
+	/// Record-framed clients (Nightjar, after the Rubylight host) switch their
+	/// PyroWave presentation with the control stream's HDR mode and convert
+	/// the planes by it rather than by the sequence header: HDR-off shows
+	/// 10-bit BT.709 on an SDR surface. Mapped into HDR10 instead, SDR white
+	/// sits at the scaler's 200 nits and looks dim beside the device's SDR
+	/// brightness. Pyrolight reads the sequence header and keeps HDR10.
+	pub(crate) fn set_sdr_content_as_sdr(&mut self, enabled: bool) {
+		self.sdr_content_as_sdr = enabled;
+	}
+
+	/// Whether `color_space` frames are encoded as HDR10 by this encoder.
+	pub(crate) fn encodes_as_hdr(&self, color_space: FrameColorSpace) -> bool {
+		encodes_as_hdr(self.format.hdr, self.sdr_content_as_sdr, color_space)
+	}
+
 	/// Encode one frame and read back its bitstream.
 	///
 	/// On every return, including errors, no submitted GPU work still reads the
@@ -977,7 +1002,7 @@ impl PyroWaveEncoder {
 			FrameColorSpace::Bt2020Pq => vk::ColorSpaceKHR::HDR10_ST2084_EXT,
 			FrameColorSpace::ScrgbLinear => vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
 		};
-		let output_color_space = if self.format.hdr {
+		let output_color_space = if self.encodes_as_hdr(frame.color_space) {
 			vk::ColorSpaceKHR::HDR10_ST2084_EXT
 		} else {
 			vk::ColorSpaceKHR::SRGB_NONLINEAR
@@ -999,9 +1024,15 @@ impl PyroWaveEncoder {
 			force_linear_filtering: false,
 			skip_dither: false,
 			crop_rect: ptr::null(),
-			// `new` rejects limited range, so the scaler always writes full range.
-			ycbcr_range: vk::SamplerYcbcrRange::ITU_FULL,
-			ycbcr_range_bit_depth: 0,
+			// The scaler writes the negotiated range and stamps it in the
+			// sequence header. Pyrolight always asks for full range; Moonlight
+			// clients such as Nightjar default to limited and convert with
+			// their own setting rather than the header, so it must be honored.
+			ycbcr_range: match self.format.range {
+				ColorRange::Full => vk::SamplerYcbcrRange::ITU_FULL,
+				ColorRange::Limited => vk::SamplerYcbcrRange::ITU_NARROW,
+			},
+			ycbcr_range_bit_depth: u32::from(self.format.bit_depth.bits()),
 		};
 		let rate = RateControl {
 			maximum_bitstream_size: self.maximum_frame_bytes,
@@ -1205,6 +1236,17 @@ impl PyroWaveEncoder {
 		self.maximum_frame_bytes
 	}
 
+	/// Retarget the per-frame budget for a live bitrate; the next encode uses
+	/// it. PyroWave has no rate controller or references to carry over, so
+	/// this is all a rate change is. Returns the accepted bitrate, which the
+	/// budget's 4-byte alignment may lower slightly.
+	pub(crate) fn set_bitrate(&mut self, bitrate: usize, fps: u32) -> Result<usize, String> {
+		let bytes = wire_v1_frame_budget(bitrate, fps)
+			.ok_or_else(|| format!("a {bitrate} bps PyroWave frame budget is outside 1 KiB to 3 MiB"))?;
+		self.maximum_frame_bytes = bytes;
+		Ok(bytes.saturating_mul(8).saturating_mul(fps as usize))
+	}
+
 	pub(crate) fn import_cache_len(&self) -> usize {
 		self.images.entries.len()
 	}
@@ -1233,6 +1275,21 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Record-framed HDR10 streams (Nightjar) carry SDR frames as 10-bit
+	/// BT.709; native streams (Pyrolight) and SDR streams are unchanged.
+	#[test]
+	fn only_record_framed_hdr_streams_carry_sdr_frames_as_sdr() {
+		use FrameColorSpace::{Bt2020Pq, ScrgbLinear, Srgb};
+		for color_space in [Srgb, Bt2020Pq, ScrgbLinear] {
+			assert!(!encodes_as_hdr(false, false, color_space));
+			assert!(!encodes_as_hdr(false, true, color_space));
+			assert!(encodes_as_hdr(true, false, color_space));
+		}
+		assert!(!encodes_as_hdr(true, true, Srgb));
+		assert!(encodes_as_hdr(true, true, Bt2020Pq));
+		assert!(encodes_as_hdr(true, true, ScrgbLinear));
+	}
 
 	#[test]
 	fn import_cache_soak_releases_old_resources_and_preserves_active_buffers() {

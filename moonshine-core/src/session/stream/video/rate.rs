@@ -44,6 +44,9 @@ struct State {
 struct Shared {
 	generation: AtomicU64,
 	pending: AtomicBool,
+	/// Rate the encoder installed for the current generation; 0 while it
+	/// still runs at the negotiated rate.
+	applied_bps: AtomicU64,
 	state: Mutex<State>,
 }
 
@@ -59,6 +62,7 @@ pub(crate) fn channel(generation: u64) -> (RateControl, RateReceiver) {
 	let shared = Arc::new(Shared {
 		generation: AtomicU64::new(generation),
 		pending: AtomicBool::new(false),
+		applied_bps: AtomicU64::new(0),
 		state: Mutex::default(),
 	});
 	(RateControl(shared.clone()), RateReceiver(shared))
@@ -99,6 +103,13 @@ impl RateControl {
 		self.0.pending.store(true, Ordering::Release);
 		Ok(waiting)
 	}
+	/// Rate installed for the current generation, if a request replaced the
+	/// negotiated one.
+	pub fn applied(&self) -> Option<u32> {
+		u32::try_from(self.0.applied_bps.load(Ordering::Acquire))
+			.ok()
+			.filter(|bps| *bps != 0)
+	}
 	pub fn status(&self) -> Option<RateUpdate> {
 		self.0
 			.state
@@ -112,7 +123,10 @@ impl RateControl {
 
 impl RateReceiver {
 	pub fn activate(&self, generation: u64) {
-		self.0.generation.store(generation, Ordering::Release);
+		if self.0.generation.swap(generation, Ordering::AcqRel) != generation {
+			// A new generation starts at its own negotiated rate.
+			self.0.applied_bps.store(0, Ordering::Release);
+		}
 		let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
 		if state
 			.command
@@ -179,6 +193,11 @@ impl PendingRate {
 		} else {
 			RateState::Stale
 		};
+		if command.update.state == RateState::Applied
+			&& let Some(accepted) = command.update.accepted_bps
+		{
+			self.shared.applied_bps.store(u64::from(accepted), Ordering::Release);
+		}
 		command.update.first_affected_frame = frame;
 		command.update.error = error;
 		let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -242,6 +261,15 @@ mod tests {
 		);
 		assert_eq!(applied.state, RateState::Applied);
 		assert!(receiver.take().is_none());
+		assert_eq!(control.applied(), Some(15_000_000));
+		receiver.activate(1);
+		assert_eq!(control.applied(), Some(15_000_000), "same generation keeps it");
+		receiver.activate(2);
+		assert_eq!(
+			control.applied(),
+			None,
+			"a new generation starts at its negotiated rate"
+		);
 	}
 	#[test]
 	fn epochs_close_and_failed_installation_never_report_applied() {

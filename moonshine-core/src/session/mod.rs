@@ -140,6 +140,12 @@ pub struct SessionContext {
 	/// If true, the compositor will be launched with HDR support.
 	pub hdr: bool,
 
+	/// The launch's `hdrMode`, when it sent one. Moonlight clients send
+	/// `hdrMode=1` for HDR and nothing otherwise; an explicit `hdrMode=0` is how
+	/// Sunshine-family clients (Nightjar) ask for 10-bit SDR alongside an
+	/// ANNOUNCE `dynamicRangeMode=1`, which alone means 10-bit (see `rtsp`).
+	pub hdr_mode: Option<bool>,
+
 	/// Address of the paired client that authenticated the original launch.
 	/// The current launch/resume client is owned by `StreamAuthorization`;
 	/// this launch metadata does not change when the retained session resumes.

@@ -46,6 +46,8 @@ fn fixture(enable_pairing: bool, limits: WebLimits) -> Fixture {
 		server_certs: server_cert,
 		supported_codecs: 0,
 		hdr_supported: false,
+		frame_limit: Default::default(),
+		replacements: Default::default(),
 		shutdown,
 		limits,
 	};
@@ -677,6 +679,7 @@ async fn malformed_resume_from_another_client_preserves_reported_address() {
 			resolution: (1920, 1080),
 			refresh_rate: 60,
 			hdr: false,
+			hdr_mode: None,
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: client,
@@ -781,6 +784,9 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 		("rikeyid", Some("-2147483648")),
 		("rikeyid", Some("4294967295")),
 		("mode", Some("7680x4320x240")),
+		// Fractional refresh as Nightjar (decimal) and Artemis (millihertz) send it.
+		("mode", Some("3840x2160x59.94")),
+		("mode", Some("3840x2160x119880")),
 		("clientVrrRequested", Some("1")),
 		("clientVrrRequested", Some("0")),
 	] {
@@ -1030,6 +1036,7 @@ async fn catalog_refresh_during_an_active_stream_leaves_it_untouched() {
 			resolution: (1920, 1080),
 			refresh_rate: 60,
 			hdr: false,
+			hdr_mode: None,
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: client,
@@ -1118,6 +1125,7 @@ async fn serverinfo_reports_steam_game_state_with_the_running_game() {
 			resolution: (1280, 800),
 			refresh_rate: 60,
 			hdr: false,
+			hdr_mode: None,
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: "127.0.0.1".parse().unwrap(),
@@ -1158,4 +1166,245 @@ async fn serverinfo_reports_steam_game_state_with_the_running_game() {
 		SteamGameState::Running
 	);
 	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+}
+
+/// `/bitrate` (the Vibepollo/Foundation Sunshine runtime call) is a paired,
+/// HTTPS-only request that changes nothing unless the caller holds the live
+/// stream; refusals keep the `<bitrate>0</bitrate>` element clients read.
+#[tokio::test]
+async fn live_bitrate_requires_a_paired_caller_and_its_own_stream() {
+	use crate::session::stream::audio::AudioChannels;
+
+	let Fixture {
+		server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	let (status, _) = http(&server, REMOTE, get("/bitrate?bitrate=20000", "192.168.1.10")).await;
+	assert_eq!(status, 404, "not served over plain HTTP");
+
+	let paired = PairingClient::new("A", "1234");
+	client_manager
+		.persistent_state()
+		.pair(paired.unique_id.clone(), paired.fingerprint())
+		.unwrap();
+	let address = serve_https(&server).await;
+	assert_eq!(
+		credential_request(address, &PairingClient::new("B", "1234"), "/bitrate?bitrate=20000").await,
+		401
+	);
+	assert_eq!(
+		credential_request(address, &paired, "/bitrate?bitrate=20000").await,
+		200
+	);
+
+	let client: SocketAddr = "192.168.1.50:50000".parse().unwrap();
+	let reply = |params: &[(&str, &str)], peer: SocketAddr| {
+		let params = params
+			.iter()
+			.map(|(name, value)| (name.to_string(), value.to_string()))
+			.collect();
+		let server = server.clone();
+		async move { body_text(server.set_live_bitrate(params, peer).await).await }
+	};
+	for params in [
+		&[][..],
+		&[("bitrate", "0")][..],
+		&[("bitrate", "-1")][..],
+		&[("bitrate", "20 Mbps")][..],
+		&[("bitrate", "4294968")][..],
+	] {
+		let body = reply(params, client).await;
+		assert!(body.contains("status_code=\"400\""), "{params:?}: {body}");
+		assert_eq!(xml_value(&body, "bitrate"), "0");
+	}
+
+	let idle = reply(&[("bitrate", "20000")], client).await;
+	assert!(idle.contains("status_code=\"404\""), "{idle}");
+	assert_eq!(xml_value(&idle, "bitrate"), "0");
+
+	// A launched session without running video, and a paired peer other than
+	// the authorized one, are both "no stream for this client".
+	let _foreground = server
+		.session_manager
+		.reporting_session_for_test(SessionContext {
+			application: Default::default(),
+			application_id: 1,
+			resolution: (1920, 1080),
+			refresh_rate: 60,
+			hdr: false,
+			hdr_mode: None,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: client.ip(),
+			client_identity: None,
+			vrr_requested: false,
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				crate::session::RemoteInputKey::from_bytes([7; 16]),
+				crate::session::RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let grant = server.session_manager.authorize_client_for_test(client.ip()).await;
+	for peer in [client, "192.168.1.51:50000".parse().unwrap()] {
+		let body = reply(&[("bitrate", "4294967")], peer).await;
+		assert!(body.contains("status_code=\"404\""), "{peer}: {body}");
+		assert_eq!(xml_value(&body, "bitrate"), "0");
+	}
+	assert_eq!(
+		server.session_manager.authorize_stream(client.ip()).await,
+		Some(grant),
+		"a bitrate request never rotates the authorization"
+	);
+	server.session_manager.stop_session().await.unwrap();
+	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+}
+
+/// Vibepollo's replacement protocol: `/launch` of another application while
+/// one runs is answered with the exact prompt Nightjar matches, and nothing
+/// stops until the same client repeats the same request for the same session.
+#[test]
+fn launch_replacement_needs_a_matching_repeat_within_the_window() {
+	let start = Instant::now();
+	let mut confirmations = ReplacementConfirmations::default();
+	assert!(!confirmations.arm_or_confirm("a", 1, 10, start));
+	// Another client, application or session does not confirm it.
+	assert!(!confirmations.arm_or_confirm("b", 1, 10, start));
+	assert!(!confirmations.arm_or_confirm("a", 1, 11, start), "re-armed for 11");
+	assert!(
+		!confirmations.arm_or_confirm("a", 2, 11, start),
+		"re-armed for session 2"
+	);
+	assert!(confirmations.arm_or_confirm("a", 2, 11, start + Duration::from_secs(59)));
+	// Consumed: a third request prompts again.
+	assert!(!confirmations.arm_or_confirm("a", 2, 11, start + Duration::from_secs(59)));
+	// Expired: a repeat at the window's end prompts again.
+	assert!(!confirmations.arm_or_confirm("c", 1, 10, start));
+	assert!(!confirmations.arm_or_confirm("c", 1, 10, start + REPLACEMENT_CONFIRMATION_WINDOW));
+	assert_eq!(
+		REPLACEMENT_CONFIRMATION,
+		"An app is already running. Launch this app again within 60 seconds to confirm that you want to close it."
+	);
+}
+
+#[tokio::test]
+async fn launch_of_another_application_asks_for_confirmation_first() {
+	use crate::app_scanner::{Library, legacy_id};
+	use crate::session::application::ApplicationConfig;
+	use crate::session::stream::audio::AudioChannels;
+
+	let application = |title: &str| ApplicationConfig {
+		title: title.into(),
+		command: vec![format!("/usr/bin/{}", title.to_lowercase().replace(' ', "-"))],
+		..Default::default()
+	};
+	let mut fixture = fixture(true, WebLimits::default());
+	fixture.server.library = Library::fixed(&[application("Steam"), application("Portal 2")]);
+	let server = &fixture.server;
+	let entry = server.library.catalog().find(legacy_id("Portal 2")).unwrap().clone();
+	let peer: SocketAddr = "192.168.1.50:50000".parse().unwrap();
+	let _foreground = server
+		.session_manager
+		.reporting_session_for_test(SessionContext {
+			application: entry.application.clone(),
+			application_id: entry.id,
+			resolution: (1920, 1080),
+			refresh_rate: 60,
+			hdr: false,
+			hdr_mode: None,
+			audio_channels: AudioChannels::Stereo,
+			audio_channel_mask: 3,
+			client_ip: peer.ip(),
+			client_identity: None,
+			vrr_requested: false,
+			keys: SessionKeys::Keys(SessionKeyData::new(
+				crate::session::RemoteInputKey::from_bytes([7; 16]),
+				crate::session::RemoteInputKeyId::new(1),
+			)),
+		})
+		.await;
+	let before = server.session_manager.session_view().await.unwrap();
+	let steam = legacy_id("Steam").to_string();
+	let portal = entry.id.to_string();
+
+	let prompt = body_text(
+		server
+			.launch(launch_params(&[("appid", Some(&steam))]), None, peer, Some("a".into()))
+			.await,
+	)
+	.await;
+	assert!(prompt.contains("status_code=\"410\""), "{prompt}");
+	assert!(prompt.contains(REPLACEMENT_CONFIRMATION), "{prompt}");
+
+	// The running application itself, and a request without a client
+	// certificate, keep the previous answer.
+	let same = body_text(
+		server
+			.launch(launch_params(&[("appid", Some(&portal))]), None, peer, Some("a".into()))
+			.await,
+	)
+	.await;
+	assert!(
+		!same.contains("status_code=\"410\"") && !same.contains("status_code=\"200\""),
+		"{same}"
+	);
+	let anonymous = body_text(
+		server
+			.launch(launch_params(&[("appid", Some(&steam))]), None, peer, None)
+			.await,
+	)
+	.await;
+	assert!(!anonymous.contains("status_code=\"410\""), "{anonymous}");
+
+	let after = server.session_manager.session_view().await.unwrap();
+	assert_eq!(
+		(after.epoch, after.application_id),
+		(before.epoch, before.application_id)
+	);
+	server.session_manager.stop_session().await.unwrap();
+	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+}
+
+/// The frame-limiter description doubles as Nightjar's marker of Vibepollo's
+/// stream extensions, so it is present on every serverinfo.
+#[tokio::test]
+async fn serverinfo_describes_the_frame_limiter() {
+	use crate::session::frame_limit::{FrameLimitConfig, FrameLimitMode};
+	let mut fixture = fixture(true, WebLimits::default());
+	for (config, enabled, stream, millihertz) in [
+		(FrameLimitConfig::default(), "0", "0", "0"),
+		(
+			FrameLimitConfig {
+				mode: FrameLimitMode::Stream,
+				..Default::default()
+			},
+			"1",
+			"1",
+			"0",
+		),
+		(
+			FrameLimitConfig {
+				mode: FrameLimitMode::Custom,
+				fps: 90,
+				..Default::default()
+			},
+			"1",
+			"0",
+			"90000",
+		),
+	] {
+		fixture.server.frame_limit = config;
+		let (_, body) = http(&fixture.server, REMOTE, get("/serverinfo", "192.168.1.10")).await;
+		assert_eq!(xml_value(&body, "FrameLimiterSupported"), "1");
+		assert_eq!(xml_value(&body, "FrameLimiterEnabled"), enabled);
+		assert_eq!(xml_value(&body, "VirtualDisplayFrameLimiterEnabled"), stream);
+		assert_eq!(xml_value(&body, "FrameLimiterFpsLimitMilliHz"), millihertz);
+		// Encoder rates are for paired clients during a stream only.
+		assert!(!body.contains("RustHostEncoderBitrateKbps"), "{body}");
+	}
+	fixture
+		.server
+		.shutdown
+		.trigger_shutdown(ShutdownReason::AppQuit)
+		.unwrap();
 }

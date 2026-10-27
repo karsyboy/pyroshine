@@ -469,6 +469,7 @@ impl Moonshine {
 				cert,
 				client_manager,
 				session_manager,
+				config.frame_limit.clone(),
 				shutdown.clone(),
 			)?,
 			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),

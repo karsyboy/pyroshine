@@ -476,18 +476,20 @@ impl RtspServer {
 			},
 		};
 
-		let (dynamic_range, chroma_sampling_type, bit_depth) = match negotiated_video_axes(&sdp_session) {
-			Ok(axes) => axes,
-			Err(()) => {
-				tracing::warn!("Client requested malformed or unsupported video profile attributes");
-				self.report_rejection(
-					"video_profile_invalid",
-					"The client requested a malformed or unsupported video profile (dynamic range, chroma or bit depth).",
-					"Reset the client's video settings, or update the client.",
-				);
-				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-			},
-		};
+		let requested_hdr_mode = self.session_manager.requested_hdr_mode().await;
+		let (dynamic_range, chroma_sampling_type, bit_depth) =
+			match negotiated_video_axes(&sdp_session, video_format, requested_hdr_mode) {
+				Ok(axes) => axes,
+				Err(()) => {
+					tracing::warn!("Client requested malformed or unsupported video profile attributes");
+					self.report_rejection(
+						"video_profile_invalid",
+						"The client requested a malformed or unsupported video profile (dynamic range, chroma or bit depth).",
+						"Reset the client's video settings, or update the client.",
+					);
+					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+				},
+			};
 
 		let max_reference_frames: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
@@ -547,6 +549,7 @@ impl RtspServer {
 				chroma = %format.chroma,
 				bit_depth = format.bit_depth.bits(),
 				hdr = format.hdr,
+				range = ?format.range,
 				"Requested video combination was not detected on this GPU/encoder; refusing silent fallback"
 			);
 			let verified = codec_profile_labels(self.supported_codecs);
@@ -1076,8 +1079,17 @@ fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attr
 }
 
 // Missing legacy attributes have defaults; malformed or unknown values do not.
+/// Dynamic range, chroma and bit depth of an ANNOUNCE.
+///
+/// `dynamicRangeMode=1` asks for HDR10 unless the launch or resume said
+/// `hdrMode=0` outright: Sunshine reads the mode as 10-bit encoding and HDR as
+/// a separate launch choice, and Nightjar asks for 10-bit SDR that way. Only
+/// the conventional codecs encode 10-bit SDR; PyroWave's 10-bit format is HDR10.
+/// An explicit `x-moonshine-video[0].bitDepth` keeps its own meaning.
 fn negotiated_video_axes(
 	session: &sdp_types::Session,
+	codec: VideoCodec,
+	requested_hdr_mode: Option<bool>,
 ) -> Result<(VideoDynamicRange, VideoChromaSampling, BitDepth), ()> {
 	fn optional_u32(session: &sdp_types::Session, name: &str) -> Result<Option<u32>, ()> {
 		unique_sdp_attribute(session, name)
@@ -1090,7 +1102,12 @@ fn negotiated_video_axes(
 		VideoChromaSampling::try_from(optional_u32(session, "x-ss-video[0].chromaSamplingType")?.unwrap_or(0))?;
 	let depth = match optional_u32(session, "x-moonshine-video[0].bitDepth")? {
 		Some(value) => BitDepth::try_from(value)?,
-		None if dynamic == VideoDynamicRange::Hdr => BitDepth::Ten,
+		None if dynamic == VideoDynamicRange::Hdr => {
+			if requested_hdr_mode == Some(false) && codec != VideoCodec::PyroWave {
+				return Ok((VideoDynamicRange::Sdr, chroma, BitDepth::Ten));
+			}
+			BitDepth::Ten
+		},
 		None => BitDepth::Eight,
 	};
 	Ok((dynamic, chroma, depth))
@@ -1177,6 +1194,32 @@ mod tests {
 				response.status().into(),
 				String::from_utf8_lossy(response.body()).into_owned(),
 			)
+		}
+
+		/// Nightjar asks for PyroWave in limited range unless its *full range*
+		/// setting is on, and converts with that setting rather than the
+		/// bitstream header, so the host encodes the requested range.
+		#[tokio::test]
+		async fn nightjar_pyrowave_is_accepted_in_either_range() {
+			use crate::healthcheck::{CODEC_PYROWAVE, CODEC_PYROWAVE_444, CODEC_PYROWAVE_HDR};
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			server.supported_codecs = CODEC_PYROWAVE | CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
+
+			let nightjar: Vec<(&str, &str)> = include_str!("../tests/protocol/nightjar-announce.sdp")
+				.lines()
+				.filter_map(|line| line.strip_prefix("a=")?.split_once(':'))
+				.collect();
+			// encoderCscMode: Rec.709 (1 << 1) plus the range bit.
+			for csc in ["2", "3"] {
+				let mut overrides = nightjar.clone();
+				overrides.push(("x-nv-video[0].encoderCscMode", csc));
+				let (status, body) = announce(&server, &grant, sdp(&overrides)).await;
+				assert_eq!(status, 500, "encoderCscMode {csc}: {body}");
+			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 		}
 
 		#[tokio::test]
@@ -1738,6 +1781,12 @@ mod tests {
 				include_str!("../tests/protocol/nonary-announce.sdp"),
 				PyroWaveDialect::RecordFramed,
 			),
+			// Nightjar (Android): records by feature bit, plus pacing and link
+			// hints Pyroshine does not use.
+			(
+				include_str!("../tests/protocol/nightjar-announce.sdp"),
+				PyroWaveDialect::RecordFramed,
+			),
 		] {
 			let session = sdp_types::Session::parse(attributes.as_bytes()).unwrap();
 			assert_eq!(
@@ -1777,14 +1826,17 @@ mod tests {
 						"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\na=x-nv-video[0].dynamicRangeMode:{hdr}\r\na=x-ss-video[0].chromaSamplingType:{chroma}\r\na=x-moonshine-video[0].bitDepth:{depth}\r\n"
 					);
 					let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
-					assert_eq!(
-						negotiated_video_axes(&session).unwrap(),
-						(
-							VideoDynamicRange::try_from(hdr).unwrap(),
-							VideoChromaSampling::try_from(chroma).unwrap(),
-							BitDepth::try_from(depth).unwrap()
-						)
-					);
+					// An explicit depth is never reinterpreted by the launch's hdrMode.
+					for hdr_mode in [None, Some(false), Some(true)] {
+						assert_eq!(
+							negotiated_video_axes(&session, VideoCodec::Hevc, hdr_mode).unwrap(),
+							(
+								VideoDynamicRange::try_from(hdr).unwrap(),
+								VideoChromaSampling::try_from(chroma).unwrap(),
+								BitDepth::try_from(depth).unwrap()
+							)
+						);
+					}
 				}
 			}
 		}
@@ -1796,7 +1848,7 @@ mod tests {
 		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n";
 		let session = sdp_types::Session::parse(base.as_bytes()).unwrap();
 		assert_eq!(
-			negotiated_video_axes(&session).unwrap(),
+			negotiated_video_axes(&session, VideoCodec::Hevc, None).unwrap(),
 			(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420, BitDepth::Eight)
 		);
 		for (attribute, value) in [
@@ -1808,8 +1860,37 @@ mod tests {
 			("x-moonshine-video[0].bitDepth", "ten"),
 		] {
 			let data = format!("{base}a={attribute}:{value}\r\n");
-			assert!(negotiated_video_axes(&sdp_types::Session::parse(data.as_bytes()).unwrap()).is_err());
+			let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
+			assert!(negotiated_video_axes(&session, VideoCodec::Hevc, None).is_err());
 		}
+	}
+
+	/// Nightjar's 10-bit SDR: `dynamicRangeMode=1` without a bit depth, after a
+	/// launch or resume that said `hdrMode=0` outright. Moonlight clients send
+	/// `hdrMode=1` for HDR and nothing otherwise, so they keep HDR10.
+	#[test]
+	fn explicit_sdr_launch_turns_ten_bit_dynamic_range_into_sdr() {
+		use super::*;
+		let data = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\na=x-nv-video[0].dynamicRangeMode:1\r\n";
+		let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
+		let axes = |codec, hdr_mode| negotiated_video_axes(&session, codec, hdr_mode).unwrap();
+		for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+			assert_eq!(
+				axes(codec, Some(false)),
+				(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
+			);
+			for hdr_mode in [None, Some(true)] {
+				assert_eq!(
+					axes(codec, hdr_mode),
+					(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
+				);
+			}
+		}
+		// PyroWave has no 10-bit SDR format.
+		assert_eq!(
+			axes(VideoCodec::PyroWave, Some(false)),
+			(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
+		);
 	}
 
 	/// DESCRIBE advertises the highest audio quality level, ANNOUNCE requests a

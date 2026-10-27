@@ -114,12 +114,110 @@ application replaced its selected game. It identifies the application, not two
 successive sessions of the same application. Client disconnect/resume and
 stream reconfiguration never use this operation.
 
+## Display modes
+
+`/launch` and `/resume` take `mode=WIDTHxHEIGHTxREFRESH`. Besides whole
+hertz, Pyroshine accepts the two fractional forms that Apollo-derived hosts
+define and their clients send:
+
+| Form | Example | Sent by |
+| --- | --- | --- |
+| Whole hertz, below 1000 | `1920x1080x60` | Every Moonlight client |
+| Decimal hertz, up to three decimals | `1920x1080x59.94` | Nightjar, Vibepollo clients |
+| Millihertz, 1000 and above | `1920x1080x59940` | Artemis, on a fractional-rate display |
+
+The refresh is rounded to whole hertz (59.94 Hz runs at 60 Hz, as it does for
+a client that sends `60`). Like Apollo, a value of 1000 or more is millihertz.
+
+## Dynamic range and bit depth
+
+`/launch` and `/resume` take `hdrMode`; RTSP ANNOUNCE takes
+`x-nv-video[0].dynamicRangeMode` and, from Pyrolight, an explicit
+`x-moonshine-video[0].bitDepth`. ANNOUNCE decides the stream:
+
+| `dynamicRangeMode` | `bitDepth` | Request's `hdrMode` | Stream |
+| --- | --- | --- | --- |
+| `0` or absent | absent | any | 8-bit SDR |
+| `1` | absent | `1` or absent | HDR10 (10-bit, BT.2020/PQ) |
+| `1` | absent | `0` | 10-bit SDR (BT.709), H.264/HEVC/AV1 only |
+| either | `8` or `10` | any | that depth, SDR or HDR10 as `dynamicRangeMode` says |
+
+Moonlight clients send `hdrMode=1` with HDR and nothing otherwise. Sunshine
+reads `dynamicRangeMode=1` as 10-bit encoding and HDR as a separate launch
+choice, and Nightjar asks for 10-bit SDR that way: `hdrMode=0` outright, then
+`dynamicRangeMode=1` with HEVC or AV1 Main10. The request is the one that
+authorized the stream: the latest `/resume` that sent `hdrMode`, else the
+launch. PyroWave has no 10-bit SDR format, so its `dynamicRangeMode=1` stays
+HDR10. A codec the GPU cannot encode in 10-bit SDR is refused, as any
+unverified profile is.
+
+## Live bitrate
+
+A paired client may change the encoder bitrate of its own stream without
+reconnecting:
+
+```text
+GET /bitrate?bitrate=20000   (HTTPS, paired client certificate)
+<root status_code="200"><bitrate>20000</bitrate></root>
+```
+
+This is the runtime call that Vibepollo and Foundation Sunshine define;
+Nightjar sends it from its stream menu and automatic bitrate. `bitrate` is in kbps, like `x-ml-video.configuredBitrateKbps`, and
+the reply's `<bitrate>` is the rate the encoder accepted: the profile's maximum
+may lower it, and PyroWave's per-frame budget is aligned down to 4 bytes.
+
+| Status | `<bitrate>` | Cause |
+| --- | --- | --- |
+| 200 | accepted kbps | Applied from the next encoded picture. If no picture is encoded within a second (a static VRR scene), the reply carries the requested kbps and the change applies with the next picture. |
+| 400 | 0 | `bitrate` missing, zero or above 4294967 kbps. |
+| 404 | 0 | No video is streaming, or the caller's address does not hold the stream's authorization. |
+| 409 | 0 | A reconnect is in progress, a newer request or reconnect replaced it, or the encoder refused the rate (a PyroWave frame budget outside 1 KiB to 3 MiB). |
+
+Errors use the GameStream convention of HTTP 200 with the status in the XML.
+Changes belong to the stream's authorization generation: a reconnect
+negotiates its bitrate in its own ANNOUNCE and discards an unapplied request.
+Plain HTTP does not serve `/bitrate`.
+
+During a stream, a paired client's `/serverinfo` reports the encoder rates as
+`<RustHostEncoderBitrateKbps>` (current) and
+`<RustHostInitialEncoderBitrateKbps>` (negotiated), Rubylight's names, which
+Nightjar's automatic bitrate starts from.
+
+## Vibepollo extensions
+
+Clients built for Vibepollo, such as Nightjar, enable a group of features when
+`/serverinfo` carries `<FrameLimiterSupported>`, whatever its value. Pyroshine
+always sends it, with the configured default `[frame_limit]`:
+
+| Element | Value |
+| --- | --- |
+| `FrameLimiterSupported` | `1` |
+| `FrameLimiterEnabled` | `1` unless `mode = "off"` |
+| `VirtualDisplayFrameLimiterEnabled` | `1` for `mode = "stream"` |
+| `FrameLimiterFpsLimitMilliHz` | `fps` × 1000 for `mode = "custom"`, else `0` |
+
+The features it unlocks, all served here:
+
+- `clientVrrRequested=1` at launch and resume, which selects VRR capture.
+- Decimal refresh rates (see [display modes](#display-modes)).
+- `/bitrate` (see [live bitrate](#live-bitrate)).
+- Host-confirmed replacement. Such a client launches a different application
+  without `/cancel`. Pyroshine answers the first such `/launch` with status 410
+  and Vibepollo's exact prompt, `An app is already running. Launch this app
+  again within 60 seconds to confirm that you want to close it.`; the client
+  asks its user and repeats the request. A repeat from the same client
+  certificate, for the same application and the same running session, within
+  60 seconds stops the running application and launches the new one. Any other
+  request re-arms the prompt. A launch of the running application itself, or
+  one without a client certificate, is unchanged and reports the running
+  session.
+
 ## Validation
 
 Automated:
 
 ```sh
-cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_instance steam_game
+cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_instance steam_game session::negotiation session::stream::video::rate
 ```
 
 - `catalog::tests::launcher_identities_*`: own keys, manual overrides, equal
@@ -135,7 +233,26 @@ cargo test -p moonshine-core --lib -- app_scanner::catalog webserver steam_insta
 - `webserver::security_tests::serverinfo_reports_steam_game_state_with_the_running_game`.
 - `session::steam_instance::tests`: Steam command detection, process
   detection by user and state, hooks and Desktop Mode exemptions.
+- `session::negotiation::tests::fractional_and_millihertz_refresh_rates_round_to_hertz`
+  and `webserver::security_tests::malformed_launch_and_resume_values_change_nothing`:
+  the three refresh forms and their rejections.
+- `rtsp::tests::explicit_sdr_launch_turns_ten_bit_dynamic_range_into_sdr`,
+  `rtsp::tests::profile_axes_preserve_hdr_chroma_and_explicit_sdr_depth` and
+  `session::manager::lifecycle_tests::requested_hdr_mode_follows_the_launch_then_each_resume`:
+  10-bit SDR from an explicit `hdrMode=0`, explicit depths unchanged.
+- `webserver::security_tests::live_bitrate_requires_a_paired_caller_and_its_own_stream`
+  (paired HTTPS only, value domain, no stream, foreign peer) and
+  `session::stream::video::rate::tests` (coalescing, generation scoping,
+  failure reporting).
 
 Manual, on a host with Steam installed: with the desktop Steam running,
 launching a Steam game from a client reports `steam_already_running` and the
 game does not open on the desktop; with it closed, the game streams.
+
+Manual, with a real client: change the bitrate from Nightjar's stream
+menu during an H.264, HEVC, AV1 and PyroWave stream and confirm the encoder rate in the
+session log (`Client changed the live bitrate`) and the client's statistics.
+Stream from Artemis on a 59.94 Hz display and confirm a 60 Hz session.
+Turn on Nightjar's 10-bit SDR setting with HDR off, stream HEVC and AV1, and
+confirm `bit_depth=10` with `hdr=false` in the session log and an SDR picture,
+then disconnect and resume.

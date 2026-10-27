@@ -29,8 +29,10 @@ use crate::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
 		application::SessionMode,
 		failure::{Problem, SessionFailure},
-		manager::SessionManager,
+		frame_limit::{FrameLimitConfig, FrameLimitMode},
+		manager::{LiveBitrateRefusal, SessionManager},
 		negotiation::{self, DisplayMode},
+		stream::video::rate::{RateState, RateUpdate},
 	},
 	tls::TlsAcceptor,
 };
@@ -102,6 +104,10 @@ pub struct Webserver {
 	server_certs: String,
 	supported_codecs: u32,
 	hdr_supported: bool,
+	/// Configured default frame limit, described in `/serverinfo`.
+	frame_limit: FrameLimitConfig,
+	/// Pending confirmations of `/launch` replacing the running application.
+	replacements: std::sync::Arc<std::sync::Mutex<ReplacementConfirmations>>,
 	shutdown: ShutdownManager<ShutdownReason>,
 	limits: WebLimits,
 }
@@ -151,6 +157,7 @@ impl Webserver {
 		server_certs: String,
 		client_manager: ClientManager,
 		session_manager: SessionManager,
+		frame_limit: FrameLimitConfig,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let server = Self {
@@ -165,6 +172,8 @@ impl Webserver {
 			server_certs,
 			supported_codecs,
 			hdr_supported,
+			frame_limit,
+			replacements: Default::default(),
 			shutdown: shutdown.clone(),
 			limits: WebLimits::default(),
 		};
@@ -508,6 +517,12 @@ impl Webserver {
 					}
 					self.cancel(params).await
 				},
+				(&Method::GET, "/bitrate") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					self.set_live_bitrate(params, peer_address).await
+				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -701,6 +716,16 @@ impl Webserver {
 				bandwidth::PROBE_BYTES
 			);
 		}
+		if paired_peer && let Some((current, negotiated)) = self.session_manager.video_bitrate().await {
+			// Rubylight's names; Nightjar's automatic bitrate starts from the
+			// live encoder rate and treats the negotiated one as its ceiling.
+			response += &format!(
+				"<RustHostEncoderBitrateKbps>{}</RustHostEncoderBitrateKbps><RustHostInitialEncoderBitrateKbps>{}</RustHostInitialEncoderBitrateKbps>",
+				current.div_ceil(1000),
+				negotiated.div_ceil(1000)
+			);
+		}
+		response += &frame_limiter_fields(&self.frame_limit);
 		// Public like the rest of this document: it only tells an integration
 		// whether `/applist` (paired clients only) carries launcher identities.
 		response += &format!("<PyroshineAppSources>{APP_SOURCES_VERSION}</PyroshineAppSources>");
@@ -853,11 +878,12 @@ impl Webserver {
 			},
 		};
 
-		let hdr = match params.remove("hdrMode").map(|value| value.parse::<u32>()) {
-			None => false,
-			Some(Ok(value)) => value != 0,
+		let hdr_mode = match params.remove("hdrMode").map(|value| value.parse::<u32>()) {
+			None => None,
+			Some(Ok(value)) => Some(value != 0),
 			Some(Err(error)) => return xml_error(400, &format!("Invalid hdrMode in launch request: {error}.")),
 		};
+		let hdr = hdr_mode == Some(true);
 		let vrr_requested = match client_vrr_requested(&mut params) {
 			Ok(requested) => requested,
 			Err(error) => return xml_error(400, &format!("Invalid clientVrrRequested in launch request: {error}.")),
@@ -874,6 +900,43 @@ impl Webserver {
 				return xml_error(400, &message);
 			},
 		};
+
+		// Another application runs: replace it only once this client confirms
+		// by repeating the request (Vibepollo's protocol, which Nightjar follows
+		// instead of cancelling first). Other clients cancel first and never
+		// reach this; without confirmation the launch reports the session.
+		if let Some(running) = self.session_manager.session_view().await
+			&& running.application_id != application_id
+			&& let Some(client) = client_identity.as_deref()
+		{
+			let now = std::time::Instant::now();
+			let confirmed = self
+				.replacements
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.arm_or_confirm(client, running.epoch, application_id, now);
+			if !confirmed {
+				tracing::info!(
+					running = running.application_id,
+					requested = application_id,
+					"Launch of another application awaits the client's confirmation"
+				);
+				return xml_error(410, REPLACEMENT_CONFIRMATION);
+			}
+			tracing::info!(
+				running = running.application_id,
+				requested = application_id,
+				"Client confirmed replacing the running application"
+			);
+			if self
+				.session_manager
+				.stop_session_if_application(running.application_id)
+				.await
+				.is_err()
+			{
+				return xml_error(503, "Failed to stop the running application");
+			}
+		}
 
 		if application.mode == SessionMode::Desktop && hdr {
 			// The client negotiates its codec profile before it launches. The
@@ -893,6 +956,7 @@ impl Webserver {
 				audio_channels,
 				audio_channel_mask,
 				hdr,
+				hdr_mode,
 				client_ip: peer_address.ip(),
 				client_identity,
 				vrr_requested,
@@ -1066,6 +1130,69 @@ impl Webserver {
 			.headers_mut()
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
+	}
+
+	/// `GET /bitrate?bitrate=KBPS`: change the encoder bitrate of the requesting
+	/// client's own stream without reconnecting. This is the runtime call that
+	/// Vibepollo and Foundation Sunshine define and their clients (Nightjar,
+	/// Moonlight V+ and its client-side adaptive bitrate) send; the reply's
+	/// `<bitrate>` is the accepted kbps, which the profile's maximum (or
+	/// PyroWave's word-aligned frame budget) may lower, and `0` with an error
+	/// status otherwise.
+	async fn set_live_bitrate(
+		&self,
+		params: HashMap<String, String>,
+		peer_address: SocketAddr,
+	) -> Response<Full<Bytes>> {
+		let Some(kbps) = params
+			.get("bitrate")
+			.and_then(|value| value.parse::<u32>().ok())
+			.filter(|kbps| (1..=MAX_LIVE_BITRATE_KBPS).contains(kbps))
+		else {
+			return bitrate_reply(
+				400,
+				Some(&format!(
+					"Expected bitrate in kbps between 1 and {MAX_LIVE_BITRATE_KBPS}"
+				)),
+				0,
+			);
+		};
+		let update = match self
+			.session_manager
+			.client_set_bitrate(peer_address.ip(), kbps * 1000)
+			.await
+		{
+			Ok(update) => update,
+			Err(refusal @ LiveBitrateRefusal::NoStream) => return bitrate_reply(404, Some(&refusal.to_string()), 0),
+			Err(refusal) => return bitrate_reply(409, Some(&refusal.to_string()), 0),
+		};
+		match tokio::time::timeout(LIVE_BITRATE_REPLY_TIMEOUT, update).await {
+			Ok(Ok(RateUpdate {
+				state: RateState::Applied,
+				accepted_bps: Some(accepted),
+				..
+			})) => {
+				let accepted = accepted.div_ceil(1000);
+				tracing::info!(
+					requested_kbps = kbps,
+					accepted_kbps = accepted,
+					"Client changed the live bitrate"
+				);
+				bitrate_reply(200, None, accepted)
+			},
+			Ok(Ok(update)) => {
+				let message = update
+					.error
+					.unwrap_or_else(|| "The bitrate was replaced by a newer request or a reconnect".into());
+				tracing::info!(requested_kbps = kbps, state = ?update.state, "Live bitrate not applied: {message}");
+				bitrate_reply(409, Some(&message), 0)
+			},
+			Ok(Err(_)) => bitrate_reply(409, Some("The video encoder stopped"), 0),
+			// No picture was encoded in time (a static VRR scene sends none): the
+			// request stays staged for this generation and applies with the next
+			// one, unless a newer request or a reconnect replaces it first.
+			Err(_) => bitrate_reply(200, Some("Applies with the next frame"), kbps),
+		}
 	}
 
 	/// Operator approval is a host-local administrative action served on the
@@ -1305,6 +1432,88 @@ fn xml_response(xml: String) -> Response<Full<Bytes>> {
 		.headers_mut()
 		.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 	response
+}
+
+/// Vibepollo's prompt for replacing the running application. Clients match
+/// this text exactly to ask the user, then repeat the launch to confirm.
+const REPLACEMENT_CONFIRMATION: &str =
+	"An app is already running. Launch this app again within 60 seconds to confirm that you want to close it.";
+
+/// How long a client has to confirm a replacement.
+const REPLACEMENT_CONFIRMATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One pending replacement per client certificate.
+#[derive(Default)]
+struct ReplacementConfirmations(HashMap<String, PendingReplacement>);
+
+struct PendingReplacement {
+	/// Session epoch of the application to be replaced.
+	epoch: u64,
+	requested: i32,
+	expires: std::time::Instant,
+}
+
+impl ReplacementConfirmations {
+	/// True when `client` repeats an unexpired request for `requested` against
+	/// the same session; otherwise (re)arm the confirmation and return false.
+	fn arm_or_confirm(&mut self, client: &str, epoch: u64, requested: i32, now: std::time::Instant) -> bool {
+		self.0.retain(|_, pending| pending.expires > now);
+		if self
+			.0
+			.remove(client)
+			.is_some_and(|pending| pending.epoch == epoch && pending.requested == requested)
+		{
+			return true;
+		}
+		self.0.insert(
+			client.to_string(),
+			PendingReplacement {
+				epoch,
+				requested,
+				expires: now + REPLACEMENT_CONFIRMATION_WINDOW,
+			},
+		);
+		false
+	}
+}
+
+/// Vibepollo's description of the configured default frame limit. Clients
+/// built for Vibepollo (Nightjar) also read the presence of
+/// `FrameLimiterSupported` as the marker of Vibepollo's stream extensions:
+/// they then send `clientVrrRequested`, decimal refresh rates and the runtime
+/// `/bitrate` call, and `/launch` a different application without `/cancel`,
+/// expecting the host to confirm the replacement. Pyroshine serves all four.
+fn frame_limiter_fields(config: &FrameLimitConfig) -> String {
+	let enabled = config.mode != FrameLimitMode::Off;
+	let stream_rate = config.mode == FrameLimitMode::Stream;
+	let millihertz = match config.mode {
+		FrameLimitMode::Custom => config.fps.saturating_mul(1000),
+		FrameLimitMode::Off | FrameLimitMode::Stream => 0,
+	};
+	format!(
+		"<FrameLimiterSupported>1</FrameLimiterSupported><FrameLimiterEnabled>{}</FrameLimiterEnabled>\
+		 <VirtualDisplayFrameLimiterEnabled>{}</VirtualDisplayFrameLimiterEnabled>\
+		 <FrameLimiterFpsLimitMilliHz>{millihertz}</FrameLimiterFpsLimitMilliHz>",
+		u8::from(enabled),
+		u8::from(stream_rate)
+	)
+}
+
+/// Largest live bitrate: the encoder's rate is in bits per second as a `u32`.
+const MAX_LIVE_BITRATE_KBPS: u32 = u32::MAX / 1000;
+
+/// How long `/bitrate` waits for the encoder to apply a rate before answering.
+const LIVE_BITRATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A `/bitrate` reply. Errors keep the `<bitrate>0</bitrate>` element the
+/// reference hosts send, which the clients read before the status.
+fn bitrate_reply(status_code: u16, message: Option<&str>, kbps: u32) -> Response<Full<Bytes>> {
+	let message = message
+		.map(|message| format!(" status_message=\"{}\"", escape_xml(message)))
+		.unwrap_or_default();
+	xml_response(format!(
+		"<root status_code=\"{status_code}\"{message}><bitrate>{kbps}</bitrate></root>"
+	))
 }
 
 fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {

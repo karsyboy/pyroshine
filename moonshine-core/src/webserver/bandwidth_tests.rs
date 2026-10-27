@@ -124,6 +124,8 @@ async fn authenticated_probe_discovery_exact_payload_and_admission() {
 		server_certs: host.cert.pem(),
 		supported_codecs: crate::healthcheck::CODEC_PYROWAVE,
 		hdr_supported: false,
+		frame_limit: Default::default(),
+		replacements: Default::default(),
 		shutdown,
 		limits: WebLimits::default(),
 	};
@@ -243,6 +245,8 @@ impl Fixture {
 			server_certs: host.cert.pem(),
 			supported_codecs,
 			hdr_supported: false,
+			frame_limit: Default::default(),
+			replacements: Default::default(),
 			shutdown,
 			limits: WebLimits::default(),
 		};

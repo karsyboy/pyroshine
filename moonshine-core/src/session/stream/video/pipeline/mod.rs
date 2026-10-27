@@ -1358,6 +1358,9 @@ impl VideoPipelineInner {
 			ctx.fps,
 			self.config.pyrowave_queue,
 		)?;
+		encoder.set_sdr_content_as_sdr(
+			ctx.pyrowave_dialect == Some(super::pyrowave_protocol::PyroWaveDialect::RecordFramed),
+		);
 		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 		let quality_reference_bytes =
@@ -1437,14 +1440,30 @@ impl VideoPipelineInner {
 		let mut failures = FailurePolicy::default();
 		// A requested replay of the last frame, kept until a frame is sent.
 		let mut resend_last = false;
+		// A live bitrate installed in the encoder, applied once the first frame
+		// encoded with it has been sent.
+		let mut pending_rate: Option<super::rate::PendingRate> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
-			if let Some(rate) = self.rate_rx.take() {
-				rate.finish(
-					super::rate::RateState::Failed,
-					None,
-					Some("live bitrate is supported by conventional encoders only".into()),
-				);
+			if let Some(mut rate) = self.rate_rx.take() {
+				match encoder.set_bitrate(rate.requested() as usize, ctx.fps) {
+					Ok(accepted) => {
+						// Ordered ahead of the next batch, which is the first one
+						// encoded with this budget.
+						if packet_tx
+							.blocking_send(VideoPacketMessage::PacingBitrate(accepted as u64))
+							.is_err()
+						{
+							return Err("video packet channel closed".to_string());
+						}
+						if let Some(old) = pending_rate.take() {
+							old.finish(super::rate::RateState::Superseded, None, None);
+						}
+						rate.stage(u32::try_from(accepted).unwrap_or(u32::MAX));
+						pending_rate = Some(rate);
+					},
+					Err(error) => rate.finish(super::rate::RateState::Failed, None, Some(error)),
+				}
 			}
 			if let Ok(command) = reconfigure_rx.try_recv() {
 				frame_rx.reset();
@@ -1459,6 +1478,10 @@ impl VideoPipelineInner {
 				sequence_number = 0;
 				rtp_clock.reset(std::time::Instant::now());
 				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
+				// The resumed generation negotiated its own rate; BeginEpoch
+				// restored the sender's pacing to it.
+				pending_rate = None;
+				encoder.set_bitrate(ctx.bitrate, ctx.fps)?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
 			}
@@ -1519,12 +1542,21 @@ impl VideoPipelineInner {
 					// compositor buffer is no longer referenced by PyroWave.
 					frame.consumed.store(true, Ordering::Release);
 					if ctx.format.hdr {
+						// The client is told whether this frame is HDR10 or the
+						// 10-bit BT.709 SDR of a record-framed stream.
+						let enabled = encoder.encodes_as_hdr(frame.color_space);
 						let state = HdrModeState {
-							enabled: true,
-							metadata: frame.hdr_metadata,
+							enabled,
+							metadata: frame.hdr_metadata.filter(|_| enabled),
 						};
 						let _ = hdr_metadata_tx.send_if_modified(|current| {
 							if *current != state {
+								if current.enabled != state.enabled {
+									tracing::info!(
+										"PyroWave content switched to {}",
+										if enabled { "HDR (BT.2020/PQ)" } else { "SDR (BT.709)" }
+									);
+								}
 								*current = state;
 								true
 							} else {
@@ -1617,6 +1649,9 @@ impl VideoPipelineInner {
 					},
 				}
 			};
+			if new_content && let Some(rate) = pending_rate.take() {
+				rate.finish(super::rate::RateState::Applied, Some(u64::from(frame_number)), None);
+			}
 			let stats = FrameStats {
 				channel_wait,
 				import: encoded.import,

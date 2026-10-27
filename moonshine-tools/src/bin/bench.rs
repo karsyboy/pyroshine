@@ -50,6 +50,10 @@ struct Args {
 	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
+	/// Use PyroWave's record-framed dialect (Nightjar): SDR frames of an HDR
+	/// stream are encoded as 10-bit BT.709 SDR.
+	#[arg(long)]
+	pyrowave_record: bool,
 	/// Transport measurement controls; encoding bitrate/quality remains unchanged.
 	#[arg(long)]
 	encrypt_video: bool,
@@ -108,9 +112,13 @@ struct Args {
 	#[arg(long, value_parser = parse_bit_depth)]
 	bit_depth: Option<u8>,
 
-	/// Encode full-range rather than limited-range YCbCr.
-	#[arg(long)]
+	/// Encode full-range rather than limited-range YCbCr (PyroWave's default).
+	#[arg(long, conflicts_with = "limited_range")]
 	full_range: bool,
+
+	/// Encode limited-range YCbCr, also for PyroWave (Moonlight clients' default).
+	#[arg(long)]
+	limited_range: bool,
 
 	/// Seconds to run before stopping (0 = run until Ctrl+C).
 	#[arg(long, default_value_t = 0)]
@@ -278,7 +286,7 @@ fn selected_format(args: &Args, codec: VideoCodec) -> Result<NegotiatedVideoForm
 		10 => BitDepth::Ten,
 		_ => unreachable!(),
 	};
-	let range = if codec == VideoCodec::PyroWave || args.full_range {
+	let range = if args.full_range || (codec == VideoCodec::PyroWave && !args.limited_range) {
 		ColorRange::Full
 	} else {
 		ColorRange::Limited
@@ -927,6 +935,7 @@ fn workload(
 		"packet_size": args.packet_size,
 		"conversion_queue": args.conversion_queue,
 		"pyrowave_queue": args.pyrowave_queue,
+		"pyrowave_record": args.pyrowave_record,
 		"duration_s": duration,
 		"warmup_s": args.warmup,
 		"command": args.command,
@@ -1192,6 +1201,7 @@ async fn run_benchmark(
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
+		hdr_mode: None,
 		// The benchmark is the local client: it discovers the video endpoint
 		// with a legacy PING from loopback below.
 		client_ip: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -1212,8 +1222,11 @@ async fn run_benchmark(
 	}
 
 	let video_ctx = VideoStreamContext {
-		pyrowave_dialect: (negotiated_format.codec == VideoCodec::PyroWave)
-			.then_some(moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1),
+		pyrowave_dialect: (negotiated_format.codec == VideoCodec::PyroWave).then_some(if args.pyrowave_record {
+			moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::RecordFramed
+		} else {
+			moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1
+		}),
 		width,
 		height,
 		fps: target_fps,

@@ -144,9 +144,7 @@ pub fn codec_profile_labels(capabilities: u32) -> Vec<&'static str> {
 
 pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -> bool {
 	if format.codec == VideoCodec::PyroWave {
-		if format.range != crate::session::stream::video::ColorRange::Full {
-			return false;
-		}
+		// Range is a scaler setting of the same encoder, so it needs no probe.
 		let chroma_supported = match format.chroma {
 			ChromaFormat::Yuv420 => capabilities & CODEC_PYROWAVE != 0,
 			ChromaFormat::Yuv444 => capabilities & CODEC_PYROWAVE_444 != 0,
@@ -1965,19 +1963,17 @@ mod tests {
 	}
 
 	#[test]
-	fn pyrowave_profiles_require_chroma_hdr_bits_and_full_range() {
+	fn pyrowave_profiles_require_chroma_and_hdr_bits_in_either_range() {
 		assert_eq!(CODEC_PYROWAVE, 0x00800000);
 		assert_eq!(CODEC_PYROWAVE_444, 0x01000000);
 		assert_eq!(CODEC_PYROWAVE_HDR, 0x02000000);
 		let caps = CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
-		assert!(supports_video_format(
-			caps,
-			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Full,)
-		));
-		assert!(!supports_video_format(
-			caps,
-			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Limited,)
-		));
+		for range in [ColorRange::Full, ColorRange::Limited] {
+			assert!(supports_video_format(
+				caps,
+				NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, range)
+			));
+		}
 		assert!(!supports_video_format(
 			CODEC_PYROWAVE_444,
 			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Full)

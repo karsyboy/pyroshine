@@ -84,20 +84,25 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 | --- | --- |
 | `x-nv-vqos[0].bitStreamFormat` | `0` H.264, `1` HEVC, `2` AV1, `3` PyroWave |
 | `x-ss-video[0].chromaSamplingType` | `0` 4:2:0, `1` 4:4:4 |
-| `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 |
+| `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 (also after `hdrMode=0`: PyroWave has no 10-bit SDR) |
 | `x-nv-video[0].encoderCscMode` bit 0 | `0` limited, `1` full range |
 | `x-ss-pyrowave.version` | `1` |
 
 Wire v1 uses an 8-bit intermediate for SDR and a 10-bit intermediate for HDR10.
+A record-framed HDR10 stream encodes SDR content as 10-bit BT.709 and reports
+HDR mode off for it (see
+[color capability translation](PYROWAVE_COMPATIBILITY.md#color-capability-translation)).
 The optional Pyroshine bit-depth attribute remains available to conventional
 codecs, but contradictory or unsupported PyroWave combinations are rejected;
 Pyroshine does not silently fall back to another chroma, depth, or codec.
 
-PyroWave's current scaled RGB API always produces full-range YCbCr, so only
-full-range PyroWave modes are advertised. Conventional codecs support either
-range according to the negotiated VUI. Adding limited-range PyroWave requires a
-clean output-range control in the fork's scaler; lying in bitstream metadata is
-not an acceptable workaround.
+PyroWave encodes the negotiated range: the scaled RGB API writes full or
+narrow (limited) range YCbCr at the stream's bit depth and records it in the
+sequence header. Pyrolight always asks for full range. Moonlight clients such
+as Nightjar ask for limited range unless their full-range setting is on, and
+convert the decoded planes with that setting rather than the header, so the
+range is never substituted. Range needs no startup probe of its own; profiles
+are advertised by chroma and dynamic range only.
 
 PyroWave has floating-point decoded samples rather than a coded 8/10-bit
 profile. Pyroshine's bit-depth selection controls the scaler's R8 or R16
@@ -114,8 +119,12 @@ is no separate low bitrate cap for 4:4:4 or HDR.
 
 Client default-bitrate heuristics are owned by Pyrolight, not a host
 congestion controller. The negotiated manual bitrate remains authoritative;
-FEC feedback adjusts parity, not PyroWave codec bitrate. Live bitrate adaptation
-would need an end-to-end capacity estimator.
+FEC feedback adjusts parity, not PyroWave codec bitrate. A client may change
+the bitrate of its own stream with `GET /bitrate`
+([client integration](CLIENT_INTEGRATION.md#live-bitrate)): the next frame is
+encoded with the budget derived from the new rate by the same rule, and the
+sender paces frames at it from that frame on. A reconnect restores the rate its
+ANNOUNCE negotiates. Pyroshine itself runs no bitrate controller.
 
 Actual throughput depends on content and format. Measure encoded payload, UDP
 bytes (including FEC/protocol/encryption) and estimated Ethernet bytes separately;
@@ -266,7 +275,7 @@ supported driver/GPU:
 1. 1080p60 and 4K60/120 where supported.
 2. 4:2:0 SDR and HDR10.
 3. 4:4:4 SDR and HDR10.
-4. Full-range metadata and SDR/HDR mode changes.
+4. Full- and limited-range metadata and SDR/HDR mode changes.
 5. Packet loss, FEC recovery, and oversized keyframe delivery.
 6. Long-running bitrate, latency, VRAM, and imported-image cache stability.
 7. A decoder built from the same authoritative fork.

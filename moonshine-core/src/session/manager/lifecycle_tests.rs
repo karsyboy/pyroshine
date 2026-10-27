@@ -464,9 +464,40 @@ fn context() -> SessionContext {
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: false,
+		hdr_mode: None,
 		client_ip: "127.0.0.1".parse().unwrap(),
 		client_identity: None,
 		vrr_requested: false,
+	}
+}
+
+/// ANNOUNCE reads the explicit `hdrMode` of the request that authorized it:
+/// the latest resume that sent one, else the launch.
+#[tokio::test]
+async fn requested_hdr_mode_follows_the_launch_then_each_resume() {
+	let h = Harness::new();
+	assert_eq!(h.core.requested_hdr_mode().await, None);
+	let mut launch = context();
+	launch.hdr_mode = Some(false);
+	h.core.initialize_session(launch).await.unwrap();
+	assert_eq!(h.core.requested_hdr_mode().await, Some(false));
+	h.core.launch_session().await.unwrap();
+	let grant = h.grant().await;
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.core.requested_hdr_mode().await, Some(false));
+
+	for (requested, expected) in [
+		(Some(true), Some(true)),
+		(None, Some(false)),
+		(Some(false), Some(false)),
+	] {
+		let request = ResumeRequest {
+			hdr: requested,
+			..ResumeRequest::default()
+		};
+		h.core.resume_session(keys(), request, h.client).await.unwrap();
+		assert_eq!(h.core.requested_hdr_mode().await, expected, "{requested:?}");
 	}
 }
 
@@ -1463,6 +1494,7 @@ impl Matrix {
 			resolution: self.resolution(),
 			refresh_rate: self.fps(),
 			hdr: self.hdr,
+			hdr_mode: None,
 			audio_channels,
 			audio_channel_mask,
 			..context()
