@@ -101,6 +101,12 @@ management interface's problem log):
 
 ## Conditional application cancellation
 
+`/serverinfo` (HTTP and HTTPS) advertises the feature as
+`<PyroshineConditionalCancel>1</PyroshineConditionalCancel>`. Builds without
+the element ignore `expectedAppId` and stop whatever is running, so a client
+must not send a conditional cancellation to them: refuse the action and ask
+the user to update the host instead of falling back to an unconditional one.
+
 Paired clients may add `expectedAppId=ID` to `/cancel`. The server compares the
 positive GameStream application ID while holding the session lifecycle lock,
 then begins teardown under that same lock. If no live session matches, the

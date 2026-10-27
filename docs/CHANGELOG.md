@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- `/serverinfo` advertises conditional cancellation as `<PyroshineConditionalCancel>1</PyroshineConditionalCancel>`, so clients such as Pyrolight and PyroDeck can tell that `/cancel?expectedAppId=` is checked before they rely on it. See [Client integration](CLIENT_INTEGRATION.md#conditional-application-cancellation).
+
+### Changed
+
+- CI now runs on pushes and pull requests to `version-*` release branches as well as `main`.
+
 ## [v0.18.0-prerelease.1] - 2026-10-27
 
 ### Added

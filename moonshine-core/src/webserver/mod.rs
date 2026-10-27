@@ -749,6 +749,10 @@ impl Webserver {
 		// Public like the rest of this document: it only tells an integration
 		// whether `/applist` (paired clients only) carries launcher identities.
 		response += &format!("<PyroshineAppSources>{APP_SOURCES_VERSION}</PyroshineAppSources>");
+		// `/cancel?expectedAppId=` is checked under the session lifecycle lock.
+		// Earlier builds ignored the parameter and stopped any game, so clients
+		// must see this before relying on the check.
+		response += &format!("<PyroshineConditionalCancel>{CONDITIONAL_CANCEL_VERSION}</PyroshineConditionalCancel>");
 		response += "<SupportedDisplayMode></SupportedDisplayMode>";
 		response += &format!("<PairStatus>{paired}</PairStatus>");
 		response += &format!(
@@ -1266,6 +1270,10 @@ impl Webserver {
 /// advertised as `<PyroshineAppSources>` in `/serverinfo`. Bump it only for
 /// an incompatible change; adding elements is compatible.
 pub(crate) const APP_SOURCES_VERSION: u32 = 1;
+
+/// Version of conditional `/cancel?expectedAppId=`, advertised as
+/// `<PyroshineConditionalCancel>` in `/serverinfo`.
+pub(crate) const CONDITIONAL_CANCEL_VERSION: u32 = 1;
 
 /// The `/applist` document for `catalog`.
 ///

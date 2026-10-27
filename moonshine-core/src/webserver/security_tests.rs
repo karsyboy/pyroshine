@@ -1160,11 +1160,15 @@ async fn catalog_refresh_during_an_active_stream_leaves_it_untouched() {
 /// Integrations read the app-metadata version without pairing; the
 /// metadata itself stays behind the paired-client `/applist`.
 #[tokio::test]
-async fn serverinfo_advertises_the_app_sources_version() {
+async fn serverinfo_advertises_integration_versions() {
 	let Fixture { server, .. } = fixture(true, WebLimits::default());
 	let (status, body) = http(&server, REMOTE, get("/serverinfo", "192.168.1.10")).await;
 	assert_eq!(status, 200);
 	assert_eq!(xml_value(&body, "PyroshineAppSources"), APP_SOURCES_VERSION.to_string());
+	assert_eq!(
+		xml_value(&body, "PyroshineConditionalCancel"),
+		CONDITIONAL_CANCEL_VERSION.to_string()
+	);
 	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
 }
 
