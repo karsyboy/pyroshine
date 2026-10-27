@@ -12,7 +12,7 @@ use pixelforge::{
 };
 
 use crate::config::Config;
-use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
+use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL};
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ConversionQueueMode, EncoderBackend, EncoderPreference, EncoderTable, KcmpProbe,
 	NegotiatedVideoFormat, VideoCodec, convert,
@@ -925,14 +925,14 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>, prefe
 	if pyrowave_errors.is_empty() {
 		report.add_passed(
 			"PyroWave",
-			format!("{SOURCE_URL} @ {SOURCE_REVISION}"),
+			format!("{SOURCE_URL} @ {SOURCE_REVISION} + {SOURCE_PATCHES}"),
 			start.elapsed().as_millis() as u64,
 		);
 	} else {
 		report.add_warn(
 			"PyroWave",
 			format!(
-				"  Optional codec unavailable from {SOURCE_URL} @ {SOURCE_REVISION}:\n  {}",
+				"  Optional codec unavailable from {SOURCE_URL} @ {SOURCE_REVISION} + {SOURCE_PATCHES}:\n  {}",
 				pyrowave_errors.join("\n  ")
 			),
 			start.elapsed().as_millis() as u64,

@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Tue, 27 Oct 2026 11:32:14 -0400
+Subject: [PATCH 1/7] decoder: validate coefficient packets before upload
+
+A packet's header announces how many payload words follow, but the GPU
+unpacker trusts the plane counts and significance bits inside them. A
+malformed or truncated packet from the network could make it read past
+the payload. Validate every byte the unpacker consumes with byte loads
+before a packet is queued, reject a sequence header announcing more
+blocks than the frame holds, and copy headers instead of dereferencing
+possibly unaligned packet memory.
+
+The bitstream structures move to pyrowave_bitstream.hpp so validation
+and tests can use them without Granite.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pyrowave_bitstream.hpp         | 86 ++++++++++++++++++++++++++++++++++
+ pyrowave_common.hpp            | 80 +------------------------------
+ pyrowave_decoder.cpp           | 29 ++++++++----
+ pyrowave_packet_validation.hpp | 44 +++++++++++++++++
+ 4 files changed, 150 insertions(+), 89 deletions(-)
+ create mode 100644 pyrowave_bitstream.hpp
+ create mode 100644 pyrowave_packet_validation.hpp
+
+diff --git a/pyrowave_bitstream.hpp b/pyrowave_bitstream.hpp
+new file mode 100644
+index 0000000..d6d4b94
+--- /dev/null
++++ b/pyrowave_bitstream.hpp
+@@ -0,0 +1,86 @@
++// Copyright (c) 2026
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <stdint.h>
++namespace PyroWave
++{
++struct BitstreamPacket
++{
++	uint32_t offset_u32;
++	uint32_t num_words;
++};
++
++struct BitstreamHeader
++{
++	uint16_t ballot;
++	uint16_t payload_words : 12;
++	uint16_t sequence : 3;
++	uint16_t extended : 1;
++	uint32_t quant_code : 8;
++	uint32_t block_index : 24;
++};
++
++static_assert(sizeof(BitstreamHeader) == 8, "BitstreamHeader is not 8 bytes.");
++
++enum
++{
++	BITSTREAM_EXTENDED_CODE_START_OF_FRAME = 0,
++};
++
++enum
++{
++	CHROMA_RESOLUTION_420 = 0,
++	CHROMA_RESOLUTION_444 = 1
++};
++
++enum
++{
++	CHROMA_SITING_CENTER = 0,
++	CHROMA_SITING_LEFT = 1
++};
++
++enum
++{
++	YCBCR_RANGE_FULL = 0,
++	YCBCR_RANGE_LIMITED = 1
++};
++
++enum
++{
++	COLOR_PRIMARIES_SRGB = 0,
++	COLOR_PRIMARIES_BT2020 = 1
++};
++
++enum
++{
++	YCBCR_TRANSFORM_BT709 = 0,
++	YCBCR_TRANSFORM_BT2020 = 1
++};
++
++enum
++{
++	TRANSFER_FUNCTION_SRGB = 0,
++	TRANSFER_FUNCTION_PQ = 1
++};
++
++static constexpr uint32_t SequenceCountMask = 0x7;
++
++struct BitstreamSequenceHeader
++{
++	uint32_t width_minus_1 : 14;
++	uint32_t height_minus_1 : 14;
++	uint32_t sequence : 3;
++	uint32_t extended : 1;
++	uint32_t total_blocks : 24;
++	uint32_t code : 2;
++	uint32_t chroma_resolution : 1;
++	uint32_t color_primaries : 1;
++	uint32_t transfer_function : 1;
++	uint32_t ycbcr_transform : 1;
++	uint32_t ycbcr_range : 1;
++	uint32_t chroma_siting : 1;
++};
++
++static_assert(sizeof(BitstreamSequenceHeader) == 8, "BitstreamSequenceHeader is not 8 bytes.");
++
++}
+diff --git a/pyrowave_common.hpp b/pyrowave_common.hpp
+index 327b94c..631473e 100644
+--- a/pyrowave_common.hpp
++++ b/pyrowave_common.hpp
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <stdint.h>
++#include "pyrowave_bitstream.hpp"
+ #include "device.hpp"
+ #include "buffer.hpp"
+ #include "image.hpp"
+@@ -11,85 +12,6 @@
+ 
+ namespace PyroWave
+ {
+-struct BitstreamPacket
+-{
+-	uint32_t offset_u32;
+-	uint32_t num_words;
+-};
+-
+-struct BitstreamHeader
+-{
+-	uint16_t ballot;
+-	uint16_t payload_words : 12;
+-	uint16_t sequence : 3;
+-	uint16_t extended : 1;
+-	uint32_t quant_code : 8;
+-	uint32_t block_index : 24;
+-};
+-
+-static_assert(sizeof(BitstreamHeader) == 8, "BitstreamHeader is not 8 bytes.");
+-
+-enum
+-{
+-	BITSTREAM_EXTENDED_CODE_START_OF_FRAME = 0,
+-};
+-
+-enum
+-{
+-	CHROMA_RESOLUTION_420 = 0,
+-	CHROMA_RESOLUTION_444 = 1
+-};
+-
+-enum
+-{
+-	CHROMA_SITING_CENTER = 0,
+-	CHROMA_SITING_LEFT = 1
+-};
+-
+-enum
+-{
+-	YCBCR_RANGE_FULL = 0,
+-	YCBCR_RANGE_LIMITED = 1
+-};
+-
+-enum
+-{
+-	COLOR_PRIMARIES_SRGB = 0,
+-	COLOR_PRIMARIES_BT2020 = 1
+-};
+-
+-enum
+-{
+-	YCBCR_TRANSFORM_BT709 = 0,
+-	YCBCR_TRANSFORM_BT2020 = 1
+-};
+-
+-enum
+-{
+-	TRANSFER_FUNCTION_SRGB = 0,
+-	TRANSFER_FUNCTION_PQ = 1
+-};
+-
+-static constexpr uint32_t SequenceCountMask = 0x7;
+-
+-struct BitstreamSequenceHeader
+-{
+-	uint32_t width_minus_1 : 14;
+-	uint32_t height_minus_1 : 14;
+-	uint32_t sequence : 3;
+-	uint32_t extended : 1;
+-	uint32_t total_blocks : 24;
+-	uint32_t code : 2;
+-	uint32_t chroma_resolution : 1;
+-	uint32_t color_primaries : 1;
+-	uint32_t transfer_function : 1;
+-	uint32_t ycbcr_transform : 1;
+-	uint32_t ycbcr_range : 1;
+-	uint32_t chroma_siting : 1;
+-};
+-
+-static_assert(sizeof(BitstreamSequenceHeader) == 8, "BitstreamSequenceHeader is not 8 bytes.");
+-
+ struct QuantStats
+ {
+ 	uint16_t square_error_fp16;
+diff --git a/pyrowave_decoder.cpp b/pyrowave_decoder.cpp
+index 429ba8b..af19dc3 100644
+--- a/pyrowave_decoder.cpp
++++ b/pyrowave_decoder.cpp
+@@ -7,6 +7,8 @@
+ #include "math.hpp"
+ #include "pyrowave_common.hpp"
+ #include <algorithm>
++#include <cstring>
++#include "pyrowave_packet_validation.hpp"
+ 
+ namespace PyroWave
+ {
+@@ -45,7 +47,7 @@ struct Decoder::Impl final : public WaveletBuffers
+ 	                     const uint32_t *active_block_mask, size_t word_count) const;
+ 	bool has_pristine_bands(int bands, const uint32_t *active_block_mask, size_t word_count) const;
+ 
+-	bool decode_packet(const BitstreamHeader *header);
++	bool decode_packet(const BitstreamHeader *header, const uint8_t *data);
+ 
+ 	bool dequant(CommandBuffer &cmd);
+ 	bool idwt(CommandBuffer &cmd, const ViewBuffers &views);
+@@ -126,8 +128,10 @@ void Decoder::Impl::upload_payload(CommandBuffer &cmd)
+ 		memcpy(cmd.update_buffer(*payload_data, 0, required_size), payload_data_cpu.data(), required_size);
+ }
+ 
+-bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
++bool Decoder::Impl::decode_packet(const BitstreamHeader *header, const uint8_t *data)
+ {
++	if (!validate_coefficient_packet(data, header->payload_words * 4))
++		return false;
+ 	auto &offset = dequant_offset_buffer_cpu[header->block_index];
+ 	if (offset == UINT32_MAX)
+ 	{
+@@ -139,7 +143,6 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
+ 		return true;
+ 	}
+ 
+-	auto *payload_words = reinterpret_cast<const uint32_t *>(header);
+ 
+ 	if (sizeof(*header) / sizeof(uint32_t) > header->payload_words)
+ 	{
+@@ -147,10 +150,9 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
+ 		return false;
+ 	}
+ 
+-	payload_data_cpu.insert(
+-			payload_data_cpu.end(),
+-			payload_words,
+-			payload_words + header->payload_words);
++	size_t previous_size = payload_data_cpu.size();
++	payload_data_cpu.resize(previous_size + header->payload_words);
++	memcpy(payload_data_cpu.data() + previous_size, data, header->payload_words * 4);
+ 	return true;
+ }
+ 
+@@ -159,11 +161,15 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
+ 	auto *data = static_cast<const uint8_t *>(data_);
+ 	while (size >= sizeof(BitstreamHeader))
+ 	{
+-		auto *header = reinterpret_cast<const BitstreamHeader *>(data);
++		BitstreamHeader aligned_header;
++		memcpy(&aligned_header, data, sizeof(aligned_header));
++		auto *header = &aligned_header;
+ 
+ 		if (header->extended != 0)
+ 		{
+-			auto *seq = reinterpret_cast<const BitstreamSequenceHeader *>(header);
++			BitstreamSequenceHeader aligned_seq;
++			memcpy(&aligned_seq, data, sizeof(aligned_seq));
++			auto *seq = &aligned_seq;
+ 
+ 			if (sizeof(*header) > size)
+ 			{
+@@ -198,6 +204,8 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
+ 					return false;
+ 				}
+ 
++				if (seq->total_blocks > unsigned(block_count_32x32))
++					return false;
+ 				total_blocks_in_sequence = int(seq->total_blocks);
+ 			}
+ 			else
+@@ -248,7 +256,8 @@ bool Decoder::Impl::push_packet(const void *data_, size_t size)
+ 			return false;
+ 		}
+ 
+-		if (!decode_packet(header))
++		// decode_packet copies the full packet and never dereferences an unaligned word.
++		if (!decode_packet(header, data))
+ 			return false;
+ 
+ 		data += packet_size;
+diff --git a/pyrowave_packet_validation.hpp b/pyrowave_packet_validation.hpp
+new file mode 100644
+index 0000000..bef133a
+--- /dev/null
++++ b/pyrowave_packet_validation.hpp
+@@ -0,0 +1,44 @@
++// Copyright (c) 2026
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <cstddef>
++#include <cstdint>
++
++namespace PyroWave
++{
++// Validate every byte consumed by the GPU coefficient unpacker before upload.
++// Uses byte loads, so network packet alignment is irrelevant.
++inline bool validate_coefficient_packet(const uint8_t *data, size_t size)
++{
++	if (!data || size < 8 || (size & 3))
++		return false;
++	unsigned ballot = unsigned(data[0]) | (unsigned(data[1]) << 8);
++	unsigned words = (unsigned(data[2]) | (unsigned(data[3]) << 8)) & 0xfff;
++	if (size != words * 4 || words < 2)
++		return false;
++	unsigned count = 0;
++	for (unsigned bits = ballot; bits; bits &= bits - 1)
++		count++;
++	size_t offset = 8 + count * 3;
++	if (offset > size)
++		return false;
++	unsigned significant = 0;
++	for (unsigned i = 0; i < count; i++)
++	{
++		unsigned control = unsigned(data[8 + i * 2]) | (unsigned(data[9 + i * 2]) << 8);
++		unsigned q = data[8 + count * 2 + i] & 15;
++		for (unsigned sub = 0; sub < 8; sub++)
++		{
++			unsigned planes = q + ((control >> (sub * 2)) & 3);
++			if (planes > size - offset)
++				return false;
++			unsigned mask = 0;
++			for (unsigned p = 0; p < planes; p++)
++				mask |= data[offset++];
++			for (; mask; mask &= mask - 1)
++				significant++;
++		}
++	}
++	return ((offset + (significant + 7) / 8 + 3) & ~size_t(3)) == size;
++}
++}

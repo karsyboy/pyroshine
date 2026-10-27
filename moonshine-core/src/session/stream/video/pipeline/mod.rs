@@ -36,7 +36,7 @@ use crate::session::stream::video::fec::{FecController, FrameFecStatus};
 use crate::session::stream::video::gso_socket::duration_micros_u64;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::pyrowave::{
-	EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
+	EncodedFrame, PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
 };
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
@@ -1422,6 +1422,7 @@ impl VideoPipelineInner {
 			initial_fec_percentage = fec_controller.percentage(),
 			pyrowave_source = SOURCE_URL,
 			pyrowave_revision = SOURCE_REVISION,
+			pyrowave_patches = SOURCE_PATCHES,
 			"Initialized zero-copy PyroWave encoder"
 		);
 		if encoder.maximum_frame_bytes().saturating_mul(4) < quality_reference_bytes.saturating_mul(3) {

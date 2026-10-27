@@ -1,6 +1,6 @@
 # Maintaining vendored dependencies
 
-Inputtino and Pixelforge use the same maintenance workflow. Each source tree is
+Inputtino, Pixelforge and PyroWave use the same maintenance workflow. Each source tree is
 generated from an immutable upstream commit plus a numbered patch series.
 Dependency-specific behavior and hardware acceptance checks live in each
 `LOCAL_CHANGES.md`.
@@ -9,6 +9,7 @@ Dependency-specific behavior and hardware acceptance checks live in each
 | --- | --- | --- | --- |
 | Inputtino | `inputtino/` | `inputtino-patches/`, `inputtino-patches/UPSTREAM` | [Inputtino notes](inputtino/LOCAL_CHANGES.md) |
 | Pixelforge | `pixelforge/` | `pixelforge-patches/`, `pixelforge-patches/UPSTREAM` | [Pixelforge notes](pixelforge/LOCAL_CHANGES.md) |
+| PyroWave | `pyrowave/` | `pyrowave-patches/`, `pyrowave-patches/UPSTREAM` | [PyroWave notes](pyrowave/LOCAL_CHANGES.md) |
 
 ## Source and patch format
 
@@ -19,7 +20,7 @@ with paths relative to the upstream repository root. Prefer one concern per
 patch and create patches with `git format-patch` in a temporary upstream
 checkout. Preserve upstream license notices.
 
-Never edit generated source directly. The two `scripts/vendor-*.sh` entry points
+Never edit generated source directly. The three `scripts/vendor-*.sh` entry points
 share `scripts/vendor-dependency.sh`: clone, check out the pin, apply each patch,
 and copy the dependency's selected files. Regeneration replaces the generated
 files only after every patch applies, preserving the root `LOCAL_CHANGES.md`.
@@ -31,7 +32,16 @@ only Inputtino's native `inputtino-sys` backend and the Pixelforge crate. The
 Inputtino public Rust crate has an explicit `rev` matching its native base;
 Pixelforge keeps its upstream release tag, verified against the base commit.
 `--check` also checks these declarations, local crate versions and Cargo.lock.
-Nix includes both source trees through `nix/package.nix`'s vendor fileset;
+PyroWave is a native library, not a Cargo dependency: `scripts/build-pyrowave.sh`
+and `nix/pyrowave.nix` build `vendor/pyrowave` directly, and `--check` verifies
+that `SOURCE_REVISION` in `pyrowave.rs` and Nix's `upstreamRevision` equal the
+base commit. Its Granite changes are patch files inside the series
+(`vendor/pyrowave/patches/`), applied by the vendored `checkout_granite.sh` or
+by Nix to the pinned Granite; changing a Granite shader also means regenerating
+`shaders/slangmosh_scaler.hpp` in the same patch. Pyrolight builds its decoder
+from this tree at a pinned Pyroshine commit.
+
+Nix includes both Cargo source trees through `nix/package.nix`'s vendor fileset;
 Inputtino's existing Nix C++ linker adjustment remains a packaging adaptation.
 
 ## Updating
@@ -41,8 +51,8 @@ update, following [the repository policy](../AGENTS.md#upstream-synchronization)
 An update is a reviewed change, never an automatic tracking-branch build.
 
 The daily [Vendor upstream workflow](../.github/workflows/vendor-upstream.yaml)
-proposes updates: when Inputtino's default branch or a newer Pixelforge release
-tag moves past the pin, it regenerates the tree with the existing patches,
+proposes updates: when Inputtino's or PyroWave's default branch or a newer
+Pixelforge release tag moves past the pin, it regenerates the tree with the existing patches,
 moves the Cargo pins, runs `--check` and opens a `vendor-update/<dependency>`
 pull request. If regeneration fails, usually because a patch no longer
 applies, it opens an issue instead. Merging that pull request is the approval;
@@ -53,14 +63,17 @@ CI runs on these pull requests only when the `VENDOR_UPDATE_TOKEN` secret is set
 # After editing a patch, regenerate at the existing pin.
 scripts/vendor-inputtino.sh
 scripts/vendor-pixelforge.sh
+scripts/vendor-pyrowave.sh
 
-# Verify source reconstruction and Cargo pins.
+# Verify source reconstruction and pins.
 scripts/vendor-inputtino.sh --check
 scripts/vendor-pixelforge.sh --check
+scripts/vendor-pyrowave.sh --check
 
 # Run each dependency's hardware-independent regression suite.
 scripts/vendor-inputtino.sh --test
 scripts/vendor-pixelforge.sh --test
+scripts/vendor-pyrowave.sh --test
 ```
 
 To use an existing upstream Git checkout or mirror, add `--source /path/to/repo`
@@ -70,14 +83,16 @@ change the upstream source recorded in Cargo or the pin.
 
 For an approved base update, pass the exact upstream ref to the corresponding
 script. Rebase each patch in order, dropping it only when upstream provides the
-same behavior. Update the dependency's Cargo `rev` or `tag`, refresh Cargo.lock,
-and update its notes. Run both `--check` commands, dependency tests and relevant
-workspace, Nix and hardware checks before committing. If no patches remain,
+same behavior. Update the dependency's Cargo `rev` or `tag` and refresh
+Cargo.lock, or for PyroWave `SOURCE_REVISION`, Nix's `upstreamRevision` and the
+base in `docs/PYROWAVE.md`, and update its notes. Run the `--check` commands,
+dependency tests and relevant workspace, Nix and hardware checks before
+committing. If no patches remain,
 review removal of the vendor override and return to the pinned upstream source.
 
 ## Validation
 
-CI verifies reconstruction and Cargo pin consistency for both dependencies and
+CI verifies reconstruction and pin consistency for every dependency and
 runs Pixelforge's unit tests explicitly: workspace tests do not run the unit
 tests of a path-patched dependency. Inputtino's hardware-independent tests run
 under ASan/UBSan in the existing known-defects CI step; `--test` provides the same

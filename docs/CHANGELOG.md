@@ -21,7 +21,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Changed
 
-- Build PyroWave from fork revision `ac5a7ec`, which merges two upstream rate-control fixes: dropping a whole block was costed without its frequency weight, so at low bitrates whole chroma blocks were thrown away and large areas lost their colour, and the bucket prefix scan stopped one step short. Low-bitrate PyroWave streams keep their colour at the same bitrate. It also adds P010 input for scaled encodes. The bitstream and C API 1.1.0 are unchanged, so existing Pyrolight clients decode it as before.
+- Build PyroWave from upstream [Themaister/pyrowave](https://github.com/Themaister/pyrowave) `7fe0e26` plus a vendored patch series (`vendor/pyrowave/`, maintained like Pixelforge) instead of the `karsyboy/pyrowave` fork. The series carries the fork's changes and Pyroshine's own Granite patch, so the library and C API 1.1.0 are the same, and builds no longer need the fork. The new base brings two upstream rate-control fixes: dropping a whole block was costed without its frequency weight, so at low bitrates whole chroma blocks were thrown away and large areas lost their colour, and the bucket prefix scan stopped one step short. Low-bitrate PyroWave streams keep their colour at the same bitrate. It also adds P010 input for scaled encodes, whose range is no longer written into the stream's color metadata. The bitstream is unchanged, so existing Pyrolight clients decode it as before. See [PyroWave](PYROWAVE.md#pinned-dependency).
 
 ### Fixed
 

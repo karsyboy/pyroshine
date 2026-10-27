@@ -244,8 +244,8 @@ Pyroshine is an independent community fork of
 ecosystem and work pioneered by [Sunshine](https://github.com/LizardByte/Sunshine).
 It retains Moonshine's internal names and paths for compatibility. The client fork is
 [Pyrolight](https://github.com/karsyboy/pyrolight), and
-the codec is the pinned [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave)
-fork of [PyroWave](https://github.com/Themaister/pyrowave).
+the codec is [PyroWave](https://github.com/Themaister/pyrowave), vendored with a
+small patch series (`vendor/pyrowave-patches/`).
 
 VRR streaming is based on [Nonary](https://github.com/Nonary)'s idea and
 reference implementations in [Vibepollo](https://github.com/Nonary/Vibepollo)
