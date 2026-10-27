@@ -347,6 +347,25 @@ It can also be run with `workflow_dispatch` for an existing tag. Check that the
 workflow succeeded and all assets are attached, then test installation and an
 upgrade from the previous release.
 
+### Prereleases
+
+A prerelease follows the same steps with a `-prerelease` or `-prerelease.N`
+version, for example `0.18.0-prerelease.1` in `Cargo.toml` and a dated
+`## [v0.18.0-prerelease.1]` changelog entry:
+
+```sh
+git tag -a v0.18.0-prerelease.1 -m "Pyroshine v0.18.0-prerelease.1"
+git push origin v0.18.0-prerelease.1
+```
+
+The [prerelease workflow](.github/workflows/prerelease.yaml) runs the release
+workflow for these tags, with the same validation, `release` environment
+approval and assets, and marks the GitHub release as a prerelease; the
+release workflow itself ignores them. It can also be run with
+`workflow_dispatch` for an existing prerelease tag. Other suffixed tags such as
+`v1.2.3-rc.1` go through the release workflow as before and are not published
+to the pacman repository.
+
 Packaging is defined in [nfpm.yaml](nfpm.yaml) (one package: the server with
 its tray, the web interface's files and the application-menu entry; it replaces
 the former `pyroshine-ui` package) and [dist/](dist/).
@@ -356,12 +375,14 @@ changing service, udev, policy or desktop-entry paths.
 ### Pacman repository
 
 The [`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages) publishes
-`pyroshine-bin`, which repackages the release's Arch package. After a stable release is published, the release workflow's `pacman`
-job starts that repository's **Publish** workflow, so a release needs no further
-step; prereleases are not published. The job needs the `PACKAGES_DISPATCH_TOKEN`
+`pyroshine-bin`, which repackages the newest stable release's Arch package, and
+`pyroshine-prerelease-bin`, which follows the newest release including
+prereleases. After a stable release or a prerelease is published, the release
+workflow's `pacman` job starts that repository's **Publish** workflow, so a
+release needs no further step. The job needs the `PACKAGES_DISPATCH_TOKEN`
 secret: a fine-grained token with access to `pyrowave-packages` only and the
 **Actions: Read and write** permission. If the job fails, run **Publish** in
 `pyrowave-packages` by hand.
 
-When changing the `archlinux` dependencies in the nfpm files, update the
-PKGBUILD there to match.
+When changing the `archlinux` dependencies in the nfpm files, update both
+PKGBUILDs there to match.
