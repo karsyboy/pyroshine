@@ -1,10 +1,12 @@
 name: CI
 
+# version-* branches are maintained release lines; they get the same checks
+# as main so their commits are validated before a release tag is cut.
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "version-*" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "version-*" ]
 
 env:
   CARGO_TERM_COLOR: always
