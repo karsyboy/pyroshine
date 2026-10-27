@@ -1,0 +1,758 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Tue, 27 Oct 2026 11:32:14 -0400
+Subject: [PATCH 4/7] c-api: 1.1 additions for color metadata, overlay layers
+ and completion
+
+Upstream froze the C API/ABI at 1.0; these are additions on top of it,
+so the library reports 1.1.0.
+
+- pyrowave_encoder_set_color_metadata: the sequence header's color
+  fields (primaries, transfer, matrix, range, siting) were always zero.
+  They are now written at packetize time from the metadata current when
+  the frame was encoded; the scaled path derives them from its color
+  spaces and range.
+- pyrowave_encoder_encode_gpu_scaled_overlay/_layers: composite up to
+  two layers (CPU texels or an imported RGBA image, with opacity) over a
+  single-plane RGB input, through the patched Granite scaler.
+- Completion contract: Granite's fence wait reports nothing on failure,
+  so the readback calls now check that the fence really signalled and
+  return PYROWAVE_ERROR_GENERIC otherwise. A failed scaled encode waits
+  for scaler work it already queued, so an error means no read of the
+  caller's input is outstanding, except PYROWAVE_ERROR_GENERIC.
+- packetize validates its arguments and that the encoded blocks fit the
+  output before writing.
+- The readback copy is reported as its own GPU stage.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt              |   2 +-
+ pyrowave-shared.def         |   4 +-
+ pyrowave.h                  |  90 ++++++++++++-
+ pyrowave_c.cpp              | 245 +++++++++++++++++++++++++++++++++---
+ pyrowave_c_interop_test.cpp |  43 ++++---
+ pyrowave_c_test.cpp         |  15 ++-
+ 6 files changed, 355 insertions(+), 44 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8a470c5..d8e89c5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -143,7 +143,7 @@ if (${PROJECT_IS_TOP_LEVEL})
+     target_compile_options(pyrowave-device-validation PRIVATE ${PYROWAVE_CXX_FLAGS})
+ 
+     set(PYROWAVE_API_VERSION_MAJOR 1)
+-    set(PYROWAVE_API_VERSION_MINOR 0)
++    set(PYROWAVE_API_VERSION_MINOR 1)
+     set(PYROWAVE_API_VERSION_PATCH 0)
+     set(PYROWAVE_API_VERSION ${PYROWAVE_API_VERSION_MAJOR}.${PYROWAVE_API_VERSION_MINOR}.${PYROWAVE_API_VERSION_PATCH})
+ 
+diff --git a/pyrowave-shared.def b/pyrowave-shared.def
+index 19db0bf..47a6fd7 100644
+--- a/pyrowave-shared.def
++++ b/pyrowave-shared.def
+@@ -25,6 +25,8 @@ EXPORTS
+ 	pyrowave_encoder_create
+ 	pyrowave_encoder_encode_gpu
+ 	pyrowave_encoder_encode_gpu_scaled
++	pyrowave_encoder_encode_gpu_scaled_overlay
++	pyrowave_encoder_encode_gpu_scaled_layers
+ 	pyrowave_encoder_encode_cpu
+ 	pyrowave_encoder_set_frame_context
+ 	pyrowave_encoder_compute_num_packets
+@@ -37,6 +39,7 @@ EXPORTS
+ 	pyrowave_encoder_get_num_active_blocks
+ 	pyrowave_encoder_compute_block_active_words
+ 	pyrowave_encoder_destroy
++	pyrowave_encoder_set_color_metadata
+ 	pyrowave_decoder_device_prefers_fragment_path
+ 	pyrowave_decoder_create
+ 	pyrowave_decoder_clear
+@@ -49,4 +52,3 @@ EXPORTS
+ 	pyrowave_decoder_decode_cpu_buffer_complete
+ 	pyrowave_decoder_set_ycbcr_scaling_factor
+ 	pyrowave_decoder_destroy
+-
+diff --git a/pyrowave.h b/pyrowave.h
+index 9be06ca..8b0e779 100644
+--- a/pyrowave.h
++++ b/pyrowave.h
+@@ -17,8 +17,10 @@ extern "C" {
+ #include <stdbool.h>
+ #endif
+ 
++// Upstream froze the API/ABI at 1.0. Minor versions above that are additions
++// carried by Pyroshine's patch series (color metadata, overlay layers).
+ #define PYROWAVE_API_VERSION_MAJOR 1
+-#define PYROWAVE_API_VERSION_MINOR 0
++#define PYROWAVE_API_VERSION_MINOR 1
+ #define PYROWAVE_API_VERSION_PATCH 0
+ 
+ #if !defined(PYROWAVE_PUBLIC_API)
+@@ -453,6 +455,21 @@ typedef struct pyrowave_rate_control
+ 	size_t maximum_bitstream_size;
+ } pyrowave_rate_control;
+ 
++// Bitstream color metadata; values follow bitstream/bitstream.md (each is 0 or 1).
++// No bit-depth profile: decoded samples are floating point.
++typedef struct pyrowave_color_metadata
++{
++	uint32_t color_primaries; // 0: sRGB (BT.709 primaries), 1: BT.2020
++	uint32_t transfer_function; // 0: sRGB, 1: PQ
++	uint32_t ycbcr_transform; // 0: BT.709, 1: BT.2020 NCL
++	uint32_t ycbcr_range; // 0: full, 1: limited
++	uint32_t chroma_siting; // 0: center, 1: left
++} pyrowave_color_metadata;
++
++// Set metadata for raw planar input. The scaled encode path sets it automatically.
++PYROWAVE_PUBLIC_API pyrowave_result
++pyrowave_encoder_set_color_metadata(pyrowave_encoder encoder, const pyrowave_color_metadata *metadata);
++
+ // The entry points for encoder are not thread safe. Application must ensure synchronization.
+ PYROWAVE_PUBLIC_API pyrowave_result
+ pyrowave_encoder_create(const pyrowave_encoder_create_info *info, pyrowave_encoder *encoder);
+@@ -548,6 +565,11 @@ typedef struct pyrowave_scaled_encode_info
+ 	uint32_t ycbcr_range_bit_depth;
+ } pyrowave_scaled_encode_info;
+ 
++// Pyroshine contract: without a command buffer set on the device, a failed call
++// leaves no GPU read of the input outstanding, so the caller may reuse it,
++// except PYROWAVE_ERROR_GENERIC, which means completion of reads that were
++// already queued could not be established (e.g. device loss).
++// The same holds for the _overlay and _layers variants.
+ PYROWAVE_PUBLIC_API pyrowave_result
+ pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
+                                    const pyrowave_gpu_sync_operation *acquire,
+@@ -555,6 +577,69 @@ pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
+                                    const pyrowave_scaled_encode_info *scaling_info,
+                                    const pyrowave_rate_control *rate_control);
+ 
++// An image composited over the input before color conversion, e.g. a cursor
++// a compositor would otherwise draw by rendering the whole scene again.
++// Texels are premultiplied-alpha 8-bit RGBA (VK_FORMAT_R8G8B8A8_UNORM) or
++// BGRA (VK_FORMAT_B8G8R8A8_UNORM) and are blended source-over 1:1 in the
++// input's own encoding, before any transfer function or primary conversion.
++typedef struct pyrowave_overlay
++{
++	const void *pixels;
++	uint32_t width;
++	uint32_t height;
++	// Bytes between rows; at least width * 4.
++	uint32_t stride;
++	VkFormat format;
++	// Top-left corner in input texels; may be partially outside the input.
++	int32_t x;
++	int32_t y;
++	// Pixels are uploaded only when this differs from the previous call's.
++	uint64_t generation;
++} pyrowave_overlay;
++
++// Pyroshine addition (API 1.1). Same as pyrowave_encoder_encode_gpu_scaled,
++// additionally compositing `overlay` when non-NULL. Overlays require a
++// single-plane RGB input at the encoder's resolution without cropping, and no
++// command buffer set on pyrowave_device; otherwise INVALID_ARGUMENT is
++// returned before anything is submitted.
++PYROWAVE_PUBLIC_API pyrowave_result
++pyrowave_encoder_encode_gpu_scaled_overlay(pyrowave_encoder encoder,
++                                           const pyrowave_gpu_sync_operation *acquire,
++                                           const pyrowave_gpu_sync_operation *release,
++                                           const pyrowave_scaled_encode_info *scaling_info,
++                                           const pyrowave_overlay *overlay,
++                                           const pyrowave_rate_control *rate_control);
++
++// One composited layer (Pyroshine addition, API 1.1). Texels come from `pixels` when non-NULL
++// (its x/y are ignored), otherwise from `view`, a single-plane 8-bit RGBA/BGRA
++// image on this device in GENERAL layout, e.g. an imported client DMA-BUF.
++// The view must stay valid until the encode's completion fence is waited.
++typedef struct pyrowave_overlay_layer
++{
++	const pyrowave_overlay *pixels;
++	pyrowave_image_view view;
++	// Top-left corner in input texels; may be partially outside the input.
++	int32_t x;
++	int32_t y;
++	// Element alpha applied to the premultiplied texels (compositor opacity).
++	float opacity;
++	// Treat the texel alpha as one (X formats).
++	bool opaque;
++} pyrowave_overlay_layer;
++
++#define PYROWAVE_MAX_OVERLAY_LAYERS 2
++
++// Pyroshine addition (API 1.1). Like pyrowave_encoder_encode_gpu_scaled_overlay
++// with up to PYROWAVE_MAX_OVERLAY_LAYERS layers composited bottom to top.
++PYROWAVE_PUBLIC_API pyrowave_result
++pyrowave_encoder_encode_gpu_scaled_layers(pyrowave_encoder encoder,
++                                          const pyrowave_gpu_sync_operation *acquire,
++                                          const pyrowave_gpu_sync_operation *release,
++                                          const pyrowave_scaled_encode_info *scaling_info,
++                                          const pyrowave_overlay_layer *layers,
++                                          uint32_t layer_count,
++                                          const pyrowave_rate_control *rate_control);
++
+ // Encode where pixel data is provided on CPU. Encoding still happens on GPU of course.
+ // A command buffer must not be set on pyrowave_device.
+ PYROWAVE_PUBLIC_API pyrowave_result
+@@ -563,6 +648,9 @@ pyrowave_encoder_encode_cpu(pyrowave_encoder encoder, const pyrowave_cpu_buffer
+ 
+ // Can only be called after a successful encoding operation and result is only valid for that particular frame.
+ // Computes the number of network packets required if each packet can consume a provided number of bytes.
++// These, packetize and the other readback calls wait for the frame's GPU work;
++// PYROWAVE_ERROR_GENERIC means that wait failed and the work, including its
++// reads of the input, may still be running.
+ PYROWAVE_PUBLIC_API pyrowave_result
+ pyrowave_encoder_compute_num_packets(pyrowave_encoder encoder, size_t packet_boundary, size_t *num_packets);
+ PYROWAVE_PUBLIC_API pyrowave_result
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+index 1654a18..f07d736 100644
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -8,6 +8,7 @@
+ #include "pyrowave.h"
+ #include "pyrowave_decoder.hpp"
+ #include "pyrowave_encoder.hpp"
++#include "pyrowave_bitstream.hpp"
+ #include "logging.hpp"
+ #include "slangmosh_scaler.hpp"
+ #include "scaler.hpp"
+@@ -31,6 +32,18 @@ struct NullLogger : Util::LoggingInterface
+ 
+ static NullLogger null_logger;
+ 
++// Granite's FenceHolder::wait() returns nothing when the wait fails (device
++// loss, hang report), so ask the fence afterwards whether it really signalled.
++// A false result means the GPU work it covers may still be running: the caller
++// must neither read its results nor release what it reads.
++static bool wait_fence_checked(Fence &fence)
++{
++	if (!fence)
++		return true;
++	fence->wait();
++	return fence->wait_timeout(0);
++}
++
+ extern "C" {
+ void pyrowave_get_api_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
+ {
+@@ -864,6 +877,7 @@ struct pyrowave_encoder_opaque
+ 	Device *device = nullptr;
+ 	pyrowave_device pyro_device = nullptr;
+ 	Encoder encoder;
++	pyrowave_color_metadata color = {};
+ 
+ 	ChromaSubsampling chroma = {};
+ 	int width = 0;
+@@ -874,6 +888,15 @@ struct pyrowave_encoder_opaque
+ 	ImageHandle scaler_planes[3];
+ 	VideoScaler scaler;
+ 
++	// Last uploaded CPU texels per layer slot; generations are caller-defined.
++	struct OverlaySlot
++	{
++		ImageHandle image;
++		uint64_t generation = 0;
++		VkFormat format = VK_FORMAT_UNDEFINED;
++	};
++	OverlaySlot overlay_slots[PYROWAVE_MAX_OVERLAY_LAYERS];
++
+ 	int context = 0;
+ 
+ 	struct
+@@ -885,6 +908,8 @@ struct pyrowave_encoder_opaque
+ 		BufferHandle queued_bitstream_gpu;
+ 		ImageHandle upload_images[3];
+ 		Semaphore upload_semaphore;
++		// Metadata as of this context's encode; packetize may run a frame later.
++		pyrowave_color_metadata color = {};
+ 	} contexts[PYROWAVE_MAX_FRAME_CONTEXTS];
+ };
+ 
+@@ -1124,13 +1149,17 @@ pyrowave_encoder_encode_gpu_inner(pyrowave_encoder encoder,
+ 	// Performance issue since these memory types are mapped coherent on the GPU.
+ 	// A staging copy is just better. Could avoid it on iGPU, but iGPU isn't really supposed to be
+ 	// used as the encoder when streaming.
++	auto start_readback = cmd->write_timestamp(VK_PIPELINE_STAGE_2_COPY_BIT);
+ 	cmd->copy_buffer(*context.queued_meta, *context.queued_meta_gpu);
+ 	cmd->copy_buffer(*context.queued_bitstream, *context.queued_bitstream_gpu);
+ 
+ 	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+ 				 VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
++	auto end_readback = cmd->write_timestamp(VK_PIPELINE_STAGE_2_COPY_BIT);
++	device->register_time_interval("GPU", std::move(start_readback), std::move(end_readback), "Readback");
+ 
+ 	context.queued_fence.reset();
++	context.color = encoder->color;
+ 
+ 	if (encoder->pyro_device->cmd)
+ 	{
+@@ -1172,12 +1201,14 @@ pyrowave_encoder_encode_gpu(pyrowave_encoder encoder,
+ 	return pyrowave_encoder_encode_gpu_inner(encoder, acquire, release, views, rate_control);
+ }
+ 
+-pyrowave_result
+-pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
+-                                   const pyrowave_gpu_sync_operation *acquire,
+-                                   const pyrowave_gpu_sync_operation *release,
+-                                   const pyrowave_scaled_encode_info *scaling_info,
+-                                   const pyrowave_rate_control *rate_control)
++static pyrowave_result
++pyrowave_encoder_encode_gpu_scaled_inner(pyrowave_encoder encoder,
++                                         const pyrowave_gpu_sync_operation *acquire,
++                                         const pyrowave_gpu_sync_operation *release,
++                                         const pyrowave_scaled_encode_info *scaling_info,
++                                         const pyrowave_overlay_layer *layers,
++                                         uint32_t layer_count,
++                                         const pyrowave_rate_control *rate_control)
+ {
+ 	Util::set_thread_logging_interface(&null_logger);
+ 
+@@ -1195,6 +1226,81 @@ pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+ 	auto *device = encoder->device;
++
++	// Views sampled by the scaler for each layer slot; wrapped imported views
++	// are kept alive by these handles until the command buffer retires.
++	const ImageView *layer_views[PYROWAVE_MAX_OVERLAY_LAYERS] = {};
++	ImageHandle wrapped_layer_images[PYROWAVE_MAX_OVERLAY_LAYERS];
++	ImageViewHandle wrapped_layer_views[PYROWAVE_MAX_OVERLAY_LAYERS];
++
++	if (layer_count)
++	{
++		// Only the unscaled single-plane path samples input texels 1:1, which
++		// is what makes the blend equal to compositing before encoding.
++		// Granite stages uploads itself, which an external command buffer
++		// would not wait for.
++		bool full_input = !scaling_info->crop_rect ||
++		                  (scaling_info->crop_rect->offset.x == 0 && scaling_info->crop_rect->offset.y == 0 &&
++		                   int(scaling_info->crop_rect->extent.width) == encoder->width &&
++		                   int(scaling_info->crop_rect->extent.height) == encoder->height);
++		if (!layers || layer_count > PYROWAVE_MAX_OVERLAY_LAYERS || encoder->pyro_device->cmd ||
++		    format_ycbcr_num_planes(scaling_info->view.view_format) != 1 ||
++		    int(scaling_info->view.width) != encoder->width || int(scaling_info->view.height) != encoder->height ||
++		    !full_input || scaling_info->force_linear_filtering)
++		{
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++		}
++
++		auto rgba8 = [](VkFormat format) {
++			return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM;
++		};
++		for (uint32_t i = 0; i < layer_count; i++)
++		{
++			auto &layer = layers[i];
++			if (!(layer.opacity >= 0.0f && layer.opacity <= 1.0f))
++				return PYROWAVE_ERROR_INVALID_ARGUMENT;
++			if (layer.pixels)
++			{
++				auto *pixels = layer.pixels;
++				if (!pixels->pixels || !pixels->width || !pixels->height ||
++				    pixels->stride < pixels->width * 4 || !rgba8(pixels->format))
++					return PYROWAVE_ERROR_INVALID_ARGUMENT;
++			}
++			else if (!layer.view.image || !rgba8(layer.view.view_format) || !layer.view.width || !layer.view.height)
++				return PYROWAVE_ERROR_INVALID_ARGUMENT;
++		}
++
++		for (uint32_t i = 0; i < layer_count; i++)
++		{
++			auto &layer = layers[i];
++			if (layer.pixels)
++			{
++				auto *pixels = layer.pixels;
++				auto &slot = encoder->overlay_slots[i];
++				if (!slot.image || slot.generation != pixels->generation || slot.format != pixels->format ||
++				    slot.image->get_width() != pixels->width || slot.image->get_height() != pixels->height)
++				{
++					auto info = ImageCreateInfo::immutable_2d_image(pixels->width, pixels->height, pixels->format);
++					ImageInitialData initial = {};
++					initial.data = pixels->pixels;
++					initial.row_length = pixels->stride / 4;
++					slot.image = device->create_image(info, &initial);
++					if (!slot.image)
++						return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
++					slot.generation = pixels->generation;
++					slot.format = pixels->format;
++				}
++				layer_views[i] = &slot.image->get_view();
++			}
++			else
++			{
++				if (!wrap_view(device, layer.view, wrapped_layer_images[i], wrapped_layer_views[i],
++				               VK_IMAGE_USAGE_SAMPLED_BIT))
++					return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++				layer_views[i] = wrapped_layer_views[i].get();
++			}
++		}
++	}
+ 	device->next_frame_context();
+ 
+ 	if (!encoder->scaler_planes[0])
+@@ -1250,9 +1356,21 @@ pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
+ 	VideoScaler::RescaleInfo info = {};
+ 	info.input_color_space = scaling_info->input_color_space;
+ 	info.output_color_space = scaling_info->output_color_space;
++	const uint32_t hdr = info.output_color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT ? 1u : 0u;
++	// NV12 input skips color conversion, so ycbcr_range only applies to RGB input.
++	const uint32_t narrow = scaling_info->ycbcr_range == VK_SAMPLER_YCBCR_RANGE_ITU_NARROW &&
++	                        scaling_info->view.view_format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? 1u : 0u;
++	encoder->color = { hdr, hdr, hdr, narrow, 0 };
+ 	info.crop_rect = scaling_info->crop_rect;
+ 	info.skip_dither = scaling_info->skip_dither;
+ 	info.force_linear_filtering = scaling_info->force_linear_filtering;
++	for (uint32_t i = 0; i < layer_count; i++)
++	{
++		info.overlays[i].view = layer_views[i];
++		info.overlays[i].offset = { layers[i].x, layers[i].y };
++		info.overlays[i].opacity = layers[i].opacity;
++		info.overlays[i].opaque = layers[i].opaque;
++	}
+ 	encoder->scaler.set_ycbcr_chroma_midpoint(scaling_info->ycbcr_chroma_midpoint);
+ 	encoder->scaler.set_ycbcr_range(scaling_info->ycbcr_range, ycbcr_range_bit_depth);
+ 
+@@ -1354,7 +1472,21 @@ pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
+ 	for (int i = 0; i < 3; i++)
+ 		buffers.planes[i] = &encoder->scaler_planes[i]->get_view();
+ 	buffers.range_scale = encoder->ycbcr_scaling_factor;
+-	return pyrowave_encoder_encode_gpu_inner(encoder, nullptr, release, buffers, rate_control);
++	auto ret = pyrowave_encoder_encode_gpu_inner(encoder, nullptr, release, buffers, rate_control);
++
++	// The scaler work above reads the caller's source and is already queued.
++	// On success the encode's fence covers it; on failure nothing does, and the
++	// caller may reuse the source as soon as this returns. Flush the queue and
++	// wait for it, so an error means no source read is outstanding, except
++	// PYROWAVE_ERROR_GENERIC: completion of the queued reads is unknown.
++	if (ret != PYROWAVE_SUCCESS && !encoder->pyro_device->cmd)
++	{
++		Fence drained;
++		device->submit_empty(encoder->pyro_device->queue_type, &drained, nullptr);
++		if (!drained || !wait_fence_checked(drained))
++			return PYROWAVE_ERROR_GENERIC;
++	}
++	return ret;
+ }
+ 
+ static bool pyrowave_cpu_buffer_format_subsampled(pyrowave_cpu_buffer_format format)
+@@ -1377,6 +1509,47 @@ static bool pyrowave_cpu_buffer_format_16bit(pyrowave_cpu_buffer_format format)
+ 	return format > PYROWAVE_CPU_BUFFER_FORMAT_YUV444P;
+ }
+ 
++pyrowave_result
++pyrowave_encoder_encode_gpu_scaled(pyrowave_encoder encoder,
++                                   const pyrowave_gpu_sync_operation *acquire,
++                                   const pyrowave_gpu_sync_operation *release,
++                                   const pyrowave_scaled_encode_info *scaling_info,
++                                   const pyrowave_rate_control *rate_control)
++{
++	return pyrowave_encoder_encode_gpu_scaled_inner(encoder, acquire, release, scaling_info, nullptr, 0, rate_control);
++}
++
++pyrowave_result
++pyrowave_encoder_encode_gpu_scaled_overlay(pyrowave_encoder encoder,
++                                           const pyrowave_gpu_sync_operation *acquire,
++                                           const pyrowave_gpu_sync_operation *release,
++                                           const pyrowave_scaled_encode_info *scaling_info,
++                                           const pyrowave_overlay *overlay,
++                                           const pyrowave_rate_control *rate_control)
++{
++	if (!overlay)
++		return pyrowave_encoder_encode_gpu_scaled_inner(encoder, acquire, release, scaling_info, nullptr, 0, rate_control);
++	pyrowave_overlay_layer layer = {};
++	layer.pixels = overlay;
++	layer.x = overlay->x;
++	layer.y = overlay->y;
++	layer.opacity = 1.0f;
++	return pyrowave_encoder_encode_gpu_scaled_inner(encoder, acquire, release, scaling_info, &layer, 1, rate_control);
++}
++
++pyrowave_result
++pyrowave_encoder_encode_gpu_scaled_layers(pyrowave_encoder encoder,
++                                          const pyrowave_gpu_sync_operation *acquire,
++                                          const pyrowave_gpu_sync_operation *release,
++                                          const pyrowave_scaled_encode_info *scaling_info,
++                                          const pyrowave_overlay_layer *layers,
++                                          uint32_t layer_count,
++                                          const pyrowave_rate_control *rate_control)
++{
++	return pyrowave_encoder_encode_gpu_scaled_inner(encoder, acquire, release, scaling_info, layers, layer_count,
++	                                                rate_control);
++}
++
+ pyrowave_result
+ pyrowave_encoder_set_frame_context(pyrowave_encoder encoder, int context)
+ {
+@@ -1556,8 +1729,8 @@ pyrowave_encoder_compute_num_packets_with_padding(
+ 	Util::set_thread_logging_interface(&null_logger);
+ 
+ 	auto &context = encoder->contexts[encoder->context];
+-	if (context.queued_fence)
+-		context.queued_fence->wait();
++	if (!wait_fence_checked(context.queued_fence))
++		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	if (!context.queued_meta)
+ 		return PYROWAVE_ERROR_GENERIC;
+@@ -1586,8 +1759,8 @@ pyrowave_encoder_compute_num_critical_packets(
+ 	if (bands < 0 || bands > 4)
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+-	if (context.queued_fence)
+-		context.queued_fence->wait();
++	if (!wait_fence_checked(context.queued_fence))
++		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	if (!context.queued_meta)
+ 		return PYROWAVE_ERROR_GENERIC;
+@@ -1598,27 +1771,62 @@ pyrowave_encoder_compute_num_critical_packets(
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
++pyrowave_result
++pyrowave_encoder_set_color_metadata(pyrowave_encoder encoder, const pyrowave_color_metadata *metadata)
++{
++	if (!encoder || !metadata || metadata->color_primaries > 1 || metadata->transfer_function > 1 ||
++	    metadata->ycbcr_transform > 1 || metadata->ycbcr_range > 1 || metadata->chroma_siting > 1)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	encoder->color = *metadata;
++	return PYROWAVE_SUCCESS;
++}
++
+ pyrowave_result
+ pyrowave_encoder_packetize_with_padding(
+ 		pyrowave_encoder encoder, pyrowave_packet *packets, size_t packet_boundary, size_t padding_size,
+ 		size_t *out_packets, void *bitstream, size_t size)
+ {
+ 	Util::set_thread_logging_interface(&null_logger);
++	if (!encoder || !packets || !out_packets || !bitstream || packet_boundary < 8 || padding_size >= packet_boundary)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+ 	auto &context = encoder->contexts[encoder->context];
+ 
+-	if (context.queued_fence)
+-		context.queued_fence->wait();
++	if (!wait_fence_checked(context.queued_fence))
++		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	if (!context.queued_meta || !context.queued_bitstream)
+ 		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	auto *mapped_meta = encoder->device->map_host_buffer(*context.queued_meta, MEMORY_ACCESS_READ_BIT);
+ 	auto *mapped_bitstream = encoder->device->map_host_buffer(*context.queued_bitstream, MEMORY_ACCESS_READ_BIT);
++	size_t required = sizeof(BitstreamSequenceHeader);
++	auto *meta = static_cast<const BitstreamPacket *>(mapped_meta);
++	const size_t blocks = encoder->encoder.get_meta_required_size() / sizeof(BitstreamPacket);
++	for (size_t i = 0; i < blocks; i++)
++	{
++		const size_t block_size = size_t(meta[i].num_words) * 4;
++		if (block_size > size || required > size - block_size)
++			return PYROWAVE_ERROR_INVALID_ARGUMENT;
++		required += block_size;
++	}
++	if (required > size)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+ 	*out_packets = encoder->encoder.packetize(
+ 		reinterpret_cast<Encoder::Packet *>(packets), packet_boundary, bitstream,
+ 		size, mapped_meta, mapped_bitstream, padding_size);
++	if (*out_packets && size >= sizeof(BitstreamSequenceHeader))
++	{
++		BitstreamSequenceHeader header;
++		memcpy(&header, bitstream, sizeof(header));
++		header.color_primaries = context.color.color_primaries;
++		header.transfer_function = context.color.transfer_function;
++		header.ycbcr_transform = context.color.ycbcr_transform;
++		header.ycbcr_range = context.color.ycbcr_range;
++		header.chroma_siting = context.color.chroma_siting;
++		memcpy(bitstream, &header, sizeof(header));
++	}
+ 
+ 	return PYROWAVE_SUCCESS;
+ }
+@@ -1632,8 +1840,8 @@ pyrowave_encoder_get_mapped_raw_bitstream(
+ 
+ 	auto &context = encoder->contexts[encoder->context];
+ 
+-	if (context.queued_fence)
+-		context.queued_fence->wait();
++	if (!wait_fence_checked(context.queued_fence))
++		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	if (!context.queued_meta || !context.queued_bitstream)
+ 		return PYROWAVE_ERROR_GENERIC;
+@@ -1667,8 +1875,8 @@ pyrowave_encoder_compute_block_active_words(pyrowave_encoder encoder,
+ 
+ 	auto &context = encoder->contexts[encoder->context];
+ 
+-	if (context.queued_fence)
+-		context.queued_fence->wait();
++	if (!wait_fence_checked(context.queued_fence))
++		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	if (!context.queued_meta)
+ 		return PYROWAVE_ERROR_GENERIC;
+@@ -2082,7 +2290,8 @@ pyrowave_decoder_decode_cpu_buffer_complete(pyrowave_decoder decoder, const pyro
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+ 	auto *device = decoder->device;
+-	context.fence->wait();
++	if (!wait_fence_checked(context.fence))
++		return PYROWAVE_ERROR_GENERIC;
+ 
+ 	for (int plane = 0; plane < 3; plane++)
+ 	{
+diff --git a/pyrowave_c_interop_test.cpp b/pyrowave_c_interop_test.cpp
+index 9eb1ae1..3f2dd2c 100644
+--- a/pyrowave_c_interop_test.cpp
++++ b/pyrowave_c_interop_test.cpp
+@@ -693,7 +693,7 @@ static void test_direct_interop()
+ 	pyrowave_device_destroy(pyro_device);
+ }
+ 
+-static void test_direct_interop_scaling(VkSamplerYcbcrRange range, uint32_t bit_depth)
++static void test_direct_interop_scaling(bool hdr, VkSamplerYcbcrRange range, uint32_t bit_depth)
+ {
+ 	ASSERT_THAT(Context::init_loader(nullptr));
+ 
+@@ -782,13 +782,13 @@ static void test_direct_interop_scaling(VkSamplerYcbcrRange range, uint32_t bit_
+ 			int g = 128;
+ 			int b = 128;
+ #endif
+-			plane_data[y][x] = r | (g << 8) | (b << 16);
++			plane_data[y][x] = hdr ? uint32_t(r * 4) | (uint32_t(g * 4) << 10) | (uint32_t(b * 4) << 20) | (3u << 30) : r | (g << 8) | (b << 16);
+ 		}
+ 	}
+ 
+-	auto image_info = ImageCreateInfo::immutable_2d_image(67, 66, VK_FORMAT_R8G8B8A8_SRGB);
++	auto image_info = ImageCreateInfo::immutable_2d_image(67, 66, hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_SRGB);
+ 	image_info.initial_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
+-	image_info.misc = IMAGE_MISC_MUTABLE_SRGB_BIT;
++	image_info.misc = hdr ? 0 : IMAGE_MISC_MUTABLE_SRGB_BIT;
+ 	ImageInitialData initial_data = { plane_data };
+ 	auto input_image = device.create_image(image_info, &initial_data);
+ 	ASSERT_THAT(input_image);
+@@ -812,7 +812,7 @@ static void test_direct_interop_scaling(VkSamplerYcbcrRange range, uint32_t bit_
+ 	view.width = input_image->get_width();
+ 	view.height = input_image->get_height();
+ 	view.image_format = input_image->get_format();
+-	view.view_format = VK_FORMAT_R8G8B8A8_UNORM;
++	view.view_format = hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM;
+ 	view.layer = 0;
+ 	view.layout = input_image->get_layout(VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL);
+ 	view.mip_level = 0;
+@@ -825,9 +825,9 @@ static void test_direct_interop_scaling(VkSamplerYcbcrRange range, uint32_t bit_
+ 	pyrowave_scaled_encode_info scaling = {};
+ 	scaling.intermediate_plane_format = VK_FORMAT_R16_UNORM;
+ 	scaling.view = view;
+-	scaling.input_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+-	scaling.output_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+-	scaling.ycbcr_chroma_midpoint = 130.0f / 255.0f;
++	scaling.input_color_space = hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++	scaling.output_color_space = scaling.input_color_space;
++	scaling.ycbcr_chroma_midpoint = hdr ? 0.5f : 130.0f / 255.0f;
+ 	scaling.ycbcr_range = range;
+ 	scaling.ycbcr_range_bit_depth = bit_depth;
+ 	scaling.force_linear_filtering = true;
+@@ -910,18 +910,18 @@ static void test_direct_interop_scaling(VkSamplerYcbcrRange range, uint32_t bit_
+ 		for (int x = 0; x < 64; x++)
+ 		{
+ #if 1
+-			auto r = float(mirror(128 + (y + 1) * 3 + (x + 2) * 1)) / 255.0f;
+-			auto g = float(mirror(128 + (y + 1) * 5 + (x + 2) * 3)) / 255.0f;
+-			auto b = float(mirror(128 + (y + 1) * 7 + (x + 2) * 5)) / 255.0f;
++			auto r = float(mirror(128 + (y + 1) * 3 + (x + 2) * 1)) / (hdr ? 1023.0f / 4.0f : 255.0f);
++			auto g = float(mirror(128 + (y + 1) * 5 + (x + 2) * 3)) / (hdr ? 1023.0f / 4.0f : 255.0f);
++			auto b = float(mirror(128 + (y + 1) * 7 + (x + 2) * 5)) / (hdr ? 1023.0f / 4.0f : 255.0f);
+ #else
+-			float r = 128.0f / 255.0f;
+-			float g = 128.0f / 255.0f;
+-			float b = 128.0f / 255.0f;
++			float r = 128.0f / (hdr ? 1023.0f / 4.0f : 255.0f);
++			float g = 128.0f / (hdr ? 1023.0f / 4.0f : 255.0f);
++			float b = 128.0f / (hdr ? 1023.0f / 4.0f : 255.0f);
+ #endif
+ 
+-			auto Y = luma_offset + luma_scale * (0.2126f * r + 0.7152f * g + 0.0722f * b);
+-			auto Cb = 130.0f / 255.0f + chroma_scale * (-0.114572f * r - 0.385428f * g + 0.5f * b);
+-			auto Cr = 130.0f / 255.0f + chroma_scale * (0.5f * r - 0.454153f * g - 0.0458471f * b);
++			auto Y = luma_offset + luma_scale * (hdr ? 0.2627f * r + 0.6780f * g + 0.0593f * b : 0.2126f * r + 0.7152f * g + 0.0722f * b);
++			auto Cb = scaling.ycbcr_chroma_midpoint + chroma_scale * ((hdr ? -0.139630f * r - 0.360370f * g : -0.114572f * r - 0.385428f * g) + 0.5f * b);
++			auto Cr = scaling.ycbcr_chroma_midpoint + chroma_scale * (0.5f * r + (hdr ? -0.459786f * g - 0.040214f * b : -0.454153f * g - 0.0458471f * b));
+ 
+ 			float readback_y = float(readback_ptr[0 * 64 * 64 + y * 64 + x]) / float(0xffff);
+ 			float readback_cb = float(readback_ptr[1 * 64 * 64 + y * 64 + x]) / float(0xffff);
+@@ -931,6 +931,7 @@ static void test_direct_interop_scaling(VkSamplerYcbcrRange range, uint32_t bit_
+ 			float cb_delta = std::abs(readback_cb - Cb);
+ 			float cr_delta = std::abs(readback_cr - Cr);
+ 			ASSERT_THAT(y_delta <= 1.0f / 255.0f);
++			if (cb_delta > 3.0f / 255.0f) fprintf(stderr, "HDR=%d x=%d y=%d RGB=%f,%f,%f expected=%f cb=%f delta=%f\n", hdr, x,y,r,g,b,Cb,readback_cb,cb_delta);
+ 			ASSERT_THAT(cb_delta <= 3.0f / 255.0f);
+ 			ASSERT_THAT(cr_delta <= 3.0f / 255.0f);
+ 		}
+@@ -2681,11 +2682,13 @@ int main(int argc, char **argv)
+ 
+ 	printf("Running Vulkan <-> Vulkan interop test with direct device share ...\n");
+ 	test_direct_interop();
+-	test_direct_interop_scaling(VK_SAMPLER_YCBCR_RANGE_ITU_FULL, 0);
++	test_direct_interop_scaling(false, VK_SAMPLER_YCBCR_RANGE_ITU_FULL, 0);
++	test_direct_interop_scaling(true, VK_SAMPLER_YCBCR_RANGE_ITU_FULL, 0);
+ 	printf("Running scaled encode test with 8-bit narrow range ...\n");
+-	test_direct_interop_scaling(VK_SAMPLER_YCBCR_RANGE_ITU_NARROW, 8);
++	test_direct_interop_scaling(false, VK_SAMPLER_YCBCR_RANGE_ITU_NARROW, 8);
+ 	printf("Running scaled encode test with 10-bit narrow range ...\n");
+-	test_direct_interop_scaling(VK_SAMPLER_YCBCR_RANGE_ITU_NARROW, 10);
++	test_direct_interop_scaling(false, VK_SAMPLER_YCBCR_RANGE_ITU_NARROW, 10);
++	test_direct_interop_scaling(true, VK_SAMPLER_YCBCR_RANGE_ITU_NARROW, 10);
+ 
+ 	printf("Running opaque Vulkan <-> Vulkan interop test ...\n");
+ 	test_opaque_interop(false);
+diff --git a/pyrowave_c_test.cpp b/pyrowave_c_test.cpp
+index 740677d..6f0890b 100644
+--- a/pyrowave_c_test.cpp
++++ b/pyrowave_c_test.cpp
+@@ -332,7 +332,7 @@ static void test_error_correction_api()
+ 	pyrowave_device_destroy(device);
+ }
+ 
+-static void test_basic_encoder_roundtrip(bool fragment_decode, bool nv12_encode, pyrowave_chroma_subsampling chroma)
++static void test_basic_encoder_roundtrip(bool fragment_decode, bool nv12_encode, pyrowave_chroma_subsampling chroma, bool hdr)
+ {
+ 	if (chroma == PYROWAVE_CHROMA_SUBSAMPLING_444 && nv12_encode)
+ 		return;
+@@ -425,6 +425,10 @@ static void test_basic_encoder_roundtrip(bool fragment_decode, bool nv12_encode,
+ 	cpu_buffer.width = Width;
+ 	cpu_buffer.height = Height;
+ 	const pyrowave_rate_control rate_control = { 64 * 1024 }; // Just give it something massive.
++	pyrowave_color_metadata color = { uint32_t(hdr), uint32_t(hdr), uint32_t(hdr), 0, 0 };
++	CHECKED(pyrowave_encoder_set_color_metadata(encoder, &color));
++	color.transfer_function = 2;
++	ASSERT_THAT(pyrowave_encoder_set_color_metadata(encoder, &color) == PYROWAVE_ERROR_INVALID_ARGUMENT);
+ 	CHECKED(pyrowave_encoder_encode_cpu(encoder, &cpu_buffer, &rate_control));
+ 
+ 	size_t num_packets;
+@@ -443,6 +447,11 @@ static void test_basic_encoder_roundtrip(bool fragment_decode, bool nv12_encode,
+ 	ASSERT_THAT(packet.size != 0);
+ 	ASSERT_THAT(packet.size <= bitstream.size());
+ 	bitstream.resize(packet.size);
++	uint32_t metadata;
++	std::memcpy(&metadata, bitstream.data() + 4, 4);
++	ASSERT_THAT(((metadata >> 27) & 7) == (hdr ? 7u : 0u));
++	ASSERT_THAT(bool(metadata & (1u << 26)) == (chroma == PYROWAVE_CHROMA_SUBSAMPLING_444));
++	ASSERT_THAT(pyrowave_encoder_packetize(encoder, &packet, 64 * 1024, &num_packets, bitstream.data(), 4) == PYROWAVE_ERROR_INVALID_ARGUMENT);
+ 
+ 	// Just padding on its own should not change the bitstream in any way if the splits don't happen.
+ 	CHECKED(pyrowave_encoder_packetize_with_padding(encoder, &packet, 64 * 1024, 16, &num_packets,
+@@ -854,12 +863,12 @@ int main()
+ 	test_basic_system_stability(true);
+ 
+ 	// Correctness tests for small-ish outputs.
+-	for (int variant = 0; variant < 8; variant++)
++	for (int variant = 0; variant < 16; variant++)
+ 	{
+ 		printf("Running roundtrip variant %d test ...\n", variant);
+ 		test_basic_encoder_roundtrip(
+ 			(variant & 1) != 0, (variant & 2) != 0,
+-			(variant & 4) != 0 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420);
++			(variant & 4) != 0 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420, (variant & 8) != 0);
+ 	}
+ 
+ 	test_extended_cpu_formats(false);

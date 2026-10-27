@@ -2,8 +2,9 @@ name: Vendor upstream
 
 # Watches the upstreams of the vendored dependencies (vendor/README.md). When
 # an upstream moves past the pinned base, regenerate the vendor tree on that
-# revision with the existing patch series, update the Cargo pins and open a
-# pull request for review. If the patch series no longer applies, open an
+# revision with the existing patch series, update the pins (Cargo, or for
+# PyroWave the Rust provenance, Nix and docs) and open a pull request for
+# review. If the patch series no longer applies, open an
 # issue instead: the patches must be rebased by hand. Nothing here merges;
 # the pull request is the reviewed change the upstream policy requires.
 #
@@ -45,6 +46,11 @@ jobs:
             name: Pixelforge
             upstream: https://github.com/hgaiser/pixelforge
             track: release
+          # PyroWave has no releases; the base follows the default branch.
+          - dependency: pyrowave
+            name: PyroWave
+            upstream: https://github.com/Themaister/pyrowave
+            track: branch
     env:
       DEPENDENCY: ${{ matrix.dependency }}
       NAME: ${{ matrix.name }}
@@ -142,6 +148,10 @@ jobs:
             sed -i "s/${PINNED_COMMIT}/${commit}/g" "vendor/${DEPENDENCY}/LOCAL_CHANGES.md"
             if [[ "${DEPENDENCY}" == inputtino ]]; then
               sed -i "s/rev = \"${PINNED_COMMIT}\"/rev = \"${commit}\"/" moonshine-core/Cargo.toml
+            elif [[ "${DEPENDENCY}" == pyrowave ]]; then
+              # Rust provenance, Nix and the documented base name the commit.
+              sed -i "s/${PINNED_COMMIT}/${commit}/g" \
+                moonshine-core/src/session/stream/video/pyrowave.rs nix/pyrowave.nix docs/PYROWAVE.md
             else
               sed -i "s/tag = \"${PINNED_DESCRIBE}\"/tag = \"${describe}\"/" moonshine-core/Cargo.toml
               sed -i "s/^# Pixelforge ${PINNED_DESCRIBE} /# Pixelforge ${describe} /" Cargo.toml
@@ -186,6 +196,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch --create "${BRANCH}"
           git add --all vendor Cargo.toml Cargo.lock moonshine-core/Cargo.toml
+          if [[ "${DEPENDENCY}" == pyrowave ]]; then
+            git add moonshine-core/src/session/stream/video/pyrowave.rs nix/pyrowave.nix docs/PYROWAVE.md
+          fi
           git commit --quiet --message "${title}" \
             --message "Regenerated vendor/${DEPENDENCY} from ${UPSTREAM} ${DESCRIBE} (${COMMIT}) with the existing patch series."
           git push --force origin "HEAD:refs/heads/${BRANCH}"
@@ -198,6 +211,9 @@ jobs:
             printf -- '- [ ] Drop any patch upstream now provides; update `vendor/%s/LOCAL_CHANGES.md`.\n' "${DEPENDENCY}"
             printf -- '- [ ] `scripts/vendor-%s.sh --test` and the workspace CI pass.\n' "${DEPENDENCY}"
             printf -- '- [ ] Hardware acceptance checks in `LOCAL_CHANGES.md` and the Nix build.\n'
+            if [[ "${DEPENDENCY}" == pyrowave ]]; then
+              printf -- '- [ ] After merging, re-pin Pyrolight to the merge commit (it builds its decoder from `vendor/pyrowave`).\n'
+            fi
             printf '\n_Opened by the Vendor upstream workflow. A newer upstream revision updates this branch and pull request._\n'
           } > "${RUNNER_TEMP}/body.md"
           pr="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"

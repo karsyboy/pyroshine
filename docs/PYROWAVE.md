@@ -14,46 +14,47 @@ in `moonshine-core/src/session/stream/video/{format,pyrowave,packetizer,fec}.rs`
 
 ## Pinned dependency
 
-The only supported PyroWave source is:
+PyroWave is vendored like Pixelforge and Inputtino ([vendor guide](../vendor/README.md)):
+`vendor/pyrowave/` is generated from an upstream commit plus the numbered patch
+series in `vendor/pyrowave-patches/`, and is never edited by hand.
 
-- repository: `https://github.com/karsyboy/pyrowave`
-- branch: `master` (the build uses the detached revision below, not the moving branch)
-- revision: `ac5a7ec4b7a326ec8d3230ab8b2e884417799060`
-- C API: 1.1.0
+- upstream: `https://github.com/Themaister/pyrowave`
+- base: `vendor/pyrowave-patches/UPSTREAM` (`7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b`)
+- C API: 1.1.0 (upstream 1.0 plus the series' additions)
 - Granite: `53090429539bf3404250d18fe58db971f0907c04`
 - Volk: `47cddf7ed97b94118a08aacb548a411188e016cc`
 - Vulkan-Headers: `6802bb4733b63ed5efd3adb308a6c885ef180ea1`
 
-Nix builds these revisions in `nix/pyrowave.nix`. CI and release packaging use
-`scripts/build-pyrowave.sh`. A unit test checks that the Rust provenance and Nix
-pins agree and rejects an accidental upstream PyroWave URL.
+The series holds everything Pyroshine needs beyond upstream: coefficient
+packet validation in the decoder, the 4:4:4 payload size, the C API 1.1
+additions (sequence-header color metadata, overlay layers for late
+composition, and the completion contract below), their tests, and three
+Granite scaler patches in `vendor/pyrowave/patches/` (SDR normalization,
+two-layer 1:1 overlays, and the BT.2408 203-nit reference white). Upstream
+`shaders/slangmosh_scaler.hpp` is replaced by one generated from the patched
+scaler; the 203-nit patch changes only host code. What each patch does and
+which can be offered upstream is in
+[`vendor/pyrowave/LOCAL_CHANGES.md`](../vendor/pyrowave/LOCAL_CHANGES.md).
 
-To update the dependency, review the fork relative to upstream, update every
-revision above in the Nix expression and build script, update `SOURCE_REVISION`
-and the required API version in `pyrowave.rs`, then run the full test suite and
-the manual GPU matrix below. Never substitute the Themaister repository as an
-implicit fallback.
+Nix builds the tree in `nix/pyrowave.nix`, applying the Granite patches to its
+own Granite copy. CI and release packaging use `scripts/build-pyrowave.sh`,
+which copies the tree, runs its `checkout_granite.sh` (clone at the pin, then
+the Granite patches), verifies every transitive revision and runs packet
+validation. `scripts/vendor-pyrowave.sh --check` verifies the tree against the
+base and patches, and that `SOURCE_REVISION` in `pyrowave.rs` and Nix's
+`upstreamRevision` name the same base; a unit test checks the same pins.
+
+To update the base or a patch, follow the [vendor guide](../vendor/README.md#updating),
+then run the full test suite and the manual GPU matrix below. Pyrolight builds
+its decoder from this same tree at a pinned Pyroshine commit, so re-pin it
+after a change that reaches the decoder or the bitstream.
 
 At runtime Pyroshine normally searches the loader paths for
 `libpyrowave-shared.so.1` and then `libpyrowave-shared.so`. Administrators and
 developers may set `MOONSHINE_PYROWAVE_LIBRARY` to one explicit library path
 for packaging tests or diagnostics. When set, no fallback path is attempted;
-the library must expose exactly C API 1.1.0.
-
-Both build paths apply the maintained patches in `nix/patches/`: the Granite
-scaler's SDR normalization and its two-layer 1:1 overlay support, in that order. The fork
-carries the same files and its generated `shaders/slangmosh_scaler.hpp` is
-built from them; never change those two copies on the host alone, since the
-fork's `checkout_granite.sh` applies its own. Host-only changes are separate
-patches applied after them: `granite-sdr-reference-white-203.patch` moves the
-scaler's SDR reference white from 200 to the 203 nits composition and the
-conventional converter use (a uniform value, so the generated shader is
-unchanged). `scripts/build-pyrowave.sh` restores Granite's pinned files before
-patching, so a reused work directory builds the same tree. When updating
-pins, review whether each patch remains needed, keep the script/Nix patch sets
-aligned, and run packet validation plus the explicit C API load test documented
-in [CONTRIBUTING.md](../CONTRIBUTING.md#validation). A library load test does not
-exercise GPU encoding.
+the library must expose exactly C API 1.1.0, so an unpatched upstream build is
+rejected.
 
 ## Capability and negotiation extension
 
@@ -237,7 +238,7 @@ takes ownership. The compositor buffer is released only after PyroWave's
 packetization call has waited for the GPU encode.
 
 Failures keep the same rule ([encoder failure contract](ARCHITECTURE.md#video-path)).
-The pinned fork documents a completion contract in `pyrowave.h`: a failed
+The vendored library documents a completion contract in `pyrowave.h`: a failed
 scaled encode flushes and waits for any scaler pass it already queued, and the
 readback calls (`compute_num_packets`, `packetize`) check their fence wait
 instead of trusting Granite's unchecked `wait()`. Every failed frame can
@@ -284,7 +285,7 @@ supported driver/GPU:
 4. Full- and limited-range metadata and SDR/HDR mode changes.
 5. Packet loss, FEC recovery, and oversized keyframe delivery.
 6. Long-running bitrate, latency, VRAM, and imported-image cache stability.
-7. A decoder built from the same authoritative fork.
+7. A decoder built from the same vendored tree.
 
 `moonshine-bench` can exercise the format axes directly. Its
 `--pyrowave-matrix` mode covers 1080p, 1440p, and 4K at 60/120/144 FPS for the

@@ -10,7 +10,9 @@ Related repositories:
 - [Pyrolight](https://github.com/karsyboy/pyrolight):
   the client fork. Protocol, capability-bit and PyroWave wire changes must stay
   compatible with it (and its `moonlight-common-c` submodule fork).
-- [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave): the pinned codec fork.
+- [`Themaister/pyrowave`](https://github.com/Themaister/pyrowave): the codec, vendored
+  in `vendor/pyrowave/` with a numbered patch series; Pyrolight builds its decoder
+  from the same tree.
 
 ## Working approach
 
@@ -80,7 +82,7 @@ Other workspace and integration areas:
   launcher; no GUI toolkit), run by the server as a child process in desktop sessions
   (`launcher.rs`). The web interface and the tray are clients of the management
   interface only; `moonshine-core` and `moonshine-management` must never depend on them.
-- `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
+- `scripts/`: vendored PyroWave build helper, embedded SPIR-V regeneration
   (`build-shaders.sh`), VA-API/NVENC binding regeneration
   (`generate-encoder-ffi.sh`), changelog tooling/tests, measurement harnesses, the
   baseline recorder and result comparison (`record_baseline.py`,
@@ -90,8 +92,8 @@ Other workspace and integration areas:
   installers, systemd, device permissions and system policy. The Arch
   `pyroshine-bin` PKGBUILD lives in `karsyboy/pyrowave-packages`.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
-- `vendor/inputtino/`, `vendor/pixelforge/`: generated dependencies with numbered
-  patch series; shared maintenance workflow in `vendor/README.md`.
+- `vendor/inputtino/`, `vendor/pixelforge/`, `vendor/pyrowave/`: generated dependencies
+  with numbered patch series; shared maintenance workflow in `vendor/README.md`.
 
 ## Choose the source of truth
 
@@ -160,9 +162,11 @@ Other workspace and integration areas:
   `--test` runs the dependency's regression tests). Inputtino's public Rust crate
   has an explicit revision matching its vendored native base.
 - For PyroWave pins, C API assumptions or build changes, follow the pinned
-  dependency process in `docs/PYROWAVE.md`. Keep Rust provenance/API requirements,
-  `scripts/build-pyrowave.sh`, `nix/pyrowave.nix` and documented pins synchronized.
-  Keep dependency patches under `nix/patches/` consistent across build paths;
+  dependency process in `docs/PYROWAVE.md`. PyroWave is a generated vendor tree
+  like Pixelforge: change it only through `vendor/pyrowave-patches/` and
+  `scripts/vendor-pyrowave.sh`; Granite changes are patch files inside that
+  series (`vendor/pyrowave/patches/`). Keep Rust provenance/API requirements,
+  `nix/pyrowave.nix` and documented pins synchronized (`--check` verifies them);
   never substitute another PyroWave source or ABI. Check that the client's
   pinned decoder still accepts the bitstream family before changing pins.
 - Configuration additions/removals/renames/default or behavior changes must update
@@ -266,8 +270,8 @@ Upstream is [Moonshine](https://github.com/hgaiser/moonshine), configured as
 the `upstream` remote (branch `main`); `origin` is the fork. Verify with
 `git remote -v` rather than assuming. Fork history begins after upstream
 v0.16.1 (see `docs/UPSTREAM_CHANGELOG.md`). Pinned third-party sources have
-their own upstreams: PyroWave (`karsyboy/pyrowave`, derived from
-`Themaister/pyrowave`; see `docs/PYROWAVE.md`), Inputtino
+their own upstreams: PyroWave (`Themaister/pyrowave`, vendored with local
+patches; see `vendor/pyrowave/LOCAL_CHANGES.md`), Inputtino
 (`games-on-whales/inputtino`; see `vendor/inputtino/LOCAL_CHANGES.md`), Pixelforge
 (`hgaiser/pixelforge`, vendored with local patches; see
 `vendor/pixelforge/LOCAL_CHANGES.md`), and the Git-pinned Smithay and ash

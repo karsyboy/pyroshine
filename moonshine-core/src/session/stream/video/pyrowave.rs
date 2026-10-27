@@ -1,9 +1,10 @@
 //! Safe, deliberately small wrapper around the PyroWave 1.1 C API (upstream
-//! 1.0 plus the fork's color-metadata and overlay-layer additions).
+//! 1.0 plus the color-metadata and overlay-layer additions of
+//! `vendor/pyrowave-patches/`).
 //!
 //! The shared library is loaded at runtime. This keeps the conventional Vulkan
 //! Video codecs usable on systems where PyroWave is not installed, while the
-//! package definition can still provide and pin the authoritative fork.
+//! package definition still builds and pins the vendored source.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
@@ -25,8 +26,12 @@ use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAcces
 use crate::session::capture::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "ac5a7ec4b7a326ec8d3230ab8b2e884417799060";
+/// Upstream of the generated `vendor/pyrowave` tree and its base revision
+/// (`vendor/pyrowave-patches/UPSTREAM`, checked by `check-vendor-pins.py`).
+pub(crate) const SOURCE_URL: &str = "https://github.com/Themaister/pyrowave";
+pub(crate) const SOURCE_REVISION: &str = "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b";
+/// Where the local changes on top of [`SOURCE_REVISION`] live.
+pub(crate) const SOURCE_PATCHES: &str = "vendor/pyrowave-patches";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -398,7 +403,7 @@ const ERROR_NOT_IMPLEMENTED: ResultCode = -6;
 ///
 /// `source` is the caller's view of the source buffer when the call fails
 /// with anything but `ERROR_GENERIC`. It relies on the completion contract of
-/// the pinned fork (revision [`SOURCE_REVISION`], documented in `pyrowave.h`):
+/// the vendored library ([`SOURCE_PATCHES`], documented in `pyrowave.h`):
 /// a failed scaled encode has flushed and waited for any scaler pass it
 /// queued, so no source read is outstanding, and the readback calls check
 /// their fence wait. `ERROR_GENERIC` from the encode or the first wait means
@@ -1416,15 +1421,21 @@ mod tests {
 	}
 
 	#[test]
-	fn authoritative_source_is_pinned() {
-		assert_eq!(SOURCE_URL, "https://github.com/karsyboy/pyrowave");
+	fn vendored_source_is_pinned() {
+		assert_eq!(SOURCE_URL, "https://github.com/Themaister/pyrowave");
 		assert_eq!(SOURCE_REVISION.len(), 40);
 		assert!(SOURCE_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
 		assert_eq!(API_VERSION, (1, 1, 0));
+		let base = include_str!("../../../../../vendor/pyrowave-patches/UPSTREAM");
+		assert!(base.lines().any(|line| line == format!("commit {SOURCE_REVISION}")));
 		let nix_dependency = include_str!("../../../../../nix/pyrowave.nix");
 		assert!(nix_dependency.contains(SOURCE_URL));
 		assert!(nix_dependency.contains(SOURCE_REVISION));
-		assert!(!nix_dependency.contains("https://github.com/Themaister/pyrowave"));
+		assert!(nix_dependency.contains("../vendor/pyrowave"));
+		// The API additions exist only in the vendored header.
+		let header = include_str!("../../../../../vendor/pyrowave/pyrowave.h");
+		assert!(header.contains("#define PYROWAVE_API_VERSION_MINOR 1"));
+		assert!(header.contains("pyrowave_encoder_encode_gpu_scaled_layers"));
 	}
 
 	#[test]

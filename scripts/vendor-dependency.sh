@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Shared implementation for vendor-inputtino.sh and vendor-pixelforge.sh.
+# Shared implementation for vendor-inputtino.sh, vendor-pixelforge.sh and
+# vendor-pyrowave.sh.
 # See vendor/README.md. Do not invoke this helper directly.
 set -euo pipefail
 
@@ -14,6 +15,14 @@ case "${dependency}" in
   inputtino)
     upstream="https://github.com/games-on-whales/inputtino"
     files=(CMakeLists.txt LICENSE bindings cmake include share src tests)
+    ;;
+  pyrowave)
+    # The library build and its tests; Metal, Android, evaluation data and
+    # development tools are left out. Entries may be shell globs.
+    upstream="https://github.com/Themaister/pyrowave"
+    files=(CMakeLists.txt LICENSE README.md bitstream checkout_granite.sh com_ptr.hpp
+      encode_desktop.cpp link.T patches pkg-config pyrowave-shared.def pyrowave.h
+      'pyrowave_*.cpp' 'pyrowave_*.hpp' shaders slangmosh.sh tests yuv4mpeg.cpp yuv4mpeg.hpp)
     ;;
   *) echo "error: unknown dependency ${dependency}" >&2; exit 1 ;;
 esac
@@ -51,6 +60,10 @@ if [[ "${mode}" == test ]]; then
     printf '\n[workspace]\n' >> "${copy}/Cargo.toml"
     cargo test --manifest-path "${copy}/Cargo.toml" \
       --target-dir "${CARGO_TARGET_DIR:-${root}/target}/vendor-pixelforge" --lib
+  elif [[ "${dependency}" == pyrowave ]]; then
+    # CPU-only checks; the GPU tests are in vendor/pyrowave/LOCAL_CHANGES.md.
+    build="${CARGO_TARGET_DIR:-${root}/target}/vendor-pyrowave"
+    "${root}/scripts/build-pyrowave.sh" "${build}" "${build}/install"
   else
     build="${CARGO_TARGET_DIR:-${root}/target}/vendor-inputtino"
     sanitize="-fsanitize=address,undefined -fno-omit-frame-pointer"
@@ -90,7 +103,11 @@ for patch in "${patches}"/[0-9][0-9][0-9][0-9]-*.patch; do
 done
 mkdir "${work}/out"
 for file in "${files[@]}"; do
-  cp -a "${work}/src/${file}" "${work}/out/"
+  # Unquoted so that glob entries expand; a pattern matching nothing stays
+  # literal and fails the existence check.
+  matches=("${work}/src/"${file})
+  [[ -e "${matches[0]}" ]] || { echo "error: ${file} is missing upstream" >&2; exit 1; }
+  cp -a "${matches[@]}" "${work}/out/"
 done
 
 if [[ "${mode}" == check ]]; then
@@ -107,7 +124,7 @@ if [[ "${mode}" == check ]]; then
     }
   fi
   python3 "${root}/scripts/check-vendor-pins.py" "${dependency}"
-  echo "vendor/${dependency} matches ${commit} plus ${count} patch(es); Cargo pins agree."
+  echo "vendor/${dependency} matches ${commit} plus ${count} patch(es); pins agree."
   exit 0
 fi
 

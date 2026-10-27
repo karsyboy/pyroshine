@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Tue, 27 Oct 2026 11:32:40 -0400
+Subject: [PATCH 6/7] granite: use the BT.2408 reference white for SDR in PQ
+
+The scaler mapped SDR white to 200 nits when converting between SDR and
+PQ. BT.2408 puts SDR reference white at 203 nits, which Pyroshine's
+compositor and its H.264/HEVC/AV1 converter use, so PyroWave HDR10
+streams encoded SDR content slightly dimmer than the other codecs.
+Apply the change after the other Granite patches; it touches only
+scaler.cpp, so slangmosh_scaler.hpp is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ checkout_granite.sh                           |  7 +++---
+ patches/granite-sdr-reference-white-203.patch | 24 +++++++++++++++++++
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+ create mode 100644 patches/granite-sdr-reference-white-203.patch
+
+diff --git a/checkout_granite.sh b/checkout_granite.sh
+index e3da299..e4fbde8 100755
+--- a/checkout_granite.sh
++++ b/checkout_granite.sh
+@@ -26,10 +26,11 @@ update third_party/volk
+ update third_party/khronos/vulkan-headers
+ 
+ # Maintained Granite changes, applied in order (later patches build on
+-# earlier ones): HDR-to-SDR normalization, then 1:1 scaler overlays.
+-# shaders/slangmosh_scaler.hpp is generated from the patched scaler.
++# earlier ones): HDR-to-SDR normalization, 1:1 scaler overlays, then the
++# BT.2408 reference white. shaders/slangmosh_scaler.hpp is generated from the
++# patched scaler; the last patch changes only host code.
+ cd ..
+-for name in granite-sdr-normalization.patch granite-scaler-overlay.patch; do
++for name in granite-sdr-normalization.patch granite-scaler-overlay.patch granite-sdr-reference-white-203.patch; do
+ 	patch_file="$PWD/patches/$name"
+ 	if git apply --check "$patch_file"; then
+ 		git apply "$patch_file"
+diff --git a/patches/granite-sdr-reference-white-203.patch b/patches/granite-sdr-reference-white-203.patch
+new file mode 100644
+index 0000000..fa145b8
+--- /dev/null
++++ b/patches/granite-sdr-reference-white-203.patch
+@@ -0,0 +1,24 @@
++diff --git a/Granite/video/scaler.cpp b/Granite/video/scaler.cpp
++index eb581d9c..335b4259 100644
++--- a/Granite/video/scaler.cpp
+++++ b/Granite/video/scaler.cpp
++@@ -430,15 +430,16 @@ void VideoScaler::rescale(CommandBuffer &cmd, const RescaleInfo &info)
++ 
++ 		float sdr_scale = 1.0f;
++ 		if (info.input_color_space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++-			sdr_scale = 200.0f;
+++			// BT.2408 reference white, as Pyroshine's compositor and converter use.
+++			sdr_scale = 203.0f;
++ 		else if (info.input_color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
++ 			sdr_scale = 80.0f;
++ 
++ 		if (info.output_color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
++ 			sdr_scale /= 80.0f;
++ 		else if (info.output_color_space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++-			// PQ is in nits; SDR linear RGB is relative to 200-nit white.
++-			sdr_scale /= 200.0f;
+++			// PQ is in nits; SDR linear RGB is relative to 203-nit white.
+++			sdr_scale /= 203.0f;
++ 
++ 		ubo->primary_transform[0] = vec4(sdr_scale * conv[0], 0.0f);
++ 		ubo->primary_transform[1] = vec4(sdr_scale * conv[1], 0.0f);
