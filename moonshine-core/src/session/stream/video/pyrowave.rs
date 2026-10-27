@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use pixelforge::VideoContext;
 use super::format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 };
-use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
+use super::pipeline::dmabuf::{ImportCacheStats, same_buffer};
 use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
 use crate::session::capture::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
 use serde::{Deserialize, Serialize};
@@ -608,7 +608,7 @@ impl ImportedImage {
 			&& desc
 				.planes()
 				.first()
-				.is_some_and(|(fd, _, _)| same_open_file(self.identity_fd.as_raw_fd(), fd.as_raw_fd()))
+				.is_some_and(|&(fd, _, _)| same_buffer(self.identity_fd.as_fd(), fd))
 	}
 }
 
@@ -825,12 +825,9 @@ impl PyroWaveEncoder {
 		let Some(&(first_fd, _, _)) = desc.planes().first() else {
 			return Err(rejected("compositor exported a DMA-BUF without planes".to_string()));
 		};
-		if desc.planes()[1..]
-			.iter()
-			.any(|(fd, _, _)| !same_open_file(first_fd.as_raw_fd(), fd.as_raw_fd()))
-		{
+		if desc.planes()[1..].iter().any(|&(fd, _, _)| !same_buffer(first_fd, fd)) {
 			return Err(rejected(
-				"PyroWave cannot import a DMA-BUF whose planes use different file descriptions".to_string(),
+				"PyroWave cannot import a DMA-BUF whose planes are in different buffers".to_string(),
 			));
 		}
 		let source_fd = first_fd;

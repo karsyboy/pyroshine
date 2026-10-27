@@ -30,7 +30,8 @@ Intel's media driver; packages recommend libva but do not install the driver:
 | Fedora | `sudo dnf install libva intel-media-driver` (RPM Fusion) |
 
 NVENC uses the NVIDIA driver's own libraries and needs nothing extra.
-The kernel must allow `kcmp(2)`; restrictive sandboxes may block it.
+Linux 5.3 or later is needed. Where a sandbox blocks `kcmp(2)` (Podman's default
+seccomp profile, Flatpak), Pyroshine compares DMA-BUF inode numbers instead.
 A monitor or active desktop compositor is unnecessary.
 
 PyroWave additionally needs Pyrolight, the matching encoder library (bundled),

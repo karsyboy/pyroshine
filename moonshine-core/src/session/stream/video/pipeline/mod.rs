@@ -47,6 +47,7 @@ use backend::{ConventionalEncoder, EncodeError, EncoderInput, PacketFuture};
 pub use backend::{EncoderBackend, EncoderPreference, EncoderTable};
 pub use convert::ConversionQueueMode;
 use convert::{ChromaSiting, ColorSpace, ConvertFormat, InputConverter, Target};
+pub(crate) use dmabuf::KcmpProbe;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 

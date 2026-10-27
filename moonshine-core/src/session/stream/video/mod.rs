@@ -38,6 +38,7 @@ use gso_socket::duration_micros_u64;
 pub(crate) use gso_socket::{FramePacing, UdpGsoSocket};
 pub(crate) use pacing_timer::PacingTimer;
 pub(crate) use packetizer::wire_shard_size;
+pub(crate) use pipeline::KcmpProbe;
 use pipeline::VideoPipeline;
 pub(crate) use shard_batch::{ShardBatch, ShardBuf};
 
