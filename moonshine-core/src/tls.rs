@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
+use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, Error, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{TlsAcceptor as TlsAcceptorTokio, server::TlsStream};
 use tracing::Level;
 use x509_parser::prelude::*;
@@ -291,15 +292,18 @@ impl TlsAcceptor {
 		Ok(Self { acceptor })
 	}
 
-	pub(crate) async fn accept(&self, connection: TcpStream) -> Result<TlsStream<TcpStream>, ()> {
+	pub(crate) async fn accept<IO>(&self, connection: IO, peer: SocketAddr) -> Result<TlsStream<IO>, ()>
+	where
+		IO: AsyncRead + AsyncWrite + Unpin,
+	{
 		match self.acceptor.accept(connection).await {
 			Ok(stream) => Ok(stream),
 			Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-				tracing::debug!("TLS handshake aborted by peer: {}", e);
+				tracing::debug!(%peer, "TLS handshake aborted by peer: {}", e);
 				Err(())
 			},
 			Err(e) => {
-				tracing::warn!("TLS handshake failed: {}", e);
+				tracing::warn!(%peer, "TLS handshake failed: {}", e);
 				Err(())
 			},
 		}

@@ -66,7 +66,15 @@ async fn http(server: &Webserver, peer: &str, request: String) -> (u16, String) 
 	let task = tokio::spawn(async move {
 		let local = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), HTTP_PORT));
 		server
-			.serve_http(TokioIo::new(serving), local, peer, None, false, None)
+			.serve_http(
+				TokioIo::new(serving),
+				local,
+				peer,
+				None,
+				false,
+				None,
+				crate::ingress::ConnectionActivity::untracked(),
+			)
 			.await;
 	});
 	let (mut read, mut write) = tokio::io::split(client);
@@ -549,6 +557,62 @@ async fn idle_tls_connection_does_not_block_valid_clients() {
 		matches!(closed, Ok(0) | Err(_)),
 		"idle handshake closed at its deadline"
 	);
+	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+}
+
+/// Moonlight iOS opens a new HTTPS connection for every request and leaves the
+/// previous one idle in keep-alive. Those abandoned connections must not use
+/// up the address's share and refuse the next request, which iOS reports as
+/// "A TLS error caused the secure connection to fail".
+#[tokio::test]
+async fn abandoned_keep_alive_connections_do_not_lock_out_a_client() {
+	let Fixture { server, _directory, .. } = fixture(true, WebLimits::default());
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let address = listener.local_addr().unwrap();
+	let acceptor = TlsAcceptor::from_config(
+		server.webserver_config.certificate.clone(),
+		server.webserver_config.private_key.clone(),
+	)
+	.unwrap();
+	let ingress = Ingress::new("https-test", MAX_HTTP_CONNECTIONS, server.shutdown.clone())
+		.with_idle_eviction_after(Duration::from_millis(50));
+	tokio::spawn({
+		let server = server.clone();
+		async move {
+			let shutdown = server.shutdown.clone();
+			shutdown
+				.wrap_cancel(server.serve_listener(listener, Some(Arc::new(acceptor)), ingress))
+				.await
+		}
+	});
+
+	let mut abandoned = Vec::new();
+	// Twice the per-address share of the listener.
+	for poll in 0..MAX_HTTP_CONNECTIONS / 2 {
+		let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+		let mut stream = tokio::time::timeout(
+			Duration::from_secs(5),
+			tls_client().connect(ServerName::try_from("localhost").unwrap(), socket),
+		)
+		.await
+		.unwrap()
+		.unwrap_or_else(|e| panic!("poll {poll}: TLS connection refused: {e}"));
+		let request = "GET /serverinfo HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+		stream.write_all(request.as_bytes()).await.unwrap();
+		let mut response = Vec::new();
+		let mut buffer = [0u8; 4096];
+		while !String::from_utf8_lossy(&response).contains("</root>") {
+			let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+				.await
+				.unwrap()
+				.unwrap();
+			assert!(read > 0, "poll {poll}: connection closed before the response");
+			response.extend_from_slice(&buffer[..read]);
+		}
+		assert!(response.starts_with(b"HTTP/1.1 200"), "poll {poll}");
+		abandoned.push(stream);
+		tokio::time::sleep(Duration::from_millis(60)).await;
+	}
 	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
 }
 

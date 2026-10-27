@@ -24,7 +24,7 @@ use crate::{
 	ShutdownReason,
 	app_scanner::Library,
 	clients::{ClientManager, RevokeError},
-	ingress::Ingress,
+	ingress::{ActivityIo, ConnectionActivity, Ingress},
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
 		application::SessionMode,
@@ -239,7 +239,8 @@ impl Webserver {
 					let listener = bind_listener(address)
 						.map_err(|e| tracing::error!("Failed to bind to address {address}: {e}"))?;
 					tracing::debug!("{name} server listening for connections on {address}");
-					let ingress = Ingress::new(name, MAX_HTTP_CONNECTIONS, server.shutdown.clone());
+					let ingress =
+						Ingress::new(name, MAX_HTTP_CONNECTIONS, server.shutdown.clone()).with_idle_eviction();
 					server.serve_listener(listener, tls, ingress).await
 				}))
 				.await;
@@ -267,7 +268,8 @@ impl Webserver {
 			};
 			let server = self.clone();
 			let tls = tls.clone();
-			permit.spawn(async move { server.serve_connection(connection, address, tls).await });
+			let activity = permit.activity();
+			permit.spawn(async move { server.serve_connection(connection, address, tls, activity).await });
 		}
 	}
 
@@ -276,10 +278,12 @@ impl Webserver {
 		connection: tokio::net::TcpStream,
 		address: SocketAddr,
 		tls: Option<std::sync::Arc<TlsAcceptor>>,
+		activity: std::sync::Arc<ConnectionActivity>,
 	) {
 		let peer_address = unmap_v4_mapped(address);
 		let local_address = connection.local_addr().ok().map(unmap_v4_mapped);
 		let mac_address = local_address.and_then(|address| get_mac_address(address.ip()).unwrap_or(None));
+		let connection = ActivityIo::new(connection, activity.clone());
 
 		let Some(acceptor) = tls else {
 			self.serve_http(
@@ -289,20 +293,25 @@ impl Webserver {
 				mac_address,
 				false,
 				None,
+				activity,
 			)
 			.await;
 			return;
 		};
 
-		let connection =
-			match tokio::time::timeout(self.limits.tls_handshake_timeout, acceptor.accept(connection)).await {
-				Ok(Ok(connection)) => connection,
-				Ok(Err(())) => return,
-				Err(_) => {
-					tracing::debug!("TLS handshake from {peer_address} timed out.");
-					return;
-				},
-			};
+		let connection = match tokio::time::timeout(
+			self.limits.tls_handshake_timeout,
+			acceptor.accept(connection, peer_address),
+		)
+		.await
+		{
+			Ok(Ok(connection)) => connection,
+			Ok(Err(())) => return,
+			Err(_) => {
+				tracing::debug!("TLS handshake from {peer_address} timed out.");
+				return;
+			},
+		};
 
 		// Extract peer certificate fingerprint from TLS connection for mTLS verification.
 		let peer_cert_fingerprint = connection
@@ -319,11 +328,13 @@ impl Webserver {
 			mac_address,
 			true,
 			peer_cert_fingerprint,
+			activity,
 		)
 		.await;
 	}
 
 	/// Serve HTTP/1.1 requests on an established (optionally TLS) connection.
+	#[allow(clippy::too_many_arguments)]
 	async fn serve_http<I>(
 		&self,
 		io: I,
@@ -332,6 +343,7 @@ impl Webserver {
 		mac_address: Option<String>,
 		https: bool,
 		peer_cert_fingerprint: Option<String>,
+		activity: std::sync::Arc<ConnectionActivity>,
 	) where
 		I: hyper::rt::Read + hyper::rt::Write + Unpin,
 	{
@@ -342,14 +354,22 @@ impl Webserver {
 			.serve_connection(
 				io,
 				service_fn(|request| {
-					self.serve(
+					// In progress until the response is produced: a waiting
+					// request (a pairing PIN, an app launch) is never evicted.
+					let request_guard = activity.request();
+					let response = self.serve(
 						request,
 						local_address,
 						peer_address,
 						mac_address.clone(),
 						https,
 						peer_cert_fingerprint.clone(),
-					)
+					);
+					async move {
+						let response = response.await;
+						drop(request_guard);
+						response
+					}
 				}),
 			)
 			.await;

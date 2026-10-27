@@ -15,7 +15,7 @@ async fn request(
 	let task = tokio::spawn(async move {
 		let (socket, peer) = listener.accept().await.unwrap();
 		if let Some(acceptor) = acceptor {
-			let connection = acceptor.accept(socket).await.unwrap();
+			let connection = acceptor.accept(socket, peer).await.unwrap();
 			let fingerprint = connection
 				.get_ref()
 				.1

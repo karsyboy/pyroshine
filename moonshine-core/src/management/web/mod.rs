@@ -291,7 +291,7 @@ async fn serve_connection(
 	let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
 	match tls {
 		None => serve_http(context, TokioIo::new(connection), peer).await,
-		Some(acceptor) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(connection)).await {
+		Some(acceptor) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(connection, peer)).await {
 			Ok(Ok(stream)) => serve_http(context, TokioIo::new(stream), peer).await,
 			Ok(Err(())) => {},
 			Err(_) => tracing::debug!(%peer, "Web management TLS handshake timed out"),

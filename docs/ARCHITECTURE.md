@@ -649,7 +649,12 @@ negotiated per session, not configured. The application receives
 
 Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
 (`ingress.rs`) that hold a global shutdown delay token and apply TLS-handshake,
-request-header and RTSP-framing deadlines. Pairing trust changes are serialized,
+request-header and RTSP-framing deadlines. Each listener bounds its connections,
+and any one address to a quarter of them. On the GameStream HTTP and HTTPS
+listeners a new connection over either bound replaces the longest-idle
+connection (no request in progress, no socket I/O for two seconds) instead of
+being refused: Moonlight iOS opens a new connection for every request and
+leaves the previous one idle in keep-alive. Pairing trust changes are serialized,
 written atomically and synced before they take effect; revocation drains
 in-flight launch/resume/cancel requests and stops the active session.
 
