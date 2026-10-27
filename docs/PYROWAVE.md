@@ -18,7 +18,7 @@ The only supported PyroWave source is:
 
 - repository: `https://github.com/karsyboy/pyrowave`
 - branch: `master` (the build uses the detached revision below, not the moving branch)
-- revision: `78084ece21b1725d193442a7619660625f3f735a`
+- revision: `ac5a7ec4b7a326ec8d3230ab8b2e884417799060`
 - C API: 1.1.0
 - Granite: `53090429539bf3404250d18fe58db971f0907c04`
 - Volk: `47cddf7ed97b94118a08aacb548a411188e016cc`

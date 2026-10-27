@@ -19,6 +19,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Let clients change the bitrate of their own stream without reconnecting, through the paired-client `GET /bitrate?bitrate=KBPS` request that Vibepollo and Foundation Sunshine define. H.264, HEVC and AV1 retarget the encoder; PyroWave changes its per-frame budget and send pacing from the next frame. Nightjar's stream-menu and automatic bitrate now work with Pyroshine. Only the client holding the stream can change it, and a reconnect renegotiates it. See [Client integration](CLIENT_INTEGRATION.md#live-bitrate).
 - Let Nightjar use VRR, live bitrate and fractional refresh rates with Pyroshine. `/serverinfo` now describes the frame limiter as Vibepollo does, which Nightjar reads as the marker of those extensions, and launching a different application while one runs asks the client to confirm, as Vibepollo does, instead of failing. See [Client integration](CLIENT_INTEGRATION.md#vibepollo-extensions).
 
+### Changed
+
+- Build PyroWave from fork revision `ac5a7ec`, which merges two upstream rate-control fixes: dropping a whole block was costed without its frequency weight, so at low bitrates whole chroma blocks were thrown away and large areas lost their colour, and the bucket prefix scan stopped one step short. Low-bitrate PyroWave streams keep their colour at the same bitrate. It also adds P010 input for scaled encodes. The bitstream and C API 1.1.0 are unchanged, so existing Pyrolight clients decode it as before.
+
 ### Fixed
 
 - Start inside containers and sandboxes that block `kcmp(2)`, such as Podman's default seccomp profile and Flatpak. The DMA-BUF import caches of H.264/HEVC/AV1 and PyroWave used `kcmp(2)` to recognise a recycled fd number, and the health check refused to start without it. When `kcmp(2)` is blocked or missing, both caches now compare the buffers' inode numbers (Linux 5.3 or later), the health check warns instead of failing, and a failed comparison re-imports the buffer instead of panicking. From upstream Moonshine, extended to the PyroWave cache.

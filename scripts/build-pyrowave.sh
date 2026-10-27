@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Reproducible build of Pyroshine's authoritative PyroWave dependency.
 SOURCE_URL="https://github.com/karsyboy/pyrowave"
-SOURCE_REVISION="78084ece21b1725d193442a7619660625f3f735a"
+SOURCE_REVISION="ac5a7ec4b7a326ec8d3230ab8b2e884417799060"
 GRANITE_REVISION="53090429539bf3404250d18fe58db971f0907c04"
 VOLK_REVISION="47cddf7ed97b94118a08aacb548a411188e016cc"
 VULKAN_HEADERS_REVISION="6802bb4733b63ed5efd3adb308a6c885ef180ea1"
