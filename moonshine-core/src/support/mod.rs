@@ -16,7 +16,7 @@
 //! | `vulkaninfo.txt` | `vulkaninfo --summary`, when installed |
 //! | `collection.txt` | Steps that could not be completed |
 //!
-//! The daemon builds bundles for `GetSupportBundle` (the desktop app and
+//! The daemon builds bundles for `GetSupportBundle` (the web interface and
 //! `pyroshine diag`); `pyroshine diag` builds one itself when no daemon is
 //! reachable. Collection runs on a blocking thread and never touches a
 //! session: external commands have a deadline, and the health check runs

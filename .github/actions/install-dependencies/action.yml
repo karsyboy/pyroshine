@@ -18,6 +18,9 @@ runs:
           libevdev-dev \
           libgbm-dev \
           libopus-dev \
+          libpipewire-0.3-dev \
+          libspa-0.2-dev \
+          libpulse-dev \
           libwayland-dev \
           libxkbcommon-dev \
           patchelf \

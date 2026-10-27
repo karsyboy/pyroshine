@@ -106,8 +106,10 @@ impl TryFrom<u32> for BitDepth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransferFunction {
+	/// IEC 61966-2-1 sRGB: SDR desktop and game framebuffers, converted to
+	/// YCbCr without a transfer change and signaled as such (H.273 code 13).
 	#[default]
-	Bt709,
+	Srgb,
 	Pq,
 }
 
@@ -171,7 +173,7 @@ impl NegotiatedVideoFormat {
 			chroma,
 			bit_depth,
 			primaries: ColorPrimaries::Bt709,
-			transfer: TransferFunction::Bt709,
+			transfer: TransferFunction::Srgb,
 			matrix: MatrixCoefficients::Bt709,
 			range,
 			hdr: false,

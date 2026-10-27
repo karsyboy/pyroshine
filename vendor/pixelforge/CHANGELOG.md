@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.0] - 19-10-2026
+
+### Added
+
+- Add H.264 decoding support.
+- Add queue selection for adopted devices.
+- Add encoding on a caller-created device.
+- Add `VideoContext::supports_encode_format`.
+- Route validation layer messages into `tracing`.
+
+### Changed
+
+- Use push descriptors in the colour converter instead of `VK_EXT_descriptor_buffer`.
+- Require the `timelineSemaphore` feature when adopting a device for decode.
+- Allow adopted devices to use any Vulkan version from 1.1 up.
+
+### Fixed
+
+- Enable the ycbcr and 4:4:4 features without requiring descriptor buffers.
+- Stop the colour converter reusing a stale source view.
+- Order the DPB encode-layout barrier before the encode.
+- Fix H.264 decoding on NVIDIA hardware.
+- Check encode requirements on the queue family the caller chose.
+- Stop requesting 4:4:4 and AV1 encode features when the driver has them disabled.
+- Keep a converter's timeline semaphore alive until the context is dropped.
+
+### Removed
+
+- Remove host readback and `copy_frame_to_planes`.
+- Remove `PixelForgeError::NeedsKeyframe`.
+- Remove the free-standing stream splitter.
+
 ## [0.9.1] - 01-09-2026
 
 ### Fixed

@@ -67,6 +67,12 @@ reconnect; PLAY waits for ordered encoder/key/sample/FEC reset and transport act
 before completing, including identical-mode resumes. Dropped paused batches must
 still release PyroWave's send completion/capture credit.
 
+Leave the desktop still during disconnect, then reconnect without moving the
+pointer or typing. The first recovery frame must wait for StartB and the current
+client's video PING, and capture must retain the newest producer picture while
+delivery is paused. Repeat with a delayed video PING and with the PING arriving
+before PLAY; neither ordering may require another desktop redraw to show video.
+
 Repeat PyroWave → PyroWave, PyroWave → HEVC, HEVC → HEVC and HEVC →
 PyroWave → PyroWave while the same game remains running. Inspect client frame
 loss, presentation cadence and visible micro-stutter, as well as average host FPS.

@@ -7,22 +7,25 @@
   libdrm,
   libevdev,
   libpulseaudio,
+  pipewire,
   libxkbcommon,
   libgbm,
   libopus,
   vulkan-loader,
   wayland,
   libglvnd,
+  libva,
   callPackage,
   pyrowave ? callPackage ./pyrowave.nix { },
+  pyroshine-web ? callPackage ./web.nix { },
 }:
 
 let
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
   # Only what the build actually consumes, so touching flake.nix, the README,
-  # or CI config doesn't rebuild the world. assets/ is required: the webserver
-  # embeds assets/pin.html via include_bytes!.
+  # or CI config doesn't rebuild the world. The web interface is its own
+  # derivation (web.nix).
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -32,7 +35,6 @@ let
       ../moonshine-core
       ../moonshine-management
       ../moonshine-tools
-      ../assets
       ../dist
       ../vendor
     ];
@@ -49,15 +51,6 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     allowBuiltinFetchGit = true;
-    outputHashes = {
-      # Exception: ash's pinned rev sits on an unmerged PR branch, unreachable
-      # from any ref, so the builtin git fetcher (which only fetches refs)
-      # cannot get it and this fixed hash is needed. If the ash pin changes
-      # this fails loudly: a rev bump prints the correct new hash in the
-      # mismatch error, and once the pin moves to a rev on a normal branch or
-      # tag this entry can simply be deleted.
-      "ash-0.38.0+1.4.329" = "sha256-apzc//AZqS3F4e4Epm3Dl20ZkkMKUvLjyxv7ZwJh1Jw=";
-    };
   };
 
   # The local inputtino-sys patch includes its native C++ source tree.
@@ -83,6 +76,7 @@ rustPlatform.buildRustPackage {
     libdrm
     libevdev
     libpulseaudio
+    pipewire
     libxkbcommon
     libgbm # smithay's GPU buffer allocation (split out of mesa in nixpkgs)
     libopus
@@ -96,6 +90,19 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
+    install -Dm644 dist/pyroshine-desktop-guard.service $out/lib/systemd/user/pyroshine-desktop-guard.service
+    substituteInPlace $out/lib/systemd/user/pyroshine-desktop-guard.service \
+      --replace-fail /usr/bin/pyroshine $out/bin/moonshine
+
+    # The web management interface, found next to the executable
+    # (bin/../share/pyroshine/web). The server shows the desktop tray itself
+    # (a child process of bin/moonshine) in desktop sessions.
+    mkdir -p $out/share/pyroshine
+    cp -r ${pyroshine-web} $out/share/pyroshine/web
+    install -Dm644 dist/pyroshine.desktop $out/share/applications/pyroshine.desktop
+    substituteInPlace $out/share/applications/pyroshine.desktop \
+      --replace-fail 'Exec=pyroshine ' "Exec=$out/bin/moonshine "
+
     # Input-group access + active-seat ACLs for /dev/uinput and /dev/uhid,
     # picked up by services.udev.packages.
     install -Dm644 dist/60-moonshine.rules $out/lib/udev/rules.d/60-moonshine.rules
@@ -111,13 +118,17 @@ rustPlatform.buildRustPackage {
     # NVIDIA (and GPU generally): pixelforge opens libvulkan.so.1 with
     # dlopen (ash's "loaded" feature) and smithay's GL renderer does the
     # same for libEGL, so neither lands in DT_NEEDED and the automatic
-    # buildInputs RUNPATH doesn't cover them. Add the Vulkan loader + glvnd
-    # dispatch explicitly, and /run/opengl-driver/lib (addDriverRunpath) so
-    # the NVIDIA userspace driver and its Vulkan ICD resolve at runtime.
+    # buildInputs RUNPATH doesn't cover them. The VA-API encoder opens
+    # libva.so.2 the same way. Add the Vulkan loader, glvnd dispatch and
+    # libva explicitly, and /run/opengl-driver/lib (addDriverRunpath) so the
+    # NVIDIA userspace driver (its Vulkan ICD, libcuda, libnvidia-encode)
+    # resolves at runtime; libva finds VA drivers (hardware.graphics.
+    # extraPackages, e.g. intel-media-driver) under /run/opengl-driver.
     patchelf --add-rpath ${
       lib.makeLibraryPath [
         vulkan-loader
         libglvnd
+        libva
         pyrowave
       ]
     } $out/bin/moonshine

@@ -40,23 +40,18 @@ class ChangelogTests(unittest.TestCase):
         (self.root / "Cargo.lock").write_text(
             lock(["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools"])
         )
-        ui = self.root / "pyroshine-ui"
-        (ui / "src-tauri").mkdir(parents=True, exist_ok=True)
-        (ui / "src-tauri/Cargo.lock").write_text(lock(["moonshine-management", "moonshine-ui"]))
-        (ui / "src-tauri/Cargo.toml").write_text(
-            f'[package]\nname = "moonshine-ui"\nversion = "{version}"\nedition = "2024"\n\n'
-            f'[dependencies]\nserde = "{version}"\n'
-        )
+        ui = self.root / "web"
+        ui.mkdir(parents=True, exist_ok=True)
         (ui / "package.json").write_text(
-            json.dumps({"name": "pyroshine-ui", "version": version, "dependencies": {"x": version}}, indent=2) + "\n"
+            json.dumps({"name": "web", "version": version, "dependencies": {"x": version}}, indent=2) + "\n"
         )
         (ui / "package-lock.json").write_text(
             json.dumps(
                 {
-                    "name": "pyroshine-ui",
+                    "name": "web",
                     "version": version,
                     "lockfileVersion": 3,
-                    "packages": {"": {"name": "pyroshine-ui", "version": version}, "node_modules/x": {"version": version}},
+                    "packages": {"": {"name": "web", "version": version}, "node_modules/x": {"version": version}},
                 },
                 indent=2,
             )
@@ -106,10 +101,9 @@ class ChangelogTests(unittest.TestCase):
         message = str(raised.exception)
         for copy in [
             "Cargo.lock (moonshine-management)",
-            "pyroshine-ui/src-tauri/Cargo.lock (moonshine-ui)",
-            "pyroshine-ui/src-tauri/Cargo.toml",
-            "pyroshine-ui/package.json",
-            'pyroshine-ui/package-lock.json (packages."".version)',
+            "Cargo.lock (moonshine-tools)",
+            "web/package.json",
+            'web/package-lock.json (packages."".version)',
         ]:
             self.assertIn(copy, message)
         self.assertIn("sync-versions", message)
@@ -119,10 +113,8 @@ class ChangelogTests(unittest.TestCase):
             path: (self.root / path).read_text()
             for path in [
                 "Cargo.lock",
-                "pyroshine-ui/src-tauri/Cargo.lock",
-                "pyroshine-ui/src-tauri/Cargo.toml",
-                "pyroshine-ui/package.json",
-                "pyroshine-ui/package-lock.json",
+                "web/package.json",
+                "web/package-lock.json",
             ]
         }
         self.assertEqual(changelog.sync_versions(self.root), [])
@@ -138,10 +130,9 @@ class ChangelogTests(unittest.TestCase):
             if path.endswith(".lock"):
                 # A dependency that happens to share the old version is untouched.
                 self.assertIn('name = "serde"\nversion = "1.2.3"', after, path)
-        self.assertIn('serde = "1.2.3"', (self.root / "pyroshine-ui/src-tauri/Cargo.toml").read_text())
-        lock = json.loads((self.root / "pyroshine-ui/package-lock.json").read_text())
+        lock = json.loads((self.root / "web/package-lock.json").read_text())
         self.assertEqual(lock["packages"]["node_modules/x"]["version"], "1.2.3")
-        self.assertEqual(json.loads((self.root / "pyroshine-ui/package.json").read_text())["dependencies"]["x"], "1.2.3")
+        self.assertEqual(json.loads((self.root / "web/package.json").read_text())["dependencies"]["x"], "1.2.3")
 
     def test_prepare_preserves_history_and_moves_unreleased(self):
         self.set_version("1.2.4")

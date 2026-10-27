@@ -145,9 +145,14 @@ if [[ "$UNINSTALL" == "true" ]]; then
     sudo systemctl disable "pyroshine@${USER}" || true
   fi
 
+  # The guard is a user unit independent of the server. Restore before removal.
+  if systemctl --user cat pyroshine-desktop-guard.service >/dev/null 2>&1; then
+    systemctl --user stop pyroshine-desktop-guard.service || die "Restore Desktop Mode before uninstalling."
+  fi
   step "Removing files..."
   sudo rm -rf /opt/pyroshine
   sudo rm -f /etc/systemd/system/pyroshine@.service
+  sudo rm -f /etc/systemd/user/pyroshine-desktop-guard.service
   sudo rm -f /etc/udev/rules.d/60-pyroshine.rules
   sudo rm -f /etc/modules-load.d/pyroshine.conf
   sudo rm -f /etc/sysusers.d/pyroshine.conf
@@ -155,6 +160,8 @@ if [[ "$UNINSTALL" == "true" ]]; then
   sudo rm -f /etc/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules
   sudo rm -f /etc/profile.d/pyroshine.sh
   sudo rm -f /etc/atomic-update.conf.d/pyroshine.conf
+  sudo rm -f /usr/local/share/applications/pyroshine.desktop
+  systemctl --user daemon-reload || true
   sudo systemctl daemon-reload || true
   sudo udevadm control --reload || true
 
@@ -230,6 +237,13 @@ if [[ -z "$HEALTHCHECK" ]]; then
   prompt "Run health check?" HEALTHCHECK Y
 fi
 
+# Restore any active desktop before replacing the executable or its guard unit.
+systemctl --user stop pyroshine-desktop-guard.service 2>/dev/null || {
+  if systemctl --user is-active --quiet pyroshine-desktop-guard.service; then
+    die "Cannot stop the desktop guard; restore Desktop Mode before upgrading."
+  fi
+}
+
 # --- build and run privileged commands ---
 
 PYROSHINE_HOME="/opt/pyroshine"
@@ -259,6 +273,11 @@ CMDS=(
   "cp '${S}/lib/libpyrowave-shared.so.1' '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.1'"
   "chmod 755 '${PYROSHINE_HOME}/lib/libpyrowave-shared.so.1'"
 
+  # Deploy the web management interface (served by pyroshine from share/)
+  "rm -rf '${PYROSHINE_HOME}/share/pyroshine/web'"
+  "mkdir -p '${PYROSHINE_HOME}/share/pyroshine'"
+  "cp -R '${S}/share/pyroshine/web' '${PYROSHINE_HOME}/share/pyroshine/web'"
+
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/pyroshine-install.sh' '${PYROSHINE_HOME}/bin/pyroshine-install.sh'"
   "chmod 755 '${PYROSHINE_HOME}/bin/pyroshine-install.sh'"
@@ -269,6 +288,10 @@ CMDS=(
 
   # Deploy service unit with path patched
   "sed 's|/usr/bin/start-pyroshine.sh|${PYROSHINE_HOME}/start-pyroshine.sh|' '${S}/share/pyroshine/pyroshine@.service' > /etc/systemd/system/pyroshine@.service"
+
+  # The user-session guard runs outside the streaming server's cgroup.
+  "mkdir -p /etc/systemd/user"
+  "sed 's|/usr/bin/pyroshine|${PYROSHINE_HOME}/start-pyroshine.sh|' '${S}/share/pyroshine/pyroshine-desktop-guard.service' > /etc/systemd/user/pyroshine-desktop-guard.service"
 
   # Deploy udev rules
   "cp '${S}/share/pyroshine/60-pyroshine.rules' /etc/udev/rules.d/60-pyroshine.rules"
@@ -304,6 +327,13 @@ CMDS=(
 
   # Reload polkit
   "systemctl reload-or-restart polkit.service || true"
+)
+
+CMDS+=(
+  # Application-menu entry for the web interface. The server shows the tray
+  # itself in desktop sessions.
+  "mkdir -p /usr/local/share/applications"
+  "sed 's|^Exec=pyroshine |Exec=${PYROSHINE_HOME}/bin/pyroshine |' '${S}/share/pyroshine/pyroshine.desktop' > /usr/local/share/applications/pyroshine.desktop"
 )
 
 if $LINGER_NEEDED && [[ "$LINGER" == "true" ]]; then
@@ -354,6 +384,7 @@ fi
 echo ""
 echo -e "  ${DIM}status${RESET}  ${BOLD}systemctl status pyroshine@${USER}${RESET}"
 echo -e "  ${DIM}config${RESET}  ${BOLD}/home/${USER}/.config/moonshine/config.toml${RESET}"
+echo -e "  ${DIM}manage${RESET}  ${BOLD}pyroshine web setup${RESET}, then open ${BOLD}http://127.0.0.1:47990/${RESET}"
 echo ""
 
 ok "Done"

@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -16,11 +14,40 @@ pub fn default_launch_timeout() -> u64 {
 	2
 }
 
+/// What a session of an application entry streams.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+	/// Game Mode: the application in Pyroshine's own isolated compositor.
+	#[default]
+	Game,
+	/// Desktop Mode: the user's running desktop; no application is launched.
+	Desktop,
+}
+
+impl SessionMode {
+	pub fn is_game(&self) -> bool {
+		*self == Self::Game
+	}
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Game => "game",
+			Self::Desktop => "desktop",
+		}
+	}
+}
+
 /// Configuration for a single application that can be launched in a session.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
+
+	/// `game` (default) launches `command` in the isolated compositor;
+	/// `desktop` streams the running desktop and ignores `command`.
+	#[serde(default, skip_serializing_if = "SessionMode::is_game")]
+	pub mode: SessionMode,
 
 	/// Path to a boxart image.
 	pub boxart: Option<PathBuf>,
@@ -52,12 +79,18 @@ pub struct ApplicationConfig {
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Overrides of `[frame_limit]` (`frame_limit_mode`, `frame_limit_fps`,
+	/// `frame_limit_method`).
+	#[serde(flatten)]
+	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
 }
 
 impl Default for ApplicationConfig {
 	fn default() -> Self {
 		Self {
 			title: String::new(),
+			mode: SessionMode::Game,
 			boxart: None,
 			command: Vec::new(),
 			output_scale: None,
@@ -66,16 +99,8 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			frame_limit: Default::default(),
 		}
-	}
-}
-
-impl ApplicationConfig {
-	pub fn id(&self) -> i32 {
-		let mut hasher = DefaultHasher::new();
-		self.title.hash(&mut hasher);
-		// Clients only accept non-negative application IDs.
-		(hasher.finish() as i32) & i32::MAX
 	}
 }
 
@@ -151,6 +176,8 @@ pub(crate) struct ApplicationContext {
 	pub hdr: bool,
 	/// Environment variables to pass on.
 	pub extra_env: HashMap<String, String>,
+	/// Frame limit for this launch (`None`: the application launches unchanged).
+	pub frame_limit: Option<crate::session::frame_limit::FrameLimit>,
 }
 
 /// A launched application unit and its exit monitor.
@@ -182,7 +209,6 @@ impl Application {
 			.with_hint("Set its command in the Pyroshine configuration."));
 		};
 		let args = &config.command[1..];
-		let envs = make_envs(&context)?;
 
 		tracing::info!(program, ?args, "Launching application.");
 
@@ -194,6 +220,12 @@ impl Application {
 		subscribe_to_systemd_signals(&conn)
 			.await
 			.map_err(|()| session_bus_failure("subscribing to systemd signals failed"))?;
+
+		let limit_env = match context.frame_limit {
+			Some(limit) => frame_limit_environment(&conn, &config.title, limit).await,
+			None => Vec::new(),
+		};
+		let envs = make_envs(&context, &limit_env)?;
 
 		// Stop any leftover unit from a previous session. A unit whose processes
 		// cannot be shown gone, or that is still loaded, cannot be replaced
@@ -211,6 +243,12 @@ impl Application {
 				)
 				.with_hint(format!("Stop it with: systemctl --user stop {}", context.unit_name))
 			})?;
+
+		// With the previous unit gone, a running Steam belongs to someone else
+		// and would take this launch over (see `steam_instance`).
+		if let Some(failure) = crate::session::steam_instance::check_current_user(&config).await {
+			return Err(failure);
+		}
 
 		// Launch the application as a transient systemd service unit.
 		let options = LaunchOptions {
@@ -308,8 +346,53 @@ pub(crate) async fn stop_application_unit(unit_name: &str) -> Result<(), ()> {
 	stop_unit_owned(unit_name.to_string()).await
 }
 
+/// Environment that applies `limit` to the application unit (see
+/// `session::frame_limit`). Only runs when a limit is configured.
+async fn frame_limit_environment(
+	conn: &Connection,
+	title: &str,
+	limit: crate::session::frame_limit::FrameLimit,
+) -> Vec<(String, String)> {
+	use crate::session::frame_limit;
+	// The unit inherits the user manager's environment; a limit the user set
+	// there is theirs to keep.
+	let inherited: std::collections::HashSet<String> =
+		match Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER).await {
+			Ok(proxy) => proxy
+				.get_property::<Vec<String>>("Environment")
+				.await
+				.unwrap_or_else(|error| {
+					tracing::debug!(%error, "Cannot read the user manager environment");
+					Vec::new()
+				})
+				.into_iter()
+				.filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
+				.collect(),
+			Err(_) => Default::default(),
+		};
+	let mangohud = limit.method == frame_limit::FrameLimitMethod::Mangohud
+		&& tokio::task::spawn_blocking(frame_limit::mangohud_layer_installed)
+			.await
+			.unwrap_or(false);
+	let applied = frame_limit::environment(limit, &inherited, mangohud);
+	for note in &applied.notes {
+		tracing::warn!(application = title, "Frame limit: {note}");
+	}
+	match applied.method {
+		Some(method) => tracing::info!(
+			application = title,
+			fps = limit.fps,
+			?method,
+			variables = ?applied.variables,
+			"Frame limit applied to the application unit"
+		),
+		None => tracing::info!(application = title, "Frame limit left to the user environment"),
+	}
+	applied.variables
+}
+
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, SessionFailure> {
+fn make_envs(context: &ApplicationContext, frame_limit: &[(String, String)]) -> Result<Vec<String>, SessionFailure> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -360,6 +443,9 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, SessionFailure
 		}
 		envs.push(format!("{key}={value}"));
 	}
+
+	// Unit-scoped: only this application and its children see these.
+	envs.extend(frame_limit.iter().map(|(key, value)| format!("{key}={value}")));
 
 	Ok(envs)
 }
@@ -991,10 +1077,25 @@ async fn wait_for_unit_terminal_state(conn: &Connection, unit_name: &str, watch:
 					.deserialize()
 					.map_err(|e| tracing::error!("Failed to deserialize UnitRemoved signal: {e}"))?;
 				if id == unit_name {
-					return Ok("removed".to_string());
+					if let Some(state) = unit_removed_state(&query_activity(conn, unit_name).await) {
+						return Ok(state.to_string());
+					}
+					tracing::debug!(unit = unit_name, "Application unit is still running after UnitRemoved (systemd reload)");
 				}
 			},
 		}
+	}
+}
+
+/// What a `UnitRemoved` signal for the application unit establishes, given
+/// the unit's state queried after it: the terminal state, or `None` while the
+/// unit still runs. Reloading systemd (`systemctl daemon-reload`) emits
+/// `UnitRemoved` for running units too. Without an answer the signal itself
+/// is systemd's, so the unit counts as removed.
+fn unit_removed_state(activity: &Result<Activity, String>) -> Option<&'static str> {
+	match activity {
+		Ok(Activity::State(state)) => terminal_state(state),
+		Ok(Activity::Absent) | Err(_) => Some("removed"),
 	}
 }
 
@@ -1860,6 +1961,23 @@ mod tests {
 		}
 	}
 
+	/// A reload's `UnitRemoved` for a running unit must not end the session.
+	#[test]
+	fn unit_removed_during_reload_keeps_a_running_unit() {
+		use super::{Activity, unit_removed_state};
+		for state in ["active", "activating", "deactivating", "reloading"] {
+			assert_eq!(unit_removed_state(&Ok(Activity::State(state.into()))), None, "{state}");
+		}
+		for state in ["inactive", "failed"] {
+			assert_eq!(unit_removed_state(&Ok(Activity::State(state.into()))), Some(state));
+		}
+		assert_eq!(unit_removed_state(&Ok(Activity::Absent)), Some("removed"));
+		assert_eq!(
+			unit_removed_state(&Err("GetUnit failed: timeout".into())),
+			Some("removed")
+		);
+	}
+
 	#[test]
 	fn launch_environment_exposes_real_displays_without_presentation_injection() {
 		let context = super::ApplicationContext {
@@ -1869,8 +1987,17 @@ mod tests {
 			wayland_display: "wayland-pyroshine-test".into(),
 			hdr: true,
 			extra_env: Default::default(),
+			frame_limit: None,
 		};
-		let env = super::make_envs(&context).unwrap();
+		let env = super::make_envs(&context, &[]).unwrap();
+		// Disabled limiting adds nothing.
+		assert!(
+			!env.iter()
+				.any(|e| e.starts_with("DXVK_FRAME_RATE") || e.starts_with("MANGOHUD"))
+		);
+		let limited = super::make_envs(&context, &[("DXVK_FRAME_RATE".into(), "60".into())]).unwrap();
+		assert_eq!(limited.len(), env.len() + 1);
+		assert_eq!(limited.last().unwrap(), "DXVK_FRAME_RATE=60");
 		assert!(env.contains(&"DISPLAY=:5".into()));
 		assert!(env.contains(&"WAYLAND_DISPLAY=wayland-pyroshine-test".into()));
 		assert!(env.iter().all(|e| !super::obsolete_presentation_environment(
@@ -1879,7 +2006,7 @@ mod tests {
 		)));
 		let mut obsolete = context;
 		obsolete.extra_env.insert("ENABLE_MOONSHINE_WSI".into(), "1".into());
-		assert!(super::make_envs(&obsolete).is_err());
+		assert!(super::make_envs(&obsolete, &[]).is_err());
 		assert!(super::obsolete_presentation_environment(
 			"MOONSHINE_WSI_DISABLE_BYPASS",
 			"1"

@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Tue, 27 Oct 2026 11:32:50 -0400
+Subject: [PATCH 7/7] c-api: treat P010 input like NV12 for the range metadata
+
+The scaled path writes the limited-range bit only for RGB input, because
+NV12 is scaled without color conversion and keeps its own range. P010
+input, added upstream later, takes the same path without conversion but
+was not excluded, so a narrow ycbcr_range marked a P010 stream limited
+although the scaler never applied it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pyrowave_c.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+index f07d736..266f370 100644
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -1357,9 +1357,10 @@ pyrowave_encoder_encode_gpu_scaled_inner(pyrowave_encoder encoder,
+ 	info.input_color_space = scaling_info->input_color_space;
+ 	info.output_color_space = scaling_info->output_color_space;
+ 	const uint32_t hdr = info.output_color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT ? 1u : 0u;
+-	// NV12 input skips color conversion, so ycbcr_range only applies to RGB input.
+-	const uint32_t narrow = scaling_info->ycbcr_range == VK_SAMPLER_YCBCR_RANGE_ITU_NARROW &&
+-	                        scaling_info->view.view_format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? 1u : 0u;
++	// NV12 and P010 input skip color conversion, so ycbcr_range only applies to RGB input.
++	const bool ycbcr_input = scaling_info->view.view_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
++	                         scaling_info->view.view_format == VK_FORMAT_G16_B16R16_2PLANE_420_UNORM;
++	const uint32_t narrow = scaling_info->ycbcr_range == VK_SAMPLER_YCBCR_RANGE_ITU_NARROW && !ycbcr_input ? 1u : 0u;
+ 	encoder->color = { hdr, hdr, hdr, narrow, 0 };
+ 	info.crop_rect = scaling_info->crop_rect;
+ 	info.skip_dither = scaling_info->skip_dither;

@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 26 Oct 2026 20:46:39 -0400
+Subject: [PATCH] encoder: signal the 4:2:0 chroma sample position
+
+A converter decides where its 4:2:0 chroma samples sit: a 2x2 box filter
+centers them, while decoders that receive no position assume left siting
+(the H.264/H.265 default, and FFmpeg/libplacebo for AV1), reconstructing
+chroma half a luma pixel away. Add ColorDescription::chroma_location and
+write it as chroma_loc_info in H.264/H.265 VUI and as AV1
+chroma_sample_position, for 4:2:0 only. AV1 cannot express centered
+siting; producers must generate left or co-located samples for it.
+---
+ src/encoder/av1/session_params.rs  |  9 +++-
+ src/encoder/h264/session_params.rs | 10 ++++-
+ src/encoder/h265/session_params.rs | 11 +++--
+ src/encoder/mod.rs                 | 67 ++++++++++++++++++++++++++++++
+ src/lib.rs                         |  2 +-
+ 5 files changed, 92 insertions(+), 7 deletions(-)
+
+diff --git a/src/encoder/av1/session_params.rs b/src/encoder/av1/session_params.rs
+index e731226..84bb512 100644
+--- a/src/encoder/av1/session_params.rs
++++ b/src/encoder/av1/session_params.rs
+@@ -70,7 +70,14 @@ impl Av1 {
+             color_primaries: av1_color_primaries,
+             transfer_characteristics: av1_transfer,
+             matrix_coefficients: av1_matrix,
+-            chroma_sample_position: ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
++            // Only 4:2:0 carries a position (AV1 spec 5.5.2).
++            chroma_sample_position: if (subsampling_x, subsampling_y) == (1, 1) {
++                ash::vk::native::StdVideoAV1ChromaSamplePosition::from(
++                    desc.chroma_location.av1_sample_position(),
++                )
++            } else {
++                ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN
++            },
+         };
+ 
+         let profile = match config.pixel_format {
+diff --git a/src/encoder/h264/session_params.rs b/src/encoder/h264/session_params.rs
+index c4d5aa7..0edb41e 100644
+--- a/src/encoder/h264/session_params.rs
++++ b/src/encoder/h264/session_params.rs
+@@ -75,6 +75,12 @@ impl H264 {
+         vui_flags.set_video_signal_type_present_flag(1);
+         vui_flags.set_video_full_range_flag(if desc.full_range { 1 } else { 0 });
+         vui_flags.set_color_description_present_flag(1);
++        // Chroma position is defined for 4:2:0 (ChromaArrayType 1) only.
++        let chroma_loc_type = desc
++            .chroma_location
++            .h26x_loc_type()
++            .filter(|_| config.pixel_format == PixelFormat::Yuv420);
++        vui_flags.set_chroma_loc_info_present_flag(u32::from(chroma_loc_type.is_some()));
+         // Avoid HRD with zeroed bitrates (device loss on some drivers).
+         vui_flags.set_nal_hrd_parameters_present_flag(0);
+         vui_flags.set_bitstream_restriction_flag(1);
+@@ -93,8 +99,8 @@ impl H264 {
+             time_scale: 0,
+             max_num_reorder_frames: if config.b_frame_count > 0 { 1 } else { 0 },
+             max_dec_frame_buffering: max_active + 1,
+-            chroma_sample_loc_type_top_field: 0,
+-            chroma_sample_loc_type_bottom_field: 0,
++            chroma_sample_loc_type_top_field: chroma_loc_type.unwrap_or(0),
++            chroma_sample_loc_type_bottom_field: chroma_loc_type.unwrap_or(0),
+             reserved1: 0,
+             pHrdParameters: ptr::null(),
+         };
+diff --git a/src/encoder/h265/session_params.rs b/src/encoder/h265/session_params.rs
+index d1f06c6..d902e2d 100644
+--- a/src/encoder/h265/session_params.rs
++++ b/src/encoder/h265/session_params.rs
+@@ -119,6 +119,11 @@ impl H265 {
+             ),
+         };
+ 
++        // Chroma position is defined for 4:2:0 (ChromaArrayType 1) only.
++        let chroma_loc_type = desc
++            .chroma_location
++            .h26x_loc_type()
++            .filter(|_| config.pixel_format == PixelFormat::Yuv420);
+         let vui_flags = ash::vk::native::StdVideoH265SpsVuiFlags {
+             _bitfield_align_1: [],
+             _bitfield_1: ash::vk::native::StdVideoH265SpsVuiFlags::new_bitfield_1(
+@@ -128,7 +133,7 @@ impl H265 {
+                 1,
+                 if desc.full_range { 1 } else { 0 },
+                 1,
+-                0,
++                u32::from(chroma_loc_type.is_some()),
+                 0,
+                 0,
+                 0,
+@@ -154,8 +159,8 @@ impl H265 {
+             colour_primaries: desc.color_primaries,
+             transfer_characteristics: desc.transfer_characteristics,
+             matrix_coeffs: desc.matrix_coefficients,
+-            chroma_sample_loc_type_top_field: 0,
+-            chroma_sample_loc_type_bottom_field: 0,
++            chroma_sample_loc_type_top_field: chroma_loc_type.unwrap_or(0),
++            chroma_sample_loc_type_bottom_field: chroma_loc_type.unwrap_or(0),
+             reserved1: 0,
+             reserved2: 0,
+             def_disp_win_left_offset: 0,
+diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
+index 52b3345..edce9f0 100644
+--- a/src/encoder/mod.rs
++++ b/src/encoder/mod.rs
+@@ -256,6 +256,50 @@ pub struct ColorDescription {
+     pub matrix_coefficients: u8,
+     /// Full range (true) or limited/TV range (false).
+     pub full_range: bool,
++    /// Where the producer placed 4:2:0 chroma samples; ignored for 4:4:4.
++    pub chroma_location: ChromaLocation,
++}
++
++/// Position of 4:2:0 chroma samples relative to the luma grid.
++///
++/// Decoders that receive no position assume [`ChromaLocation::Left`] (the
++/// H.264/H.265 default and libplacebo's/FFmpeg's assumption for AV1), so a
++/// producer that samples elsewhere must say so or reconstruct a shifted image.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum ChromaLocation {
++    /// Not signaled.
++    #[default]
++    Unspecified,
++    /// Horizontally co-sited with even luma columns, vertically between rows
++    /// (H.273 chroma_sample_loc_type 0, AV1 CSP_VERTICAL).
++    Left,
++    /// Centered in each 2x2 luma block, as a box filter produces
++    /// (chroma_sample_loc_type 1). AV1 has no code for it.
++    Center,
++    /// Co-sited with the top-left luma sample (chroma_sample_loc_type 2,
++    /// AV1 CSP_COLOCATED).
++    TopLeft,
++}
++
++impl ChromaLocation {
++    /// H.264/H.265 `chroma_sample_loc_type`, or `None` when not signaled.
++    pub fn h26x_loc_type(self) -> Option<u8> {
++        match self {
++            Self::Unspecified => None,
++            Self::Left => Some(0),
++            Self::Center => Some(1),
++            Self::TopLeft => Some(2),
++        }
++    }
++
++    /// AV1 `chroma_sample_position`: 0 unknown, 1 vertical, 2 co-located.
++    pub fn av1_sample_position(self) -> u8 {
++        match self {
++            Self::Left => 1,
++            Self::TopLeft => 2,
++            Self::Unspecified | Self::Center => 0,
++        }
++    }
+ }
+ 
+ impl ColorDescription {
+@@ -275,6 +319,7 @@ impl ColorDescription {
+             transfer_characteristics: Self::TRANSFER_BT709,
+             matrix_coefficients: Self::MATRIX_BT709,
+             full_range: false,
++            chroma_location: ChromaLocation::Unspecified,
+         }
+     }
+ 
+@@ -291,6 +336,7 @@ impl ColorDescription {
+             transfer_characteristics: Self::TRANSFER_SRGB,
+             matrix_coefficients: Self::MATRIX_BT709,
+             full_range: false,
++            chroma_location: ChromaLocation::Unspecified,
+         }
+     }
+ 
+@@ -301,6 +347,7 @@ impl ColorDescription {
+             transfer_characteristics: Self::TRANSFER_ST2084_PQ,
+             matrix_coefficients: Self::MATRIX_BT2020_NCL,
+             full_range: false,
++            chroma_location: ChromaLocation::Unspecified,
+         }
+     }
+ 
+@@ -310,6 +357,12 @@ impl ColorDescription {
+         self
+     }
+ 
++    /// Set the 4:2:0 chroma sample position the producer generates.
++    pub fn with_chroma_location(mut self, chroma_location: ChromaLocation) -> Self {
++        self.chroma_location = chroma_location;
++        self
++    }
++
+     /// Whether this description makes the stream HDR.
+     ///
+     /// The PQ (ST 2084) transfer function is what decides it; primaries and
+@@ -1160,6 +1213,20 @@ mod tests {
+             assert_eq!(cd.with_full_range(false), ColorDescription::bt709());
+         }
+ 
++        #[test]
++        fn test_chroma_location_codes() {
++            assert_eq!(ColorDescription::bt709().chroma_location, ChromaLocation::Unspecified);
++            assert_eq!(ChromaLocation::Unspecified.h26x_loc_type(), None);
++            assert_eq!(ChromaLocation::Left.h26x_loc_type(), Some(0));
++            assert_eq!(ChromaLocation::Center.h26x_loc_type(), Some(1));
++            assert_eq!(ChromaLocation::TopLeft.h26x_loc_type(), Some(2));
++            assert_eq!(ChromaLocation::Left.av1_sample_position(), 1);
++            assert_eq!(ChromaLocation::TopLeft.av1_sample_position(), 2);
++            assert_eq!(ChromaLocation::Center.av1_sample_position(), 0);
++            let cd = ColorDescription::srgb().with_chroma_location(ChromaLocation::Center);
++            assert_eq!(cd.with_chroma_location(ChromaLocation::Unspecified), ColorDescription::srgb());
++        }
++
+         #[test]
+         fn test_is_hdr() {
+             // The luma range doesn't decide it.
+diff --git a/src/lib.rs b/src/lib.rs
+index 9d42459..b55c586 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -369,7 +369,7 @@ pub use decoder::{
+     DecodeConfig, DecodeSink, DecodeSource, DecodeStatus, DecodedFrame, Decoder, FramePoll, Framing,
+ };
+ pub use encoder::{
+-    BitDepth as EncodeBitDepth, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
++    BitDepth as EncodeBitDepth, ChromaLocation, Codec, ColorDescription, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE,
+     DEFAULT_H264_QP, DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES,
+     DEFAULT_TARGET_BITRATE, EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint,
+     EncodedPacket, Encoder, EncoderCapabilities, EncoderTuningMode, FrameType, PixelFormat,
+-- 
+2.56.0
+

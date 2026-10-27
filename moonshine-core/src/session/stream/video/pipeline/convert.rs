@@ -39,10 +39,10 @@
 use std::sync::Arc;
 
 use ash::vk;
-use pixelforge::{Codec, ColorSpace, OutputFormat, VideoContext};
+use pixelforge::{Codec, VideoContext};
 
 use super::dmabuf::CachedImport;
-use crate::session::compositor::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
+use crate::session::capture::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
 
 /// Precompiled from `shaders/convert.comp` by `scripts/build-shaders.sh`.
 const CONVERT_SPIRV: &[u8] = include_bytes!("shaders/convert.spv");
@@ -86,14 +86,17 @@ struct PushConstants {
 	chroma_pitch: u32,
 	blocks_x: u32,
 	blocks_y: u32,
-	_padding: [u32; 3],
+	scaled: u32,
+	chroma_siting: u32,
+	_padding: u32,
 	layer_rect: [[i32; 4]; MAX_OVERLAYS],
 	layer_opacity: [f32; MAX_OVERLAYS],
 	layer_opaque: [u32; MAX_OVERLAYS],
+	viewport: [u32; 4],
 }
 
 // Every implementation supports at least 128 bytes of push constants.
-const _: () = assert!(std::mem::size_of::<PushConstants>() == 112);
+const _: () = assert!(std::mem::size_of::<PushConstants>() == 128);
 
 /// Where a late-composition layer's texels come from.
 pub(crate) enum LayerInput<'a> {
@@ -122,12 +125,28 @@ pub(crate) struct Layer<'a> {
 /// Layers bottom to top (notification, cursor).
 pub(crate) type Layers<'a> = [Option<Layer<'a>>; MAX_OVERLAYS];
 
-/// The image receiving the converted planes and the layout it is in before
-/// the conversion and must be left in afterwards.
+/// Where the converted planes are copied, for each encoder backend.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Target {
-	pub image: vk::Image,
-	pub layout: vk::ImageLayout,
+pub(crate) enum Target {
+	/// A multi-planar image addressed by plane aspects, and the layout it is
+	/// in before the conversion and must be left in afterwards.
+	Image { image: vk::Image, layout: vk::ImageLayout },
+	/// One single-plane image per output plane, imported from memory another
+	/// driver owns (the DMA-BUF layers of a VA-API surface). Their content is
+	/// replaced: each is acquired from `QUEUE_FAMILY_FOREIGN_EXT` without
+	/// preserving it and released back in `GENERAL` after the copy. The VA
+	/// driver is not the Vulkan driver, so `QUEUE_FAMILY_EXTERNAL` (same
+	/// device and driver identity) would not cover the hand-off; the context
+	/// must have `VK_EXT_queue_family_foreign` enabled.
+	ExternalPlanes { images: [vk::Image; 2], count: usize },
+	/// A buffer with exactly this converter's [`Layout`] that another API of
+	/// the same driver reads in place (an NVENC input buffer that CUDA
+	/// imported from an opaque FD). It receives a buffer copy between an
+	/// acquire from and a release to `QUEUE_FAMILY_EXTERNAL`: the external
+	/// reader observes the copy only through that release (and the host's
+	/// fence wait). The acquire does not preserve the previous content, which
+	/// the copy replaces entirely.
+	Buffer { buffer: vk::Buffer },
 }
 
 impl Target {
@@ -135,41 +154,123 @@ impl Target {
 	/// creation and leaves it in `VIDEO_ENCODE_SRC_KHR`, and every conversion
 	/// returns it there.
 	pub(crate) fn encoder_input(image: vk::Image) -> Self {
-		Self {
+		Self::Image {
 			image,
 			layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
 		}
 	}
 }
 
-/// Per-format sample sizes of the 2-plane (Y + interleaved CbCr) layouts.
+/// Output sample layout of a conversion.
+///
+/// The 2-plane layouts match Vulkan Video's input formats; the packed 4:4:4
+/// layouts are what VA-API (and NVENC for 8-bit) encode 4:4:4 from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ConvertFormat {
+	/// 8-bit luma plane, then interleaved CbCr at half width and height (NV12).
+	Nv12,
+	/// NV12 with 16-bit samples holding 10 bits in the high bits (P010).
+	P010,
+	/// 8-bit luma plane, then interleaved CbCr at full resolution
+	/// (`G8_B8R8_2PLANE_444_UNORM`).
+	Yuv444,
+	/// [`Self::Yuv444`] with P010-style 16-bit samples.
+	Yuv444P10,
+	/// One little-endian 32-bit word per pixel: Cr, Cb, Y and 0xFF from the
+	/// lowest byte. VA-API `XYUV`, DRM `XYUV8888` and NVENC `AYUV` share it.
+	Xyuv,
+	/// One little-endian 32-bit word per pixel: Cb in bits 0-9, Y in 10-19,
+	/// Cr in 20-29 and alpha 3 in 30-31 (VA-API and DRM `Y410`).
+	Y410,
+}
+
+impl ConvertFormat {
+	/// Bits per sample.
+	pub(crate) fn bit_depth(self) -> u32 {
+		match self {
+			Self::Nv12 | Self::Yuv444 | Self::Xyuv => 8,
+			Self::P010 | Self::Yuv444P10 | Self::Y410 => 10,
+		}
+	}
+
+	/// Whether chroma has half the luma width and height.
+	pub(crate) fn subsampled(self) -> bool {
+		matches!(self, Self::Nv12 | Self::P010)
+	}
+}
+
+/// Per-format sample sizes: the 2-plane (Y + interleaved CbCr) layouts, or a
+/// single plane of packed 4:4:4 words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FormatInfo {
-	/// Shader format code (Pixelforge's numbering).
+	/// Shader format code.
 	code: u32,
-	/// Bytes per luma sample.
+	/// Bytes per luma sample, or per pixel of a packed format.
 	luma_bytes: u32,
-	/// Bytes per CbCr pair.
+	/// Bytes per CbCr pair; 0 for packed formats (no chroma plane).
 	chroma_bytes: u32,
 	/// 4:2:0 (chroma at half width and height) rather than 4:4:4.
 	subsampled: bool,
 }
 
-fn format_info(format: OutputFormat) -> Option<FormatInfo> {
+impl FormatInfo {
+	fn packed(&self) -> bool {
+		self.chroma_bytes == 0
+	}
+}
+
+fn format_info(format: ConvertFormat) -> FormatInfo {
 	let info = |code, luma_bytes, chroma_bytes, subsampled| FormatInfo {
 		code,
 		luma_bytes,
 		chroma_bytes,
 		subsampled,
 	};
-	// I420 (3 planes) is never negotiated by Pyroshine.
 	match format {
-		OutputFormat::NV12 => Some(info(0, 1, 2, true)),
-		OutputFormat::YUV444 => Some(info(2, 1, 2, false)),
-		OutputFormat::P010 => Some(info(3, 2, 4, true)),
-		OutputFormat::YUV444P10 => Some(info(4, 2, 4, false)),
-		OutputFormat::I420 => None,
+		ConvertFormat::Nv12 => info(0, 1, 2, true),
+		ConvertFormat::Yuv444 => info(2, 1, 2, false),
+		ConvertFormat::P010 => info(3, 2, 4, true),
+		ConvertFormat::Yuv444P10 => info(4, 2, 4, false),
+		ConvertFormat::Xyuv => info(5, 4, 0, false),
+		ConvertFormat::Y410 => info(6, 4, 0, false),
 	}
+}
+
+/// Color conversion the shader applies, selecting the RGB to YCbCr matrix and,
+/// for HDR streams, the transfer from the captured buffer's color space.
+///
+/// Pixelforge's converter replaced its equivalent mode list with separate
+/// source and target color specifications; the shader here keeps one mode per
+/// supported capture-to-stream pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ColorSpace {
+	/// BT.709 SDR: the captured sRGB buffer is converted without transfer changes.
+	#[default]
+	Bt709,
+	/// BT.2020: the captured buffer is already wide gamut and PQ encoded (HDR10).
+	Bt2020,
+	/// sRGB input to BT.2020 + PQ: SDR content in an HDR stream. Applies the
+	/// inverse sRGB EOTF, BT.709 to BT.2020 gamut mapping and the PQ OETF.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "shader mode verified by the reference tests; no capture path selects it"
+		)
+	)]
+	SrgbToBt2020Pq,
+	/// scRGB input (linear BT.709, FP16) to BT.2020 + PQ, for
+	/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` content. The input is already
+	/// linear, so only gamut mapping and the PQ OETF apply.
+	Bt709LinearToBt2020Pq,
+	/// Gamma 2.2 input (BT.709 primaries) re-encoded with the sRGB transfer:
+	/// the stream signals sRGB, and a gamma 2.2 buffer passed through would
+	/// be decoded with the wrong curve (most visibly near black). This is the
+	/// conversion the compositor applies when it composes such a surface.
+	Gamma22ToSrgb,
+	/// BT.709/BT.601 video-transfer input (BT.709 primaries), decoded per
+	/// BT.1886 (gamma 2.4) and re-encoded with the sRGB transfer.
+	Bt1886ToSrgb,
 }
 
 fn color_space_code(color_space: ColorSpace) -> u32 {
@@ -178,6 +279,41 @@ fn color_space_code(color_space: ColorSpace) -> u32 {
 		ColorSpace::Bt2020 => 1,
 		ColorSpace::SrgbToBt2020Pq => 2,
 		ColorSpace::Bt709LinearToBt2020Pq => 3,
+		ColorSpace::Gamma22ToSrgb => 4,
+		ColorSpace::Bt1886ToSrgb => 5,
+	}
+}
+
+/// Where 4:2:0 chroma samples sit relative to the luma grid. The encoder
+/// signals the same position (see [`ChromaSiting::location`]); decoders that
+/// assume another one shift chroma by half a luma pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChromaSiting {
+	/// Centered in each 2x2 block: the mean of its four pixels. H.264 and
+	/// HEVC signal it as chroma_sample_loc_type 1.
+	#[default]
+	Center,
+	/// Horizontally co-sited with the even column and vertically centered:
+	/// a [1 2 1]/4 filter across the column and its neighbors, averaged over
+	/// both rows. AV1 cannot signal centered chroma, so it uses this
+	/// position (CSP_VERTICAL), which is also what decoders assume.
+	Left,
+}
+
+impl ChromaSiting {
+	fn code(self) -> u32 {
+		match self {
+			Self::Center => 0,
+			Self::Left => 1,
+		}
+	}
+
+	/// The position the encoder signals for this siting.
+	pub(crate) fn location(self) -> pixelforge::ChromaLocation {
+		match self {
+			Self::Center => pixelforge::ChromaLocation::Center,
+			Self::Left => pixelforge::ChromaLocation::Left,
+		}
 	}
 }
 
@@ -204,19 +340,25 @@ pub(crate) fn conversion_extent(codec: Codec, width: u32, height: u32) -> Result
 }
 
 /// Plane layout of the conversion buffer and of its copy into the encoder
-/// input image.
+/// input.
 ///
 /// Both planes start on a 32-bit word and every row is a whole number of
 /// words, so each word lies in one row and belongs to exactly one 4x2 block:
 /// luma rows hold `4 * blocks_x` samples, chroma rows hold the CbCr pairs of
-/// the same blocks (`2 * blocks_x` for 4:2:0, `4 * blocks_x` for 4:4:4). The
+/// the same blocks (`2 * blocks_x` for 4:2:0, `4 * blocks_x` for 4:4:4).
+/// Packed 4:4:4 formats have one plane of one word per pixel. The
 /// copy regions address the conversion extent through `bufferRowLength`, so
 /// the samples past it are never copied. Word-aligned offsets also satisfy
 /// `VkBufferImageCopy::bufferOffset` (a multiple of each plane's element
 /// size, at most four bytes) on any queue family.
+///
+/// [`Self::aligned`] pads rows to a byte alignment for a [`Target::Buffer`]
+/// read in place: there every plane shares the luma row pitch in bytes
+/// (4:2:0) and the chroma plane starts right after the last luma row, which is
+/// how NVENC addresses a registered pitched buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
-	pub format: OutputFormat,
+	pub format: ConvertFormat,
 	info: FormatInfo,
 	/// Conversion extent copied into the target image.
 	pub extent: (u32, u32),
@@ -233,8 +375,22 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-	pub(crate) fn new(format: OutputFormat, (width, height): (u32, u32)) -> Result<Self, String> {
-		let info = format_info(format).ok_or_else(|| format!("unsupported output format {format:?}"))?;
+	#[cfg(test)]
+	pub(crate) fn new(format: ConvertFormat, extent: (u32, u32)) -> Result<Self, String> {
+		Self::aligned(format, extent, 4)
+	}
+
+	/// A layout whose row pitches are multiples of `row_alignment` bytes (a
+	/// multiple of four).
+	pub(crate) fn aligned(
+		format: ConvertFormat,
+		(width, height): (u32, u32),
+		row_alignment: u32,
+	) -> Result<Self, String> {
+		let info = format_info(format);
+		if row_alignment == 0 || !row_alignment.is_multiple_of(4) {
+			return Err(format!("row alignment {row_alignment} is not a multiple of four bytes"));
+		}
 		if width == 0 || height == 0 {
 			return Err(format!("empty conversion extent {width}x{height}"));
 		}
@@ -245,11 +401,24 @@ impl Layout {
 		}
 		let blocks_x = u64::from(width.div_ceil(BLOCK_WIDTH));
 		let blocks_y = u64::from(height.div_ceil(BLOCK_HEIGHT));
-		let luma_pitch = blocks_x * u64::from(info.luma_bytes);
-		let (chroma_pitch, chroma_rows) = if info.subsampled {
-			(blocks_x * 2 * u64::from(info.chroma_bytes) / 4, blocks_y)
+		let alignment_words = u64::from(row_alignment / 4);
+		// Words per row before alignment, then the chroma rows' share of it:
+		// equal for 4:2:0 (half as many pairs of twice the size), twice the
+		// luma width for 2-plane 4:4:4, none for packed formats.
+		let luma_words = blocks_x * u64::from(info.luma_bytes);
+		let luma_pitch = luma_words.next_multiple_of(alignment_words);
+		let (chroma_pitch, chroma_rows) = if info.packed() {
+			(0, 0)
+		} else if info.subsampled {
+			(
+				luma_pitch * 2 * u64::from(info.chroma_bytes) / 4 / u64::from(info.luma_bytes),
+				blocks_y,
+			)
 		} else {
-			(blocks_x * u64::from(info.chroma_bytes), blocks_y * 2)
+			(
+				luma_pitch * u64::from(info.chroma_bytes) / u64::from(info.luma_bytes),
+				blocks_y * 2,
+			)
 		};
 		let chroma_offset = luma_pitch * blocks_y * 2;
 		let words = chroma_offset + chroma_pitch * chroma_rows;
@@ -279,8 +448,34 @@ impl Layout {
 		}
 	}
 
-	/// Luma and chroma `VkBufferImageCopy` regions.
+	/// Number of output planes (2, or 1 for packed formats).
+	pub(crate) fn plane_count(&self) -> usize {
+		if self.info.packed() { 1 } else { 2 }
+	}
+
+	/// Row pitch of the luma (or packed) plane in bytes.
+	pub(crate) fn row_pitch_bytes(&self) -> u32 {
+		self.luma_pitch * 4
+	}
+
+	/// Rows of the luma plane in the buffer: the conversion height rounded up
+	/// to the 4x2 block grid. The chroma plane follows them.
+	pub(crate) fn luma_rows(&self) -> u32 {
+		self.blocks.1 * BLOCK_HEIGHT
+	}
+
+	/// Plane regions for a multi-planar target ([`Target::Image`]); only the
+	/// first [`Self::plane_count`] are used.
 	pub(crate) fn copy_regions(&self) -> [vk::BufferImageCopy; 2] {
+		self.plane_regions([vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1])
+	}
+
+	/// The same regions for per-plane images ([`Target::ExternalPlanes`]).
+	pub(crate) fn plane_image_regions(&self) -> [vk::BufferImageCopy; 2] {
+		self.plane_regions([vk::ImageAspectFlags::COLOR; 2])
+	}
+
+	fn plane_regions(&self, aspects: [vk::ImageAspectFlags; 2]) -> [vk::BufferImageCopy; 2] {
 		let region = |offset, row_length, aspect, (width, height)| vk::BufferImageCopy {
 			buffer_offset: offset,
 			buffer_row_length: row_length,
@@ -298,19 +493,20 @@ impl Layout {
 				depth: 1,
 			},
 		};
-		[
-			region(
-				0,
-				self.luma_pitch * 4 / self.info.luma_bytes,
-				vk::ImageAspectFlags::PLANE_0,
-				self.extent,
-			),
+		let chroma = if self.info.packed() {
+			// Unused: packed formats have one plane.
+			region(0, 0, aspects[1], (0, 0))
+		} else {
 			region(
 				u64::from(self.chroma_offset) * 4,
 				self.chroma_pitch * 4 / self.info.chroma_bytes,
-				vk::ImageAspectFlags::PLANE_1,
+				aspects[1],
 				self.chroma_extent(),
-			),
+			)
+		};
+		[
+			region(0, self.luma_pitch * 4 / self.info.luma_bytes, aspects[0], self.extent),
+			chroma,
 		]
 	}
 
@@ -319,6 +515,9 @@ impl Layout {
 	pub(crate) fn read_planes(&self, bytes: &[u8]) -> Result<reference::Planes, String> {
 		if (bytes.len() as u64) < self.size {
 			return Err(format!("buffer holds {} of {} bytes", bytes.len(), self.size));
+		}
+		if self.info.packed() {
+			return self.read_packed(bytes);
 		}
 		let ten_bit = self.info.luma_bytes == 2;
 		let sample = |offset: usize| -> Result<u16, String> {
@@ -350,6 +549,40 @@ impl Layout {
 		}
 		Ok(planes)
 	}
+
+	/// [`Self::read_planes`] for the packed 4:4:4 formats.
+	fn read_packed(&self, bytes: &[u8]) -> Result<reference::Planes, String> {
+		let (width, height) = self.extent;
+		let mut planes = reference::Planes::new(self.extent, self.extent);
+		for y in 0..height as usize {
+			for x in 0..width as usize {
+				let offset = y * self.luma_pitch as usize * 4 + x * 4;
+				let word = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+				let index = y * width as usize + x;
+				let (luma, cb, cr) = match self.format {
+					ConvertFormat::Xyuv => {
+						if word >> 24 != 0xff {
+							return Err(format!(
+								"XYUV word 0x{word:08x} at byte {offset} has alpha other than 0xff"
+							));
+						}
+						((word >> 16) & 0xff, (word >> 8) & 0xff, word & 0xff)
+					},
+					_ => {
+						if word >> 30 != 3 {
+							return Err(format!(
+								"Y410 word 0x{word:08x} at byte {offset} has alpha other than 3"
+							));
+						}
+						((word >> 10) & 0x3ff, word & 0x3ff, (word >> 20) & 0x3ff)
+					},
+				};
+				planes.luma[index] = luma as u16;
+				planes.chroma[index] = [cb as u16, cr as u16];
+			}
+		}
+		Ok(planes)
+	}
 }
 
 /// Independent CPU definition of the conversion, used by the creation-time
@@ -360,11 +593,13 @@ impl Layout {
 /// scaled B-Y and R-Y differences, SMPTE ST 2084 (PQ), the IEC 61966-2-1 sRGB
 /// decoding function, the Rec. ITU-R BT.2087 primaries conversion, and the
 /// Rec. ITU-R BT.2100 / ITU-T H.273 quantization with round-to-nearest. 4:2:0
-/// chroma is the mean of the 2x2 co-sited pixels; pixels past the frame
+/// chroma is the mean of the 2x2 co-sited pixels ([`ChromaSiting::Center`])
+/// or, left-sited, the [1 2 1]/4 horizontal filter around the even column
+/// averaged over both rows; pixels past the frame (also left of it)
 /// replicate its nearest edge pixel. Arithmetic is in f64, so the GPU (f32)
 /// may differ by one code where a value lies on a rounding boundary.
 pub(crate) mod reference {
-	use pixelforge::{ColorSpace, OutputFormat};
+	use super::{ChromaSiting, ColorSpace, ConvertFormat};
 
 	/// Color conversion parameters of one frame.
 	#[derive(Clone, Copy, Debug)]
@@ -373,6 +608,8 @@ pub(crate) mod reference {
 		pub full_range: bool,
 		/// Nits of the SDR/scRGB reference white in the PQ conversions.
 		pub sdr_white_nits: f32,
+		/// 4:2:0 chroma position; ignored for 4:4:4.
+		pub siting: ChromaSiting,
 	}
 
 	/// Code values of both planes over an extent. 10-bit samples are stored
@@ -416,6 +653,15 @@ pub(crate) mod reference {
 		}
 	}
 
+	fn linear_to_srgb(value: f64) -> f64 {
+		let value = value.clamp(0.0, 1.0);
+		if value <= 0.003_130_8 {
+			value * 12.92
+		} else {
+			1.055 * value.powf(1.0 / 2.4) - 0.055
+		}
+	}
+
 	fn bt709_to_bt2020([r, g, b]: [f64; 3]) -> [f64; 3] {
 		[
 			0.6274 * r + 0.3293 * g + 0.0433 * b,
@@ -433,9 +679,11 @@ pub(crate) mod reference {
 			ColorSpace::Bt709 | ColorSpace::Bt2020 => rgb,
 			ColorSpace::SrgbToBt2020Pq => bt709_to_bt2020(rgb.map(srgb_to_linear)).map(|c| pq(c * scale)),
 			ColorSpace::Bt709LinearToBt2020Pq => bt709_to_bt2020(rgb).map(|c| pq(c * scale)),
+			ColorSpace::Gamma22ToSrgb => rgb.map(|c| linear_to_srgb(c.clamp(0.0, 1.0).powf(2.2))),
+			ColorSpace::Bt1886ToSrgb => rgb.map(|c| linear_to_srgb(c.clamp(0.0, 1.0).powf(2.4))),
 		};
 		let (kr, kb) = match color.space {
-			ColorSpace::Bt709 => (0.2126, 0.0722),
+			ColorSpace::Bt709 | ColorSpace::Gamma22ToSrgb | ColorSpace::Bt1886ToSrgb => (0.2126, 0.0722),
 			_ => (0.2627, 0.0593),
 		};
 		let [r, g, b] = signal;
@@ -479,19 +727,14 @@ pub(crate) mod reference {
 	/// are left zero (and skipped by [`compare`]); chroma rows follow their
 	/// first luma row.
 	pub(crate) fn convert(
-		format: OutputFormat,
+		format: ConvertFormat,
 		color: Color,
 		frame: (u32, u32),
 		extent: (u32, u32),
 		rgb: &dyn Fn(u32, u32) -> [f32; 3],
 		row: &dyn Fn(u32) -> bool,
 	) -> Planes {
-		let (bits, subsampled) = match format {
-			OutputFormat::NV12 => (8, true),
-			OutputFormat::P010 => (10, true),
-			OutputFormat::YUV444 | OutputFormat::I420 => (8, false),
-			OutputFormat::YUV444P10 => (10, false),
-		};
+		let (bits, subsampled) = (format.bit_depth(), format.subsampled());
 		let chroma_extent = if subsampled {
 			(extent.0.div_ceil(2), extent.1.div_ceil(2))
 		} else {
@@ -514,14 +757,21 @@ pub(crate) mod reference {
 						chroma_code(cr, bits, color.full_range),
 					];
 				} else if y % 2 == 0 && x % 2 == 0 {
+					// (column, weight) taps on both rows, and the weight sum.
+					let (taps, total): (&[(u32, f64)], f64) = match color.siting {
+						ChromaSiting::Center => (&[(x, 1.0), (x + 1, 1.0)], 4.0),
+						ChromaSiting::Left => (&[(x.saturating_sub(1), 1.0), (x, 2.0), (x + 1, 1.0)], 8.0),
+					};
 					let mut sum = [0.0; 2];
-					for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-						let [_, cb, cr] = at(x + dx, y + dy);
-						sum[0] += cb;
-						sum[1] += cr;
+					for dy in 0..2 {
+						for &(tx, weight) in taps {
+							let [_, cb, cr] = at(tx, y + dy);
+							sum[0] += weight * cb;
+							sum[1] += weight * cr;
+						}
 					}
 					let index = (y / 2) as usize * chroma_extent.0 as usize + (x / 2) as usize;
-					planes.chroma[index] = sum.map(|s| chroma_code(s / 4.0, bits, color.full_range));
+					planes.chroma[index] = sum.map(|s| chroma_code(s / total, bits, color.full_range));
 				}
 			}
 		}
@@ -634,6 +884,40 @@ fn color_range() -> vk::ImageSubresourceRange {
 	}
 }
 
+/// The queue family a captured DMA-BUF is acquired from. Its producer (a
+/// game's GL or Vulkan driver, XWayland, the compositor's EGL) is generally
+/// not this Vulkan driver, which `QUEUE_FAMILY_FOREIGN_EXT` describes;
+/// `QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity
+/// and remains the fallback on a driver without `VK_EXT_queue_family_foreign`.
+fn dmabuf_producer_family(has_queue_family_foreign: bool) -> u32 {
+	if has_queue_family_foreign {
+		vk::QUEUE_FAMILY_FOREIGN_EXT
+	} else {
+		vk::QUEUE_FAMILY_EXTERNAL
+	}
+}
+
+/// The barriers around a copy into `buffer`, which a reader of the same
+/// driver outside Vulkan (CUDA, for NVENC) consumes in place: ownership is
+/// acquired from `QUEUE_FAMILY_EXTERNAL` before the copy (discarding the
+/// content, which the copy replaces) and released back to it afterwards, which
+/// makes the write available to the external reader.
+fn external_buffer_handoff(buffer: vk::Buffer, queue_family: u32) -> [vk::BufferMemoryBarrier<'static>; 2] {
+	let barrier = vk::BufferMemoryBarrier::default().buffer(buffer).size(vk::WHOLE_SIZE);
+	[
+		barrier
+			.src_access_mask(vk::AccessFlags::empty())
+			.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+			.src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+			.dst_queue_family_index(queue_family),
+		barrier
+			.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+			.dst_access_mask(vk::AccessFlags::empty())
+			.src_queue_family_index(queue_family)
+			.dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL),
+	]
+}
+
 fn find_memory_type(context: &VideoContext, type_bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32, String> {
 	// SAFETY: plain physical-device property query.
 	let properties = unsafe {
@@ -741,6 +1025,8 @@ struct SourceBinding {
 	image: vk::Image,
 	view: vk::ImageView,
 	extent: (u32, u32),
+	/// Scale the whole source onto the frame instead of sampling 1:1.
+	scaled: bool,
 	/// First use of an imported (EXCLUSIVE, external) image: acquire it.
 	first_use: bool,
 }
@@ -749,6 +1035,9 @@ pub(crate) struct InputConverter {
 	context: VideoContext,
 	queue: vk::Queue,
 	queue_family: u32,
+	/// The queue family captured DMA-BUFs are acquired from (see
+	/// [`dmabuf_producer_family`]).
+	producer_family: u32,
 	/// Whether conversion runs on a dedicated compute family.
 	pub(crate) async_compute: bool,
 	/// Frame (logical) extent.
@@ -758,6 +1047,7 @@ pub(crate) struct InputConverter {
 	color_space: ColorSpace,
 	full_range: bool,
 	sdr_white_nits: f32,
+	chroma_siting: ChromaSiting,
 	set_layout: vk::DescriptorSetLayout,
 	pipeline_layout: vk::PipelineLayout,
 	pipeline: vk::Pipeline,
@@ -793,12 +1083,14 @@ impl InputConverter {
 	/// and its output is compared with [`reference`]; a mismatch is returned
 	/// as an error that locates the defect, since every frame would be
 	/// corrupted the same way.
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		context: VideoContext,
 		mode: ConversionQueueMode,
 		frame: (u32, u32),
 		extent: (u32, u32),
-		output_format: OutputFormat,
+		output_format: ConvertFormat,
+		row_alignment: u32,
 		color_space: ColorSpace,
 		full_range: bool,
 	) -> Result<Self, ConverterError> {
@@ -808,6 +1100,7 @@ impl InputConverter {
 			frame,
 			extent,
 			output_format,
+			row_alignment,
 			color_space,
 			full_range,
 			false,
@@ -823,7 +1116,8 @@ impl InputConverter {
 		mode: ConversionQueueMode,
 		(width, height): (u32, u32),
 		extent: (u32, u32),
-		output_format: OutputFormat,
+		output_format: ConvertFormat,
+		row_alignment: u32,
 		color_space: ColorSpace,
 		full_range: bool,
 		readback: bool,
@@ -834,7 +1128,7 @@ impl InputConverter {
 				extent.0, extent.1
 			));
 		}
-		let layout = Layout::new(output_format, extent)?;
+		let layout = Layout::aligned(output_format, extent, row_alignment)?;
 		let limits = context.device_properties().limits;
 		if layout.size > u64::from(limits.max_storage_buffer_range) {
 			return Err(format!(
@@ -863,22 +1157,25 @@ impl InputConverter {
 				.instance()
 				.get_physical_device_queue_family_properties(context.physical_device())
 		};
-		let dedicated = context.transfer_queue_family();
-		let dedicated_compute = dedicated != context.compute_queue_family()
-			&& families.get(dedicated as usize).is_some_and(|family| {
-				family.queue_flags.contains(vk::QueueFlags::COMPUTE)
-					&& !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-			});
+		// Pixelforge's compute family is one without graphics when the device
+		// has one; its graphics family is the graphics-and-compute family and
+		// equals the compute family on devices without a dedicated one.
+		let compute = context.compute_queue_family();
+		let dedicated_compute = families.get(compute as usize).is_some_and(|family| {
+			family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+				&& !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+		});
 		let use_dedicated = dedicated_compute && mode != ConversionQueueMode::Graphics;
 		if mode == ConversionQueueMode::Compute && !dedicated_compute && !readback {
 			tracing::warn!("No dedicated compute queue family is available; converting on the graphics family");
 		}
 		// The encoder input image is shared CONCURRENTLY by Pixelforge between
-		// its encode, transfer and compute families, so either family may write it.
+		// its encode, transfer, compute and graphics families, so either
+		// conversion family may write it.
 		let (queue_family, queue) = if use_dedicated {
-			(dedicated, context.transfer_queue())
+			(compute, context.compute_queue())
 		} else {
-			(context.compute_queue_family(), context.compute_queue())
+			(context.graphics_queue_family(), context.graphics_queue())
 		};
 		let timestamps = families
 			.get(queue_family as usize)
@@ -887,6 +1184,7 @@ impl InputConverter {
 		let mut converter = Self {
 			queue,
 			queue_family,
+			producer_family: dmabuf_producer_family(context.has_queue_family_foreign()),
 			async_compute: use_dedicated,
 			width,
 			height,
@@ -894,6 +1192,7 @@ impl InputConverter {
 			color_space,
 			full_range,
 			sdr_white_nits: 203.0,
+			chroma_siting: ChromaSiting::Center,
 			set_layout: vk::DescriptorSetLayout::null(),
 			pipeline_layout: vk::PipelineLayout::null(),
 			pipeline: vk::Pipeline::null(),
@@ -998,8 +1297,10 @@ impl InputConverter {
 			self.sampler = device
 				.create_sampler(
 					&vk::SamplerCreateInfo::default()
-						.mag_filter(vk::Filter::NEAREST)
-						.min_filter(vk::Filter::NEAREST)
+						// texelFetch (1:1 sampling) ignores filtering; the
+						// scaled path samples bilinearly.
+						.mag_filter(vk::Filter::LINEAR)
+						.min_filter(vk::Filter::LINEAR)
 						.address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
 						.address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
 						.address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
@@ -1122,6 +1423,12 @@ impl InputConverter {
 		self.color_space = color_space;
 		self.full_range = full_range;
 		self.sdr_white_nits = sdr_white_nits;
+	}
+
+	/// Select the 4:2:0 chroma position (ignored for 4:4:4 output). Both
+	/// positions are verified by the creation-time self-check.
+	pub(crate) fn set_chroma_siting(&mut self, siting: ChromaSiting) {
+		self.chroma_siting = siting;
 	}
 
 	/// (Re)allocate a slot's upload texture and staging buffer for `width` x `height`.
@@ -1349,6 +1656,7 @@ impl InputConverter {
 		source: &Arc<CachedImport>,
 		source_format: vk::Format,
 		first_use: bool,
+		scaled: bool,
 		layers: &Layers<'_>,
 		target: Target,
 	) -> Result<ConvertOutcome, vk::Result> {
@@ -1360,6 +1668,8 @@ impl InputConverter {
 			image: source.image(),
 			view,
 			extent: source.extent(),
+			// A 1:1 source needs no filtering, whatever the frame asked.
+			scaled: scaled && source.extent() != (self.width, self.height),
 			first_use,
 		};
 		let outcome = self.dispatch(&binding, layers, Some(target))?;
@@ -1392,10 +1702,17 @@ impl InputConverter {
 			chroma_pitch: layout.chroma_pitch,
 			blocks_x: layout.blocks.0,
 			blocks_y: layout.blocks.1,
-			_padding: [0; 3],
+			scaled: u32::from(source.scaled),
+			chroma_siting: self.chroma_siting.code(),
+			_padding: 0,
 			layer_rect: [[0; 4]; MAX_OVERLAYS],
 			layer_opacity: [0.0; MAX_OVERLAYS],
 			layer_opaque: [0; MAX_OVERLAYS],
+			viewport: {
+				let (x, y, w, h) =
+					crate::session::capture::frame::fit_viewport(source.extent, (self.width, self.height));
+				[x, y, w, h]
+			},
 		};
 		// Per slot: the view to bind, whether staged texels must be uploaded,
 		// and an imported image with its first-use flag (needs acquire/release).
@@ -1482,9 +1799,9 @@ impl InputConverter {
 			}
 
 			// The first use of an imported (EXCLUSIVE) DMA-BUF acquires it from
-			// the external owner; later uses start from the GENERAL layout left
-			// below. Imported layers are client DMA-BUFs and follow the same
-			// protocol.
+			// its producer (`producer_family`); later uses start from the
+			// GENERAL layout left below. Imported layers are client DMA-BUFs and
+			// follow the same protocol.
 			let acquire = |image: vk::Image, first_use: bool| {
 				vk::ImageMemoryBarrier::default()
 					.old_layout(if first_use {
@@ -1494,7 +1811,7 @@ impl InputConverter {
 					})
 					.new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
 					.src_queue_family_index(if first_use {
-						vk::QUEUE_FAMILY_EXTERNAL
+						self.producer_family
 					} else {
 						vk::QUEUE_FAMILY_IGNORED
 					})
@@ -1724,19 +2041,23 @@ impl InputConverter {
 
 	/// Record the copy of the output buffer into `target` after `writer`
 	/// (the dispatch in this command buffer, or a completed earlier one)
-	/// wrote the buffer, leaving `target` in its layout.
+	/// wrote the buffer, leaving `target` ready for its encoder.
+	///
+	/// The encode that reads the target is submitted after the host observed
+	/// this submission's fence, so no barrier orders the copy against it; the
+	/// target's previous reader (an encode) completed before its encoder handed
+	/// the target out again.
 	///
 	/// # Safety
 	///
-	/// `cmd` is recording on this converter's queue family.
+	/// `cmd` is recording on this converter's queue family, and every target
+	/// handle belongs to this converter's device.
 	unsafe fn record_copy(&self, cmd: vk::CommandBuffer, writer: BufferWriter, target: Target) {
 		let (src_stage, src_access) = match writer {
 			BufferWriter::Dispatch => (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE),
 			BufferWriter::Completed => (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_WRITE),
 		};
 		let device = self.context.device();
-		// Buffer writes -> copy; target -> TRANSFER_DST. The target's previous
-		// reader (an encode) completed before Pixelforge returned the slot.
 		let buffer_barrier = [vk::BufferMemoryBarrier::default()
 			.src_access_mask(src_access)
 			.dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1744,56 +2065,151 @@ impl InputConverter {
 			.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
 			.buffer(self.output_buffer)
 			.size(vk::WHOLE_SIZE)];
-		let image_barrier = |old, new, src, dst| {
-			[vk::ImageMemoryBarrier::default()
+		let image_barrier = |image, old, new, src, dst, (src_family, dst_family)| {
+			vk::ImageMemoryBarrier::default()
 				.src_access_mask(src)
 				.dst_access_mask(dst)
 				.old_layout(old)
 				.new_layout(new)
-				.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-				.image(target.image)
-				.subresource_range(color_range())]
+				.src_queue_family_index(src_family)
+				.dst_queue_family_index(dst_family)
+				.image(image)
+				.subresource_range(color_range())
 		};
+		let ignored = (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED);
 		// SAFETY: guaranteed by the caller.
 		unsafe {
-			device.cmd_pipeline_barrier(
-				cmd,
-				src_stage,
-				vk::PipelineStageFlags::TRANSFER,
-				vk::DependencyFlags::empty(),
-				&[],
-				&buffer_barrier,
-				&image_barrier(
-					target.layout,
-					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-					vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-					vk::AccessFlags::TRANSFER_WRITE,
-				),
-			);
-			device.cmd_copy_buffer_to_image(
-				cmd,
-				self.output_buffer,
-				target.image,
-				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-				&self.layout.copy_regions(),
-			);
-			// The encode that reads the target is submitted after the host
-			// observed this submission's fence.
-			device.cmd_pipeline_barrier(
-				cmd,
-				vk::PipelineStageFlags::TRANSFER,
-				vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-				vk::DependencyFlags::empty(),
-				&[],
-				&[],
-				&image_barrier(
-					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-					target.layout,
-					vk::AccessFlags::TRANSFER_WRITE,
-					vk::AccessFlags::empty(),
-				),
-			);
+			match target {
+				Target::Image { image, layout } => {
+					device.cmd_pipeline_barrier(
+						cmd,
+						src_stage,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&buffer_barrier,
+						&[image_barrier(
+							image,
+							layout,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+							vk::AccessFlags::TRANSFER_WRITE,
+							ignored,
+						)],
+					);
+					let regions = self.layout.copy_regions();
+					device.cmd_copy_buffer_to_image(
+						cmd,
+						self.output_buffer,
+						image,
+						vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+						&regions[..self.layout.plane_count()],
+					);
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&[image_barrier(
+							image,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							layout,
+							vk::AccessFlags::TRANSFER_WRITE,
+							vk::AccessFlags::empty(),
+							ignored,
+						)],
+					);
+				},
+				Target::ExternalPlanes { images, count } => {
+					let count = count.min(self.layout.plane_count());
+					// Acquire without preserving: the copy replaces every texel
+					// the encoder reads (the surface measures the conversion extent).
+					let acquire: Vec<_> = images[..count]
+						.iter()
+						.map(|&image| {
+							image_barrier(
+								image,
+								vk::ImageLayout::UNDEFINED,
+								vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+								vk::AccessFlags::empty(),
+								vk::AccessFlags::TRANSFER_WRITE,
+								(vk::QUEUE_FAMILY_FOREIGN_EXT, self.queue_family),
+							)
+						})
+						.collect();
+					device.cmd_pipeline_barrier(
+						cmd,
+						src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&buffer_barrier,
+						&acquire,
+					);
+					let regions = self.layout.plane_image_regions();
+					for (image, region) in images[..count].iter().zip(regions.iter()) {
+						device.cmd_copy_buffer_to_image(
+							cmd,
+							self.output_buffer,
+							*image,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							std::slice::from_ref(region),
+						);
+					}
+					let release: Vec<_> = images[..count]
+						.iter()
+						.map(|&image| {
+							image_barrier(
+								image,
+								vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+								vk::ImageLayout::GENERAL,
+								vk::AccessFlags::TRANSFER_WRITE,
+								vk::AccessFlags::empty(),
+								(self.queue_family, vk::QUEUE_FAMILY_FOREIGN_EXT),
+							)
+						})
+						.collect();
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&release,
+					);
+				},
+				Target::Buffer { buffer } => {
+					let [acquire, release] = external_buffer_handoff(buffer, self.queue_family);
+					device.cmd_pipeline_barrier(
+						cmd,
+						src_stage | vk::PipelineStageFlags::TOP_OF_PIPE,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[buffer_barrier[0], acquire],
+						&[],
+					);
+					device.cmd_copy_buffer(
+						cmd,
+						self.output_buffer,
+						buffer,
+						&[vk::BufferCopy::default().size(self.layout.size)],
+					);
+					// Release the copy to the external reader before the fence.
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[release],
+						&[],
+					);
+				},
+			}
 		}
 	}
 
@@ -1825,7 +2241,7 @@ impl InputConverter {
 	/// Static-scene recovery needs this: the encoder rotates its input slots,
 	/// so the current slot never holds the latest frame (review 2026-10-05
 	/// BUG-002).
-	pub(crate) fn copy_last_output(&self, target: vk::Image) -> Result<bool, vk::Result> {
+	pub(crate) fn copy_last_output(&self, target: Target) -> Result<bool, vk::Result> {
 		if !self.output_valid {
 			return Ok(false);
 		}
@@ -1839,7 +2255,7 @@ impl InputConverter {
 				cmd,
 				&vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
 			)?;
-			self.record_copy(cmd, BufferWriter::Completed, Target::encoder_input(target));
+			self.record_copy(cmd, BufferWriter::Completed, target);
 			device.end_command_buffer(cmd)?;
 			if let Err(e) = self.submit_and_wait(cmd) {
 				// A failed wait leaves the submission state unknown; idle the
@@ -1918,7 +2334,7 @@ impl From<SelfCheckFailure> for ConverterError {
 /// A self-check that ran and produced wrong output (or could not run).
 #[derive(Debug)]
 pub(crate) struct SelfCheckFailure {
-	pub format: OutputFormat,
+	pub format: ConvertFormat,
 	/// Where the output differs (plane and block column), or why the check
 	/// could not run.
 	pub detail: String,
@@ -1935,13 +2351,14 @@ impl std::fmt::Display for SelfCheckFailure {
 }
 
 /// Operator name of a converter output format and its stream profile.
-pub(crate) fn format_label(format: OutputFormat) -> &'static str {
+pub(crate) fn format_label(format: ConvertFormat) -> &'static str {
 	match format {
-		OutputFormat::NV12 => "4:2:0 8-bit (NV12)",
-		OutputFormat::P010 => "4:2:0 10-bit (P010)",
-		OutputFormat::YUV444 => "4:4:4 8-bit",
-		OutputFormat::YUV444P10 => "4:4:4 10-bit",
-		OutputFormat::I420 => "4:2:0 8-bit (I420)",
+		ConvertFormat::Nv12 => "4:2:0 8-bit (NV12)",
+		ConvertFormat::P010 => "4:2:0 10-bit (P010)",
+		ConvertFormat::Yuv444 => "4:4:4 8-bit",
+		ConvertFormat::Yuv444P10 => "4:4:4 10-bit",
+		ConvertFormat::Xyuv => "4:4:4 8-bit (packed XYUV)",
+		ConvertFormat::Y410 => "4:4:4 10-bit (packed Y410)",
 	}
 }
 
@@ -1952,14 +2369,14 @@ pub(crate) fn format_label(format: OutputFormat) -> &'static str {
 pub(crate) fn self_check(
 	context: &VideoContext,
 	mode: ConversionQueueMode,
-	format: OutputFormat,
+	format: ConvertFormat,
 ) -> Result<(), SelfCheckFailure> {
 	self_check_inner(context, mode, format).map_err(|detail| SelfCheckFailure { format, detail })
 }
 
-fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: OutputFormat) -> Result<(), String> {
+fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: ConvertFormat) -> Result<(), String> {
 	let frame = SELF_CHECK_FRAME;
-	let subsampled = format_info(format).is_some_and(|info| info.subsampled);
+	let subsampled = format.subsampled();
 	let extent = if subsampled {
 		(frame.0.next_multiple_of(2), frame.1.next_multiple_of(2))
 	} else {
@@ -1971,6 +2388,7 @@ fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: O
 		frame,
 		extent,
 		format,
+		4,
 		ColorSpace::Bt709,
 		false,
 		true,
@@ -1979,36 +2397,50 @@ fn self_check_inner(context: &VideoContext, mode: ConversionQueueMode, format: O
 		.flat_map(|y| (0..frame.0).flat_map(move |x| self_check_pixel(x, y)))
 		.collect();
 	let source = SelfCheckSource::new(&converter, frame, &pixels)?;
-	converter
-		.dispatch(
-			&SourceBinding {
-				image: source.image,
-				view: source.view,
-				extent: frame,
-				first_use: false,
-			},
-			&[None, None],
-			None,
-		)
-		.map_err(|e| format!("conversion failed: {e}"))?;
-	let actual = converter.layout().read_planes(converter.readback())?;
 	let rgb = |x: u32, y: u32| {
 		let [r, g, b, _] = self_check_pixel(x, y);
 		[r, g, b].map(|c| f32::from(c) / 255.0)
 	};
-	let expected = reference::convert(
-		format,
-		reference::Color {
-			space: ColorSpace::Bt709,
-			full_range: false,
-			sdr_white_nits: 203.0,
-		},
-		frame,
-		extent,
-		&rgb,
-		&|_| true,
-	);
-	reference::compare(&expected, &actual, 1, &|_| true).map(|_| ())
+	// The encoder selects the chroma position by codec after creation;
+	// verify every position this format can use.
+	let sitings: &[ChromaSiting] = if subsampled {
+		&[ChromaSiting::Center, ChromaSiting::Left]
+	} else {
+		&[ChromaSiting::Center]
+	};
+	for &siting in sitings {
+		converter.set_chroma_siting(siting);
+		converter
+			.dispatch(
+				&SourceBinding {
+					image: source.image,
+					view: source.view,
+					extent: frame,
+					scaled: false,
+					first_use: false,
+				},
+				&[None, None],
+				None,
+			)
+			.map_err(|e| format!("conversion failed: {e}"))?;
+		let actual = converter.layout().read_planes(converter.readback())?;
+		let expected = reference::convert(
+			format,
+			reference::Color {
+				space: ColorSpace::Bt709,
+				full_range: false,
+				sdr_white_nits: 203.0,
+				siting,
+			},
+			frame,
+			extent,
+			&rgb,
+			&|_| true,
+		);
+		reference::compare(&expected, &actual, 1, &|_| true)
+			.map_err(|detail| format!("{siting:?} chroma: {detail}"))?;
+	}
+	Ok(())
 }
 
 /// The self-check's source image (RGBA8, GENERAL layout) and view, freed on

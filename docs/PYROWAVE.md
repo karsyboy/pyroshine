@@ -14,40 +14,47 @@ in `moonshine-core/src/session/stream/video/{format,pyrowave,packetizer,fec}.rs`
 
 ## Pinned dependency
 
-The only supported PyroWave source is:
+PyroWave is vendored like Pixelforge and Inputtino ([vendor guide](../vendor/README.md)):
+`vendor/pyrowave/` is generated from an upstream commit plus the numbered patch
+series in `vendor/pyrowave-patches/`, and is never edited by hand.
 
-- repository: `https://github.com/karsyboy/pyrowave`
-- branch: `master` (the build uses the detached revision below, not the moving branch)
-- revision: `b09e1365155e91710497be22eac6500f04bf74ea`
-- C API: 1.1.0
-- Granite: `fb178c8080d163419e8d20f10715c61c53c1ec9b`
+- upstream: `https://github.com/Themaister/pyrowave`
+- base: `vendor/pyrowave-patches/UPSTREAM` (`7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b`)
+- C API: 1.1.0 (upstream 1.0 plus the series' additions)
+- Granite: `53090429539bf3404250d18fe58db971f0907c04`
 - Volk: `47cddf7ed97b94118a08aacb548a411188e016cc`
 - Vulkan-Headers: `6802bb4733b63ed5efd3adb308a6c885ef180ea1`
 
-Nix builds these revisions in `nix/pyrowave.nix`. CI and release packaging use
-`scripts/build-pyrowave.sh`. A unit test checks that the Rust provenance and Nix
-pins agree and rejects an accidental upstream PyroWave URL.
+The series holds everything Pyroshine needs beyond upstream: coefficient
+packet validation in the decoder, the 4:4:4 payload size, the C API 1.1
+additions (sequence-header color metadata, overlay layers for late
+composition, and the completion contract below), their tests, and three
+Granite scaler patches in `vendor/pyrowave/patches/` (SDR normalization,
+two-layer 1:1 overlays, and the BT.2408 203-nit reference white). Upstream
+`shaders/slangmosh_scaler.hpp` is replaced by one generated from the patched
+scaler; the 203-nit patch changes only host code. What each patch does and
+which can be offered upstream is in
+[`vendor/pyrowave/LOCAL_CHANGES.md`](../vendor/pyrowave/LOCAL_CHANGES.md).
 
-To update the dependency, review the fork relative to upstream, update every
-revision above in the Nix expression and build script, update `SOURCE_REVISION`
-and the required API version in `pyrowave.rs`, then run the full test suite and
-the manual GPU matrix below. Never substitute the Themaister repository as an
-implicit fallback.
+Nix builds the tree in `nix/pyrowave.nix`, applying the Granite patches to its
+own Granite copy. CI and release packaging use `scripts/build-pyrowave.sh`,
+which copies the tree, runs its `checkout_granite.sh` (clone at the pin, then
+the Granite patches), verifies every transitive revision and runs packet
+validation. `scripts/vendor-pyrowave.sh --check` verifies the tree against the
+base and patches, and that `SOURCE_REVISION` in `pyrowave.rs` and Nix's
+`upstreamRevision` name the same base; a unit test checks the same pins.
+
+To update the base or a patch, follow the [vendor guide](../vendor/README.md#updating),
+then run the full test suite and the manual GPU matrix below. Pyrolight builds
+its decoder from this same tree at a pinned Pyroshine commit, so re-pin it
+after a change that reaches the decoder or the bitstream.
 
 At runtime Pyroshine normally searches the loader paths for
 `libpyrowave-shared.so.1` and then `libpyrowave-shared.so`. Administrators and
 developers may set `MOONSHINE_PYROWAVE_LIBRARY` to one explicit library path
 for packaging tests or diagnostics. When set, no fallback path is attempted;
-the library must expose exactly C API 1.1.0.
-
-Both build paths apply the maintained patches in `nix/patches/`: the Granite
-scaler's SDR normalization and its two-layer 1:1 overlay support, in that order. The fork
-carries the same files and its generated `shaders/slangmosh_scaler.hpp` is
-built from them. When updating
-pins, review whether each patch remains needed, keep the script/Nix patch sets
-aligned, and run packet validation plus the explicit C API load test documented
-in [CONTRIBUTING.md](../CONTRIBUTING.md#validation). A library load test does not
-exercise GPU encoding.
+the library must expose exactly C API 1.1.0, so an unpatched upstream build is
+rejected.
 
 ## Capability and negotiation extension
 
@@ -84,20 +91,25 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 | --- | --- |
 | `x-nv-vqos[0].bitStreamFormat` | `0` H.264, `1` HEVC, `2` AV1, `3` PyroWave |
 | `x-ss-video[0].chromaSamplingType` | `0` 4:2:0, `1` 4:4:4 |
-| `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 |
+| `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 (also after `hdrMode=0`: PyroWave has no 10-bit SDR) |
 | `x-nv-video[0].encoderCscMode` bit 0 | `0` limited, `1` full range |
 | `x-ss-pyrowave.version` | `1` |
 
 Wire v1 uses an 8-bit intermediate for SDR and a 10-bit intermediate for HDR10.
+An HDR10 stream to Nightjar encodes SDR content as 10-bit SDR (sRGB transfer,
+BT.709 primaries and matrix) and reports HDR mode off for it (see
+[color capability translation](PYROWAVE_COMPATIBILITY.md#color-capability-translation)).
 The optional Pyroshine bit-depth attribute remains available to conventional
 codecs, but contradictory or unsupported PyroWave combinations are rejected;
 Pyroshine does not silently fall back to another chroma, depth, or codec.
 
-PyroWave's current scaled RGB API always produces full-range YCbCr, so only
-full-range PyroWave modes are advertised. Conventional codecs support either
-range according to the negotiated VUI. Adding limited-range PyroWave requires a
-clean output-range control in the fork's scaler; lying in bitstream metadata is
-not an acceptable workaround.
+PyroWave encodes the negotiated range: the scaled RGB API writes full or
+narrow (limited) range YCbCr at the stream's bit depth and records it in the
+sequence header. Pyrolight always asks for full range. Moonlight clients such
+as Nightjar ask for limited range unless their full-range setting is on, and
+convert the decoded planes with that setting rather than the header, so the
+range is never substituted. Range needs no startup probe of its own; profiles
+are advertised by chroma and dynamic range only.
 
 PyroWave has floating-point decoded samples rather than a coded 8/10-bit
 profile. Pyroshine's bit-depth selection controls the scaler's R8 or R16
@@ -114,8 +126,12 @@ is no separate low bitrate cap for 4:4:4 or HDR.
 
 Client default-bitrate heuristics are owned by Pyrolight, not a host
 congestion controller. The negotiated manual bitrate remains authoritative;
-FEC feedback adjusts parity, not PyroWave codec bitrate. Live bitrate adaptation
-would need an end-to-end capacity estimator.
+FEC feedback adjusts parity, not PyroWave codec bitrate. A client may change
+the bitrate of its own stream with `GET /bitrate`
+([client integration](CLIENT_INTEGRATION.md#live-bitrate)): the next frame is
+encoded with the budget derived from the new rate by the same rule, and the
+sender paces frames at it from that frame on. A reconnect restores the rate its
+ANNOUNCE negotiates. Pyroshine itself runs no bitrate controller.
 
 Actual throughput depends on content and format. Measure encoded payload, UDP
 bytes (including FEC/protocol/encryption) and estimated Ethernet bytes separately;
@@ -130,10 +146,15 @@ instead of submitting every chunk back-to-back. The schedule is anchored to the
 capture timestamp, so GPU encode time consumes part of the window rather than
 being added to it. The sender distributes chunks across the remaining time
 without reordering or interleaving frames. If the whole window elapsed during
-encode, or socket backpressure consumes scheduled slots, it rebases the
-remaining schedule instead of emitting an unbounded catch-up burst. The
-pipeline holds capture admission until actual send completion, so paced sending
-cannot accumulate a backlog of rendered scenes. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
+encode, the frame is spread across the time left before the next capture slot
+(nine tenths of the frame interval after capture), never slower than the bitrate
+window and never faster than four times the bitrate. Restarting a full window
+there would add it to the encode time and lose the next capture whenever encode
+time exceeds the window, for example while the GPU stays at idle clocks or a game
+contends for its queue. If socket backpressure consumes scheduled slots, the
+sender rebases the remaining schedule instead of emitting an unbounded catch-up
+burst. The pipeline holds capture admission until actual send completion, so
+paced sending cannot accumulate a backlog of rendered scenes. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
 
 Packet size and GSO limits are derived from negotiated shard layout, not a fixed
 number of submissions per frame. `stream.video.max_packet_size` can cap client
@@ -217,7 +238,7 @@ takes ownership. The compositor buffer is released only after PyroWave's
 packetization call has waited for the GPU encode.
 
 Failures keep the same rule ([encoder failure contract](ARCHITECTURE.md#video-path)).
-The pinned fork documents a completion contract in `pyrowave.h`: a failed
+The vendored library documents a completion contract in `pyrowave.h`: a failed
 scaled encode flushes and waits for any scaler pass it already queued, and the
 readback calls (`compute_num_packets`, `packetize`) check their fence wait
 instead of trusting Granite's unchecked `wait()`. Every failed frame can
@@ -261,10 +282,10 @@ supported driver/GPU:
 1. 1080p60 and 4K60/120 where supported.
 2. 4:2:0 SDR and HDR10.
 3. 4:4:4 SDR and HDR10.
-4. Full-range metadata and SDR/HDR mode changes.
+4. Full- and limited-range metadata and SDR/HDR mode changes.
 5. Packet loss, FEC recovery, and oversized keyframe delivery.
 6. Long-running bitrate, latency, VRAM, and imported-image cache stability.
-7. A decoder built from the same authoritative fork.
+7. A decoder built from the same vendored tree.
 
 `moonshine-bench` can exercise the format axes directly. Its
 `--pyrowave-matrix` mode covers 1080p, 1440p, and 4K at 60/120/144 FPS for the

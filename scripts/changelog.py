@@ -70,16 +70,14 @@ def workspace_version(root):
     return tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
 
 
-# Packages whose Cargo.lock entries carry the workspace version: the server
-# workspace's members, and the desktop app's separate workspace (which also
-# locks moonshine-management through its path dependency, so `--locked`
-# builds fail when it is stale).
+# Packages whose Cargo.lock entries carry the workspace version: the
+# workspace's members.
 SERVER_LOCK = ("Cargo.lock", ["moonshine", "moonshine-core", "moonshine-management", "moonshine-tools"])
-UI_LOCK = ("pyroshine-ui/src-tauri/Cargo.lock", ["moonshine-ui", "moonshine-management"])
-UI_MANIFEST = "pyroshine-ui/src-tauri/Cargo.toml"
+# The web interface's npm project: its build records this version for the
+# server's compatibility check (pyroshine-web.json).
 NPM_FILES = {
-    "pyroshine-ui/package.json": [("version",)],
-    "pyroshine-ui/package-lock.json": [("version",), ("packages", "", "version")],
+    "web/package.json": [("version",)],
+    "web/package-lock.json": [("version",), ("packages", "", "version")],
 }
 
 
@@ -87,20 +85,14 @@ def lock_entry(name):
     return re.compile(r'(\[\[package\]\]\nname = "' + re.escape(name) + r'"\nversion = ")([^"]*)(")')
 
 
-def manifest_version():
-    return re.compile(r'(\[package\]\n(?:[^\[\n][^\n]*\n|\n)*?version = ")([^"]*)(")')
-
-
 def version_copies(root):
     """Every copy of the release version: (description, current value)."""
     copies = []
-    for path, names in (SERVER_LOCK, UI_LOCK):
-        text = (root / path).read_text()
-        for name in names:
-            match = lock_entry(name).search(text)
-            copies.append((f"{path} ({name})", match[2] if match else None))
-    match = manifest_version().search((root / UI_MANIFEST).read_text())
-    copies.append((UI_MANIFEST, match[2] if match else None))
+    path, names = SERVER_LOCK
+    text = (root / path).read_text()
+    for name in names:
+        match = lock_entry(name).search(text)
+        copies.append((f"{path} ({name})", match[2] if match else None))
     for path, keys in NPM_FILES.items():
         document = json.loads((root / path).read_text())
         for key in keys:
@@ -126,17 +118,13 @@ def sync_versions(root):
             (root / path).write_text(text)
             changed.append(path)
 
-    for path, names in (SERVER_LOCK, UI_LOCK):
-        text = (root / path).read_text()
-        for name in names:
-            text, count = lock_entry(name).subn(lambda m: m[1] + version + m[3], text)
-            if count != 1:
-                raise ValueError(f"{path} has no single entry for {name}.")
-        write(path, text)
-    text, count = manifest_version().subn(lambda m: m[1] + version + m[3], (root / UI_MANIFEST).read_text(), count=1)
-    if count != 1:
-        raise ValueError(f"{UI_MANIFEST} has no [package] version.")
-    write(UI_MANIFEST, text)
+    path, names = SERVER_LOCK
+    text = (root / path).read_text()
+    for name in names:
+        text, count = lock_entry(name).subn(lambda m: m[1] + version + m[3], text)
+        if count != 1:
+            raise ValueError(f"{path} has no single entry for {name}.")
+    write(path, text)
     for path, keys in NPM_FILES.items():
         document = json.loads((root / path).read_text())
         for key in keys:

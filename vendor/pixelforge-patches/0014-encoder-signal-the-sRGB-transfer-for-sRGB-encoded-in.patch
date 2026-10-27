@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 26 Oct 2026 20:45:28 -0400
+Subject: [PATCH] encoder: signal the sRGB transfer for sRGB-encoded input
+
+Desktop and game framebuffers are sRGB-encoded, and a converter that only
+applies the YCbCr matrix keeps that encoding. Signaling it as the BT.709
+transfer makes decoders apply BT.1886, which renders SDR darker and with
+more contrast than the source. Add ColorDescription::srgb() with H.273
+transfer 13 and map it to the AV1 sRGB transfer; H.264/H.265 VUI carry the
+code point unchanged.
+---
+ src/encoder/av1/session_params.rs |  1 +
+ src/encoder/mod.rs                | 29 ++++++++++++++++++++++++++++-
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/encoder/av1/session_params.rs b/src/encoder/av1/session_params.rs
+index 6e892f5..e731226 100644
+--- a/src/encoder/av1/session_params.rs
++++ b/src/encoder/av1/session_params.rs
+@@ -29,6 +29,7 @@ impl Av1 {
+             _ => ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
+         };
+         let av1_transfer = match desc.transfer_characteristics {
++            13 => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SRGB,
+             16 => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SMPTE_2084,
+             _ => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
+         };
+diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
+index c0b72f8..52b3345 100644
+--- a/src/encoder/mod.rs
++++ b/src/encoder/mod.rs
+@@ -250,7 +250,7 @@ pub struct Dimensions {
+ pub struct ColorDescription {
+     /// Color primaries (1=BT.709, 9=BT.2020).
+     pub color_primaries: u8,
+-    /// Transfer characteristics (1=BT.709, 16=ST2084/PQ).
++    /// Transfer characteristics (1=BT.709, 13=sRGB, 16=ST2084/PQ).
+     pub transfer_characteristics: u8,
+     /// Matrix coefficients (1=BT.709, 9=BT.2020 NCL).
+     pub matrix_coefficients: u8,
+@@ -263,6 +263,7 @@ impl ColorDescription {
+     const PRIMARIES_BT709: u8 = 1;
+     const PRIMARIES_BT2020: u8 = 9;
+     const TRANSFER_BT709: u8 = 1;
++    const TRANSFER_SRGB: u8 = 13;
+     const TRANSFER_ST2084_PQ: u8 = 16;
+     const MATRIX_BT709: u8 = 1;
+     const MATRIX_BT2020_NCL: u8 = 9;
+@@ -277,6 +278,22 @@ impl ColorDescription {
+         }
+     }
+ 
++    /// sRGB: BT.709 primaries and matrix with the IEC 61966-2-1 transfer
++    /// function (limited range).
++    ///
++    /// Desktop and game framebuffers are sRGB-encoded. Converted to YCbCr
++    /// without a transfer conversion they must be signaled as sRGB: decoders
++    /// interpret the BT.709 transfer as BT.1886, which renders the same
++    /// samples darker and with more contrast.
++    pub fn srgb() -> Self {
++        Self {
++            color_primaries: Self::PRIMARIES_BT709,
++            transfer_characteristics: Self::TRANSFER_SRGB,
++            matrix_coefficients: Self::MATRIX_BT709,
++            full_range: false,
++        }
++    }
++
+     /// BT.2020 with PQ transfer function (HDR10).
+     pub fn bt2020_pq() -> Self {
+         Self {
+@@ -1116,6 +1133,16 @@ mod tests {
+             assert!(!cd.full_range);
+         }
+ 
++        #[test]
++        fn test_srgb() {
++            let cd = ColorDescription::srgb();
++            assert_eq!(cd.color_primaries, 1);
++            assert_eq!(cd.transfer_characteristics, 13);
++            assert_eq!(cd.matrix_coefficients, 1);
++            assert!(!cd.full_range);
++            assert!(!cd.is_hdr());
++        }
++
+         #[test]
+         fn test_bt2020_pq() {
+             let cd = ColorDescription::bt2020_pq();
+-- 
+2.56.0
+

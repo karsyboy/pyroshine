@@ -1,14 +1,24 @@
 name: Release
 
+# Prerelease tags (vX.Y.Z-prerelease[.N]) are built by prerelease.yaml, which
+# calls this workflow; a tag containing "prerelease" is published as a GitHub
+# prerelease and reaches the [pyrowave] repository as pyroshine-prerelease-bin.
 on:
   push:
     tags:
       - "v[0-9]*"
+      - "!v*prerelease*"
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to build (e.g. v0.13.0)
+        description: Tag to build (e.g. v0.13.0 or v0.18.0-prerelease.1)
         required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build; defaults to the tag that started the caller
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,10 +35,38 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.record.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
+    - name: Resolve tag
+      id: tag
+      env:
+        REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+      run: |
+        TAG="$REQUESTED_TAG"
+        if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+          echo "Release tag must look like v1.2.3 or v1.2.3-rc.1, got: $TAG" >&2
+          exit 1
+        fi
+        PRERELEASE=false
+        if [[ "$TAG" == *prerelease* ]]; then
+          # The [pyrowave] repository maps this form to a pacman version.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-prerelease(\.[0-9]+)?$ ]]; then
+            echo "Prerelease tags must look like v1.2.3-prerelease or v1.2.3-prerelease.1, got: $TAG" >&2
+            exit 1
+          fi
+          PRERELEASE=true
+        fi
+        {
+          echo "tag=$TAG"
+          echo "version=${TAG#v}"
+          echo "prerelease=$PRERELEASE"
+        } >> "$GITHUB_OUTPUT"
+
     - uses: actions/checkout@v7
       with:
-        ref: ${{ github.event.inputs.tag || github.ref }}
+        ref: ${{ steps.tag.outputs.tag }}
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -38,23 +76,18 @@ jobs:
     - name: Install dependencies
       uses: ./.github/actions/install-dependencies
 
-    - name: Install desktop app dependencies
-      run: |
-        sudo apt-get install -y --no-install-recommends \
-          libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
-
     - uses: actions/setup-node@v7
       with:
         node-version: 22
         cache: npm
-        cache-dependency-path: pyroshine-ui/package-lock.json
+        cache-dependency-path: web/package-lock.json
 
     - name: Server checks
       run: |
         set -o pipefail
         mkdir -p "$RUNNER_TEMP/validation"
         python3 -m unittest discover -s scripts -p 'test_changelog.py'
-        python3 scripts/changelog.py check --tag "${{ github.event.inputs.tag || github.ref_name }}"
+        python3 scripts/changelog.py check --tag "${{ steps.tag.outputs.tag }}"
         cargo fmt --all -- --check
         cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
         RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --all-features
@@ -74,16 +107,13 @@ jobs:
     - name: Known defects and native sanitizer tests
       run: python3 scripts/known_defects.py --json "$RUNNER_TEMP/validation/known-defects.json"
 
-    - name: Desktop app checks
-      working-directory: pyroshine-ui
+    - name: Web interface checks
+      working-directory: web
       run: |
         npm ci
         npm run typecheck
         npm test
         npm run build
-        cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-        cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-        cargo test --locked --manifest-path src-tauri/Cargo.toml
 
     - name: Record validation
       id: record
@@ -125,22 +155,9 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-    - name: Resolve tag
-      id: tag
-      env:
-        REQUESTED_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-      run: |
-        TAG="$REQUESTED_TAG"
-        if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
-          echo "Release tag must look like v1.2.3 or v1.2.3-rc.1, got: $TAG" >&2
-          exit 1
-        fi
-        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-        echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-
     - uses: actions/checkout@v7
       with:
-        ref: ${{ github.event.inputs.tag || github.ref }}
+        ref: ${{ needs.validate.outputs.tag }}
 
     - name: Build the validated commit only
       env:
@@ -153,7 +170,7 @@ jobs:
 
     - name: Validate changelog and extract release notes
       env:
-        RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        RELEASE_TAG: ${{ needs.validate.outputs.tag }}
       run: |
         python3 scripts/changelog.py check --tag "$RELEASE_TAG"
         python3 scripts/changelog.py notes --tag "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
@@ -174,25 +191,21 @@ jobs:
     - name: Build
       run: cargo build --release --workspace
 
-    # The optional desktop app is a separate workspace and package, so the
-    # server package keeps no GTK/WebKitGTK dependency.
-    - name: Install desktop app dependencies
-      run: |
-        sudo apt-get install -y --no-install-recommends \
-          libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
-
+    # The web interface ships as static files in the server package; Node.js
+    # is needed only here. Its build records this version (pyroshine-web.json),
+    # which the server checks against its own.
     - uses: actions/setup-node@v7
       with:
         node-version: 22
         cache: npm
-        cache-dependency-path: pyroshine-ui/package-lock.json
+        cache-dependency-path: web/package-lock.json
 
-    - name: Build desktop app
-      working-directory: pyroshine-ui
+    - name: Build web interface
+      working-directory: web
       run: |
         npm ci
         npm run build
-        cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+        test "$(python3 -c 'import json; print(json.load(open("dist/pyroshine-web.json"))["version"])')" = "${{ needs.validate.outputs.version }}"
 
     - name: Strip and fixup
       run: |
@@ -205,7 +218,7 @@ jobs:
 
     - name: Bake version into install script
       run: |
-        sed -i 's/VERSION="__VERSION__"/VERSION="${{ steps.tag.outputs.tag }}"/' ./dist/pyroshine-install.sh
+        sed -i 's/VERSION="__VERSION__"/VERSION="${{ needs.validate.outputs.tag }}"/' ./dist/pyroshine-install.sh
 
     # Portable tarball with an FHS-ish layout (bin/, lib/, share/).
     - name: Package portable tarball
@@ -213,15 +226,16 @@ jobs:
         STAGE="$RUNNER_TEMP/pyroshine"
         mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share/pyroshine"
         cp ./target/release/moonshine "$STAGE/bin/pyroshine"
+        cp -R ./web/dist "$STAGE/share/pyroshine/web"
         cp ./target/release/libpyrowave-shared.so.1 "$STAGE/lib/"
         cp ./dist/start-pyroshine.sh ./dist/60-pyroshine.rules ./dist/50-pyroshine-inhibit-sleep.rules \
            ./dist/pyroshine-modules.conf ./dist/pyroshine-sysusers.conf \
-           ./dist/pyroshine@.service \
+           ./dist/pyroshine@.service ./dist/pyroshine-desktop-guard.service ./dist/pyroshine.desktop \
            ./dist/pyroshine-atomic-update.conf "$STAGE/share/pyroshine/"
         cp ./dist/pyroshine-install.sh "$STAGE/bin/"
         cp README.md CONTRIBUTING.md LICENSE "$STAGE/"
         cp -R docs "$STAGE/docs"
-        tar --zstd -cf "./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
+        tar --zstd -cf "./pyroshine-${{ needs.validate.outputs.tag }}-linux-amd64.tar.zst" \
           -C "$RUNNER_TEMP" pyroshine
 
     - name: Install nfpm
@@ -238,18 +252,16 @@ jobs:
 
     - name: Package native formats
       run: |
-        export VERSION="${{ steps.tag.outputs.version }}"
+        export VERSION="${{ needs.validate.outputs.version }}"
         for fmt in deb rpm archlinux; do
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
-          nfpm package --config nfpm-ui.yaml --packager "$fmt" --target .
         done
 
     - name: Generate checksums
       run: |
         sha256sum \
-          ./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst \
+          ./pyroshine-${{ needs.validate.outputs.tag }}-linux-amd64.tar.zst \
           ./pyroshine_*.deb \
-          ./pyroshine-ui_*.deb \
           ./pyroshine-*.rpm \
           ./pyroshine-*.pkg.tar.zst \
           ./dist/pyroshine-install.sh \
@@ -259,13 +271,13 @@ jobs:
     - name: Create GitHub release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{ steps.tag.outputs.tag }}
+        tag_name: ${{ needs.validate.outputs.tag }}
         body_path: ${{ runner.temp }}/release-notes.md
+        prerelease: ${{ needs.validate.outputs.prerelease }}
         fail_on_unmatched_files: true
         files: |
-          ./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
+          ./pyroshine-${{ needs.validate.outputs.tag }}-linux-amd64.tar.zst
           ./pyroshine_*.deb
-          ./pyroshine-ui_*.deb
           ./pyroshine-*.rpm
           ./pyroshine-*.pkg.tar.zst
           ./dist/pyroshine-install.sh
@@ -273,12 +285,14 @@ jobs:
           ./SHA256SUMS
 
   # Publishes the release to the [pyrowave] pacman repository by starting the
-  # Publish workflow of karsyboy/pyrowave-packages, which skips prereleases.
-  # Needs the PACKAGES_DISPATCH_TOKEN secret; see CONTRIBUTING.md.
+  # Publish workflow of karsyboy/pyrowave-packages: stable releases as
+  # pyroshine-bin, prereleases as pyroshine-prerelease-bin. Other suffixed tags
+  # (v1.2.3-rc.1) are not published there. Needs the PACKAGES_DISPATCH_TOKEN
+  # secret; see CONTRIBUTING.md.
   pacman:
     name: Update pacman repository
-    needs: build
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
+    needs: [validate, build]
+    if: ${{ needs.validate.outputs.prerelease == 'true' || !contains(needs.validate.outputs.tag, '-') }}
     runs-on: ubuntu-24.04
     steps:
     - name: Start the pyrowave-packages Publish workflow

@@ -7,7 +7,7 @@ edition = "2024"
 aes = "0.9.3"
 aes-gcm = "0.11.1"
 async-shutdown = "0.2.2"
-ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
+ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
 aws-lc-rs = "1.18.2"
 bitflags = "2.13.2"
 byteorder = "1.5.0"
@@ -15,7 +15,7 @@ bytes = "1.12.1"
 calloop = "0.14.5"
 cbc = "0.2.1"
 crossbeam-channel = "0.5.17"
-dasp = { version = "0.11.0", features = ["signal", "interpolate", "interpolate-sinc", "ring_buffer"] }
+dasp = "0.11.0"
 dirs = "7.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
 flate2 = "1.1.9"
@@ -23,7 +23,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 gethostname = "1.1.0"
 hex = "0.4.3"
 http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper = { version = "1.12.0", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 image = "0.25.10"
 inputtino = { version = "0.1.0", git = "https://github.com/games-on-whales/inputtino", rev = "d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8" }
@@ -38,14 +38,16 @@ network-interface = "2.0.5"
 notify-rust = "4.18.2"
 opus = "0.4.0"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.9.1", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.10.0", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.10"
 regex = "1.13.1"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
+rubato = "5.0.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = "0.23.45"
+rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 sdp-types = "0.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -79,13 +81,20 @@ uuid = { version = "1.28.0", features = ["v4"] }
 walkdir = "2.5.0"
 which = "8.0.6"
 x509-parser = "0.18.1"
+yaml_serde = "0.10"
 xcursor = "0.3.11"
+# Desktop Mode: the desktop compositor's DMA-BUF main device.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 zbus = { version = "5.19.0", features = ["blocking"] }
 zvariant = "5.15.0"
+pipewire = { version = "0.10.1", features = ["v0_3_40"] }
+reis = { version = "0.7.1", features = ["calloop"] }
+enumflags2 = "0.7.12"
+wayland-scanner = "0.31"
+libpulse-binding = "2.30"
 
 [dev-dependencies]
-wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-wayland-client = "0.31"
 tempfile = "3.27.0"
 # X11 client for the ignored compositor/XWayland tests (same version as Smithay's).
 x11rb = "0.13.2"

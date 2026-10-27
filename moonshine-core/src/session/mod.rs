@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
 use tokio::sync::watch;
 
-use crate::session::compositor::CompositorConfig;
 use crate::session::stream::audio::AudioChannels;
+use crate::session::stream::audio::AudioSource;
 use crate::session::stream::audio::AudioStream;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
 use crate::session::stream::video::FrameStats;
+use crate::session::stream::video::VideoCodec;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::VideoStreamHandle;
@@ -19,9 +21,9 @@ use crate::session::stream::video::VideoStreamHandle;
 use self::application::Application;
 use self::application::ApplicationConfig;
 use self::application::ApplicationContext;
-use self::compositor::Compositor;
-use self::compositor::LaunchedCompositor;
-use self::compositor::frame::HdrModeState;
+use self::application::SessionMode;
+use self::capture::frame::HdrModeState;
+use self::capture::{CaptureBackend, CapturePacing, CaptureSettings, CaptureSource, LiveCapture};
 use self::failure::{SessionFailure, StopCauseSlot};
 use self::inhibit::SleepInhibitor;
 use self::lifecycle::StartLatch;
@@ -32,14 +34,18 @@ use self::stream::video::VideoStreamConfig;
 
 pub mod application;
 pub mod authorization;
+pub(crate) mod capture;
 pub mod compositor;
 pub mod failure;
+pub mod frame_limit;
 pub mod inhibit;
 pub mod keys;
 pub(crate) mod lifecycle;
 pub mod manager;
 pub(crate) mod negotiation;
 pub(crate) mod status;
+pub(crate) mod steam_game;
+pub(crate) mod steam_instance;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
@@ -54,11 +60,11 @@ pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
 /// session's teardown has stopped this unit.
 const APPLICATION_UNIT_NAME: &str = "moonshine-session.service";
 
-/// The application unit name: [`APPLICATION_UNIT_NAME`], or
+/// The application unit name: `moonshine-session.service`, or
 /// `MOONSHINE_APPLICATION_UNIT` for a benchmark or test instance that must not
 /// replace a live service's session on the same account. An invalid override
 /// is ignored with a warning.
-pub(crate) fn application_unit_name() -> &'static str {
+pub fn application_unit_name() -> &'static str {
 	static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 	NAME.get_or_init(|| match std::env::var("MOONSHINE_APPLICATION_UNIT") {
 		Ok(name) if valid_application_unit_name(&name) => Box::leak(name.into_boxed_str()),
@@ -80,6 +86,7 @@ fn valid_application_unit_name(name: &str) -> bool {
 	})
 }
 
+pub use self::capture::portal::probe as desktop_probe;
 pub use self::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
 pub(crate) type SessionKeysReceiver = watch::Receiver<keys::ActiveKeys>;
@@ -133,10 +140,19 @@ pub struct SessionContext {
 	/// If true, the compositor will be launched with HDR support.
 	pub hdr: bool,
 
+	/// The launch's `hdrMode`, when it sent one. Moonlight clients send
+	/// `hdrMode=1` for HDR and nothing otherwise; an explicit `hdrMode=0` is how
+	/// Sunshine-family clients (Nightjar) ask for 10-bit SDR alongside an
+	/// ANNOUNCE `dynamicRangeMode=1`, which alone means 10-bit (see `rtsp`).
+	pub hdr_mode: Option<bool>,
+
 	/// Address of the paired client that authenticated the original launch.
 	/// The current launch/resume client is owned by `StreamAuthorization`;
 	/// this launch metadata does not change when the retained session resumes.
 	pub client_ip: IpAddr,
+	/// Verified TLS certificate fingerprint for per-client desktop preferences.
+	/// Absent for local tools; never derived from a request's uniqueid or IP.
+	pub client_identity: Option<String>,
 
 	/// The launching client asked for VRR presentation (`clientVrrRequested`).
 	/// Carried by its authorization generation, like a resume's request.
@@ -148,6 +164,7 @@ pub struct SessionContext {
 /// values are retained to drive and diagnose compositor/capture changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResumeRequest {
+	pub client_identity: Option<String>,
 	pub resolution: Option<(u32, u32)>,
 	pub refresh_rate: Option<u32>,
 	pub hdr: Option<bool>,
@@ -163,7 +180,7 @@ pub(crate) struct ResumeRequest {
 /// resource-creating work for each transition while the manager owns state,
 /// generations, cancellation and teardown ordering.
 pub(crate) struct SystemSession {
-	pub(crate) compositor_config: CompositorConfig,
+	pub(crate) capture_settings: CaptureSettings,
 	pub(crate) video_config: VideoStreamConfig,
 	pub(crate) audio_config: AudioStreamConfig,
 	pub(crate) control_config: ControlStreamConfig,
@@ -172,6 +189,10 @@ pub(crate) struct SystemSession {
 	pub(crate) inhibit_sleep: bool,
 	pub(crate) stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	pub(crate) presence_tx: std::sync::Arc<watch::Sender<status::ClientPresence>>,
+	/// Shares the video UDP port with bandwidth calibration runs.
+	pub(crate) video_port: crate::calibration::VideoPortArbiter,
+	/// `[frame_limit]`, applied when an application launches.
+	pub(crate) frame_limit: frame_limit::FrameLimitConfig,
 }
 
 impl SessionBackend for SystemSession {
@@ -186,8 +207,20 @@ impl SessionBackend for SystemSession {
 		cause: StopCauseSlot,
 		foreground_tx: watch::Sender<Option<moonshine_management::dto::ForegroundApplication>>,
 	) -> Result<InitializedSession, SessionFailure> {
+		if crate::desktop::recovery_pending() {
+			let result = tokio::task::spawn_blocking(crate::desktop::status).await;
+			if !matches!(result,Ok(Ok(ref status)) if status.phase == "idle") {
+				return Err(SessionFailure::new(
+					"desktop_recovery_required",
+					"Restore the previous desktop configuration before starting another session.",
+				)
+				.with_hint("Use Restore Desktop in the dashboard or run pyroshine desktop restore."));
+			}
+		}
+		// A calibration run may hold the video port; a session always wins.
+		let _claim = self.video_port.release_for_session().await;
 		InitializedSession::new(
-			self.compositor_config.clone(),
+			self.capture_settings.clone(),
 			self.video_config.clone(),
 			self.audio_config.clone(),
 			self.control_config.clone(),
@@ -202,7 +235,7 @@ impl SessionBackend for SystemSession {
 	}
 
 	async fn launch(&self, session: InitializedSession) -> Result<LaunchedSession, SessionFailure> {
-		session.launch().await
+		session.launch(&self.frame_limit).await
 	}
 
 	async fn start(
@@ -275,6 +308,30 @@ impl SessionBackend for SystemSession {
 	async fn stop_application(&self, unit_name: &str) -> Result<(), ()> {
 		application::stop_application_unit(unit_name).await
 	}
+
+	fn desktop_lease(launched: &LaunchedSession) -> Option<String> {
+		launched.capture.desktop_lease()
+	}
+	async fn verify_desktop_cleanup(&self) -> Result<(), ()> {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+		loop {
+			if tokio::task::spawn_blocking(crate::desktop::cleanup_complete)
+				.await
+				.map_err(|_| ())?
+				.is_ok()
+			{
+				return Ok(());
+			}
+			if tokio::time::Instant::now() >= deadline {
+				return Err(());
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}
+
+	fn capture_details(launched: &LaunchedSession) -> Option<moonshine_management::dto::CaptureDetails> {
+		Some(launched.capture.details())
+	}
 }
 
 /// A stream socket could not be created. The common cause is another process
@@ -291,10 +348,10 @@ fn stream_setup_failure(stream: &str, port: u16) -> SessionFailure {
 	))
 }
 
-/// Initialized session state — components created, compositor and app not yet started.
+/// Initialized session state — components created, capture and app not yet started.
 pub(crate) struct InitializedSession {
 	context: SessionContext,
-	compositor: Compositor,
+	capture: CaptureSource,
 	audio_stream: AudioStream,
 	video_stream: VideoStream,
 	control_stream: ControlStream,
@@ -306,7 +363,7 @@ pub(crate) struct InitializedSession {
 impl InitializedSession {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn new(
-		compositor_config: CompositorConfig,
+		capture_settings: CaptureSettings,
 		video_config: VideoStreamConfig,
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
@@ -320,21 +377,34 @@ impl InitializedSession {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
-		// Create compositor, audio stream, video stream, and control stream.
-		let (compositor, handles) = Compositor::new(
-			compositor_config,
-			compositor::CompositorContext::from_session(&context, video_config.log_stats),
+		// Create the capture source, audio stream, video stream, and control stream.
+		// The entry's mode selects the backend: Game Mode is the default.
+		let backend = match context.application.mode {
+			SessionMode::Game => CaptureBackend::Isolated,
+			SessionMode::Desktop => CaptureBackend::Desktop,
+		};
+		let desktop_audio = capture_settings.desktop.audio;
+		let (capture, endpoints) = CaptureSource::new(
+			backend,
+			capture_settings,
+			&context,
+			video_config.log_stats,
 			stop.clone(),
+			cause.clone(),
 			foreground_tx,
 		);
 		let (audio_port, video_port, control_port) = (audio_config.port, video_config.port, control_config.port);
-		let audio = AudioStream::new(audio_config, address.clone(), stop.clone())
+		let audio_source = match backend {
+			CaptureBackend::Isolated => AudioSource::Pulse,
+			CaptureBackend::Desktop => AudioSource::Desktop { capture: desktop_audio },
+		};
+		let audio = AudioStream::new(audio_config, address.clone(), audio_source, stop.clone())
 			.await
 			.map_err(|()| stream_setup_failure("audio", audio_port))?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
-			handles.frame_rx,
+			endpoints.frames,
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
@@ -342,12 +412,12 @@ impl InitializedSession {
 		)
 		.await
 		.map_err(|()| stream_setup_failure("video", video_port))?;
-		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())
+		let control_stream = ControlStream::new(control_config, address, endpoints.input, stop.clone())
 			.map_err(|()| stream_setup_failure("control", control_port))?;
 
 		Ok(Self {
 			context,
-			compositor,
+			capture,
 			audio_stream: audio,
 			video_stream,
 			control_stream,
@@ -357,15 +427,18 @@ impl InitializedSession {
 		})
 	}
 
-	/// Launch the session — starts the compositor and application, but does not start streams.
+	/// Launch the session — starts capture and the application, but does not start streams.
 	///
 	/// The manager records the application unit before calling this, so a
 	/// cancellation after systemd accepted the unit is still cleaned up.
-	pub(crate) async fn launch(self) -> Result<LaunchedSession, SessionFailure> {
+	pub(crate) async fn launch(
+		self,
+		frame_limit: &frame_limit::FrameLimitConfig,
+	) -> Result<LaunchedSession, SessionFailure> {
 		let Self {
 			context,
-			compositor,
-			audio_stream: audio,
+			capture,
+			audio_stream: mut audio,
 			video_stream,
 			control_stream,
 			hdr_metadata_rx,
@@ -373,26 +446,39 @@ impl InitializedSession {
 			cause,
 		} = self;
 
-		// Waiting for the compositor's readiness blocks; keep it off the runtime
-		// workers. A cancelled launch drops the result, and the compositor thread
-		// exits on the session stop that cancelled it.
-		let launched_compositor = tokio::task::spawn_blocking(move || compositor.launch())
+		// Waiting for capture readiness blocks; keep it off the runtime workers.
+		// A cancelled launch drops the result, and the capture thread exits on
+		// the session stop that cancelled it.
+		let capture = tokio::task::spawn_blocking(move || capture.launch())
 			.await
 			.map_err(|e| {
-				tracing::error!("Compositor launch task failed: {e}");
-				SessionFailure::see_log("compositor_start_failed", "The streaming compositor failed to start.")
-			})?
-			.map_err(|error| {
-				SessionFailure::new(
-					"compositor_start_failed",
-					format!("The streaming compositor could not start: {error}."),
-				)
-				.with_hint(
-					"Check the GPU selection (gpu in the configuration) and the startup checks on the \
-					 Diagnostics page or with pyroshine healthcheck.",
-				)
-			})?;
-		let ready = launched_compositor.ready();
+				tracing::error!("Capture launch task failed: {e}");
+				SessionFailure::see_log("capture_start_failed", "The capture backend failed to start.")
+			})??;
+		audio.desktop_sink = capture
+			.desktop_lease()
+			.map(|lease| format!("moonshine.desktop.{lease}"));
+		let capabilities = capture.capabilities();
+		tracing::info!(
+			backend = capabilities.backend.as_str(),
+			render_node = %capabilities.render_node.display(),
+			sdr_format = ?capabilities.sdr_format,
+			hdr_format = ?capabilities.hdr_format,
+			presentation_pacing = capabilities.presentation_pacing,
+			"Capture ready"
+		);
+		// Desktop Mode streams what already runs: no application is launched.
+		let Some(display) = capture.application_display() else {
+			return Ok(LaunchedSession {
+				context,
+				application: None,
+				video_stream,
+				capture,
+				audio,
+				control_stream,
+				hdr_metadata_rx,
+			});
+		};
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
 		let application = Application::spawn(
@@ -400,11 +486,14 @@ impl InitializedSession {
 			ApplicationContext {
 				unit_name: application_unit_name().to_string(),
 				pulse_socket_path,
-				xdisplay: ready.xdisplay,
-				wayland_display: ready.wayland_display.clone(),
+				xdisplay: display.xdisplay,
+				wayland_display: display.wayland_display.clone(),
 				// Keep HDR-capable application paths enabled so a later reconnect can
 				// switch SDR/HDR without relaunching the application.
-				hdr: ready.hdr_capable,
+				hdr: capabilities.hdr(),
+				// Fixed for the application's lifetime: a resume at another frame
+				// rate keeps the limit the launching stream set.
+				frame_limit: frame_limit::resolve(frame_limit, &context.application.frame_limit, context.refresh_rate),
 				// Populate extra_env with width, height and refreshrate values of the client for e.g. scripting
 				extra_env: HashMap::from([
 					("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),
@@ -422,9 +511,9 @@ impl InitializedSession {
 
 		Ok(LaunchedSession {
 			context,
-			application,
+			application: Some(application),
 			video_stream,
-			launched_compositor,
+			capture,
 			audio,
 			control_stream,
 			hdr_metadata_rx,
@@ -432,30 +521,29 @@ impl InitializedSession {
 	}
 }
 
-/// Launched session state — compositor and app running, waiting for RTSP negotiation.
+/// Launched session state — capture and app running, waiting for RTSP negotiation.
 pub(crate) struct LaunchedSession {
 	context: SessionContext,
-	application: Application,
+	/// The launched application; `None` in Desktop Mode.
+	application: Option<Application>,
 	video_stream: VideoStream,
-	launched_compositor: LaunchedCompositor,
+	capture: LiveCapture,
 	audio: AudioStream,
 	control_stream: ControlStream,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
 }
 
 impl LaunchedSession {
-	/// Apply the negotiated output mode to the running compositor (a no-op when
-	/// it matches the launch mode) and verify the effective HDR state.
+	/// Apply the negotiated output mode to the running capture backend (a
+	/// no-op when it matches the launch mode) and verify the effective HDR state.
 	pub(crate) async fn apply_output_mode(
 		&mut self,
 		video: &VideoStreamContext,
-		capture_pacing: compositor::CapturePacing,
+		capture_pacing: CapturePacing,
 	) -> Result<(), ()> {
-		let effective_hdr = self
-			.launched_compositor
-			.reconfigure(video.output_mode(capture_pacing))
-			.await?;
-		if effective_hdr != video.format.hdr {
+		self.capture.set_scaling_fit(video.format.codec != VideoCodec::PyroWave);
+		let effective_hdr = self.capture.reconfigure(video.output_mode(capture_pacing)).await?;
+		if !hdr_state_acceptable(video.format.hdr, effective_hdr, self.capture.capabilities().hdr()) {
 			tracing::warn!(
 				requested_hdr = video.format.hdr,
 				effective_hdr,
@@ -481,7 +569,7 @@ impl LaunchedSession {
 	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
 		let Self {
 			context,
-			launched_compositor,
+			capture,
 			application,
 			audio,
 			video_stream,
@@ -541,7 +629,7 @@ impl LaunchedSession {
 		Ok((
 			ActiveSession {
 				_application: application,
-				compositor: launched_compositor,
+				capture,
 				video_handle: video_handle_for_resume,
 				audio_handle: audio_handle_for_resume,
 				video_context: video_ctx,
@@ -558,8 +646,8 @@ impl LaunchedSession {
 /// The authoritative session context (as reported to HTTP/RTSP) lives in the
 /// manager's session record; this keeps only what reconfiguration consumes.
 pub(crate) struct ActiveSession {
-	_application: Application,
-	compositor: LaunchedCompositor,
+	_application: Option<Application>,
+	capture: LiveCapture,
 	video_handle: VideoStreamHandle,
 	audio_handle: stream::audio::AudioStartHandle,
 	video_context: VideoStreamContext,
@@ -570,14 +658,18 @@ pub(crate) struct ActiveSession {
 }
 
 impl ActiveSession {
+	pub(crate) fn rate_control(&self) -> stream::video::rate::RateControl {
+		self.video_handle.rate_control.clone()
+	}
+
 	/// Reset the video stream's frame counters and force an IDR for a resuming client.
 	pub(crate) async fn reset_video_stream(&self, generation: u64) -> Result<(), ()> {
 		self.video_handle.request_reset(generation).await
 	}
 
 	/// Apply a resuming client's capture pacing to the unchanged output.
-	pub(crate) async fn apply_capture_pacing(&mut self, capture_pacing: compositor::CapturePacing) -> Result<(), ()> {
-		self.compositor
+	pub(crate) async fn apply_capture_pacing(&mut self, capture_pacing: CapturePacing) -> Result<(), ()> {
+		self.capture
 			.reconfigure(self.video_context.output_mode(capture_pacing))
 			.await
 			.map(|_| ())
@@ -586,11 +678,13 @@ impl ActiveSession {
 	pub(crate) async fn reconfigure_video(
 		&mut self,
 		context: VideoStreamContext,
-		capture_pacing: compositor::CapturePacing,
+		capture_pacing: CapturePacing,
 		generation: u64,
 	) -> Result<(), ()> {
-		let effective_hdr = self.compositor.reconfigure(context.output_mode(capture_pacing)).await?;
-		if effective_hdr != context.format.hdr {
+		self.capture
+			.set_scaling_fit(context.format.codec != VideoCodec::PyroWave);
+		let effective_hdr = self.capture.reconfigure(context.output_mode(capture_pacing)).await?;
+		if !hdr_state_acceptable(context.format.hdr, effective_hdr, self.capture.capabilities().hdr()) {
 			tracing::warn!(
 				requested_hdr = context.format.hdr,
 				effective_hdr,
@@ -616,6 +710,30 @@ impl ActiveSession {
 			.await?;
 		self.audio_context = context;
 		Ok(())
+	}
+}
+
+/// Whether a stream may run with the capture's effective HDR state.
+///
+/// A backend that can never produce HDR (Desktop Mode's SDR virtual output)
+/// falls back to SDR content inside a negotiated HDR format, since the client
+/// already set up its decoder for it: conventional encoders tag those frames
+/// BT.709 and tell the client HDR is off, and PyroWave maps them into its HDR10
+/// wire format. A backend that can produce HDR but did not apply it is an error.
+fn hdr_state_acceptable(requested: bool, effective: bool, capture_supports_hdr: bool) -> bool {
+	requested == effective || (requested && !capture_supports_hdr)
+}
+
+#[cfg(test)]
+mod hdr_fallback_tests {
+	#[test]
+	fn only_sdr_only_backends_fall_back_from_hdr() {
+		use super::hdr_state_acceptable as ok;
+		assert!(ok(true, true, true));
+		assert!(ok(false, false, false));
+		assert!(ok(true, false, false), "Desktop Mode streams SDR for an HDR client");
+		assert!(!ok(true, false, true), "an HDR-capable compositor must apply HDR");
+		assert!(!ok(false, true, true));
 	}
 }
 

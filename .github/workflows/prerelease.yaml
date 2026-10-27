@@ -1,0 +1,28 @@
+name: Prerelease
+
+# Builds prerelease tags (v1.2.3-prerelease or v1.2.3-prerelease.1) with the
+# release workflow itself: the same gates on the tagged commit, the same
+# 'release' environment approval and the same packages. The GitHub release is
+# marked as a prerelease, and the [pyrowave] pacman repository publishes it as
+# pyroshine-prerelease-bin; pyroshine-bin stays on stable releases.
+on:
+  push:
+    tags:
+      - "v[0-9]*prerelease*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Prerelease tag to build (e.g. v0.18.0-prerelease.1)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Prerelease
+    uses: ./.github/workflows/release.yaml
+    with:
+      tag: ${{ inputs.tag }}
+    # PACKAGES_DISPATCH_TOKEN for the pacman job.
+    secrets: inherit

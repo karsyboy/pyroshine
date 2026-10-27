@@ -1,7 +1,7 @@
 //! Operator-facing failure causes.
 //!
 //! Session work logs its technical cause where it happens. What the operator
-//! (Moonlight's error dialog, the desktop app, the event log) needs instead is
+//! (Moonlight's error dialog, the web interface, the event log) needs instead is
 //! a stable code, one sentence saying what failed, and, where Pyroshine knows
 //! it, what to change. [`SessionFailure`] carries that from the launch path to
 //! the HTTP response and the management interface; [`StopCause`] does the same

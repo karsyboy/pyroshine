@@ -9,7 +9,10 @@ ARM system can stream.
 
 Nix retains the upstream names: executable **`moonshine`**, module
 **`services.moonshine`**, system service **`moonshine.service`**. There is no
-`pyroshine@<user>` unit here. The optional desktop app is not included.
+`pyroshine@<user>` unit here. The package includes the web management
+interface and its application-menu entry (add the package to
+`environment.systemPackages` to list it). The service shows the desktop tray
+itself while its user is signed in to a desktop, as on other distributions.
 
 ## Install and configure
 
@@ -56,8 +59,10 @@ Nix retains the upstream names: executable **`moonshine`**, module
 
    Set up your GPU driver through your NixOS hardware configuration. The module
    enables `hardware.graphics`, but it does not select/configure a proprietary
-   NVIDIA driver for you. The built package includes the PyroWave library and
-   host driver search paths.
+   NVIDIA driver for you. The built package includes the PyroWave library,
+   libva and host driver search paths. Intel GPUs encode H.264/HEVC/AV1
+   through VA-API: add Intel's media driver with
+   `hardware.graphics.extraPackages = [ pkgs.intel-media-driver ];`.
 3. Apply the configuration:
 
    ```sh
@@ -73,9 +78,10 @@ Nix retains the upstream names: executable **`moonshine`**, module
    while the service is listening; it will report the service's ports as conflicts.
 4. Install/sign in to Steam as the configured user, install a game, and quit
    local Steam. Restart `sudo systemctl restart moonshine` to refresh scanning.
-   Run `moonshine pair` as that user, then start pairing in Moonlight/Pyrolight
-   and follow the terminal prompts. Select Steam to play. Older builds can use
-   [browser pairing](INSTALLATION.md#browser-pairing) with `journalctl -u moonshine -f -o cat`.
+   Run `moonshine web setup` as that user and open <http://127.0.0.1:47990/>
+   (over SSH: [tunnel the port](INSTALLATION.md#manage-a-headless-host)) to
+   pair in the browser, or run `moonshine pair` and follow the terminal
+   prompts. Select Steam to play.
 
 The built-in Steam command paths use `/usr/bin/steam`, which is unsuitable on
 NixOS; set both the application and scanner as above. Omit the scanner or use

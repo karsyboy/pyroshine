@@ -14,6 +14,72 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.0-prerelease.1] - 2026-10-27
+
+### Added
+
+- **Web management interface.** Manage Pyroshine in a browser at `http://127.0.0.1:47990/`, the same on a desktop or a headless host: dashboard, applications, library, clients and pairing, session history, settings, diagnostics, update checks and maintenance, live and usable on phones. Sign in with an administrator password set with `pyroshine web setup`. Reach it from another computer through an SSH tunnel or over HTTPS. **Restart now** applies saved settings without a terminal. See [Web interface and tray](MANAGEMENT.md).
+- **Desktop tray.** While you are signed in to a desktop, the service shows a status icon with session details, **End Session** and pairing notifications that open the matching web page. Headless hosts never start it; `[management] tray = false` turns it off.
+- **Session history.** Each session records the application, client, mode, codec, HDR, encoder, disconnects and a performance summary compared with the previous session (`[history]`, 90 days by default).
+- **Desktop Mode** (preview). Stream your existing KDE Plasma or GNOME Wayland desktop on a client-sized virtual display, with remote-only audio, input authorization, per-client UI scale, reconnect grace and automatic restoration of your physical displays. HDR requests fall back to SDR. Manage it from the Dashboard or `pyroshine desktop status|authorize|restore`. Games keep using isolated sessions. Streaming acceptance on physical KDE and GNOME hosts is still in progress. See [Desktop Mode](DESKTOP_MODE.md).
+- **H.264, HEVC and AV1 on Intel GPUs.** Profiles that Vulkan Video cannot encode now use VA-API (`intel-media-driver`) or NVENC on the same GPU. An Arc B390 now offers H.264, HEVC (including Main 10 and 4:4:4) and AV1; a UHD 730 offers H.264 and HEVC. Choose encoders with `stream.video.encoder`. These encoders pass GPU tests but have not yet been tested with a real client. See [GPU compatibility](GPU_COMPATIBILITY.md).
+- **Automatic game library.** Installed, removed and renamed games reach clients without a restart; Pyroshine watches each launcher and rescans only the one that changed (`[library]`). The **Library** page searches, filters, hides and rescans games and shows each launcher's status. See [`[library]`](CONFIGURATION.md#library).
+- **More game sources.** Discover Bottles games (native or Flatpak) and non-Steam games added to the host's Steam library, with their artwork and launch options. See [application scanners](CONFIGURATION.md#application_scanner).
+- **UDP bandwidth calibration** for every codec. Paired clients such as Pyrolight measure loss and queueing through the real video sender and get a conservative bitrate suggestion; nothing changes automatically. See [Bandwidth calibration](BANDWIDTH_CALIBRATION.md).
+- **Live bitrate changes.** Clients can change their stream's bitrate without reconnecting (`GET /bitrate`), as Vibepollo and Foundation Sunshine define. Nightjar's stream menu and automatic bitrate now work. See [Client integration](CLIENT_INTEGRATION.md#live-bitrate).
+- **Nightjar support** for VRR, live bitrate and fractional refresh rates through the Vibepollo extensions; launching a different application asks the client to confirm instead of failing. See [Client integration](CLIENT_INTEGRATION.md#vibepollo-extensions).
+- **Optional frame limiting** of launched games (`[frame_limit]`, off by default) to the stream's or a fixed frame rate, through Proton's limiters or MangoHud, globally or per application. See [`[frame_limit]`](CONFIGURATION.md#frame_limit).
+- **PyroDeck support.** The app list reports each game's launcher identity (such as `steam:892970`), `/serverinfo` reports what Steam says about a streamed game (launching, updating, running or exited), and cancellation can name the expected application. See [Client integration](CLIENT_INTEGRATION.md).
+- **Developer tools.** `moonshine-library` reports what each launcher scan finds; `moonshine-bench --json`, `--capabilities` and `--encoder`, `scripts/bench_results.py` and `scripts/hardware_tests.py` record and compare hardware results. See [testing](TESTING.md).
+
+### Changed
+
+- **Stable application IDs.** Discovered games keep the ID clients know across renames, reinstalls and restarts; upgrading keeps the current IDs.
+- **Each game is offered once.** Duplicates from desktop shortcuts or two launchers are merged, a manual `[[application]]` with a discovered title replaces it, and equal titles from different launchers are labeled, for example `Hades (Steam)`.
+- Games from a library that cannot be read (an unmounted drive, a half-written file) stay offered for up to seven days.
+- More box art: Steam custom, capsule and header art and Lutris banners. Box art is cached and no longer decoded on network threads.
+- Library scans at startup are much faster: a 2,000-game Steam library scans in about 40 ms.
+- A Steam launch is refused with a clear error while another Steam client of the same user is running on the host, instead of the game opening on the host's desktop. See [Close a desktop Steam before streaming Steam](TIPS.md#close-a-desktop-steam-before-streaming-steam).
+- The health check explains every codec profile it does not offer and names the encoder in use. See [GPU compatibility](GPU_COMPATIBILITY.md).
+- PyroWave is built from upstream [Themaister/pyrowave](https://github.com/Themaister/pyrowave) with a vendored patch series. Upstream rate-control fixes keep low-bitrate streams from losing color. The bitstream and C API are unchanged. See [PyroWave](PYROWAVE.md#pinned-dependency).
+- Pixelforge is updated to v0.10.0; H.264, HEVC and AV1 conversion uses a dedicated compute queue where available.
+
+### Fixed
+
+- **Color and HDR**
+  - SDR with H.264, HEVC and AV1 no longer looks darker than PyroWave; streams are now marked sRGB.
+  - Near-black shades no longer shift when a gamma 2.2 surface switches between direct capture and composition.
+  - Changed HDR metadata reaches H.264, HEVC and AV1 streams immediately instead of at the next key frame.
+  - HDR content without a declared mastering display reports the standard 1000-nit HDR10 fallback.
+  - 4:2:0 chroma is no longer shifted half a pixel, and SDR content in PyroWave HDR10 uses 203-nit white.
+- **Clients**
+  - Moonlight on iOS no longer fails with "A TLS error caused the secure connection to fail".
+  - Nightjar: PyroWave HDR streams are no longer much darker than HEVC or AV1, 10-bit SDR no longer streams as HDR10, and PyroWave works with limited range.
+  - Artemis on fractional refresh-rate displays (59.94 Hz, 119.88 Hz) no longer streams at a wrong frame rate.
+  - Reconnecting after backing out of a session before it connected no longer fails with "Failed to update session keys".
+- **Audio and input**
+  - Applications at 44.1 kHz no longer sound robotic.
+  - Audio is no longer corrupted after reconnecting with a different speaker configuration.
+  - Typing on Steam's on-screen keyboard no longer makes games stutter.
+- **Encoding and GPUs**
+  - Pyroshine starts on GPUs without Vulkan Video encode and offers PyroWave there.
+  - Profiles the GPU cannot encode at a constant bitrate are no longer advertised.
+  - Encoder padding is no longer sent, and bitrates above a profile's limit are capped.
+  - PyroWave keeps its frame rate when encoding is slow, such as an NVIDIA GPU at idle clocks or a GPU-bound game. On an RTX 3080, 4K60 rose from 41 to 60 FPS.
+- **Sessions**
+  - Ending a stream on NVIDIA no longer hangs the service.
+  - A session stops promptly when the client leaves right after a launch.
+  - A streamed application keeps running through `systemctl daemon-reload`.
+  - Pyroshine starts in containers and sandboxes that block `kcmp(2)`, such as Podman and Flatpak.
+- **Library**
+  - Two applications with the same title no longer launch the same one.
+  - Desktop-entry overrides and `Hidden=true` are honored.
+
+### Removed
+
+- The GTK desktop app (`pyroshine-ui`, `pyroshine-ui-bin`). The web interface and the server's tray replace it, and `pyroshine` (`pyroshine-bin`) replaces it on upgrade.
+- The host-local pairing page (`/pin`), which accepted a PIN from any local process. Pair in the web interface or with `pyroshine pair`.
+
 ## [v0.17.6] - 2026-10-14
 
 ### Changed
@@ -135,7 +201,7 @@ hooks and listener ports against the stricter configuration checks below.
 
 ### Added
 
-- Add the optional `pyroshine-ui` desktop app and package: a tray icon showing whether a client is streaming, the session is retained without a client, or a client waits to pair; pairing notifications with PIN approval and rejection; paired-client naming and revocation; a settings editor for every `config.toml` setting; a stream dashboard with one-second statistics and the compositor's current foreground application; and diagnostics. It manages, but never starts or stops, the service. See [Desktop app](DESKTOP.md).
+- Add the optional `pyroshine-ui` desktop app and package: a tray icon showing whether a client is streaming, the session is retained without a client, or a client waits to pair; pairing notifications with PIN approval and rejection; paired-client naming and revocation; a settings editor for every `config.toml` setting; a stream dashboard with one-second statistics and the compositor's current foreground application; and diagnostics. It manages, but never starts or stops, the service. See [Desktop app](MANAGEMENT.md).
 - Add a local management interface on the service user's D-Bus session bus (`io.github.karsyboy.Pyroshine`), used by the desktop app. Pyroshine runs unchanged without it or without a graphical session. Newly paired clients record an optional operator name and pairing time in `state.toml`.
 - Preserve explicitly identified Xbox Elite Series 1/2 (four native grip events), classic Steam Controller and Steam Deck models in automatic gamepad emulation, including motion and Deck touch events when the client supplies them.
 - Add `--cycles`, `--reconnect-cycles` and `--cursor static|moving` to `moonshine-bench` for repeated launch/stop and reconnect acceptance on real hardware and for measuring cursor capture paths.

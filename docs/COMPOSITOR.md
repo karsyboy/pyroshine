@@ -7,9 +7,11 @@ determine how applications receive that input.
 
 ## Ownership and frame handoff
 
-The embedded Smithay compositor owns the visible scene and input focus, not
-codec negotiation or packet transport. `frame.rs` carries the exported DMA-BUF,
-color/HDR metadata and consumption signal to the video pipeline. Capture demand
+The embedded Smithay compositor is the isolated capture backend (see
+[Capture backends](CAPTURE_BACKENDS.md)). It owns the visible scene and input
+focus, not codec negotiation or packet transport. The shared frame contract
+(`session/capture/frame.rs`) carries the exported DMA-BUF, color/HDR metadata
+and consumption signal to the video pipeline. Capture demand
 is separately generation-tagged; see [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
 Service buffer releases and input even when capture is blocked or the scene is
 clean. [Architecture](ARCHITECTURE.md) explains session and stream ownership.
@@ -280,6 +282,18 @@ Steam hides overlays and notifications by clearing `STEAM_OVERLAY` and
 the opacity change as its own property kind rather than as a raw atom; both
 refresh the cached classification.
 
+Steam's on-screen keyboard sends text through gamescope's private
+`gamescope_input_method_manager` protocol (`compositor/input_method.rs`), which
+Steam binds on `GAMESCOPE_WAYLAND_DISPLAY`. Each committed character is typed on
+the seat keyboard with the key, and Shift when needed, that produces it in the
+session's own keymap; editing actions are Enter, Backspace, Delete and the arrow
+keys. A character the layout lacks is typed through a temporary keymap. Without
+the protocol Steam falls back to XTest and remaps a keycode
+(`XChangeKeyboardMapping`) for every character; each remap reaches every X
+client as `MappingNotify`, and Wine rebuilds its keyboard tables on it, which
+made the game hitch on every key. The global is offered at version 2, so
+Steam does not send version 3's pointer requests.
+
 Controller Guide shortcuts are described in
 [configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
 Guide or the explicit Back+Start policy so games receive real Select holds.
@@ -379,7 +393,7 @@ cargo test -p moonshine-core --all-features --lib -- --ignored xwayland_tests
 
 ### Hardware acceptance
 
-For foreground reporting, run these checks with the desktop app open. They
+For foreground reporting, run these checks with the web interface's dashboard open. They
 require a GPU host, Moonlight, Steam and a game; automated metadata tests do not
 establish real game behavior:
 

@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Instant;
 use tokio::io::unix::AsyncFd;
 
-pub(super) struct PacingTimer {
+pub(crate) struct PacingTimer {
 	fd: AsyncFd<OwnedFd>,
 }
 

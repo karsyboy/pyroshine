@@ -1,4 +1,4 @@
-use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect};
+use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect, record_client_follows_hdr_mode};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
@@ -354,7 +354,7 @@ impl RtspServer {
 
 	/// Report a rejected negotiation to the operator. Clients show only the
 	/// RTSP status (stock Moonlight: "RTSP ANNOUNCE failed: 400"); the cause
-	/// reaches the desktop app.
+	/// reaches the web interface and the tray.
 	fn report_rejection(&self, code: &'static str, message: impl Into<String>, hint: impl Into<String>) {
 		self.session_manager
 			.report_problem(Problem::new(code, message, Some(hint.into())));
@@ -475,19 +475,22 @@ impl RtspServer {
 					.build(format!("PyroWave ANNOUNCE rejected: {reason}").into_bytes());
 			},
 		};
+		let pyrowave_sdr_as_sdr = negotiated_pyrowave_sdr_as_sdr(pyrowave_dialect, &sdp_session);
 
-		let (dynamic_range, chroma_sampling_type, bit_depth) = match negotiated_video_axes(&sdp_session) {
-			Ok(axes) => axes,
-			Err(()) => {
-				tracing::warn!("Client requested malformed or unsupported video profile attributes");
-				self.report_rejection(
-					"video_profile_invalid",
-					"The client requested a malformed or unsupported video profile (dynamic range, chroma or bit depth).",
-					"Reset the client's video settings, or update the client.",
-				);
-				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-			},
-		};
+		let requested_hdr_mode = self.session_manager.requested_hdr_mode().await;
+		let (dynamic_range, chroma_sampling_type, bit_depth) =
+			match negotiated_video_axes(&sdp_session, video_format, requested_hdr_mode) {
+				Ok(axes) => axes,
+				Err(()) => {
+					tracing::warn!("Client requested malformed or unsupported video profile attributes");
+					self.report_rejection(
+						"video_profile_invalid",
+						"The client requested a malformed or unsupported video profile (dynamic range, chroma or bit depth).",
+						"Reset the client's video settings, or update the client.",
+					);
+					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+				},
+			};
 
 		let max_reference_frames: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
@@ -547,6 +550,7 @@ impl RtspServer {
 				chroma = %format.chroma,
 				bit_depth = format.bit_depth.bits(),
 				hdr = format.hdr,
+				range = ?format.range,
 				"Requested video combination was not detected on this GPU/encoder; refusing silent fallback"
 			);
 			let verified = codec_profile_labels(self.supported_codecs);
@@ -581,6 +585,7 @@ impl RtspServer {
 			height,
 			fps,
 			pyrowave_dialect = ?pyrowave_dialect,
+			pyrowave_sdr_as_sdr,
 			pyrowave_bitstream = BITSTREAM_ID,
 			packet_size,
 			"Selected video mode"
@@ -588,6 +593,7 @@ impl RtspServer {
 
 		let video_stream_context = VideoStreamContext {
 			pyrowave_dialect,
+			pyrowave_sdr_as_sdr,
 			width,
 			height,
 			fps,
@@ -635,35 +641,20 @@ impl RtspServer {
 			},
 		};
 
-		// Parse surround audio attributes from SDP.
-		let surround_channels: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.numChannels").unwrap_or(2);
-		let surround_mask: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.channelMask").unwrap_or(0x3);
-		let surround_enable: u8 = get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.enable").unwrap_or(0);
 		let audio_quality: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.AudioQuality").unwrap_or(1);
-
-		let (channels, channel_mask) = if surround_enable != 0 {
-			match negotiation::audio_channels(surround_channels) {
-				Ok(channels) => (channels, surround_mask),
-				Err(reason) => {
-					tracing::warn!(reason, "Rejecting invalid audio negotiation");
-					self.report_rejection(
-						"audio_settings_invalid",
-						format!("The client's audio settings were rejected: {reason}."),
-						"Choose stereo, 5.1 or 7.1 audio in the client.",
-					);
-					return bad_request(cseq, request.version(), &reason);
-				},
-			}
-		} else {
-			// Fall back to the values from the HTTP launch request.
-			let ctx = self.session_manager.get_session_context().await;
-			match ctx {
-				Ok(Some(session_ctx)) => (session_ctx.audio_channels, session_ctx.audio_channel_mask),
-				_ => (AudioChannels::Stereo, 0x3),
-			}
+		let requested_layout = self.session_manager.requested_audio_layout().await;
+		let (channels, channel_mask) = match negotiated_audio_layout(&sdp_session, requested_layout) {
+			Ok(layout) => layout,
+			Err(reason) => {
+				tracing::warn!(reason, "Rejecting invalid audio negotiation");
+				self.report_rejection(
+					"audio_settings_invalid",
+					format!("The client's audio settings were rejected: {reason}."),
+					"Choose stereo, 5.1 or 7.1 audio in the client.",
+				);
+				return bad_request(cseq, request.version(), &reason);
+			},
 		};
 		let high_quality = audio_quality != 0;
 		// Pyrolight requests a bitrate level; other clients get the configured default.
@@ -1048,6 +1039,41 @@ fn negotiated_pyrowave_dialect(
 	.map(Some)
 }
 
+/// Whether a record-framed PyroWave client presents by the control stream's
+/// HDR mode (see [`record_client_follows_hdr_mode`]). A repeated attribute
+/// counts as present, which keeps the conservative HDR10 behavior.
+fn negotiated_pyrowave_sdr_as_sdr(dialect: Option<PyroWaveDialect>, session: &sdp_types::Session) -> bool {
+	let attribute = |name| unique_sdp_attribute(session, name).unwrap_or(Some(""));
+	dialect == Some(PyroWaveDialect::RecordFramed)
+		&& record_client_follows_hdr_mode(
+			attribute("x-ss-pyrowave.dialect"),
+			attribute("x-ss-video[0].pyrowaveAdaptiveFec"),
+			attribute("x-ss-video[0].pyrowaveAdaptiveBitrate"),
+		)
+}
+
+/// The channel layout an ANNOUNCE asks for.
+///
+/// Moonlight states its layout in `x-nv-audio.surround.numChannels` and
+/// `channelMask` on every ANNOUNCE (with `enable=0` for stereo). Only a client
+/// that states no channel count falls back to `requested`, the layout of the
+/// current HTTP launch/resume: the live session's context holds the previous
+/// epoch's layout, and reusing it on a reconnect that switched from surround
+/// to stereo kept encoding surround for a stereo decoder.
+fn negotiated_audio_layout(
+	session: &sdp_types::Session,
+	requested: Option<(AudioChannels, u32)>,
+) -> Result<(AudioChannels, u32), String> {
+	let mask = get_optional_sdp_attribute(session, "x-nv-audio.surround.channelMask").unwrap_or(0x3);
+	match get_optional_sdp_attribute::<u32>(session, "x-nv-audio.surround.numChannels") {
+		Some(count) => Ok((negotiation::audio_channels(count)?, mask)),
+		None if get_optional_sdp_attribute::<u8>(session, "x-nv-audio.surround.enable").unwrap_or(0) != 0 => {
+			Ok((AudioChannels::Stereo, mask))
+		},
+		None => Ok(requested.unwrap_or((AudioChannels::Stereo, 0x3))),
+	}
+}
+
 /// The audio quality level a Pyrolight client requested, if any.
 fn negotiated_audio_quality(session: &sdp_types::Session) -> Result<Option<AudioQuality>, &'static str> {
 	unique_sdp_attribute(session, "x-moonshine-audio.quality")?
@@ -1069,8 +1095,17 @@ fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attr
 }
 
 // Missing legacy attributes have defaults; malformed or unknown values do not.
+/// Dynamic range, chroma and bit depth of an ANNOUNCE.
+///
+/// `dynamicRangeMode=1` asks for HDR10 unless the launch or resume said
+/// `hdrMode=0` outright: Sunshine reads the mode as 10-bit encoding and HDR as
+/// a separate launch choice, and Nightjar asks for 10-bit SDR that way. Only
+/// the conventional codecs encode 10-bit SDR; PyroWave's 10-bit format is HDR10.
+/// An explicit `x-moonshine-video[0].bitDepth` keeps its own meaning.
 fn negotiated_video_axes(
 	session: &sdp_types::Session,
+	codec: VideoCodec,
+	requested_hdr_mode: Option<bool>,
 ) -> Result<(VideoDynamicRange, VideoChromaSampling, BitDepth), ()> {
 	fn optional_u32(session: &sdp_types::Session, name: &str) -> Result<Option<u32>, ()> {
 		unique_sdp_attribute(session, name)
@@ -1083,7 +1118,12 @@ fn negotiated_video_axes(
 		VideoChromaSampling::try_from(optional_u32(session, "x-ss-video[0].chromaSamplingType")?.unwrap_or(0))?;
 	let depth = match optional_u32(session, "x-moonshine-video[0].bitDepth")? {
 		Some(value) => BitDepth::try_from(value)?,
-		None if dynamic == VideoDynamicRange::Hdr => BitDepth::Ten,
+		None if dynamic == VideoDynamicRange::Hdr => {
+			if requested_hdr_mode == Some(false) && codec != VideoCodec::PyroWave {
+				return Ok((VideoDynamicRange::Sdr, chroma, BitDepth::Ten));
+			}
+			BitDepth::Ten
+		},
 		None => BitDepth::Eight,
 	};
 	Ok((dynamic, chroma, depth))
@@ -1170,6 +1210,32 @@ mod tests {
 				response.status().into(),
 				String::from_utf8_lossy(response.body()).into_owned(),
 			)
+		}
+
+		/// Nightjar asks for PyroWave in limited range unless its *full range*
+		/// setting is on, and converts with that setting rather than the
+		/// bitstream header, so the host encodes the requested range.
+		#[tokio::test]
+		async fn nightjar_pyrowave_is_accepted_in_either_range() {
+			use crate::healthcheck::{CODEC_PYROWAVE, CODEC_PYROWAVE_444, CODEC_PYROWAVE_HDR};
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			server.supported_codecs = CODEC_PYROWAVE | CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
+
+			let nightjar: Vec<(&str, &str)> = include_str!("../tests/protocol/nightjar-announce.sdp")
+				.lines()
+				.filter_map(|line| line.strip_prefix("a=")?.split_once(':'))
+				.collect();
+			// encoderCscMode: Rec.709 (1 << 1) plus the range bit.
+			for csc in ["2", "3"] {
+				let mut overrides = nightjar.clone();
+				overrides.push(("x-nv-video[0].encoderCscMode", csc));
+				let (status, body) = announce(&server, &grant, sdp(&overrides)).await;
+				assert_eq!(status, 500, "encoderCscMode {csc}: {body}");
+			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 		}
 
 		#[tokio::test]
@@ -1317,6 +1383,41 @@ mod tests {
 	/// Review 2026-10-05 CFG-001: SETUP advertises configured listener ports.
 	/// A configuration that passes startup validation must not make it hand a
 	/// client port 0: either validation rejects ephemeral advertised ports or
+	mod audio_layout {
+		use super::super::*;
+
+		fn layout(attributes: &str, requested: Option<(AudioChannels, u32)>) -> Result<(AudioChannels, u32), String> {
+			let body = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n{attributes}");
+			negotiated_audio_layout(&parse_sdp(body.as_bytes()).unwrap(), requested)
+		}
+
+		/// A reconnect that switches from 5.1 to stereo announces `enable=0`.
+		/// It must select stereo, not the surround layout of the live epoch
+		/// or launch, or the client decodes 6-channel Opus as stereo.
+		#[test]
+		fn stated_stereo_overrides_the_previous_surround_layout() {
+			let surround = Some((AudioChannels::Surround51, 0x3f));
+			let stereo = "a=x-nv-audio.surround.numChannels:2\r\na=x-nv-audio.surround.channelMask:3\r\na=x-nv-audio.surround.enable:0\r\n";
+			assert_eq!(layout(stereo, surround), Ok((AudioChannels::Stereo, 0x3)));
+			let surround71 = "a=x-nv-audio.surround.numChannels:8\r\na=x-nv-audio.surround.channelMask:1599\r\na=x-nv-audio.surround.enable:1\r\n";
+			assert_eq!(
+				layout(surround71, Some((AudioChannels::Stereo, 0x3))),
+				Ok((AudioChannels::Surround71, 1599))
+			);
+			assert!(layout("a=x-nv-audio.surround.numChannels:4\r\n", None).is_err());
+		}
+
+		/// Clients that state no layout keep the current launch/resume request's.
+		#[test]
+		fn unstated_layout_uses_the_http_request() {
+			assert_eq!(
+				layout("", Some((AudioChannels::Surround51, 0x3f))),
+				Ok((AudioChannels::Surround51, 0x3f))
+			);
+			assert_eq!(layout("", None), Ok((AudioChannels::Stereo, 0x3)));
+		}
+	}
+
 	/// SETUP reports the ports actually bound.
 	mod advertised_ports {
 		use super::super::*;
@@ -1696,6 +1797,12 @@ mod tests {
 				include_str!("../tests/protocol/nonary-announce.sdp"),
 				PyroWaveDialect::RecordFramed,
 			),
+			// Nightjar (Android): records by feature bit, plus pacing and link
+			// hints Pyroshine does not use.
+			(
+				include_str!("../tests/protocol/nightjar-announce.sdp"),
+				PyroWaveDialect::RecordFramed,
+			),
 		] {
 			let session = sdp_types::Session::parse(attributes.as_bytes()).unwrap();
 			assert_eq!(
@@ -1725,6 +1832,60 @@ mod tests {
 		);
 	}
 
+	/// Only a record client that presents by HDR mode (Nightjar: feature bit 1
+	/// alone) gets SDR frames as SDR. Clients that normalize zero header color
+	/// bits to the negotiated format keep every frame in HDR10: Pyrolight's
+	/// record mode (explicit dialect echo), Nonary builds with the adaptive
+	/// attributes, native clients and the conventional codecs.
+	#[test]
+	fn only_hdr_mode_record_clients_receive_sdr_frames_as_sdr() {
+		use super::*;
+		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fixture\r\nt=0 0\r\n";
+		let pyrolight_record = format!(
+			"{base}a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-pyrowave.dialect:record-framed\r\na=x-ss-pyrowave.bitstream:186f0393\r\n"
+		);
+		let nonary_bitrate_only =
+			format!("{base}a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-video[0].pyrowaveAdaptiveBitrate:1\r\n");
+		let repeated_marker = format!(
+			"{base}a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-video[0].pyrowaveAdaptiveBitrate:1\r\na=x-ss-video[0].pyrowaveAdaptiveBitrate:1\r\n"
+		);
+		let nightjar_without_hints = format!("{base}a=x-ss-video[0].pyrowaveFeatures:1\r\n");
+		for (attributes, codec, expected) in [
+			(
+				include_str!("../tests/protocol/nightjar-announce.sdp"),
+				VideoCodec::PyroWave,
+				true,
+			),
+			(nightjar_without_hints.as_str(), VideoCodec::PyroWave, true),
+			(
+				include_str!("../tests/protocol/nonary-announce.sdp"),
+				VideoCodec::PyroWave,
+				false,
+			),
+			(nonary_bitrate_only.as_str(), VideoCodec::PyroWave, false),
+			(repeated_marker.as_str(), VideoCodec::PyroWave, false),
+			(pyrolight_record.as_str(), VideoCodec::PyroWave, false),
+			(
+				include_str!("../tests/protocol/native-announce.sdp"),
+				VideoCodec::PyroWave,
+				false,
+			),
+			(
+				include_str!("../tests/protocol/nightjar-announce.sdp"),
+				VideoCodec::Hevc,
+				false,
+			),
+		] {
+			let session = sdp_types::Session::parse(attributes.as_bytes()).unwrap();
+			let dialect = negotiated_pyrowave_dialect(codec, &session).unwrap();
+			assert_eq!(
+				negotiated_pyrowave_sdr_as_sdr(dialect, &session),
+				expected,
+				"{codec:?} {attributes}"
+			);
+		}
+	}
+
 	#[test]
 	fn profile_axes_preserve_hdr_chroma_and_explicit_sdr_depth() {
 		use super::*;
@@ -1735,14 +1896,17 @@ mod tests {
 						"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\na=x-nv-video[0].dynamicRangeMode:{hdr}\r\na=x-ss-video[0].chromaSamplingType:{chroma}\r\na=x-moonshine-video[0].bitDepth:{depth}\r\n"
 					);
 					let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
-					assert_eq!(
-						negotiated_video_axes(&session).unwrap(),
-						(
-							VideoDynamicRange::try_from(hdr).unwrap(),
-							VideoChromaSampling::try_from(chroma).unwrap(),
-							BitDepth::try_from(depth).unwrap()
-						)
-					);
+					// An explicit depth is never reinterpreted by the launch's hdrMode.
+					for hdr_mode in [None, Some(false), Some(true)] {
+						assert_eq!(
+							negotiated_video_axes(&session, VideoCodec::Hevc, hdr_mode).unwrap(),
+							(
+								VideoDynamicRange::try_from(hdr).unwrap(),
+								VideoChromaSampling::try_from(chroma).unwrap(),
+								BitDepth::try_from(depth).unwrap()
+							)
+						);
+					}
 				}
 			}
 		}
@@ -1754,7 +1918,7 @@ mod tests {
 		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n";
 		let session = sdp_types::Session::parse(base.as_bytes()).unwrap();
 		assert_eq!(
-			negotiated_video_axes(&session).unwrap(),
+			negotiated_video_axes(&session, VideoCodec::Hevc, None).unwrap(),
 			(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420, BitDepth::Eight)
 		);
 		for (attribute, value) in [
@@ -1766,8 +1930,37 @@ mod tests {
 			("x-moonshine-video[0].bitDepth", "ten"),
 		] {
 			let data = format!("{base}a={attribute}:{value}\r\n");
-			assert!(negotiated_video_axes(&sdp_types::Session::parse(data.as_bytes()).unwrap()).is_err());
+			let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
+			assert!(negotiated_video_axes(&session, VideoCodec::Hevc, None).is_err());
 		}
+	}
+
+	/// Nightjar's 10-bit SDR: `dynamicRangeMode=1` without a bit depth, after a
+	/// launch or resume that said `hdrMode=0` outright. Moonlight clients send
+	/// `hdrMode=1` for HDR and nothing otherwise, so they keep HDR10.
+	#[test]
+	fn explicit_sdr_launch_turns_ten_bit_dynamic_range_into_sdr() {
+		use super::*;
+		let data = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\na=x-nv-video[0].dynamicRangeMode:1\r\n";
+		let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
+		let axes = |codec, hdr_mode| negotiated_video_axes(&session, codec, hdr_mode).unwrap();
+		for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+			assert_eq!(
+				axes(codec, Some(false)),
+				(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
+			);
+			for hdr_mode in [None, Some(true)] {
+				assert_eq!(
+					axes(codec, hdr_mode),
+					(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
+				);
+			}
+		}
+		// PyroWave has no 10-bit SDR format.
+		assert_eq!(
+			axes(VideoCodec::PyroWave, Some(false)),
+			(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
+		);
 	}
 
 	/// DESCRIBE advertises the highest audio quality level, ANNOUNCE requests a

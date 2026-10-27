@@ -1,0 +1,213 @@
+# Every `#[ignore]`d Rust test in the workspace, with what it needs to run.
+#
+# `scripts/hardware_tests.py` probes the requirements, runs the tests a host
+# can run, and reports the rest as skipped with the missing requirement. A
+# test is passed only when its harness reports exactly one passed test, so a
+# filter that matches nothing can never pass. `check-registry` fails when an
+# ignored test is missing here or an entry names a test that no longer exists:
+# add an entry in the same change as a new ignored test.
+#
+# timeout: seconds before the test is killed and failed (default: --timeout).
+#   Set for tests that finish in about a second, so a hang fails fast.
+#
+# kind:
+#   test          hardware/system contract; failures are regressions
+#   informational prints measurements; runs only with --include-informational
+#   helper        child process of another test; never run directly
+#
+# requires (probed by hardware_tests.py):
+#   render-node          a readable and writable /dev/dri/renderD* node
+#   vulkan-video-encode  a Vulkan device exposing VK_KHR_video_encode_queue
+#   xwayland             the Xwayland binary
+#   ffmpeg               the ffmpeg binary (decodes encoder output)
+#   pacat                libpulse's pacat client
+#   systemd-user         a reachable user systemd manager
+#   kde-wayland          a signed-in, unlocked KDE Wayland session
+#   desktop-takeover     explicit MOONSHINE_TEST_TAKEOVER=1 and a saved desktop input grant
+#   input-devices        writable /dev/uinput and /dev/uhid
+#   nvidia-gpu           an NVIDIA GPU (sets MOONSHINE_TEST_NVML to its PCI address)
+#   pyrowave-library     the pinned PyroWave library (--pyrowave-library or MOONSHINE_PYROWAVE_LIBRARY)
+#   unsupported-render-node  MOONSHINE_TEST_UNSUPPORTED_RENDER_NODE naming a GPU without Vulkan Video encode
+
+[[test]]
+name = "gpu::tests::capture_device_selection_on_gpu"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "gpu::tests::capture_device_without_encode_support_never_falls_back_on_gpu"
+requires = ["unsupported-render-node"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "gpu_sensors::nvml::tests::reads_an_nvidia_gpu"
+requires = ["nvidia-gpu"]
+
+[[test]]
+name = "gpu_sensors::tests::reads_this_hosts_gpus"
+requires = ["render-node"]
+
+[[test]]
+name = "session::application::tests::launch_failures_and_exits_report_the_exit_status"
+requires = ["systemd-user"]
+env = { MOONSHINE_TEST_SYSTEMD = "1" }
+
+[[test]]
+name = "session::application::tests::transient_unit_stop_establishes_termination"
+requires = ["systemd-user"]
+env = { MOONSHINE_TEST_SYSTEMD = "1" }
+
+[[test]]
+name = "session::compositor::color_management::tests::invalid_native_color_constructors_disconnect_only_the_offending_client"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::color_render::tests::native_color_draw_preserves_pq_and_scales_linear_light"
+requires = ["render-node"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_process::tests::child_process_helper"
+kind = "helper"
+
+[[test]]
+name = "session::compositor::xwayland_tests::foreground_follows_primary_focus_titles_and_window_lifetime"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::game_restored_when_steam_clears_its_overlay_properties"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::game_restored_when_steam_hides_its_overlay_by_opacity"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::input_focus_window_is_raised_in_the_x_stack"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::keyboard_focus_taken_by_steam_is_reclaimed"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::steam_input_method_types_without_keymap_changes"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::live_output_reconfiguration_resizes_windows_held_at_output_size"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::steam_browser_subwindow_keeps_focus_when_overlay_closes"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::compositor::xwayland_tests::x11_errors_on_destroyed_focus_windows_are_not_fatal"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
+name = "session::stream::audio::pulse_server::receive_tests::real_pulse_clients_play_every_layout_and_may_vanish"
+requires = ["pacat"]
+env = { MOONSHINE_TEST_PULSE_CLIENT = "1" }
+
+[[test]]
+name = "session::stream::control::input::gamepad::compatibility_tests::native_devices_join_their_threads_on_destruction"
+requires = ["input-devices"]
+env = { MOONSHINE_TEST_DEVICES = "1" }
+
+[[test]]
+name = "session::stream::video::packetizer::tests::transport_packetizer_measurements"
+kind = "informational"
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::converter_matches_reference_on_gpu"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::converter_timing_on_gpu"
+kind = "informational"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::encoder_rate_control_limits_on_gpu"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::encoder_input_slots_rotate_on_gpu"
+requires = ["render-node", "vulkan-video-encode"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::static_recovery_decodes_to_the_latest_frame_on_gpu"
+requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::stream_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "vulkan-video-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::vaapi_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "vaapi-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::nvenc_encode_decode_matches_reference_on_gpu"
+requires = ["render-node", "nvenc", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::dmabuf::tests::gpu_import_after_source_owner_teardown_and_fd_reuse"
+requires = ["render-node"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pyrowave::tests::ffi_loads_pinned_api"
+requires = ["pyrowave-library"]
+env = { MOONSHINE_TEST_PYROWAVE = "1" }
+
+[[test]]
+name = "session::stream::video::pyrowave::tests::pyrowave_imports_compositor_dmabufs_on_gpu"
+requires = ["render-node", "pyrowave-library"]
+env = { MOONSHINE_TEST_GPU = "1", MOONSHINE_TEST_PYROWAVE = "1" }
+
+[[test]]
+name = "desktop::native::kde::tests::native_120hz_capture_and_owner_cleanup_on_kde"
+requires = ["kde-wayland", "render-node", "systemd-user"]
+env = { MOONSHINE_TEST_DESKTOP = "1" }
+timeout = 45
+
+[[test]]
+name = "session::capture::portal::takeover_tests::managed_takeover_keeps_input_across_output_changes"
+requires = ["kde-wayland", "render-node", "systemd-user", "desktop-takeover"]
+timeout = 90
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::vaapi_loss_recovery_decodes_on_gpu"
+requires = ["render-node", "vaapi-encode", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }
+
+[[test]]
+name = "session::stream::video::pipeline::convert::tests::nvenc_loss_recovery_decodes_on_gpu"
+requires = ["render-node", "nvenc", "ffmpeg"]
+env = { MOONSHINE_TEST_GPU = "1" }

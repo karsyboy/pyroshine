@@ -41,6 +41,24 @@ impl PyroWaveDialect {
 		Err("Unsupported PyroWave protocol dialect; native requires version 1, records require feature bit 1")
 	}
 }
+/// Whether a record-framed client converts PyroWave planes by the control
+/// stream's HDR mode rather than by the sequence header, so SDR frames of an
+/// HDR10 stream can be sent as SDR with HDR mode off (the Rubylight host's
+/// convention).
+///
+/// Nightjar does, and announces records by feature bit 1 alone. Pyrolight's
+/// record mode (explicit `x-ss-pyrowave.dialect` echo) and Nonary builds that
+/// send the adaptive FEC or bitrate attributes treat zero header color bits
+/// as "the negotiated format" and would show such SDR frames as PQ, so they
+/// keep every frame in HDR10.
+pub fn record_client_follows_hdr_mode(
+	dialect: Option<&str>,
+	adaptive_fec: Option<&str>,
+	adaptive_bitrate: Option<&str>,
+) -> bool {
+	dialect.is_none() && adaptive_fec.is_none() && adaptive_bitrate.is_none()
+}
+
 /// Nonary accepts unpadded and straddling records. Prefix completeness permits
 /// partial recovery; ordinary GameStream FEC and encryption remain unchanged.
 pub(crate) fn record_boundaries(frame: &[u8], payload: usize) -> Result<(Vec<usize>, u16), ()> {
@@ -84,6 +102,14 @@ pub(crate) fn record_boundaries(frame: &[u8], payload: usize) -> Result<(Vec<usi
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn only_bare_feature_bit_record_clients_follow_hdr_mode() {
+		assert!(record_client_follows_hdr_mode(None, None, None));
+		assert!(!record_client_follows_hdr_mode(Some("record-framed"), None, None));
+		assert!(!record_client_follows_hdr_mode(None, Some("0"), None));
+		assert!(!record_client_follows_hdr_mode(None, None, Some("1")));
+	}
 	#[test]
 	fn native_and_nonary_are_explicit() {
 		assert_eq!(

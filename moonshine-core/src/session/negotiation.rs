@@ -64,11 +64,43 @@ impl DisplayMode {
 		let mode = Self {
 			width: parse("width", width)?,
 			height: parse("height", height)?,
-			refresh_rate: parse("refresh rate", refresh_rate)?,
+			refresh_rate: refresh_rate_hz(refresh_rate)?,
 		};
 		validate_display_mode(mode.width, mode.height, mode.refresh_rate)?;
 		Ok(mode)
 	}
+}
+
+/// The refresh of a launch/resume mode, rounded to whole hertz.
+///
+/// Besides plain hertz (`60`), clients for Apollo-derived hosts send
+/// fractional rates in two forms that those hosts define: a decimal
+/// (`59.94`, Nightjar, Vibepollo clients) and, from Artemis, an integer in
+/// millihertz (`59940`). Apollo reads any value of 1000 or more as
+/// millihertz, so this does too; no client requests a refresh of 1000 Hz or
+/// more in plain hertz. Integer hertz values keep their exact meaning.
+fn refresh_rate_hz(value: &str) -> Result<u32, String> {
+	let invalid = || format!("invalid refresh rate '{value}' in mode");
+	let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+	let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+	// A decimal point needs digits on both sides; millihertz is the finest
+	// precision any client sends.
+	if !digits(whole) || (value.contains('.') && !(digits(fraction) && fraction.len() <= 3)) {
+		return Err(invalid());
+	}
+	// Thousandths of the value as written, so 59.94 and 59940 compare exactly.
+	let thousandths = whole
+		.parse::<u64>()
+		.ok()
+		.and_then(|whole| whole.checked_mul(1000))
+		.and_then(|whole| whole.checked_add(format!("{fraction:0<3}").parse::<u64>().unwrap_or(0)))
+		.ok_or_else(invalid)?;
+	let millihertz = if thousandths < 1_000_000 {
+		thousandths
+	} else {
+		thousandths / 1000
+	};
+	u32::try_from(millihertz.saturating_add(500) / 1000).map_err(|_| invalid())
 }
 
 /// Parse a GameStream channel count (stereo, 5.1 or 7.1).
@@ -116,8 +148,7 @@ mod tests {
 			"7680x4320x60",
 			"16384x16384x1",
 			"1x1x1",
-			"1920x1080x1000",
-			"1920x1080x2147483",
+			"1920x1080x999",
 		] {
 			assert!(DisplayMode::parse(mode).is_ok(), "{mode}");
 		}
@@ -130,17 +161,55 @@ mod tests {
 			"1920x1080x0",
 			"16385x1080x60",
 			"1920x16385x60",
-			"1920x1080x2147484",
 			"4294967295x4294967295x4294967295",
 			"4294967296x1080x60",
 			"-1920x1080x60",
-			"1920x1080x60.0",
 			" 1920x1080x60",
 		] {
 			assert!(DisplayMode::parse(mode).is_err(), "{mode}");
 		}
 		// The compositor's millihertz conversion stays representable.
 		assert!(i32::try_from(MAX_REFRESH_RATE_HZ * 1000).is_ok());
+	}
+
+	#[test]
+	fn fractional_and_millihertz_refresh_rates_round_to_hertz() {
+		for (mode, hertz) in [
+			// Nightjar and Vibepollo clients: decimal hertz.
+			("1920x1080x59.94", 60),
+			("1920x1080x119.88", 120),
+			("1920x1080x60.0", 60),
+			("1920x1080x143.856", 144),
+			("1920x1080x23.976", 24),
+			// Artemis: millihertz from 1000 on, as Apollo reads it.
+			("1920x1080x59940", 60),
+			("1920x1080x119880", 120),
+			("1920x1080x1000", 1),
+			("1920x1080x2147483", 2147),
+			("1920x1080x2147483000", MAX_REFRESH_RATE_HZ),
+		] {
+			assert_eq!(
+				DisplayMode::parse(mode).map(|mode| mode.refresh_rate),
+				Ok(hertz),
+				"{mode}"
+			);
+		}
+		for mode in [
+			// Rounds to zero.
+			"1920x1080x0.4",
+			"1920x1080x.5",
+			"1920x1080x60.",
+			"1920x1080x59.9401",
+			"1920x1080x+60",
+			"1920x1080x-60",
+			"1920x1080x6e1",
+			"1920x1080x59,94",
+			"1920x1080x60.0.0",
+			"1920x1080x2147484000",
+			"1920x1080x99999999999999999999999",
+		] {
+			assert!(DisplayMode::parse(mode).is_err(), "{mode}");
+		}
 	}
 
 	#[test]

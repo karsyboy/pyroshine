@@ -55,8 +55,8 @@ use smithay::xwayland::X11Wm;
 
 use super::KeyboardConfig;
 use super::capture::DirectReject;
+use crate::session::capture::frame::{ExportedFrame, FrameColorSpace};
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
 
 /// Number of pre-allocated GBM buffers. Conventional encoders may retain
 /// multiple submitted buffers; PyroWave admits only one capture at a time.
@@ -271,8 +271,8 @@ pub(crate) struct MoonshineCompositor {
 	/// diagnostics only.
 	pub(super) source_commit_generation: u64,
 	/// Fixed refresh-slot capture, or presentation-driven capture for a client
-	/// that requested VRR presentation (see [`super::capture::CapturePacing`]).
-	pub(super) capture_pacing: super::capture::CapturePacing,
+	/// that requested VRR presentation (see [`crate::session::capture::CapturePacing`]).
+	pub(super) capture_pacing: crate::session::capture::CapturePacing,
 	/// The trigger of the capture currently being attempted.
 	capture_trigger: super::capture::CaptureTrigger,
 	/// VRR pacing: limits flips (capture opportunity plus frame callbacks) to
@@ -297,6 +297,8 @@ pub(crate) struct MoonshineCompositor {
 	/// Clipboard text queued by `TypeText` events, typed in bounded batches on
 	/// successive frame ticks. See [`crate::session::compositor::input`].
 	pub pending_text: String,
+	/// Steam's on-screen keyboard text (gamescope input-method protocol).
+	pub input_method: super::input_method::InputMethodState,
 
 	// -- Cursor --
 	pub cursor_position: Point<f64, Logical>,
@@ -431,7 +433,8 @@ pub(crate) struct MoonshineCompositor {
 
 	/// Whether HDR mode is active for this session.
 	pub hdr: bool,
-	pub hdr_capable: bool,
+	/// Reported with readiness; `hdr()` says whether HDR can be switched on.
+	pub capabilities: crate::session::capture::CaptureCapabilities,
 
 	/// Steam integration mode (gamescope's `-e`). Promotes the connector
 	/// strategy to `SteamControlled` and enables Steam window filtering.
@@ -671,7 +674,7 @@ impl MoonshineCompositor {
 		if width == 0 || height == 0 || refresh_rate == 0 {
 			return Err("output dimensions and refresh rate must be non-zero".to_string());
 		}
-		if hdr && !self.hdr_capable {
+		if hdr && !self.capabilities.hdr() {
 			return Err("HDR was requested but the live compositor is not HDR capable".to_string());
 		}
 
@@ -753,7 +756,7 @@ impl MoonshineCompositor {
 		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
-		hdr_capable: bool,
+		capabilities: crate::session::capture::CaptureCapabilities,
 		steam_mode: bool,
 		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
@@ -892,6 +895,7 @@ impl MoonshineCompositor {
 
 		// Native color descriptions remain available for SDR sessions too.
 		let color_management = Some(super::color_management::ColorManagementState::new(&display_handle, hdr));
+		let input_method = super::input_method::InputMethodState::new(&display_handle);
 
 		Ok((
 			Self {
@@ -919,7 +923,7 @@ impl MoonshineCompositor {
 				cadence: super::capture::CaptureCadence::new(log_stats),
 				commit_generation: 0,
 				source_commit_generation: 0,
-				capture_pacing: super::capture::CapturePacing::Fixed,
+				capture_pacing: crate::session::capture::CapturePacing::Fixed,
 				capture_trigger: super::capture::CaptureTrigger::Refresh,
 				flip_limiter: super::capture::PresentationLimiter::new(initial_refresh_interval),
 				last_flip_at: None,
@@ -930,6 +934,7 @@ impl MoonshineCompositor {
 				content_changed_at: None,
 				seat,
 				pending_text: String::new(),
+				input_method,
 				cursor_position: initial_cursor_position,
 				cursor: Default::default(),
 				pointer_element,
@@ -990,7 +995,7 @@ impl MoonshineCompositor {
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
 				hdr: hdr_active,
-				hdr_capable,
+				capabilities,
 				steam_mode,
 				virtual_connector_strategy,
 				focused_x11_window: None,
@@ -1305,12 +1310,14 @@ impl MoonshineCompositor {
 		{
 			return Err(DirectReject::SurfaceTree);
 		}
-		if !self.hdr
-			&& self
-				.color_management
-				.as_ref()
-				.is_some_and(|cm| cm.surface_color_space(&source) != FrameColorSpace::Srgb)
-		{
+		// Composition converts what the stream cannot carry as is: HDR into
+		// an SDR output, and gamma 2.2 into the sRGB every SDR stream signals
+		// (PyroWave's scaler has no gamma 2.2 input, and the conversion is
+		// the compositor's shader either way).
+		if self.color_management.as_ref().is_some_and(|cm| {
+			let color_space = cm.surface_color_space(&source);
+			color_space == FrameColorSpace::Gamma22 || (!self.hdr && color_space.is_hdr())
+		}) {
 			return Err(DirectReject::ForcedComposition);
 		}
 		self.surface_is_complete_output(&source)
@@ -1664,7 +1671,7 @@ impl MoonshineCompositor {
 
 	/// Switch capture pacing for the next client epoch. Deferred slots, pending
 	/// flips and limiter phase belong to the previous pacing and are dropped.
-	pub(crate) fn set_capture_pacing(&mut self, pacing: super::capture::CapturePacing) {
+	pub(crate) fn set_capture_pacing(&mut self, pacing: crate::session::capture::CapturePacing) {
 		if pacing == self.capture_pacing {
 			return;
 		}
@@ -1686,7 +1693,7 @@ impl MoonshineCompositor {
 	/// for a flip as soon as the limiter allows; fixed pacing waits for the tick.
 	pub(super) fn note_content_change(&mut self, at: std::time::Instant) {
 		self.content_changed_at = Some(self.content_changed_at.map_or(at, |previous| previous.max(at)));
-		if self.capture_pacing != super::capture::CapturePacing::Vrr {
+		if self.capture_pacing != crate::session::capture::CapturePacing::Vrr {
 			return;
 		}
 		self.flip_requested_at.get_or_insert(at);
@@ -1707,7 +1714,7 @@ impl MoonshineCompositor {
 	/// callbacks, like a variable-refresh panel showing a new frame. The
 	/// limiter keeps the average at or below the negotiated rate.
 	fn vrr_flip(&mut self, trigger: super::capture::CaptureTrigger) {
-		if self.capture_pacing != super::capture::CapturePacing::Vrr {
+		if self.capture_pacing != crate::session::capture::CapturePacing::Vrr {
 			self.flip_requested_at = None;
 			return;
 		}
@@ -1782,7 +1789,7 @@ impl MoonshineCompositor {
 	/// newest scene: the content is source-timed, so a later capture moves
 	/// only its transmit time, never its timestamp.
 	pub fn complete_deferred_capture(&mut self) {
-		if self.capture_pacing == super::capture::CapturePacing::Vrr {
+		if self.capture_pacing == crate::session::capture::CapturePacing::Vrr {
 			if self.vrr_capture_pending {
 				self.capture_trigger = super::capture::CaptureTrigger::Pending;
 				self.capture_deadline = std::time::Instant::now();
@@ -2026,7 +2033,7 @@ impl MoonshineCompositor {
 
 		let Some(credit) = self.frame_tx.try_acquire() else {
 			if send_callbacks {
-				if self.capture_pacing == super::capture::CapturePacing::Vrr {
+				if self.capture_pacing == crate::session::capture::CapturePacing::Vrr {
 					// Demand captures the newest scene once the consumer is
 					// ready; the flip's frame callbacks are not withheld.
 					self.vrr_capture_pending = true;
@@ -2119,7 +2126,7 @@ impl MoonshineCompositor {
 			// The encoder is still reading this buffer — skip the frame
 			// to avoid overwriting its content.
 			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
-			if self.capture_pacing == super::capture::CapturePacing::Vrr {
+			if self.capture_pacing == crate::session::capture::CapturePacing::Vrr {
 				self.vrr_capture_pending = true;
 			}
 			if send_callbacks {
@@ -2398,7 +2405,7 @@ impl MoonshineCompositor {
 			std::time::Instant::now(),
 		);
 		exported_frame.source_time = source_time;
-		exported_frame.vrr_capture = self.capture_pacing == super::capture::CapturePacing::Vrr;
+		exported_frame.vrr_capture = self.capture_pacing == crate::session::capture::CapturePacing::Vrr;
 		match self
 			.frame_tx
 			.try_send(exported_frame, credit.take().expect("capture credit"))
@@ -2612,7 +2619,7 @@ impl MoonshineCompositor {
 			std::time::Instant::now(),
 		);
 		exported_frame.source_time = source_time;
-		exported_frame.vrr_capture = self.capture_pacing == super::capture::CapturePacing::Vrr;
+		exported_frame.vrr_capture = self.capture_pacing == crate::session::capture::CapturePacing::Vrr;
 
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
@@ -2885,9 +2892,11 @@ impl MoonshineCompositor {
 					// Notify the session thread that XWayland is ready.
 					if let Some(tx) = data.xdisplay_tx.take() {
 						let _ = tx.send(super::CompositorReady {
-							xdisplay: display_number,
-							wayland_display: data.wayland_display.clone(),
-							hdr_capable: data.hdr_capable,
+							display: crate::session::capture::ApplicationDisplay {
+								xdisplay: display_number,
+								wayland_display: data.wayland_display.clone(),
+							},
+							capabilities: data.capabilities.clone(),
 						});
 					}
 				},
@@ -3069,23 +3078,23 @@ impl MoonshineCompositor {
 /// time of the newest captured content (or `now` for a cursor or keepalive
 /// capture), never later than the capture itself.
 fn capture_source_time(
-	pacing: super::capture::CapturePacing,
+	pacing: crate::session::capture::CapturePacing,
 	deadline: std::time::Instant,
 	content_changed_at: Option<std::time::Instant>,
 	now: std::time::Instant,
 ) -> std::time::Instant {
 	match pacing {
-		super::capture::CapturePacing::Fixed => deadline,
-		super::capture::CapturePacing::Vrr => content_changed_at.map_or(now, |at| at.min(now)),
+		crate::session::capture::CapturePacing::Fixed => deadline,
+		crate::session::capture::CapturePacing::Vrr => content_changed_at.map_or(now, |at| at.min(now)),
 	}
 }
 
 /// Refresh reported in presentation feedback: a fixed period, or under VRR
 /// pacing the minimum period of a variable-refresh output.
-fn presentation_refresh(pacing: super::capture::CapturePacing, period: std::time::Duration) -> Refresh {
+fn presentation_refresh(pacing: crate::session::capture::CapturePacing, period: std::time::Duration) -> Refresh {
 	match pacing {
-		super::capture::CapturePacing::Fixed => Refresh::Fixed(period),
-		super::capture::CapturePacing::Vrr => Refresh::Variable(period),
+		crate::session::capture::CapturePacing::Fixed => Refresh::Fixed(period),
+		crate::session::capture::CapturePacing::Vrr => Refresh::Variable(period),
 	}
 }
 

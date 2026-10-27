@@ -1,11 +1,12 @@
 pub mod pyrowave_protocol;
+pub mod rate;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::authorization::MediaStream;
-use crate::session::compositor::frame::HdrModeState;
+use crate::session::capture::frame::HdrModeState;
 use crate::session::lifecycle::{StartLatch, StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::MediaDemand;
@@ -21,18 +22,25 @@ mod pipeline;
 pub(crate) mod pyrowave;
 mod rtp_clock;
 pub use pipeline::ConversionQueueMode;
-pub(crate) use pipeline::convert;
+pub use pipeline::{EncoderBackend, EncoderPreference, EncoderTable};
+pub(crate) use pipeline::{convert, encode_caps, nvenc, vaapi};
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
+// The UDP bandwidth calibration probe (`crate::calibration`) reuses the
+// production sender so its datagrams leave with the stream's GSO cadence and pacing.
 pub use fec::FecMode;
 use fec::FrameFecStatus;
 pub use format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 	VideoChromaSampling, VideoCodec, VideoDynamicRange, VideoFormat,
 };
-use gso_socket::{UdpGsoSocket, duration_micros_u64};
+use gso_socket::duration_micros_u64;
+pub(crate) use gso_socket::{FramePacing, UdpGsoSocket};
+pub(crate) use pacing_timer::PacingTimer;
+pub(crate) use packetizer::wire_shard_size;
+pub(crate) use pipeline::KcmpProbe;
 use pipeline::VideoPipeline;
-use shard_batch::ShardBatch;
+pub(crate) use shard_batch::{ShardBatch, ShardBuf};
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,6 +79,14 @@ pub struct VideoStreamConfig {
 	/// Queue for H.264/HEVC/AV1 RGB-to-YCbCr conversion; auto prefers a
 	/// dedicated compute family so a GPU-bound game cannot delay it.
 	pub conversion_queue: pipeline::ConversionQueueMode,
+	/// Which encoder implementations encode H.264/HEVC/AV1: `auto` uses Vulkan
+	/// Video wherever it encodes a profile and VA-API or NVENC for the profiles
+	/// it cannot; `vulkan`, `vaapi` or `nvenc` use only that one.
+	pub encoder: pipeline::EncoderPreference,
+	/// The backend the startup probe chose for each advertised profile; set by
+	/// the server, not configurable.
+	#[serde(skip)]
+	pub encoder_table: pipeline::EncoderTable,
 
 	/// Upper bound for the client-requested video packet size, in bytes.
 	///
@@ -136,6 +152,8 @@ impl Default for VideoStreamConfig {
 			log_stats: true,
 			pyrowave_queue: pyrowave::PyroWaveQueueMode::Auto,
 			conversion_queue: pipeline::ConversionQueueMode::Auto,
+			encoder: pipeline::EncoderPreference::Auto,
+			encoder_table: pipeline::EncoderTable::default(),
 			max_packet_size: 0,
 		}
 	}
@@ -196,13 +214,36 @@ pub struct FrameStats {
 	/// Captured with VRR (presentation-driven) pacing.
 	pub vrr_capture: bool,
 	/// How the source frame was produced (direct export or composition).
-	pub(crate) capture_origin: crate::session::compositor::frame::CaptureOrigin,
+	pub(crate) capture_origin: crate::session::capture::frame::CaptureOrigin,
+}
+
+impl FrameStats {
+	/// How the source frame was captured: `direct`, `direct_late` (direct
+	/// export with late-composited layers) or `composited`.
+	pub fn capture_path(&self) -> &'static str {
+		use crate::session::capture::frame::CapturePath;
+		match self.capture_origin.path {
+			CapturePath::Direct => "direct",
+			CapturePath::DirectLate => "direct_late",
+			CapturePath::Composited => "composited",
+		}
+	}
+
+	/// Stable id of the first condition that ruled out direct export, for a
+	/// composited frame whose compositor recorded one.
+	pub fn composition_reason(&self) -> Option<&'static str> {
+		self.capture_origin.composition_reason.map(|reason| reason.id())
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VideoStreamContext {
 	/// Explicit setup-time PyroWave dialect; conventional codecs use None.
 	pub pyrowave_dialect: Option<pyrowave_protocol::PyroWaveDialect>,
+	/// A record-framed client that presents by the control stream's HDR mode
+	/// (see [`pyrowave_protocol::record_client_follows_hdr_mode`]): SDR frames
+	/// of an HDR10 PyroWave stream are encoded as SDR with HDR mode off.
+	pub pyrowave_sdr_as_sdr: bool,
 	/// Width of the video stream in pixels.
 	pub width: u32,
 
@@ -235,6 +276,15 @@ pub struct VideoStreamContext {
 }
 
 impl VideoStreamContext {
+	/// Transmit pacing for the intra-only PyroWave path; conventional
+	/// inter-frame codecs send immediately.
+	fn frame_pacing(&self) -> Option<FramePacing> {
+		(self.format.codec == VideoCodec::PyroWave).then(|| FramePacing {
+			bitrate_bps: u64::try_from(self.bitrate).unwrap_or(u64::MAX),
+			frame_interval: std::time::Duration::from_secs(1) / self.fps.max(1),
+		})
+	}
+
 	/// Check every value that timing, allocation, encoder and transport code
 	/// consume. Callers validate before pausing or reconfiguring a live epoch.
 	pub(crate) fn validate(&self) -> Result<(), String> {
@@ -292,9 +342,9 @@ impl VideoStreamContext {
 	/// The virtual-output properties this stream requires from the compositor.
 	pub(crate) fn output_mode(
 		&self,
-		capture_pacing: crate::session::compositor::CapturePacing,
-	) -> crate::session::compositor::OutputMode {
-		crate::session::compositor::OutputMode {
+		capture_pacing: crate::session::capture::CapturePacing,
+	) -> crate::session::capture::OutputMode {
+		crate::session::capture::OutputMode {
 			width: self.width,
 			height: self.height,
 			refresh_rate: self.fps,
@@ -313,6 +363,7 @@ impl VideoStreamContext {
 			};
 		}
 		changed!(pyrowave_dialect, "PyroWave dialect");
+		changed!(pyrowave_sdr_as_sdr, "PyroWave SDR presentation");
 		changed!(width, "width");
 		changed!(height, "height");
 		changed!(fps, "fps");
@@ -367,6 +418,7 @@ impl VideoStreamContext {
 /// immediately, then wait on a persistent [`StartLatch`] until `StartB`.
 #[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
+	pub(crate) rate_control: rate::RateControl,
 	start: StartLatch,
 	idr_tx: broadcast::Sender<()>,
 	/// Reference frame invalidation requests, carrying the inclusive
@@ -396,6 +448,10 @@ pub(super) enum VideoPacketMessage {
 		generation: u64,
 		ready: tokio::sync::oneshot::Sender<()>,
 	},
+	/// A live PyroWave bitrate, ordered before the first batch encoded with
+	/// it: frames are paced over their bytes at the bitrate they were encoded
+	/// for. The next `BeginEpoch` restores the negotiated rate.
+	PacingBitrate(u64),
 }
 
 impl VideoStreamHandle {
@@ -503,6 +559,7 @@ impl VideoStreamHandle {
 		let (idr_tx, idr_rx) = broadcast::channel(16);
 		let (packet_tx, packet_rx) = mpsc::channel(16);
 		let handle = Self {
+			rate_control: rate::channel(0).0,
 			pause_tx: watch::channel(0u64).0,
 			start: StartLatch::new(),
 			idr_tx,
@@ -518,7 +575,7 @@ impl VideoStreamHandle {
 
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
-	frame_rx: crate::session::compositor::admission::CaptureReceiver,
+	frame_rx: crate::session::capture::admission::CaptureReceiver,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	/// Receives the encoder's failure if it ends the session.
@@ -529,7 +586,7 @@ impl VideoStream {
 	pub async fn new(
 		config: VideoStreamConfig,
 		address: String,
-		frame_rx: crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: crate::session::capture::admission::CaptureReceiver,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -599,8 +656,8 @@ impl VideoStream {
 			diagnostics::spawn_watchdog(stop.clone(), packet_tx.downgrade());
 		}
 		let (reconfigure_tx, reconfigure_rx) = std::sync::mpsc::channel();
-		let pacing_bitrate =
-			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
+		let pacing = context.frame_pacing();
+		let (rate_control, rate_rx) = rate::channel(generation);
 
 		// Spawn packet handler — registered now, gated behind the start latch.
 		let demand = MediaDemand::new();
@@ -615,7 +672,7 @@ impl VideoStream {
 			start.waiter(),
 			stop.clone(),
 			worker,
-			pacing_bitrate,
+			pacing,
 			context.fps,
 			config.log_stats,
 		);
@@ -639,10 +696,12 @@ impl VideoStream {
 			reconfigure_rx,
 			demand,
 			stop_cause,
+			rate_rx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
 		Ok(VideoStreamHandle {
+			rate_control,
 			start,
 			idr_tx,
 			invalidate_tx,
@@ -676,10 +735,14 @@ fn spawn_handle_video_packets(
 	start: StartWaiter,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	worker: WorkerGuard,
-	mut pacing_bitrate: Option<u64>,
+	mut pacing: Option<FramePacing>,
 	mut fps: u32,
 	log_stats: bool,
 ) {
+	// An activated epoch is not yet deliverable until StartB and the current
+	// client's PING. In particular, do not discard the only recovery frame of
+	// an idle desktop while its endpoint is still being discovered.
+	demand.set(false);
 	tokio::spawn(async move {
 		// Declared first so it is released after the socket and channel below.
 		let _worker = worker;
@@ -703,6 +766,7 @@ fn spawn_handle_video_packets(
 		let mut transport_window = diagnostics::TransportWindow::new(log_stats);
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			let mut delivery_changed = false;
 			tokio::select! {
 				result = &mut start, if !started => {
 					if result.is_err() {
@@ -710,6 +774,7 @@ fn spawn_handle_video_packets(
 						break;
 					}
 					started = true;
+					delivery_changed = true;
 				},
 				Ok(()) = pause_rx.changed() => {
 					if !paused { client_address = None; }
@@ -733,15 +798,19 @@ fn spawn_handle_video_packets(
 							let _ = ready.send(());
 						},
 						Ok(Some(VideoPacketMessage::BeginEpoch { context, generation, ready })) => {
-							pacing_bitrate = (context.format.codec == VideoCodec::PyroWave)
-								.then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
+							pacing = context.frame_pacing();
 							fps = context.fps;
 							active_generation = generation;
 							paused = false;
-							demand.set(true);
+							delivery_changed = true;
 							let tos = if context.qos { 160 } else { 0 };
 							let _ = socket.set_tos_v4(tos);
 							let _ = ready.send(());
+						},
+						Ok(Some(VideoPacketMessage::PacingBitrate(bitrate_bps))) => {
+							if let Some(pacing) = pacing.as_mut() {
+								pacing.bitrate_bps = bitrate_bps;
+							}
 						},
 						Ok(Some(VideoPacketMessage::Batch(mut batch))) => {
 							let current = authorization.borrow().generation();
@@ -755,7 +824,7 @@ fn spawn_handle_video_packets(
 								// stops draining cannot block session shutdown. A pause
 								// or a replaced authorization stops the remaining shards.
 								let interrupted = {
-									let send = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing_bitrate));
+									let send = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing));
 									tokio::pin!(send);
 									loop {
 										tokio::select! {
@@ -768,6 +837,7 @@ fn spawn_handle_video_packets(
 											},
 											Ok(()) = authorization.changed() => {
 												if authorization.borrow_and_update().generation() != active_generation {
+													demand.set(false);
 													break None;
 												}
 											},
@@ -857,6 +927,10 @@ fn spawn_handle_video_packets(
 					}
 				},
 
+				Ok(()) = authorization.changed() => {
+					authorization.borrow_and_update();
+					delivery_changed = true;
+				},
 				message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
 					let (len, address) = match message {
 						Ok(Ok((len, address))) => (len, address),
@@ -872,10 +946,22 @@ fn spawn_handle_video_packets(
 					if authorization.borrow().admits_media_ping(MediaStream::Video, address, &buf[..len]) {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some((authorization.borrow().generation(), address));
+						delivery_changed = true;
 					} else {
 						tracing::debug!(%address, len, "Ignoring unauthorized video endpoint discovery datagram");
 					}
 				},
+			}
+			if delivery_changed {
+				demand.set(
+					deliverable(
+						client_address,
+						started && !paused,
+						active_generation,
+						authorization.borrow().generation(),
+					)
+					.is_some(),
+				);
 			}
 		}
 
@@ -902,7 +988,7 @@ fn deliverable(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::session::compositor::CapturePacing;
+	use crate::session::capture::CapturePacing;
 	use crate::session::stream::test_support::SocketId;
 
 	#[tokio::test]
@@ -1089,7 +1175,10 @@ mod tests {
 			start.waiter(),
 			stop.clone(),
 			worker(&stop),
-			Some(650_000_000),
+			Some(FramePacing {
+				bitrate_bps: 650_000_000,
+				frame_interval: Duration::from_secs(1) / 120,
+			}),
 			120,
 			false,
 		);
@@ -1249,7 +1338,7 @@ mod tests {
 	async fn busy_udp_port_fails_stream_construction() {
 		let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let port = occupied.local_addr().unwrap().port();
-		let (_capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+		let (_capture_tx, capture_rx) = crate::session::capture::admission::capture_channel();
 		let config = VideoStreamConfig {
 			port,
 			..Default::default()
@@ -1272,9 +1361,14 @@ mod tests {
 			..Default::default()
 		};
 		assert!(
-			crate::session::stream::audio::AudioStream::new(audio, "127.0.0.1".into(), ShutdownManager::new())
-				.await
-				.is_err()
+			crate::session::stream::audio::AudioStream::new(
+				audio,
+				"127.0.0.1".into(),
+				crate::session::stream::audio::AudioSource::Pulse,
+				ShutdownManager::new(),
+			)
+			.await
+			.is_err()
 		);
 	}
 
@@ -1297,7 +1391,7 @@ mod tests {
 			// Each attempt gets its own capture channel; keep the senders open.
 			let mut capture_senders = Vec::new();
 			let stream = construct_on_fixed_port(port, async || {
-				let (capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+				let (capture_tx, capture_rx) = crate::session::capture::admission::capture_channel();
 				capture_senders.push(capture_tx);
 				VideoStream::new(
 					config.clone(),
@@ -1618,11 +1712,12 @@ mod tests {
 	}
 
 	/// Review 2026-10-05 PERF-001: every pause (urgent notification or the
-	/// ordered barrier) clears media demand, and only an epoch activation
-	/// restores it, so producers stop while no client can receive media.
+	/// ordered barrier) clears media demand. Activation alone must not consume
+	/// the first recovery frame before the client discovers its video endpoint.
 	#[tokio::test]
-	async fn pauses_clear_media_demand_until_an_epoch_activates() {
+	async fn resumed_media_waits_for_the_current_video_endpoint() {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
 		let stop = ShutdownManager::new();
 		let start = StartLatch::new();
 		let (tx, rx) = mpsc::channel(16);
@@ -1644,7 +1739,21 @@ mod tests {
 			false,
 		);
 		start.open();
-		assert!(demand.wanted());
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let wait_for_demand = |wanted| {
+			let demand = demand.clone();
+			async move {
+				tokio::time::timeout(std::time::Duration::from_secs(1), async {
+					while demand.wanted() != wanted {
+						tokio::task::yield_now().await;
+					}
+				})
+				.await
+				.unwrap();
+			}
+		};
+		client.send_to(b"PING", server).await.unwrap();
+		wait_for_demand(true).await;
 		let activate = || async {
 			let (ready, activated) = tokio::sync::oneshot::channel();
 			tx.send(VideoPacketMessage::BeginEpoch {
@@ -1662,7 +1771,12 @@ mod tests {
 		acknowledged.await.unwrap();
 		assert!(!demand.wanted());
 		activate().await;
-		assert!(demand.wanted());
+		assert!(
+			!demand.wanted(),
+			"activation must retain recovery until a video endpoint exists"
+		);
+		client.send_to(b"PING", server).await.unwrap();
+		wait_for_demand(true).await;
 		// Urgent notification alone.
 		pause_tx.send_modify(|g| *g += 1);
 		tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1672,8 +1786,13 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		// The other ordering is valid too: discovery during pause cannot
+		// resume capture, but must be usable as soon as PLAY activates it.
+		client.send_to(b"PING", server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		assert!(!demand.wanted());
 		activate().await;
-		assert!(demand.wanted());
+		wait_for_demand(true).await;
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 		stop.wait_shutdown_complete().await;
 	}
@@ -1738,6 +1857,13 @@ mod tests {
 		};
 		assert_eq!(active.changed_fields(&records), vec!["PyroWave dialect"]);
 		assert_eq!(records.changed_fields(&active), vec!["PyroWave dialect"]);
+		// A Nightjar reconnect onto another record client's epoch rebuilds the
+		// encoder, whose SDR handling differs.
+		let nightjar = VideoStreamContext {
+			pyrowave_sdr_as_sdr: true,
+			..records.clone()
+		};
+		assert_eq!(records.changed_fields(&nightjar), vec!["PyroWave SDR presentation"]);
 	}
 
 	#[test]

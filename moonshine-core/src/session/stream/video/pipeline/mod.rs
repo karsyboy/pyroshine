@@ -3,12 +3,15 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+pub(crate) mod backend;
 pub(crate) mod convert;
 pub(super) mod dmabuf;
-mod encode_caps;
+pub(crate) mod encode_caps;
 pub(super) mod failure;
 mod hdr_sei;
+pub(crate) mod nvenc;
 mod padding;
+pub(crate) mod vaapi;
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -20,9 +23,10 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::admission::OverlayCaps;
-use crate::session::compositor::frame::{
-	CaptureOrigin, FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
+use crate::session::capture::admission::OverlayCaps;
+use crate::session::capture::frame::{
+	CaptureOrigin, FrameColorSpace, FrameOverlay, Hdr10Metadata, HdrMetadata, HdrModeState, MAX_OVERLAYS,
+	OverlayContent,
 };
 use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
@@ -32,21 +36,23 @@ use crate::session::stream::video::fec::{FecController, FrameFecStatus};
 use crate::session::stream::video::gso_socket::duration_micros_u64;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::pyrowave::{
-	EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
+	EncodedFrame, PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
 };
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
 	VideoCodec, VideoPacketMessage, VideoReconfigureCommand, VideoStreamConfig, VideoStreamContext,
 };
 
+use backend::{ConventionalEncoder, EncodeError, EncoderInput, PacketFuture};
+pub use backend::{EncoderBackend, EncoderPreference, EncoderTable};
 pub use convert::ConversionQueueMode;
-use convert::InputConverter;
+use convert::{ChromaSiting, ColorSpace, ConvertFormat, InputConverter, Target};
+pub(crate) use dmabuf::KcmpProbe;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
 use pixelforge::{
-	Codec, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder, EncoderTuningMode, OutputFormat,
-	PixelForgeError, PixelFormat, RateControlMode, VideoContext,
+	Codec, ColorDescription, EncodeConfig, Encoder, EncoderTuningMode, PixelFormat, RateControlMode, VideoContext,
 };
 
 /// Useful-work credits of the conventional pipeline: frames submitted to the
@@ -105,9 +111,9 @@ fn conventional_credit_limit() -> usize {
 /// Declares whether this consumer composites frame overlays (late cursor
 /// composition) and withdraws the declaration on every exit; the next
 /// consumer of the capture channel declares its own.
-struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
+struct OverlaySupport<'a>(&'a crate::session::capture::admission::CaptureReceiver);
 impl<'a> OverlaySupport<'a> {
-	fn declare(rx: &'a crate::session::compositor::admission::CaptureReceiver, caps: OverlayCaps) -> Self {
+	fn declare(rx: &'a crate::session::capture::admission::CaptureReceiver, caps: OverlayCaps) -> Self {
 		rx.set_overlay_caps(caps);
 		Self(rx)
 	}
@@ -166,20 +172,12 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 		.ok_or_else(|| format!("unsupported DRM fourcc 0x{fourcc:08x} for the conventional encoders"))
 }
 
-/// Whether a pixelforge error indicates Vulkan device loss.
-///
-/// Device loss is unrecoverable on the existing device: every subsequent GPU
-/// operation fails the same way, so the encoding loop must exit (shutting the
-/// session down) instead of retrying forever and freezing the stream.
-fn is_device_lost(e: &PixelForgeError) -> bool {
-	e.vulkan_result() == Some(vk::Result::ERROR_DEVICE_LOST)
-}
-
-/// Classify a pixelforge error from a step after the source was converted.
-/// Device loss is terminal; any other failure leaves the encoder's reference
-/// state unknown, so recovery forces an IDR.
-fn encoder_failure(stage: EncodeStage, error: &PixelForgeError) -> EncodeFailure {
-	let recovery = if is_device_lost(error) {
+/// Classify an encoder error from a step after the source was converted.
+/// Device loss is terminal (every later GPU operation fails the same way, so
+/// the loop must stop instead of freezing the stream); any other failure
+/// leaves the encoder's reference state unknown, so recovery forces an IDR.
+fn encoder_failure(stage: EncodeStage, error: &EncodeError) -> EncodeFailure {
+	let recovery = if error.device_lost() {
 		Recovery::Terminal
 	} else {
 		Recovery::RequestIdr
@@ -188,46 +186,21 @@ fn encoder_failure(stage: EncodeStage, error: &PixelForgeError) -> EncodeFailure
 	EncodeFailure::new(stage, recovery, SourceAccess::Completed, error.to_string())
 }
 
-/// The encoder-input contract of the conventional loop. The pinned Pixelforge
-/// encoder owns two input slots (`ENCODE_PIPELINE_DEPTH`): `input_image` is the
-/// current slot and every `encode` advances to the next one. Each captured
-/// frame is converted into `input_image` and encoded from it immediately, so a
-/// per-frame encode always reads the slot it just converted.
-trait EncoderInput {
-	type Future;
-	type Error;
-	fn input_image(&self) -> vk::Image;
-	fn encode(&mut self, image: vk::Image) -> Result<Self::Future, Self::Error>;
-}
-
-impl EncoderInput for Encoder {
-	type Future = EncodeFuture;
-	type Error = PixelForgeError;
-
-	fn input_image(&self) -> vk::Image {
-		Encoder::input_image(self)
-	}
-
-	fn encode(&mut self, image: vk::Image) -> Result<EncodeFuture, PixelForgeError> {
-		Encoder::encode(self, image)
-	}
-}
-
 /// Encode a recovery keyframe for a static scene: an IDR is pending (already
 /// requested from the encoder) and no new frame arrived.
 ///
-/// After an `encode`, `input_image` is the *next* slot, which holds an older
+/// After an `encode`, `input_target` is the *next* slot, which holds an older
 /// frame or none (review 2026-10-05 BUG-002). `restore` therefore first writes
 /// the latest converted frame into that slot (from the converter's output
 /// buffer, which still holds it) and only then is the slot encoded. A failed
 /// restore submits nothing.
 fn encode_static_recovery<E: EncoderInput>(
 	encoder: &mut E,
-	restore: impl FnOnce(&mut E, vk::Image) -> Result<(), E::Error>,
+	restore: impl FnOnce(&mut E, E::Target) -> Result<(), E::Error>,
 ) -> Result<E::Future, E::Error> {
-	let image = encoder.input_image();
-	restore(encoder, image)?;
-	encoder.encode(image)
+	let target = encoder.input_target()?;
+	restore(encoder, target)?;
+	encoder.encode(target)
 }
 
 /// Pixelforge's codec for a conventional stream codec.
@@ -256,6 +229,16 @@ fn apply_failure(
 		Recovery::Terminal => Err(failure.to_string()),
 		recovery => Ok(recovery),
 	}
+}
+
+/// An epoch's conventional encoder and what its converter must produce.
+struct EncoderSetup {
+	encoder: ConventionalEncoder,
+	convert: ConvertFormat,
+	/// Extent the converter writes: the frame padded to the encoder's alignment.
+	extent: (u32, u32),
+	/// Row pitch alignment of a buffer target in bytes.
+	row_alignment: u32,
 }
 
 /// Why an encoding loop ended the stream.
@@ -327,11 +310,35 @@ fn encoder_stop_cause(codec: VideoCodec, error: &EncoderError) -> crate::session
 
 fn color_description_for(format: NegotiatedVideoFormat) -> Result<ColorDescription, String> {
 	let description = match (format.primaries, format.transfer) {
-		(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
+		(ColorPrimaries::Bt709, TransferFunction::Srgb) => ColorDescription::srgb(),
 		(ColorPrimaries::Bt2020, TransferFunction::Pq) => ColorDescription::bt2020_pq(),
 		_ => return Err(format!("Unsupported color description: {format:?}")),
 	};
-	Ok(description.with_full_range(format.range == ColorRange::Full))
+	Ok(signaled(description, format))
+}
+
+/// `description` with the stream's range and the converter's chroma
+/// position, so every description the encoder signals (initial and per
+/// frame) describes the samples the converter writes.
+fn signaled(description: ColorDescription, format: NegotiatedVideoFormat) -> ColorDescription {
+	let location = if format.chroma == ChromaFormat::Yuv420 {
+		chroma_siting_for(format).location()
+	} else {
+		pixelforge::ChromaLocation::Unspecified
+	};
+	description
+		.with_full_range(format.range == ColorRange::Full)
+		.with_chroma_location(location)
+}
+
+/// Where the converter places 4:2:0 chroma: centered (the 2x2 mean) where the
+/// codec can signal it, left-sited for AV1, whose sequence header has no
+/// code for centered chroma.
+fn chroma_siting_for(format: NegotiatedVideoFormat) -> ChromaSiting {
+	match format.codec {
+		VideoCodec::Av1 => ChromaSiting::Left,
+		_ => ChromaSiting::Center,
+	}
 }
 
 pub(crate) struct VideoPipeline {}
@@ -439,7 +446,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 }
 
 /// Per-submitted-frame context handed to the packet consumer thread, in
-/// submission order. It travels alongside that frame's [`EncodeFuture`] in a
+/// submission order. It travels alongside that frame's [`PacketFuture`] in a
 /// single [`ConsumerMessage::Frame`], so the packet is paired with its context by
 /// construction — there is no separate packet channel to keep in lockstep.
 struct FrameContext {
@@ -476,12 +483,13 @@ struct FrameContext {
 }
 
 /// Message from the encoding thread to the packet consumer thread, in
-/// submission order.
+/// submission order. Passed by value: boxing `Frame` would allocate per frame.
+#[allow(clippy::large_enum_variant)]
 enum ConsumerMessage {
-	/// A submitted frame's context together with the [`EncodeFuture`] that
+	/// A submitted frame's context together with the [`PacketFuture`] that
 	/// resolves with its encoded packet. Awaiting the future yields the packet
 	/// for exactly this frame, so context and packet are paired by construction.
-	Frame(FrameContext, EncodeFuture, InFlightGuard),
+	Frame(FrameContext, PacketFuture, InFlightGuard),
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset.
@@ -504,7 +512,7 @@ const PACKETIZE_OFFLOAD_BYTES: usize = 128 * 1024;
 use super::shard_batch::NetworkCredit as InFlightGuard;
 
 /// Packet consumer thread: for each submitted frame, awaits its
-/// [`EncodeFuture`] to get the encoded packet, injects HDR SEI if needed,
+/// [`PacketFuture`] to get the encoded packet, injects HDR SEI if needed,
 /// packetizes and sends it over the network channel, and emits latency stats.
 ///
 /// Running this off the encoding thread is what realizes the latency win of the
@@ -619,12 +627,11 @@ async fn run_packet_consumer(
 		}
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
-		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
+		// encoding as BT.2020+PQ. SDR frames encoded as sRGB carry no HDR SEI.
+		// The values match the control-stream HDR metadata, including the
+		// documented fallback for an undeclared mastering display.
 		if packet.is_key_frame && frame_context.inject_hdr {
-			// Fall back to default HDR10 metadata when the content provides none
-			// (e.g. scRGB swapchains carry no mastering metadata), staying
-			// consistent with the control-stream HDR metadata.
-			let m = frame_context.hdr_metadata.unwrap_or_else(HdrMetadata::fallback);
+			let m = Hdr10Metadata::for_stream(frame_context.hdr_metadata.as_ref());
 			packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.format.codec);
 		}
 
@@ -852,7 +859,7 @@ async fn run_packet_consumer(
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		frame_rx: crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: crate::session::capture::admission::CaptureReceiver,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
@@ -869,6 +876,7 @@ impl VideoPipeline {
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		demand: crate::session::stream::MediaDemand,
 		stop_cause: crate::session::failure::StopCauseSlot,
+		rate_rx: super::rate::RateReceiver,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -876,6 +884,7 @@ impl VideoPipeline {
 			tracing::error!(%error, "Cannot start video pipeline");
 		})?;
 		let inner = VideoPipelineInner {
+			rate_rx,
 			capture_context,
 			config,
 			context,
@@ -921,6 +930,7 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
+	rate_rx: super::rate::RateReceiver,
 	capture_context: VideoContext,
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
@@ -977,6 +987,7 @@ impl VideoPipelineInner {
 		let Some(EpochActivation { generation, applied }) = activation else {
 			return Ok(());
 		};
+		self.rate_rx.activate(generation);
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		packet_tx
 			.blocking_send(VideoPacketMessage::BeginEpoch {
@@ -997,7 +1008,7 @@ impl VideoPipelineInner {
 	fn run(
 		mut self,
 		runtime: tokio::runtime::Handle,
-		frame_rx: crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: crate::session::capture::admission::CaptureReceiver,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
@@ -1066,18 +1077,15 @@ impl VideoPipelineInner {
 				)
 				.map_err(EncoderError::Runtime)
 			} else {
-				match self
-					.create_encoder()
-					.map_err(EncoderError::Setup)
-					.and_then(|(context, encoder, input_extent)| {
-						let converter = self.create_converter(&context, input_extent)?;
-						Ok((context, encoder, converter))
-					}) {
-					Ok((context, encoder, converter)) => self
+				match self.create_encoder().map_err(EncoderError::Setup).and_then(|setup| {
+					let converter = self.create_converter(&setup)?;
+					Ok((setup.encoder, converter))
+				}) {
+					Ok((encoder, converter)) => self
 						.run_encoding_loop(
 							&runtime,
 							&frame_rx,
-							context,
+							self.capture_context.clone(),
 							encoder,
 							converter,
 							packet_tx.clone(),
@@ -1123,41 +1131,23 @@ impl VideoPipelineInner {
 		tracing::debug!("Video pipeline stopped.");
 	}
 
-	/// Create the RGB-to-YCbCr converter for this epoch's encoder, whose input
-	/// images measure `input_extent`.
+	/// Create the RGB-to-YCbCr converter for this epoch's encoder.
 	///
 	/// The only RGB-to-YCbCr path of the conventional codecs: preferably on the
 	/// dedicated compute family, compositing late layers (cursor and
-	/// notification) and padding to the encoder's block alignment. A converter
-	/// this GPU cannot run correctly fails the stream setup
-	/// ([`EncoderError::ColorConversion`]).
-	fn create_converter(
-		&self,
-		context: &VideoContext,
-		input_extent: (u32, u32),
-	) -> Result<InputConverter, EncoderError> {
+	/// notification), padding to the encoder's alignment and writing the
+	/// layout its backend reads. A converter this GPU cannot run correctly
+	/// fails the stream setup ([`EncoderError::ColorConversion`]).
+	fn create_converter(&self, setup: &EncoderSetup) -> Result<InputConverter, EncoderError> {
 		let ctx = &self.context;
-		let output_format = match (ctx.format.chroma, ctx.format.bit_depth) {
-			(ChromaFormat::Yuv420, BitDepth::Eight) => OutputFormat::NV12,
-			(ChromaFormat::Yuv420, BitDepth::Ten) => OutputFormat::P010,
-			(ChromaFormat::Yuv444, BitDepth::Eight) => OutputFormat::YUV444,
-			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
-		};
-		let codec = pixelforge_codec(ctx.format.codec).map_err(EncoderError::Setup)?;
-		let (extent_width, extent_height) =
-			convert::conversion_extent(codec, ctx.width, ctx.height).map_err(EncoderError::Setup)?;
-		if extent_width > input_extent.0 || extent_height > input_extent.1 {
-			return Err(EncoderError::Setup(format!(
-				"conversion extent {extent_width}x{extent_height} exceeds the encoder input {}x{}",
-				input_extent.0, input_extent.1
-			)));
-		}
+		let (extent_width, extent_height) = setup.extent;
 		let converter = InputConverter::new(
-			context.clone(),
+			self.capture_context.clone(),
 			self.config.conversion_queue,
 			(ctx.width, ctx.height),
-			(extent_width, extent_height),
-			output_format,
+			setup.extent,
+			setup.convert,
+			setup.row_alignment,
 			if ctx.format.hdr {
 				ColorSpace::Bt2020
 			} else {
@@ -1165,6 +1155,10 @@ impl VideoPipelineInner {
 			},
 			ctx.format.range == ColorRange::Full,
 		)
+		.map(|mut converter| {
+			converter.set_chroma_siting(chroma_siting_for(ctx.format));
+			converter
+		})
 		.map_err(|error| match error {
 			convert::ConverterError::Create(error) => {
 				EncoderError::Setup(format!("Failed to create the YCbCr converter: {error}"))
@@ -1175,21 +1169,119 @@ impl VideoPipelineInner {
 			async_compute = converter.async_compute,
 			conversion_width = extent_width,
 			conversion_height = extent_height,
+			format = ?setup.convert,
 			"Using RGB to YCbCr converter with late cursor composition"
 		);
 		Ok(converter)
 	}
 
-	/// Create the encoder for this epoch; also returns the extent of its input
-	/// images (the conversion must fit).
-	fn create_encoder(&self) -> Result<(VideoContext, Encoder, (u32, u32)), String> {
+	/// The backend for this epoch's profile: the startup probe's choice, or,
+	/// without one (benchmarks, tests), the preference's first backend that
+	/// can encode it on the capture GPU.
+	fn select_backend(&self) -> Result<EncoderBackend, String> {
+		let format = self.context.format;
+		let bit = crate::healthcheck::profile_bit(format)
+			.ok_or_else(|| format!("{format:?} is not a conventional profile"))?;
+		if let Some(backend) = self.config.encoder_table.get(bit) {
+			return Ok(backend);
+		}
+		let codec = pixelforge_codec(format.codec)?;
+		let mut reasons = Vec::new();
+		for &backend in self.config.encoder.candidates() {
+			let available = match backend {
+				EncoderBackend::Vulkan => crate::healthcheck::probe_vulkan_capabilities(
+					&self.capture_context,
+					codec,
+					format.chroma,
+					format.bit_depth,
+				),
+				EncoderBackend::Vaapi => {
+					vaapi::probe(&self.capture_context, format.codec, format.chroma, format.bit_depth)
+				},
+				EncoderBackend::Nvenc => {
+					nvenc::probe(&self.capture_context, format.codec, format.chroma, format.bit_depth)
+				},
+			};
+			match available {
+				Ok(()) => return Ok(backend),
+				Err(reason) => reasons.push(format!("{}: {reason}", backend.label())),
+			}
+		}
+		Err(format!(
+			"no encoder backend encodes this profile ({})",
+			reasons.join("; ")
+		))
+	}
+
+	/// Create the encoder for this epoch and describe the input it reads.
+	fn create_encoder(&self) -> Result<EncoderSetup, String> {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
+		let codec = pixelforge_codec(ctx.format.codec)?;
+		let backend = self.select_backend()?;
+		let color_description = color_description_for(ctx.format)?;
+		let convert = backend
+			.convert_format(ctx.format.chroma, ctx.format.bit_depth)
+			.map_err(str::to_string)?;
+		let native = backend::NativeFormat {
+			codec: ctx.format.codec,
+			chroma: ctx.format.chroma,
+			bit_depth: ctx.format.bit_depth,
+			width: ctx.width,
+			height: ctx.height,
+			fps: ctx.fps,
+			bitrate: u32::try_from(ctx.bitrate).unwrap_or(u32::MAX),
+			color: color_description,
+		};
+		let setup = match backend {
+			EncoderBackend::Vulkan => self.create_vulkan_encoder(codec, convert, color_description)?,
+			EncoderBackend::Vaapi => {
+				let encoder = vaapi::VaapiEncoder::new(&self.capture_context, native)?;
+				let (convert, extent) = encoder.conversion();
+				EncoderSetup {
+					encoder: ConventionalEncoder::Vaapi(encoder),
+					convert,
+					extent,
+					row_alignment: 4,
+				}
+			},
+			EncoderBackend::Nvenc => {
+				let encoder = nvenc::NvencEncoder::new(&self.capture_context, native)?;
+				let (convert, extent, row_alignment) = encoder.conversion();
+				EncoderSetup {
+					encoder: ConventionalEncoder::Nvenc(encoder),
+					convert,
+					extent,
+					row_alignment,
+				}
+			},
+		};
+		tracing::info!(
+			backend = backend.label(),
+			codec = %ctx.format.codec,
+			chroma = %ctx.format.chroma,
+			bit_depth = ctx.format.bit_depth.bits(),
+			"Encoding with {}",
+			backend.label()
+		);
+		Ok(setup)
+	}
 
+	/// The Vulkan Video (Pixelforge) encoder for this epoch.
+	fn create_vulkan_encoder(
+		&self,
+		codec: Codec,
+		convert: ConvertFormat,
+		color_description: ColorDescription,
+	) -> Result<EncoderSetup, String> {
+		let ctx = &self.context;
 		// Reuse the compositor-verified device through every stream epoch.
 		let context = self.capture_context.clone();
-
-		let codec = pixelforge_codec(ctx.format.codec)?;
+		// A compute-only capture context (no Vulkan Video encode) never
+		// advertises Vulkan Video profiles; refuse before any video call.
+		if let Some(reason) = context.encode_unsupported_reason(codec) {
+			return Err(format!("{codec:?} cannot be encoded on this GPU: {reason}"));
+		}
 
 		// Convert pixel format.
 		let pixel_format = match ctx.format.chroma {
@@ -1203,11 +1295,8 @@ impl VideoPipelineInner {
 			BitDepth::Ten => pixelforge::EncodeBitDepth::Ten,
 		};
 
-		let color_description = color_description_for(ctx.format)?;
-
-		// Create encode configuration.
-		let target_bitrate = u32::try_from(ctx.bitrate)
-			.map_err(|_| format!("Configured bitrate {} bps exceeds the encoder API range", ctx.bitrate))?;
+		// Create encode configuration. The bitrate is set once the profile's
+		// limits are known.
 		let config = match codec {
 			Codec::H264 => EncodeConfig::h264(ctx.width, ctx.height),
 			Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
@@ -1218,7 +1307,6 @@ impl VideoPipelineInner {
 		.with_bit_depth(bit_depth)
 		.with_color_description(color_description)
 		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(target_bitrate)
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
@@ -1232,6 +1320,16 @@ impl VideoPipelineInner {
 		let caps = pixelforge::EncoderCapabilities::query(&context, &config)
 			.map_err(|e| format!("Failed to query encoder capabilities: {e}"))?;
 		encode_caps::check_frame(&caps, codec, ctx.width, ctx.height)?;
+		let requested_bitrate = ctx.bitrate as u64;
+		let target_bitrate = encode_caps::cbr_target(&caps, codec, requested_bitrate)?;
+		if u64::from(target_bitrate) < requested_bitrate {
+			tracing::info!(
+				requested_bps = ctx.bitrate,
+				encoder_bps = target_bitrate,
+				"Encoding at this GPU's maximum {codec:?} bitrate, below the requested bitrate"
+			);
+		}
+		let config = config.with_target_bitrate(target_bitrate);
 		if let Some(alignment) = caps.av1_coded_picture_alignment
 			&& (!ctx.width.is_multiple_of(alignment.width.max(1))
 				|| !ctx.height.is_multiple_of(alignment.height.max(1)))
@@ -1245,16 +1343,27 @@ impl VideoPipelineInner {
 			);
 		}
 
-		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
-
-		let extent = encoder.input_image_extent();
-		Ok((context, encoder, (extent.width, extent.height)))
+		let encoder = Encoder::new(context, config).map_err(|e| format!("Failed to create encoder: {e}"))?;
+		let input = encoder.input_image_extent();
+		let extent = convert::conversion_extent(codec, ctx.width, ctx.height)?;
+		if extent.0 > input.width || extent.1 > input.height {
+			return Err(format!(
+				"conversion extent {}x{} exceeds the encoder input {}x{}",
+				extent.0, extent.1, input.width, input.height
+			));
+		}
+		Ok(EncoderSetup {
+			encoder: ConventionalEncoder::Vulkan(encoder),
+			convert,
+			extent,
+			row_alignment: 4,
+		})
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	fn run_pyrowave_encoding_loop(
 		&self,
-		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: &crate::session::capture::admission::CaptureReceiver,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
@@ -1278,7 +1387,11 @@ impl VideoPipelineInner {
 			ctx.fps,
 			self.config.pyrowave_queue,
 		)?;
-		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
+		encoder.set_sdr_content_as_sdr(ctx.pyrowave_sdr_as_sdr);
+		// Until a frame says otherwise, assume the SDR desktop or launcher a
+		// session starts on: announcing HDR first would switch a client that
+		// presents by HDR mode into HDR and straight back at every start.
+		let _ = hdr_metadata_tx.send(HdrModeState::new(encoder.encodes_as_hdr(FrameColorSpace::Srgb)));
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 		let quality_reference_bytes =
 			quality_reference_frame_bytes(ctx.width, ctx.height, ctx.format.chroma, ctx.format.bit_depth);
@@ -1309,6 +1422,7 @@ impl VideoPipelineInner {
 			initial_fec_percentage = fec_controller.percentage(),
 			pyrowave_source = SOURCE_URL,
 			pyrowave_revision = SOURCE_REVISION,
+			pyrowave_patches = SOURCE_PATCHES,
 			"Initialized zero-copy PyroWave encoder"
 		);
 		if encoder.maximum_frame_bytes().saturating_mul(4) < quality_reference_bytes.saturating_mul(3) {
@@ -1337,6 +1451,7 @@ impl VideoPipelineInner {
 		packetizer.warm_up(
 			fec_controller.percentage(),
 			fec_controller.minimum_packets(ctx.minimum_fec_packets),
+			|| stop_session_manager.is_shutdown_triggered(),
 		);
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
@@ -1356,8 +1471,31 @@ impl VideoPipelineInner {
 		let mut failures = FailurePolicy::default();
 		// A requested replay of the last frame, kept until a frame is sent.
 		let mut resend_last = false;
+		// A live bitrate installed in the encoder, applied once the first frame
+		// encoded with it has been sent.
+		let mut pending_rate: Option<super::rate::PendingRate> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			if let Some(mut rate) = self.rate_rx.take() {
+				match encoder.set_bitrate(rate.requested() as usize, ctx.fps) {
+					Ok(accepted) => {
+						// Ordered ahead of the next batch, which is the first one
+						// encoded with this budget.
+						if packet_tx
+							.blocking_send(VideoPacketMessage::PacingBitrate(accepted as u64))
+							.is_err()
+						{
+							return Err("video packet channel closed".to_string());
+						}
+						if let Some(old) = pending_rate.take() {
+							old.finish(super::rate::RateState::Superseded, None, None);
+						}
+						rate.stage(u32::try_from(accepted).unwrap_or(u32::MAX));
+						pending_rate = Some(rate);
+					},
+					Err(error) => rate.finish(super::rate::RateState::Failed, None, Some(error)),
+				}
+			}
 			if let Ok(command) = reconfigure_rx.try_recv() {
 				frame_rx.reset();
 				return Ok(Some(command));
@@ -1371,6 +1509,10 @@ impl VideoPipelineInner {
 				sequence_number = 0;
 				rtp_clock.reset(std::time::Instant::now());
 				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
+				// The resumed generation negotiated its own rate; BeginEpoch
+				// restored the sender's pacing to it.
+				pending_rate = None;
+				encoder.set_bitrate(ctx.bitrate, ctx.fps)?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
 			}
@@ -1431,12 +1573,24 @@ impl VideoPipelineInner {
 					// compositor buffer is no longer referenced by PyroWave.
 					frame.consumed.store(true, Ordering::Release);
 					if ctx.format.hdr {
+						// The client is told whether this frame is HDR10 or the
+						// 10-bit sRGB SDR sent to a client that presents by HDR
+						// mode. The mode travels on the control stream, apart
+						// from the frame, so such a client may convert a frame
+						// or two around a switch with the previous mode.
+						let enabled = encoder.encodes_as_hdr(frame.color_space);
 						let state = HdrModeState {
-							enabled: true,
-							metadata: frame.hdr_metadata,
+							enabled,
+							metadata: frame.hdr_metadata.filter(|_| enabled),
 						};
 						let _ = hdr_metadata_tx.send_if_modified(|current| {
 							if *current != state {
+								if current.enabled != state.enabled {
+									tracing::info!(
+										"PyroWave content switched to {}",
+										if enabled { "HDR (BT.2020/PQ)" } else { "SDR (sRGB)" }
+									);
+								}
 								*current = state;
 								true
 							} else {
@@ -1529,6 +1683,9 @@ impl VideoPipelineInner {
 					},
 				}
 			};
+			if new_content && let Some(rate) = pending_rate.take() {
+				rate.finish(super::rate::RateState::Applied, Some(u64::from(frame_number)), None);
+			}
 			let stats = FrameStats {
 				channel_wait,
 				import: encoded.import,
@@ -1610,9 +1767,9 @@ impl VideoPipelineInner {
 	fn run_encoding_loop(
 		&self,
 		runtime: &tokio::runtime::Handle,
-		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
+		frame_rx: &crate::session::capture::admission::CaptureReceiver,
 		context: VideoContext,
-		mut encoder: Encoder,
+		mut encoder: ConventionalEncoder,
 		mut input_converter: InputConverter,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
@@ -1638,6 +1795,7 @@ impl VideoPipelineInner {
 			} else {
 				ctx.minimum_fec_packets
 			},
+			|| stop_session_manager.is_shutdown_triggered(),
 		);
 
 		// The encoder is asynchronous: each `encode()` returns a future that
@@ -1704,6 +1862,7 @@ impl VideoPipelineInner {
 		// A requested IDR not yet submitted. Persistent across iterations so a
 		// recovery that cannot be admitted yet (network credits) is retried.
 		let mut pending_idr = false;
+		let mut pending_replay = false;
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
@@ -1716,6 +1875,10 @@ impl VideoPipelineInner {
 		// the current epoch and advances on reset (which restarts the consumer's
 		// numbering). A rare readback drop can skew this by a frame, which at
 		// worst over-invalidates into a (safe) IDR.
+		let mut installed_rate = encoder
+			.set_bitrate(ctx.bitrate.try_into().map_err(|_| "bitrate exceeds u32")?)
+			.map_err(|e| e.to_string())?;
+		let mut pending_rate: Option<super::rate::PendingRate> = None;
 		let mut submitted_count: u64 = 0;
 		let mut frame_number_base: u64 = 0;
 
@@ -1727,6 +1890,7 @@ impl VideoPipelineInner {
 			enabled: ctx.format.hdr,
 			metadata: None,
 		};
+		let mut metadata_refresh = hdr_sei::MetadataRefresh::default();
 
 		// Track the encoder's current VUI color description, initialized
 		// to match what the encoder was created with. When the required
@@ -1736,7 +1900,8 @@ impl VideoPipelineInner {
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let reconfigure = reconfigure_rx.try_recv().ok();
-			if reconfigure.is_some() {
+			if let Some(command) = &reconfigure {
+				self.rate_rx.activate(command.generation);
 				frame_rx.reset();
 				// Exit through the flush/drain barrier below. It guarantees every
 				// packet from the old encoder epoch is consumed before activation.
@@ -1761,13 +1926,33 @@ impl VideoPipelineInner {
 			while let Ok(activation) = reset_request_rx.try_recv() {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				frame_rx.reset();
+				let activation_generation = activation.generation;
 				// The consumer orders activation after every old encoder future/batch.
 				frame_ctx_tx
 					.blocking_send(ConsumerMessage::ResetCounters(activation))
 					.map_err(|_| "video consumer stopped during resume".to_string())?;
+				self.rate_rx.activate(activation_generation);
+				pending_rate = None;
+				installed_rate = encoder
+					.set_bitrate(ctx.bitrate.try_into().map_err(|_| "bitrate exceeds u32")?)
+					.map_err(|e| e.to_string())?;
+				submitted_count = encoder.next_display_order();
 				frame_number_base = submitted_count;
 				encoder.request_idr();
 				pending_idr = true;
+			}
+
+			if let Some(mut rate) = self.rate_rx.take() {
+				match encoder.set_bitrate(rate.requested()) {
+					Ok(accepted) => {
+						if let Some(old) = pending_rate.take() {
+							old.finish(super::rate::RateState::Superseded, None, None);
+						}
+						rate.stage(accepted);
+						pending_rate = Some(rate);
+					},
+					Err(error) => rate.finish(super::rate::RateState::Failed, None, Some(error.to_string())),
+				}
 			}
 
 			// Drain any pending IDR requests.
@@ -1793,12 +1978,20 @@ impl VideoPipelineInner {
 			// falls back to an IDR when no reference survives).
 			loop {
 				match invalidate_request_rx.try_recv() {
-					Ok((first, _last)) => {
+					Ok((first, last)) => {
+						// Ambiguous wrapped/future indices cannot establish a safe
+						// parent. A fresh IDR is also safe after rare readback drops.
+						if first == 0 || first > last || submitted_count - frame_number_base >= u64::from(u32::MAX) {
+							encoder.request_idr();
+							pending_idr = true;
+							continue;
+						}
 						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
 						tracing::debug!(
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						pending_replay = true;
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
@@ -1833,26 +2026,26 @@ impl VideoPipelineInner {
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the static scene from the latest converted frame
 					// (see `encode_static_recovery`).
-					if pending_idr
+					if (pending_idr || pending_replay || pending_rate.is_some())
 						&& has_encoded && last_output
 						&& conventional_can_admit(&in_flight, credit_limit)
 						&& self.demand.may_replay(2 * frame_interval)
 					{
-						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
-						// Use current time as created_at for the re-encoded IDR (no actual frame).
+						tracing::debug!("Re-encoding last frame for pending recovery or rate control (no re-import)");
+						// A replay has no new source frame; timestamp the submission now.
 						let now = std::time::Instant::now();
-						let restore = |_: &mut Encoder, target: vk::Image| -> Result<(), PixelForgeError> {
+						let restore = |_: &mut ConventionalEncoder, target: Target| -> Result<(), EncodeError> {
 							match input_converter.copy_last_output(target) {
 								Ok(true) => Ok(()),
-								Ok(false) => Err(PixelForgeError::CommandBuffer(
-									"no converted frame to recover from".to_string(),
-								)),
-								Err(e) => Err(PixelForgeError::Vulkan(e)),
+								Ok(false) => Err(EncodeError::native("no converted frame to recover from")),
+								Err(e) => Err(EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(e))),
 							}
 						};
+						let encoded_order = encoder.next_display_order();
 						match encode_static_recovery(&mut encoder, restore) {
 							Ok(future) => {
 								pending_idr = false;
+								pending_replay = false;
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
@@ -1875,7 +2068,11 @@ impl VideoPipelineInner {
 								};
 								// Count this frame in flight; the consumer decrements when done.
 								let outstanding = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-								submitted_count += 1;
+								if let Some(rate) = pending_rate.take() {
+									installed_rate = rate.accepted();
+									rate.finish(super::rate::RateState::Applied, Some(encoded_order), None);
+								}
+								submitted_count = encoder.next_display_order();
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(
 									FrameContext {
 										outstanding: outstanding.min(u8::MAX as usize) as u8,
@@ -1886,6 +2083,10 @@ impl VideoPipelineInner {
 								));
 							},
 							Err(e) => {
+								if let Some(rate) = pending_rate.take() {
+									rate.finish(super::rate::RateState::Failed, None, Some(e.to_string()));
+									encoder.set_bitrate(installed_rate).map_err(|error| error.to_string())?;
+								}
 								// The IDR stays pending and is retried on the next frame.
 								apply_failure(&mut failures, &encoder_failure(EncodeStage::Submit, &e), None)?;
 							},
@@ -2023,35 +2224,42 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// In HDR mode, select per-frame color space and encoder VUI
-				// based on the frame's actual color space. SDR frames are
-				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
-				// dynamic VUI switching in the encoder.
-				let mut frame_color = None;
-				if ctx.format.hdr {
+				// Select the per-frame conversion. In HDR mode the encoder VUI
+				// also follows the frame: SDR frames are encoded as sRGB and HDR
+				// frames as BT.2020+PQ, with dynamic VUI switching in the
+				// encoder. Gamma 2.2 frames are re-encoded as the sRGB the
+				// stream signals, in SDR and HDR sessions alike.
+				let full_range = ctx.format.range == ColorRange::Full;
+				let (frame_space, frame_white_nits) = if ctx.format.hdr {
 					let frame_cs = frame.color_space;
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
 					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
-					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
-						FrameColorSpace::Srgb => (
-							ColorSpace::Bt709,
-							ctx.format.range == ColorRange::Full,
-							ColorDescription::bt709().with_full_range(ctx.format.range == ColorRange::Full),
+					let (cs, color_desc, sdr_white_nits) = match frame_cs {
+						FrameColorSpace::Srgb => {
+							(ColorSpace::Bt709, ColorDescription::srgb(), BT2408_SDR_REFERENCE_NITS)
+						},
+						FrameColorSpace::Gamma22 => (
+							ColorSpace::Gamma22ToSrgb,
+							ColorDescription::srgb(),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::Bt1886 => (
+							ColorSpace::Bt1886ToSrgb,
+							ColorDescription::srgb(),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::Bt2020Pq => (
 							ColorSpace::Bt2020,
-							ctx.format.range == ColorRange::Full,
-							ColorDescription::bt2020_pq().with_full_range(ctx.format.range == ColorRange::Full),
+							ColorDescription::bt2020_pq(),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
-							ctx.format.range == ColorRange::Full,
-							ColorDescription::bt2020_pq().with_full_range(ctx.format.range == ColorRange::Full),
+							ColorDescription::bt2020_pq(),
 							SCRGB_REFERENCE_WHITE_NITS,
 						),
 					};
+					let color_desc = signaled(color_desc, ctx.format);
 
 					// Switch encoder VUI first. The converter's color space is
 					// updated below only after the encoder accepted the switch,
@@ -2065,12 +2273,19 @@ impl VideoPipelineInner {
 							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
 						}
 					}
-					frame_color = Some((cs, full_range, sdr_white_nits));
-				}
+					(cs, sdr_white_nits)
+				} else {
+					// SDR sessions keep the sRGB VUI; the compositor composes
+					// HDR-declared surfaces before they reach an SDR stream.
+					let cs = match frame.color_space {
+						FrameColorSpace::Gamma22 => ColorSpace::Gamma22ToSrgb,
+						FrameColorSpace::Bt1886 => ColorSpace::Bt1886ToSrgb,
+						_ => ColorSpace::Bt709,
+					};
+					(cs, BT2408_SDR_REFERENCE_NITS)
+				};
+				input_converter.set_color(frame_space, full_range, frame_white_nits);
 
-				if let Some((cs, full_range, sdr_white_nits)) = frame_color {
-					input_converter.set_color(cs, full_range, sdr_white_nits);
-				}
 				// DMA-BUF layers go through the same identity-checked import
 				// cache as the game source; the `Arc`s pin them for the call.
 				let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
@@ -2124,23 +2339,43 @@ impl VideoPipelineInner {
 						opacity: layer.opacity,
 					})
 				});
-				// Blocks until the readback of the frame submitted two encodes
-				// earlier has freed this slot (Pixelforge's pipeline depth).
+				// Blocks until the readback of the frame submitted earlier into
+				// this slot has freed it (the encoder's pipeline depth).
 				let t_slot = std::time::Instant::now();
-				let target_image = encoder.input_image();
+				let target = match encoder.input_target() {
+					Ok(target) => target,
+					Err(e) => {
+						let failure = EncodeFailure::new(
+							EncodeStage::Submit,
+							if e.device_lost() {
+								Recovery::Terminal
+							} else {
+								Recovery::RequestIdr
+							},
+							SourceAccess::NotSubmitted,
+							format!("no encoder input available: {e}"),
+						);
+						if apply_failure(&mut failures, &failure, Some(&frame.consumed))? == Recovery::RequestIdr {
+							encoder.request_idr();
+							pending_idr = true;
+						}
+						continue;
+					},
+				};
 				let slot_wait = t_slot.elapsed();
 				let converted = input_converter
 					.convert(
 						&source_import,
 						import_vk_format,
 						needs_transition,
+						frame.scale_to_stream,
 						&layers,
-						convert::Target::encoder_input(target_image),
+						target,
 					)
 					.map(|outcome| {
 						convert_window.record(outcome.gpu_ns, frame.has_overlays());
 					})
-					.map_err(PixelForgeError::Vulkan);
+					.map_err(|e| EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(e)));
 
 				if converted.is_err() {
 					last_output = false;
@@ -2149,7 +2384,7 @@ impl VideoPipelineInner {
 					// The converter submits the conversion and waits for its fence; an
 					// error may follow a submission whose reads are still pending.
 					// Establish completion before the compositor may reuse the source.
-					let failure = if is_device_lost(&e) {
+					let failure = if e.device_lost() {
 						EncodeFailure::new(
 							EncodeStage::Convert,
 							Recovery::Terminal,
@@ -2189,25 +2424,40 @@ impl VideoPipelineInner {
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
-				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
+				// frame is encoded as BT.2020+PQ (true) or sRGB (false).
+				let mut metadata_key_frame = false;
 				if ctx.format.hdr {
 					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
 						metadata: frame.hdr_metadata,
 					};
+					// Metadata-only changes keep the PQ color description, so
+					// nothing else makes the next frame a key frame carrying it.
+					if hdr_enabled {
+						let changed = last_hdr_state.enabled && new_state.metadata != last_hdr_state.metadata;
+						if metadata_refresh.due(changed, t2_imported) {
+							tracing::debug!("HDR metadata changed; encoding a key frame to carry it");
+							encoder.request_idr();
+							pending_idr = true;
+							metadata_key_frame = true;
+						}
+					} else {
+						metadata_refresh.cancel();
+					}
 					if new_state != last_hdr_state {
 						if new_state.enabled {
 							match new_state.metadata {
 								Some(m) => tracing::info!(
-									"Content switched to HDR (BT.2020/PQ): maxCLL {} nits, maxFALL {} nits",
-									m.max_cll,
-									m.max_fall
+									max_cll = ?m.max_cll,
+									max_fall = ?m.max_fall,
+									mastering_peak_nits = ?m.mastering.map(|d| d.max_luminance / 10_000),
+									"Content switched to HDR (BT.2020/PQ)"
 								),
 								None => tracing::info!("Content switched to HDR (BT.2020/PQ)"),
 							}
 						} else {
-							tracing::info!("Content switched to SDR (BT.709)");
+							tracing::info!("Content switched to SDR (sRGB)");
 						}
 						last_hdr_state = new_state.clone();
 						let _ = hdr_metadata_tx.send(new_state);
@@ -2219,7 +2469,8 @@ impl VideoPipelineInner {
 				// Encode the converted image. This is asynchronous: it submits the
 				// frame without blocking; the encoded packet is produced by the
 				// readback thread and handled by the consumer thread.
-				let encode_result = encoder.encode(encoder.input_image());
+				let encoded_order = encoder.next_display_order();
+				let encode_result = encoder.encode(target);
 
 				let t4_encoded = std::time::Instant::now();
 
@@ -2228,6 +2479,7 @@ impl VideoPipelineInner {
 						failures.record_success();
 						// Any requested IDR applies to this submitted frame.
 						pending_idr = false;
+						pending_replay = false;
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
@@ -2253,7 +2505,11 @@ impl VideoPipelineInner {
 						};
 						// Count this frame in flight; the consumer decrements when done.
 						let outstanding = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-						submitted_count += 1;
+						if let Some(rate) = pending_rate.take() {
+							installed_rate = rate.accepted();
+							rate.finish(super::rate::RateState::Applied, Some(encoded_order), None);
+						}
+						submitted_count = encoder.next_display_order();
 						if frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(
 								FrameContext {
@@ -2270,6 +2526,13 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
+						if metadata_key_frame {
+							metadata_refresh.failed();
+						}
+						if let Some(rate) = pending_rate.take() {
+							rate.finish(super::rate::RateState::Failed, None, Some(e.to_string()));
+							encoder.set_bitrate(installed_rate).map_err(|error| error.to_string())?;
+						}
 						// The input was converted but never encoded: re-anchor the
 						// reference chain with an IDR on the next frame.
 						if apply_failure(&mut failures, &encoder_failure(EncodeStage::Submit, &e), None)?
@@ -2345,10 +2608,10 @@ impl Drop for ConsumerTask<'_> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		BT2408_SDR_REFERENCE_NITS, EncoderError, OutputFormat, SCRGB_REFERENCE_WHITE_NITS, VideoCodec, convert,
-		drm_fourcc_to_vk, encoder_stop_cause, is_device_lost,
+		BT2408_SDR_REFERENCE_NITS, ConvertFormat, EncodeError, EncoderError, SCRGB_REFERENCE_WHITE_NITS, VideoCodec,
+		convert, drm_fourcc_to_vk, encoder_stop_cause,
 	};
-	use ash::vk::{self, Handle};
+	use ash::vk;
 	use pixelforge::PixelForgeError;
 
 	#[tokio::test]
@@ -2502,10 +2765,20 @@ mod tests {
 		};
 		let lost = PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST);
 		let transient = PixelForgeError::CommandBuffer("submit failed".to_string());
+		let overflow = EncodeError::Vulkan(overflow);
+		let lost = EncodeError::Vulkan(lost);
+		let transient = EncodeError::Vulkan(transient);
+		let native_lost = EncodeError::Native {
+			message: "NVENC encode: NV_ENC_ERR_DEVICE_NOT_EXIST".into(),
+			device_lost: true,
+		};
+		let native = EncodeError::native("VA-API coded buffer overflowed");
 		for (error, recovery) in [
 			(&overflow, Recovery::RequestIdr),
 			(&transient, Recovery::RequestIdr),
 			(&lost, Recovery::Terminal),
+			(&native, Recovery::RequestIdr),
+			(&native_lost, Recovery::Terminal),
 		] {
 			for stage in [EncodeStage::Submit, EncodeStage::Readback] {
 				let failure = encoder_failure(stage, error);
@@ -2544,12 +2817,11 @@ mod tests {
 
 	#[test]
 	fn device_lost_is_detected_by_driver_result() {
-		assert!(is_device_lost(&PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)));
+		assert!(EncodeError::Vulkan(PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)).device_lost());
 		for operation in ["submit encode", "wait encode fence", "read encode feedback"] {
-			assert!(is_device_lost(&PixelForgeError::vulkan(
-				operation,
-				vk::Result::ERROR_DEVICE_LOST
-			)));
+			assert!(
+				EncodeError::Vulkan(PixelForgeError::vulkan(operation, vk::Result::ERROR_DEVICE_LOST)).device_lost()
+			);
 		}
 	}
 
@@ -2560,7 +2832,7 @@ mod tests {
 		let cause = encoder_stop_cause(
 			VideoCodec::Hevc,
 			&EncoderError::ColorConversion(convert::SelfCheckFailure {
-				format: OutputFormat::NV12,
+				format: ConvertFormat::Nv12,
 				detail: "Cb 0/4 by column within a 4x2 block".into(),
 			}),
 		);
@@ -2579,14 +2851,14 @@ mod tests {
 
 	#[test]
 	fn recoverable_errors_and_text_are_not_device_lost() {
-		assert!(!is_device_lost(&PixelForgeError::Vulkan(vk::Result::TIMEOUT)));
-		assert!(!is_device_lost(&PixelForgeError::vulkan(
-			"wait encode fence",
-			vk::Result::TIMEOUT
-		)));
-		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
-			vk::Result::ERROR_DEVICE_LOST.to_string()
-		)));
+		assert!(!EncodeError::Vulkan(PixelForgeError::Vulkan(vk::Result::TIMEOUT)).device_lost());
+		assert!(!EncodeError::Vulkan(PixelForgeError::vulkan("wait encode fence", vk::Result::TIMEOUT)).device_lost());
+		assert!(
+			!EncodeError::Vulkan(PixelForgeError::CommandBuffer(
+				vk::Result::ERROR_DEVICE_LOST.to_string()
+			))
+			.device_lost()
+		);
 	}
 
 	#[test]
@@ -2630,27 +2902,27 @@ mod tests {
 
 	impl FakeSlots {
 		/// The conventional loop's per-frame step: convert into the current
-		/// input image, then encode that image.
+		/// input target, then encode that target.
 		fn convert_and_encode(&mut self, content: char) {
 			use super::EncoderInput;
-			let target = self.input_image();
-			self.slots[target.as_raw() as usize - 1] = Some(content);
+			let target = self.input_target().unwrap();
+			self.slots[target] = Some(content);
 			self.converted = Some(content);
-			let image = self.input_image();
-			self.encode(image).unwrap();
+			self.encode(target).unwrap();
 		}
 	}
 
 	impl super::EncoderInput for FakeSlots {
+		type Target = usize;
 		type Future = ();
 		type Error = ();
 
-		fn input_image(&self) -> vk::Image {
-			vk::Image::from_raw(self.current as u64 + 1)
+		fn input_target(&mut self) -> Result<usize, ()> {
+			Ok(self.current)
 		}
 
-		fn encode(&mut self, image: vk::Image) -> Result<(), ()> {
-			self.encoded.push(self.slots[image.as_raw() as usize - 1]);
+		fn encode(&mut self, target: usize) -> Result<(), ()> {
+			self.encoded.push(self.slots[target]);
 			self.current = (self.current + 1) % self.slots.len();
 			Ok(())
 		}
@@ -2668,8 +2940,8 @@ mod tests {
 	}
 
 	/// The pipeline's restore step: copy the converter output into the slot.
-	fn restore(encoder: &mut FakeSlots, target: vk::Image) -> Result<(), ()> {
-		encoder.slots[target.as_raw() as usize - 1] = Some(encoder.converted.ok_or(())?);
+	fn restore(encoder: &mut FakeSlots, target: usize) -> Result<(), ()> {
+		encoder.slots[target] = Some(encoder.converted.ok_or(())?);
 		Ok(())
 	}
 

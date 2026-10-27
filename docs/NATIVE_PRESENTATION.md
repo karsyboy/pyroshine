@@ -37,9 +37,18 @@ provide the captured surface's metadata.
 
 | Surface declaration | Direct exported frame | Encoder behavior |
 | --- | --- | --- |
-| None, sRGB or BT.709 SDR | `Srgb` | Existing SDR RGB/YUV conversion and stream signaling |
+| None, sRGB or BT.709 SDR | `Srgb` | RGB/YUV conversion without a transfer change, signaled as sRGB (H.273 transfer 13) |
+| Gamma 2.2 SDR | Not exported directly: composed | Composition decodes gamma 2.2 and writes sRGB |
 | BT.2020 + PQ | `Bt2020Pq` | RGB/YUV conversion using BT.2020; no additional PQ OETF |
 | Linear sRGB / Windows-scRGB | `ScrgbLinear` | BT.709 to BT.2020 matrix, 80 cd/m² per linear unit, then PQ |
+
+SDR streams carry sRGB-encoded samples and say so: signaling the BT.709
+transfer would make decoders apply BT.1886, which renders the same samples
+darker than PyroWave, which also signals sRGB. Gamma 2.2 surfaces are composed
+so direct and composed capture agree and every encoder, including PyroWave,
+receives sRGB. The conventional converter can also re-encode gamma 2.2 and
+BT.709-video (BT.1886) sources as sRGB; Desktop Mode uses that for PipeWire
+producers such as Mutter that declare gamma 2.2.
 
 Buffer precision never selects HDR. Undeclared 10-bit and FP16 buffers are SDR.
 The native encoder supports the scRGB 80-nit unit; parametric descriptions with
@@ -53,11 +62,27 @@ maximum luminance, MaxCLL and MaxFALL through the standard parametric creator.
 These remain associated with that surface and travel in `ExportedFrame` to the
 existing encoder HDR SEI/OBU and Moonlight HDR control signaling. Conventional
 encoders switch SDR/HDR descriptions per frame. PyroWave retains its negotiated
-output color space and explicitly converts SDR sources to PQ in an HDR session;
-its control state describes those encoded output pixels. Partial
-metadata uses defined color-space defaults for unspecified fields; a source
-without metadata uses the encoder's existing fallback. Coordinate/luminance
-units are converted to the existing HDR10 metadata representation.
+output color space and explicitly converts SDR sources to PQ in an HDR session,
+with SDR white at the same 203-nit reference as composition; its control state
+describes those encoded output pixels. Coordinate/luminance units are converted
+to the existing HDR10 metadata representation.
+
+Metadata keeps each group's presence (`HdrMetadata`): the mastering display is
+known only when the client declared its luminance range (declared luminance
+without primaries uses the description's primaries and D65), and MaxCLL/MaxFALL
+are separate. Neither the protocol's implied primary luminance range nor
+scRGB's 80-nit unit is reported as a mastering peak. At the wire
+(`Hdr10Metadata::for_stream`), unknown content light levels are written as 0
+(unknown) and an undeclared mastering display as the documented HDR10
+compatibility values: BT.2020 primaries, D65 and 1000 nits. That fallback is a
+rendering policy for clients that tone-map on these fields, not a statement
+about the source; content light levels alone never change it.
+
+Mastering metadata travels on key frames and decoders keep it until the next.
+A metadata-only change (the PQ description is unchanged, so no header switch
+forces an IDR) requests a key frame for the first frame of the new metadata,
+at most once per second; a key frame that fails to encode is requested again
+with the next frame. The control stream carries the same values.
 
 ### Composition and direct export
 
@@ -168,6 +193,17 @@ the user manager. There was no separate typed WSI configuration to migrate.
 Do not retain the old Steam dynamic-FPS/HDR advertisements used by interception:
 `STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER` and `STEAM_GAMESCOPE_HDR_SUPPORTED` are no
 longer set by Pyroshine. Ordinary Steam overlay and input integration remains.
+
+## Optional frame limiting
+
+The removed layer also capped frame rates. Pyroshine does not intercept
+presentation for that again: the optional [`[frame_limit]`](CONFIGURATION.md#frame_limit)
+setting asks games to limit themselves through limiters already in their
+process (DXVK and vkd3d-proton under Proton, or MangoHud's Vulkan layer when the
+user installed and selected it). It only sets environment variables on the
+application unit, one limiter per launch, and never overrides values the user
+set. Capture pacing stays authoritative: a game limited to the stream rate and
+a game that renders faster are captured the same way.
 
 ## Runtime acceptance
 

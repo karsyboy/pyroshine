@@ -12,6 +12,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod diag;
 mod pair;
+mod restart;
+mod tray;
+mod web;
 
 pub use moonshine_core::ShutdownReason;
 use moonshine_core::clients::ClientManager;
@@ -38,6 +41,11 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+	/// Inspect, authorize, or recover managed Desktop Mode.
+	Desktop {
+		#[command(subcommand)]
+		action: DesktopCommand,
+	},
 	/// Run health checks and report results, then exit.
 	Healthcheck,
 	/// Pair a Moonlight or Pyrolight device with the running server.
@@ -62,7 +70,55 @@ enum Command {
 		#[arg(long)]
 		no_health_check: bool,
 	},
+	/// The web management interface of the running server.
+	Web {
+		#[command(subcommand)]
+		action: WebCommand,
+	},
+	/// Open the web interface in the default browser.
+	Open {
+		/// Page to open: dashboard, library, clients, history, settings,
+		/// diagnostics, updates or maintenance.
+		#[arg(default_value = "dashboard")]
+		page: String,
+	},
+	/// Show the desktop tray (the server starts it in desktop sessions).
+	#[command(hide = true)]
+	Tray {
+		/// Exit when standard input closes (started by the server).
+		#[arg(long)]
+		attached: bool,
+	},
 }
+
+#[derive(Subcommand, Debug)]
+enum DesktopCommand {
+	/// Inspect native output capabilities and takeover state.
+	Status,
+	/// Restore displays and audio even when the streaming daemon is stopped.
+	Restore,
+	/// Authorize remote keyboard and pointer control on this desktop.
+	Authorize,
+	/// Independently supervised desktop owner (started automatically).
+	#[command(hide = true)]
+	Guard,
+}
+
+#[derive(Subcommand, Debug)]
+enum WebCommand {
+	/// Print the web interface's address.
+	Url,
+	/// Print a one-time code that sets the administrator password in the browser.
+	Setup {
+		/// Replace a forgotten password (signs out every browser).
+		#[arg(long)]
+		reset: bool,
+	},
+}
+
+/// Longest the server waits for the initial application scan before it
+/// starts serving clients.
+const INITIAL_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn default_config_path() -> PathBuf {
 	match std::env::var("XDG_CONFIG_HOME") {
@@ -80,12 +136,54 @@ async fn main() -> Result<(), ()> {
 
 	init_tracing();
 
+	if let Some(Command::Desktop { action }) = &args.command {
+		if matches!(action, DesktopCommand::Authorize) {
+			return moonshine_core::desktop::authorize().await.map_err(|e| eprintln!("{e}"));
+		}
+		let guard = matches!(action, DesktopCommand::Guard);
+		let restore = matches!(action, DesktopCommand::Restore);
+		return tokio::task::spawn_blocking(move || {
+			if guard {
+				moonshine_core::desktop::run_guard()
+			} else {
+				let status = if restore {
+					moonshine_core::desktop::restore()?
+				} else {
+					moonshine_core::desktop::status()?
+				};
+				println!("{}", serde_json::to_string_pretty(&status).map_err(|e| e.to_string())?);
+				Ok(())
+			}
+		})
+		.await
+		.map_err(|e| eprintln!("Desktop command failed: {e}"))?
+		.map_err(|e| eprintln!("{e}"));
+	}
+
 	// Pairing talks to the running server; it must not load/create a config,
 	// probe the GPU, or acquire the daemon's state lock.
 	if let Some(Command::Pair { name }) = &args.command {
-		return pair::run(name.as_deref().unwrap_or("")).await.map_err(|error| {
+		let bus = std::env::var("MOONSHINE_MANAGEMENT_BUS").ok();
+		return pair::run(name.as_deref().unwrap_or(""), bus).await.map_err(|error| {
 			eprintln!("Pairing failed: {error}");
 		});
+	}
+
+	// Like pairing, these talk to the running server only.
+	if let Some(Command::Web { action }) = &args.command {
+		let action = match action {
+			WebCommand::Url => web::Action::Url,
+			WebCommand::Setup { reset } => web::Action::Setup { reset: *reset },
+		};
+		let bus = std::env::var("MOONSHINE_MANAGEMENT_BUS").ok();
+		return web::run(action, bus).await.map_err(|error| eprintln!("{error}"));
+	}
+
+	// The desktop side talks to the running server only, too.
+	match &args.command {
+		Some(Command::Open { page }) => return tray::open(page).await.map_err(|error| eprintln!("{error}")),
+		Some(Command::Tray { attached }) => return tray::run(*attached).await.map_err(|error| eprintln!("{error}")),
+		_ => {},
 	}
 
 	// Like pairing, collection must not create a config or touch server state.
@@ -103,7 +201,9 @@ async fn main() -> Result<(), ()> {
 	}
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
-	let mut config = Config::load_or_create(&config_path)?;
+	let config = Config::load_or_create(&config_path)?;
+	// Before anything can replace the executable (an upgrade).
+	let invocation = restart::Invocation::current();
 
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {
@@ -116,10 +216,14 @@ async fn main() -> Result<(), ()> {
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
-	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
-	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
-	config.applications.extend(scanned_applications);
-	app_scanner::resolve_missing_boxart(&mut config.applications);
+	// The library scans on its own thread while the host checks run, and
+	// keeps the catalog current afterwards (see `app_scanner::service`).
+	let library = app_scanner::Library::start(
+		config.offered_applications(),
+		config.application_scanners.clone(),
+		config.library.clone(),
+		app_scanner::service::LibraryPaths::standard(),
+	);
 
 	tracing::debug!("Waiting for D-Bus session bus...");
 	wait_for_dbus().await?;
@@ -127,7 +231,8 @@ async fn main() -> Result<(), ()> {
 
 	// Run health checks unless the user explicitly disabled them.
 	// If health checks are disabled, we still probe the GPU for supported codecs and HDR support.
-	let (supported_codecs, hdr_supported, dma_buf_supported, gpu_name, health) = if args.no_health_check {
+	let (supported_codecs, hdr_supported, dma_buf_supported, gpu_name, encoder_table, health) = if args.no_health_check
+	{
 		tracing::info!("Health checks disabled (--no-health-check); probing GPU capabilities only.");
 		let capabilities = tokio::task::spawn_blocking({
 			let cfg = config.clone();
@@ -141,6 +246,7 @@ async fn main() -> Result<(), ()> {
 			capabilities.hdr_supported,
 			capabilities.dma_buf_supported,
 			capabilities.gpu_name,
+			capabilities.gpu.encoder_table(),
 			None,
 		)
 	} else {
@@ -162,9 +268,13 @@ async fn main() -> Result<(), ()> {
 			report.hdr_supported,
 			report.dma_buf_supported,
 			report.gpu_name.clone(),
+			report.gpu.encoder_table(),
 			Some(report),
 		)
 	};
+	// Streams use the backend the probe verified for their profile.
+	let mut config = config;
+	config.stream.video.encoder_table = encoder_table;
 
 	if !dma_buf_supported {
 		tracing::error!(
@@ -204,7 +314,23 @@ async fn main() -> Result<(), ()> {
 		gpu_name,
 		health,
 	};
-	let moonshine = Moonshine::new(config, supported_codecs, hdr_supported, facts, shutdown.clone())?;
+	// Offer the complete catalog from the first `/applist`, but never let a
+	// hung file system hold up the server: past the deadline, the configured
+	// applications are offered and discovered ones follow when the scan ends.
+	if !library.ready(INITIAL_SCAN_DEADLINE).await {
+		tracing::warn!(
+			"The initial application scan is taking longer than {} s; discovered games appear when it finishes",
+			INITIAL_SCAN_DEADLINE.as_secs()
+		);
+	}
+	let moonshine = Moonshine::new(
+		config,
+		library,
+		supported_codecs,
+		hdr_supported,
+		facts,
+		shutdown.clone(),
+	)?;
 	tracing::info!("Pyroshine is ready and waiting for connections.");
 
 	shutdown.wait_shutdown_triggered().await;
@@ -212,6 +338,16 @@ async fn main() -> Result<(), ()> {
 
 	let exit_code = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
+	if exit_code == ShutdownReason::Restart {
+		match &invocation {
+			Some(invocation) => {
+				tracing::info!("Starting Pyroshine again");
+				let error = invocation.exec();
+				tracing::error!("Could not start Pyroshine again: {error}");
+			},
+			None => tracing::error!("Could not start Pyroshine again: its executable is unknown"),
+		}
+	}
 	std::process::exit(exit_code as i32);
 }
 
@@ -254,7 +390,9 @@ async fn wait_for_dbus() -> Result<(), ()> {
 }
 
 pub struct Moonshine {
-	// Dropped first: the desktop UI sees the daemon leave before listeners close.
+	// Dropped first: the tray, then management clients see the daemon leave
+	// before listeners close.
+	_tray: Option<tray::Launcher>,
 	_management: ManagementService,
 	_rtsp_server: RtspServer,
 	_session_manager: SessionManager,
@@ -267,6 +405,7 @@ impl Moonshine {
 	#[allow(clippy::result_unit_err)]
 	pub fn new(
 		config: Config,
+		library: app_scanner::Library,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		facts: ServerFacts,
@@ -276,12 +415,14 @@ impl Moonshine {
 
 		let session_manager = SessionManager::new(
 			config.compositor.clone(),
+			config.desktop.clone(),
 			config.stream.video.clone(),
 			config.stream.audio.clone(),
 			config.stream.control.clone(),
 			config.address.clone(),
 			config.stream.timeout,
 			config.inhibit_sleep,
+			config.frame_limit.clone(),
 			shutdown.clone(),
 		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;
@@ -289,12 +430,20 @@ impl Moonshine {
 		let management = ManagementService::spawn(
 			facts,
 			&config,
+			library.clone(),
 			session_manager.clone(),
 			client_manager.clone(),
 			shutdown.clone(),
 		);
 
+		// In desktop sessions only; a headless host never starts it.
+		let tray = config
+			.management
+			.tray
+			.then(|| tray::Launcher::spawn(management.tray_requests()));
+
 		Ok(Self {
+			_tray: tray,
 			_management: management,
 			_rtsp_server: RtspServer::new(
 				config.address.clone(),
@@ -313,13 +462,14 @@ impl Moonshine {
 				config.address.clone(),
 				config.stream.port,
 				config.webserver.clone(),
-				config.applications.clone(),
+				library,
 				supported_codecs,
 				hdr_supported,
 				client_manager.persistent_state().get_uuid()?.to_string(),
 				cert,
 				client_manager,
 				session_manager,
+				config.frame_limit.clone(),
 				shutdown.clone(),
 			)?,
 			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),
@@ -369,9 +519,44 @@ mod cli_tests {
 	}
 
 	#[test]
+	fn web_setup_takes_an_optional_reset() {
+		let args = Args::try_parse_from(["pyroshine", "web", "setup"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Web {
+				action: WebCommand::Setup { reset: false }
+			})
+		));
+		let args = Args::try_parse_from(["pyroshine", "web", "setup", "--reset"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Web {
+				action: WebCommand::Setup { reset: true }
+			})
+		));
+		let args = Args::try_parse_from(["pyroshine", "web", "url"]).unwrap();
+		assert!(matches!(
+			args.command,
+			Some(Command::Web {
+				action: WebCommand::Url
+			})
+		));
+	}
+
+	#[test]
 	fn healthcheck_keeps_its_positional_config_path() {
 		let args = Args::try_parse_from(["pyroshine", "/tmp/config.toml", "healthcheck"]).unwrap();
 		assert_eq!(args.config, Some(PathBuf::from("/tmp/config.toml")));
 		assert!(matches!(args.command, Some(Command::Healthcheck)));
+	}
+
+	#[test]
+	fn open_defaults_to_the_dashboard_and_the_tray_runs_attached_for_the_server() {
+		let args = Args::try_parse_from(["pyroshine", "open"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Open { page }) if page == "dashboard"));
+		let args = Args::try_parse_from(["pyroshine", "open", "clients"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Open { page }) if page == "clients"));
+		let args = Args::try_parse_from(["pyroshine", "tray", "--attached"]).unwrap();
+		assert!(matches!(args.command, Some(Command::Tray { attached: true })));
 	}
 }

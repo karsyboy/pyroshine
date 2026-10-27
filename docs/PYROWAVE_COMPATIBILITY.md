@@ -2,8 +2,8 @@
 
 Pyroshine accepts two PyroWave transport dialects: *native wire-v1*, used by
 [Pyrolight](https://github.com/karsyboy/pyrolight), and
-*record-framed*, used by Nonary-derived clients. Both use the same encoder and
-block format. This guide also covers the authenticated bandwidth probe that
+*record-framed*, used by Nonary-derived clients such as Nightjar. Both use the
+same encoder and block format. This guide also covers the authenticated bandwidth probe that
 clients use for calibration.
 
 Native wire-v1 has exactly one production path: the pinned C API 1.1.0 encoder
@@ -34,7 +34,9 @@ Record ANNOUNCE declares feature bit `pyrowaveFeatures:1`, or the documented
 `pyrowaveAdaptiveFec:0/1` capability, without claiming native version 1.
 Pyrolight, when it selects record framing for a record-only host,
 also sends `x-ss-pyrowave.dialect:record-framed` and the bitstream ID. Nonary release/6.1.0-vrr18 predates those explicit echoes and is
-recognized by its record capability markers. User-agent strings are irrelevant.
+recognized by its record capability markers, as is Nightjar, which sends
+feature bit 1 to hosts that report PyroWave fields in `/serverinfo` and ignores
+its additional pacing hints. User-agent strings are irrelevant.
 
 Unknown revisions, native versions other than 1, duplicate/empty attributes,
 and contradictory dialect markers are rejected with RTSP 400 and a text reason.
@@ -68,16 +70,43 @@ No legacy length-prefixed transport is implemented or inferred.
 | HDR10 10-bit 444 | 444 plus `0x02000000` | 444 plus `0x04000000` |
 
 Pyroshine adds the HDR444 record alias only when native HDR444 is supported.
-Internal formats remain typed independent axes. Only full-range 8-bit SDR and
-10-bit HDR10 are supported by the current scaled encoder; contradictory depth,
-range, or chroma requests are rejected. SDR uses BT.709/sRGB; HDR uses BT.2020/PQ.
+Internal formats remain typed independent axes. Only 8-bit SDR and 10-bit
+HDR10 are supported by the current scaled encoder, in full or limited range as
+the client asks; contradictory depth or chroma requests are rejected. SDR uses
+BT.709/sRGB; HDR uses BT.2020/PQ.
+
+An HDR10 stream follows its content per frame, as the conventional codecs do,
+only for a record client that presents by the control stream's HDR mode:
+Nightjar, after the Rubylight host, which converts the planes by that mode,
+not by the sequence header. Pyroshine recognizes it by its record ANNOUNCE:
+feature bit 1 with neither an explicit `x-ss-pyrowave.dialect` echo nor the
+Nonary adaptive FEC/bitrate attributes. For it, SDR frames are encoded as
+10-bit SDR (sRGB transfer, BT.709 primaries and matrix) with HDR mode off, and
+HDR frames as BT.2020/PQ with it on. Every frame's sequence header states its
+own encoding. HDR mode travels on the control stream, separately from the
+video, so a frame or two around a switch can be converted with the previous
+mode; nothing in the record contract orders the two.
+
+Every other HDR10 PyroWave stream keeps every frame in HDR10, SDR frames
+mapped with their white at the 203-nit BT.2408 reference white (the same scale
+as composition and the conventional converter): native wire-v1, because
+Pyrolight reads the sequence header, and the other record clients, because
+they normalize zero header color bits to the negotiated format.
 
 Nonary's scaled encoder leaves sequence-header color bits at zero, including
-HDR. Record sessions therefore normalize default metadata from negotiated SDP
-before native validation. Already matching metadata is accepted; conflicting
-metadata is rejected. Native metadata is never rewritten.
+HDR. Record sessions in Pyrolight therefore normalize default metadata from
+negotiated SDP before native validation. Already matching metadata is
+accepted; conflicting metadata is rejected. Native metadata is never
+rewritten. Zero color bits mean BT.709/sRGB in a Pyroshine sequence header, so
+a client that normalizes them must not be sent SDR frames in an HDR10 stream,
+which is why only Nightjar's form receives them.
 
 ## Authenticated calibration
+
+This section describes the HTTPS download probe that PyroWave clients use when
+the host lacks UDP calibration. Current Pyroshine hosts also offer frame-shaped
+[UDP bandwidth calibration](BANDWIDTH_CALIBRATION.md) for every codec, which
+measures loss, bursts and queueing that a TCP download cannot.
 
 Paired HTTPS `/serverinfo` advertises `PyroWaveBandwidthProbeBytes=33554432` and
 `PyroWaveHostLinkMbps`. HTTP and unpaired clients do not receive probe discovery.
@@ -102,6 +131,9 @@ no 400/500 Mbps cap. This calibrates network throughput, not GPU/decode capacity
 or a guarantee of loss-free UDP. Applying a recommendation is a user action.
 
 ## Validation limits
+
+Record-framed shards were reassembled byte-exact by Nightjar's own record
+reassembler (`rubylight-protocol`), with and without FEC.
 
 Setup fixtures, packet/FEC/encryption tests, native byte-preservation tests,
 reconnect dialect changes, and real loopback HTTPS authentication/admission tests

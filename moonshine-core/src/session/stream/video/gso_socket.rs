@@ -60,6 +60,23 @@ fn wire_bytes(payload_bytes: usize, shard_count: usize, addr: SocketAddr) -> u64
 	payload.saturating_add(headers)
 }
 
+/// Transmit pacing of the intra-only PyroWave stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FramePacing {
+	/// Negotiated encoder bitrate. A frame is spread across the time its
+	/// encoded size represents at this rate.
+	pub bitrate_bps: u64,
+	/// Capture slot length. Capture admission stays occupied until a frame is
+	/// sent, so a send that runs past the next slot costs that capture.
+	pub frame_interval: Duration,
+}
+
+/// A late frame finishes within this many tenths of its capture slot, leaving
+/// the rest for send completion to release capture admission before the tick.
+const LATE_FRAME_SLOT_TENTHS: u32 = 9;
+/// A late frame is never sent faster than this multiple of the bitrate.
+const LATE_FRAME_MAX_SPEEDUP: u32 = 4;
+
 /// Duration represented by `encoded_bytes` at the negotiated encoder bitrate.
 /// Chunk deadlines are scaled by actual wire bytes, so FEC and headers are
 /// spread across this duration without changing the codec bitrate.
@@ -96,6 +113,7 @@ pub(crate) fn duration_micros_u64(duration: Duration) -> u64 {
 fn pacing_schedule(
 	requested: Instant,
 	pacing_duration: Duration,
+	frame_interval: Duration,
 	started: Instant,
 ) -> (Instant, Duration, bool, Duration) {
 	let lateness = started.saturating_duration_since(requested);
@@ -111,9 +129,18 @@ fn pacing_schedule(
 			(started, deadline.duration_since(started), false, lateness)
 		},
 		_ => {
-			// The complete window elapsed while encoding. Use a fresh full window,
-			// allowing the synchronous producer to discard stale captures.
-			(started, pacing_duration, true, lateness)
+			// The complete window elapsed while encoding. A fresh full window
+			// would add the whole window to the encode time and push the send
+			// past the next capture slot, halving the frame rate whenever encode
+			// time exceeds the window (slow GPU clocks or a contended queue).
+			// Finish before that slot instead, never slower than the bitrate and
+			// never faster than LATE_FRAME_MAX_SPEEDUP times it; when even that
+			// cannot meet the slot, the frame is late regardless.
+			let slot_end = requested.checked_add(frame_interval * LATE_FRAME_SLOT_TENTHS / 10);
+			let window = slot_end
+				.map_or(pacing_duration, |end| end.saturating_duration_since(started))
+				.clamp(pacing_duration / LATE_FRAME_MAX_SPEEDUP, pacing_duration);
+			(started, window, true, lateness)
 		},
 	}
 }
@@ -252,6 +279,15 @@ impl UdpGsoSocket {
 		self.socket.local_addr()
 	}
 
+	/// Datagrams [`Self::send_batch`] submits (and paces) together for a shard size.
+	pub fn segments_per_send(&self, shard_size: usize) -> usize {
+		if !self.disable_gso && self.udp_state.max_gso_segments() > 1 {
+			gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size)
+		} else {
+			pacing_segments_per_send(shard_size)
+		}
+	}
+
 	pub fn set_tos_v4(&self, tos: u32) -> std::io::Result<()> {
 		self.socket.set_tos_v4(tos)
 	}
@@ -260,13 +296,18 @@ impl UdpGsoSocket {
 		self.socket.recv_from(buf).await
 	}
 
-	/// `bitrate_bps` is set for the intra-only PyroWave path. Conventional
+	/// Non-blocking receive; `WouldBlock` when no datagram is queued.
+	pub fn try_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+		self.socket.try_recv_from(buf)
+	}
+
+	/// `pacing` is set for the intra-only PyroWave path. Conventional
 	/// inter-frame codecs retain their established immediate-send behavior.
 	pub async fn send_batch(
 		&mut self,
 		batch: &mut ShardBatch,
 		addr: SocketAddr,
-		bitrate_bps: Option<u64>,
+		pacing: Option<FramePacing>,
 	) -> SendStats {
 		let started = Instant::now();
 		*batch.transport_parts().1 = TransportOutcome::default();
@@ -289,8 +330,8 @@ impl UdpGsoSocket {
 		};
 		stats.gso_segments_per_send = if gso_available { segments_per_send } else { 0 };
 		let chunk_bytes = segments_per_send.saturating_mul(shard_size).max(shard_size);
-		let pacing_duration = bitrate_bps
-			.map(|rate| frame_pacing_duration(batch.encoded_size(), rate))
+		let pacing_duration = pacing
+			.map(|pacing| frame_pacing_duration(batch.encoded_size(), pacing.bitrate_bps))
 			.unwrap_or_default();
 		if !pacing_duration.is_zero() && !self.pacing_timer_initialized {
 			self.pacing_timer_initialized = true;
@@ -305,8 +346,12 @@ impl UdpGsoSocket {
 		// late. Rebase it instead of releasing every overdue GSO chunk as one
 		// catch-up burst. PyroWave capture admission remains occupied until
 		// this complete frame is sent, so no rendered backlog can accumulate.
-		let (mut pacing_origin, scheduled_pacing_duration, pacing_rebased, initial_lateness) =
-			pacing_schedule(requested_pacing_origin, pacing_duration, started);
+		let (mut pacing_origin, scheduled_pacing_duration, pacing_rebased, initial_lateness) = pacing_schedule(
+			requested_pacing_origin,
+			pacing_duration,
+			pacing.map(|pacing| pacing.frame_interval).unwrap_or_default(),
+			started,
+		);
 		stats.pacing_rebased = pacing_rebased;
 		stats.initial_pacing_lateness = initial_lateness;
 		stats.scheduled_pacing_duration = scheduled_pacing_duration;
@@ -504,6 +549,13 @@ mod tests {
 		)
 	}
 
+	fn test_pacing(bitrate_bps: u64) -> FramePacing {
+		FramePacing {
+			bitrate_bps,
+			frame_interval: Duration::from_secs(1) / 60,
+		}
+	}
+
 	fn test_batch(shards: usize, shard_size: usize, encoded_size: usize) -> ShardBatch {
 		let mut batch = ShardBuf::new(shards, shard_size, 0).into_batch();
 		batch.set_frame_metadata(1, encoded_size, shards, 0, 1);
@@ -586,7 +638,9 @@ mod tests {
 				socket.faults.stall_after = Some(10);
 				socket.faults.stall_duration = Some(Duration::from_millis(stall));
 				let mut batch = test_batch(100, 1408, 100 * 1376);
-				let stats = socket.send_batch(&mut batch, destination, Some(100_000_000)).await;
+				let stats = socket
+					.send_batch(&mut batch, destination, Some(test_pacing(100_000_000)))
+					.await;
 				assert_eq!(stats.outcome.submitted_datagrams, 100);
 				assert!(stats.backpressure_rebases >= 1);
 				assert_eq!(socket.chunk_starts.len(), 3);
@@ -815,20 +869,47 @@ mod tests {
 
 	#[test]
 	fn encoding_lateness_is_spread_without_an_unbounded_catch_up() {
+		let window = Duration::from_millis(10);
+		let slot = Duration::from_millis(20);
 		let started = Instant::now();
-		let requested = started - Duration::from_millis(20);
-		let (origin, duration, rebased, lateness) = pacing_schedule(requested, Duration::from_millis(10), started);
-		assert_eq!(origin, started);
-		assert_eq!(duration, Duration::from_millis(10));
-		assert!(rebased);
-		assert_eq!(lateness, Duration::from_millis(20));
 
+		// Encoding used part of the window: the remainder carries every chunk.
 		let requested = started - Duration::from_millis(5);
-		let (origin, duration, rebased, lateness) = pacing_schedule(requested, Duration::from_millis(10), started);
+		let (origin, duration, rebased, lateness) = pacing_schedule(requested, window, slot, started);
 		assert_eq!(origin, started);
 		assert_eq!(duration, Duration::from_millis(5));
 		assert!(!rebased);
 		assert_eq!(lateness, Duration::from_millis(5));
+
+		// The window elapsed, the next capture slot (at 18 ms of 20) has not: the
+		// frame finishes before it instead of adding a full window to its encode.
+		let requested = started - Duration::from_millis(12);
+		let (origin, duration, rebased, lateness) = pacing_schedule(requested, window, slot, started);
+		assert_eq!(origin, started);
+		assert_eq!(duration, Duration::from_millis(6));
+		assert!(rebased);
+		assert_eq!(lateness, Duration::from_millis(12));
+
+		// Ample slot time left: never slower than the bitrate window.
+		let (_, duration, _, _) = pacing_schedule(
+			started - Duration::from_millis(11),
+			window,
+			Duration::from_millis(100),
+			started,
+		);
+		assert_eq!(duration, window);
+
+		// The slot is (nearly) gone: the catch-up rate stays bounded.
+		for late in [17, 25, 1000] {
+			let (origin, duration, rebased, _) =
+				pacing_schedule(started - Duration::from_millis(late), window, slot, started);
+			assert_eq!(origin, started);
+			assert_eq!(duration, window / LATE_FRAME_MAX_SPEEDUP);
+			assert!(rebased);
+		}
+		// Unknown slot length behaves like a slot that has passed.
+		let (_, duration, _, _) = pacing_schedule(started - Duration::from_millis(12), window, Duration::ZERO, started);
+		assert_eq!(duration, window / LATE_FRAME_MAX_SPEEDUP);
 	}
 
 	#[tokio::test]
@@ -914,7 +995,7 @@ mod tests {
 		batch.set_pacing_origin(Instant::now());
 		let result = tokio::time::timeout(
 			Duration::from_millis(10),
-			socket.send_batch(&mut batch, destination, Some(1_000_000_000)),
+			socket.send_batch(&mut batch, destination, Some(test_pacing(1_000_000_000))),
 		)
 		.await;
 		assert!(result.is_err(), "the send should be cancelled between pacing quanta");

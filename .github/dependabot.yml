@@ -26,27 +26,14 @@ updates:
       - dependency-name: pixelforge
       - dependency-name: smithay
       - dependency-name: ash
+      # Git-pinned for an unreleased tray API (see Cargo.toml).
+      - dependency-name: ksni
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
 
-  # The desktop app is a separate Cargo workspace.
-  - package-ecosystem: cargo
-    directory: /pyroshine-ui/src-tauri
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 10
-    commit-message:
-      prefix: deps(ui)
-    ignore:
-      - dependency-name: ksni
-    groups:
-      ui-cargo-minor-patch:
-        update-types: [minor, patch]
-
   - package-ecosystem: npm
-    directory: /pyroshine-ui
+    directory: /web
     schedule:
       interval: weekly
       day: monday

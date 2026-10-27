@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use super::icons::IconIndex;
+use super::watch::{Filter, WatchTarget};
+use super::{ArtworkOrigin, Discovered, SourceScan, Unit, UnitError, expand_path, launcher_target};
 use crate::session::application::ApplicationConfig;
 
 fn default_true() -> bool {
@@ -50,107 +53,226 @@ pub struct DesktopApplicationScannerConfig {
 	/// Seconds to wait for each scanned application to reach an active state after launch.
 	#[serde(default = "crate::session::application::default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Overrides of `[frame_limit]` for each discovered application.
+	#[serde(flatten)]
+	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
 }
 
-const SUPPORTED_IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "ico"];
 const SKIPPED_EXEC_FIELD_CODES: [char; 10] = ['f', 'F', 'u', 'U', 'd', 'D', 'n', 'N', 'v', 'm'];
 
-pub(crate) fn scan_desktop_applications(
-	config: &DesktopApplicationScannerConfig,
-) -> Result<Vec<ApplicationConfig>, ()> {
-	let mut applications = Vec::new();
+/// Subdirectories watched per configured directory; deeper or wider trees
+/// are still covered by the periodic check.
+const MAX_WATCHED_DIRECTORIES: usize = 256;
+
+/// One parsed, launchable entry before icon resolution.
+struct Parsed {
+	file_id: String,
+	path: PathBuf,
+	icon: Option<String>,
+	application: ApplicationConfig,
+}
+
+/// Scan every configured directory, one unit per directory.
+///
+/// Entries are identified by their desktop file ID (the path below the
+/// scanned directory, `/` replaced by `-`). As in the XDG menu specification,
+/// the first directory that provides an ID wins: an entry in a user
+/// directory listed first overrides, or with `Hidden`/`NoDisplay` hides, the
+/// system entry of the same ID.
+pub(crate) fn scan(config: &DesktopApplicationScannerConfig, icons: &mut IconIndex) -> SourceScan {
+	let mut claimed = std::collections::HashSet::new();
 	let mut dedupe_keys = std::collections::HashSet::new();
-	let mut icon_resolver = IconResolver::new(config.resolve_icons);
+	let mut parsed_units = Vec::new();
 
 	for directory in &config.directories {
 		let Some(directory) = expand_path(directory) else {
+			parsed_units.push(Err(Unit::failed(
+				directory.display().to_string(),
+				UnitError::Unavailable(format!("Cannot expand {}", directory.display())),
+			)));
 			continue;
 		};
+		let key = directory.display().to_string();
 
-		if !directory.exists() {
-			tracing::debug!(
-				"Skipping missing desktop application directory '{}'.",
-				directory.display()
-			);
-			continue;
+		match fs::metadata(&directory) {
+			Ok(metadata) if metadata.is_dir() => {},
+			Ok(_) => {
+				parsed_units.push(Err(Unit::failed(
+					key,
+					UnitError::Unavailable(format!("{} is not a directory", directory.display())),
+				)));
+				continue;
+			},
+			Err(error) => {
+				tracing::debug!(
+					"Skipping unavailable desktop application directory '{}': {error}",
+					directory.display()
+				);
+				parsed_units.push(Err(Unit::failed(key, UnitError::io(directory.display(), &error))));
+				continue;
+			},
 		}
 
-		for entry in WalkDir::new(&directory)
+		let mut files: Vec<PathBuf> = WalkDir::new(&directory)
 			.follow_links(true)
 			.into_iter()
 			.filter_map(|entry| entry.ok())
 			.filter(|entry| entry.file_type().is_file())
-		{
-			if entry
-				.path()
-				.extension()
-				.and_then(|extension| extension.to_str())
-				.is_none_or(|extension| !extension.eq_ignore_ascii_case("desktop"))
-			{
+			.map(|entry| entry.into_path())
+			.filter(|path| {
+				path.extension()
+					.and_then(|extension| extension.to_str())
+					.is_some_and(|extension| extension.eq_ignore_ascii_case("desktop"))
+			})
+			.collect();
+		// Directory order is arbitrary; sort for stable identities and order.
+		files.sort();
+
+		let mut parsed = Vec::new();
+		for path in files {
+			let file_id = desktop_file_id(&directory, &path);
+			let entry = match DesktopEntry::load(&path) {
+				Ok(Some(entry)) => entry,
+				Ok(None) | Err(()) => continue,
+			};
+			// Any entry claims its ID, including one that hides itself.
+			if !claimed.insert(file_id.clone()) {
 				continue;
 			}
-
-			let Some(application) = parse_desktop_application(entry.path(), config, &mut icon_resolver)? else {
+			let Some(item) = parse_desktop_application(&entry, &path, file_id, config) else {
 				continue;
 			};
-
 			let dedupe_key = (
-				application.title.trim().to_ascii_lowercase(),
-				application.command.join("\u{1f}"),
+				item.application.title.trim().to_ascii_lowercase(),
+				item.application.command.join("\u{1f}"),
 			);
 			if dedupe_keys.insert(dedupe_key) {
-				applications.push(application);
+				parsed.push(item);
 			}
 		}
+		parsed_units.push(Ok((key, parsed)));
 	}
 
-	Ok(applications)
+	if config.resolve_icons {
+		icons.prepare(
+			parsed_units
+				.iter()
+				.filter_map(|unit| unit.as_ref().ok())
+				.flat_map(|(_, parsed)| parsed.iter())
+				.filter_map(|item| item.icon.as_deref()),
+		);
+	}
+
+	let units = parsed_units
+		.into_iter()
+		.map(|unit| match unit {
+			Err(unit) => unit,
+			Ok((key, parsed)) => Unit::ok(
+				key,
+				parsed
+					.into_iter()
+					.map(|item| {
+						let boxart = item
+							.icon
+							.as_deref()
+							.filter(|_| config.resolve_icons)
+							.and_then(|icon| icons.resolve(icon, &item.path));
+						let mut discovered = Discovered::new(item.file_id, item.application);
+						discovered.launches = launcher_target(&discovered.application.command);
+						match boxart {
+							Some(boxart) => discovered.with_artwork(vec![boxart], ArtworkOrigin::DesktopIcon),
+							None => discovered,
+						}
+					})
+					.collect(),
+			),
+		})
+		.collect();
+	SourceScan { units, failure: None }
+}
+
+/// Every configured directory and its subdirectories (bounded).
+pub(crate) fn watch_targets(config: &DesktopApplicationScannerConfig) -> Vec<WatchTarget> {
+	let mut targets = Vec::new();
+	for directory in config.directories.iter().filter_map(|directory| expand_path(directory)) {
+		let mut subdirectories: Vec<PathBuf> = WalkDir::new(&directory)
+			.follow_links(true)
+			.into_iter()
+			.filter_map(|entry| entry.ok())
+			.filter(|entry| entry.file_type().is_dir())
+			.map(|entry| entry.into_path())
+			.take(MAX_WATCHED_DIRECTORIES)
+			.collect();
+		if subdirectories.is_empty() {
+			// Missing: watch the path anyway so the periodic check notices it.
+			subdirectories.push(directory);
+		}
+		targets.extend(
+			subdirectories
+				.into_iter()
+				.map(|path| WatchTarget::directory(path, Filter::Suffix(".desktop")).with_subdirectories()),
+		);
+	}
+	targets
+}
+
+/// The desktop file ID of `path` found below `directory`.
+fn desktop_file_id(directory: &Path, path: &Path) -> String {
+	path.strip_prefix(directory)
+		.unwrap_or(path)
+		.to_string_lossy()
+		.replace('/', "-")
 }
 
 fn parse_desktop_application(
+	entry: &DesktopEntry,
 	path: &Path,
+	file_id: String,
 	config: &DesktopApplicationScannerConfig,
-	icon_resolver: &mut IconResolver,
-) -> Result<Option<ApplicationConfig>, ()> {
-	let entry = match DesktopEntry::load(path) {
-		Ok(Some(entry)) => entry,
-		Ok(None) => return Ok(None),
-		Err(()) => return Ok(None),
-	};
-
+) -> Option<Parsed> {
 	if !entry.is_application() || entry.is_hidden() || entry.is_no_display() {
-		return Ok(None);
+		return None;
 	}
 
 	if entry.is_terminal() && !config.include_terminal {
-		return Ok(None);
+		return None;
 	}
 
-	check_try_exec(&entry);
+	check_try_exec(entry);
 
 	let Some(title) = entry.name() else {
 		tracing::debug!("Skipping desktop entry without a name at '{}'.", path.display());
-		return Ok(None);
+		return None;
 	};
 
-	let Some(command) = parse_exec_command(&entry, path) else {
+	let Some(command) = parse_exec_command(entry, path) else {
 		tracing::debug!("Skipping desktop entry without a usable Exec at '{}'.", path.display());
-		return Ok(None);
+		return None;
 	};
 
-	let boxart = icon_resolver.resolve(entry.icon().map(str::trim).filter(|icon| !icon.is_empty()), path);
-
-	Ok(Some(ApplicationConfig {
-		title,
-		boxart,
-		command,
-		output_scale: None,
-		pre_command: config.pre_command.clone(),
-		post_command: config.post_command.clone(),
-		stdout: config.stdout.clone(),
-		stderr: config.stderr.clone(),
-		launch_timeout_secs: config.launch_timeout_secs,
-	}))
+	Some(Parsed {
+		file_id,
+		path: path.to_path_buf(),
+		icon: entry
+			.icon()
+			.map(str::trim)
+			.filter(|icon| !icon.is_empty())
+			.map(str::to_string),
+		application: ApplicationConfig {
+			title,
+			mode: crate::session::application::SessionMode::Game,
+			boxart: None,
+			command,
+			output_scale: None,
+			pre_command: config.pre_command.clone(),
+			post_command: config.post_command.clone(),
+			stdout: config.stdout.clone(),
+			stderr: config.stderr.clone(),
+			launch_timeout_secs: config.launch_timeout_secs,
+			frame_limit: config.frame_limit.clone(),
+		},
+	})
 }
 
 #[derive(Debug, Default)]
@@ -443,12 +565,6 @@ fn resolve_executable(executable: &str) -> Option<PathBuf> {
 	None
 }
 
-fn expand_path(path: &Path) -> Option<PathBuf> {
-	let path = path.to_string_lossy();
-	let path = shellexpand::full(&path).ok()?;
-	Some(PathBuf::from(path.as_ref()))
-}
-
 fn is_executable(path: &Path) -> bool {
 	if !path.is_file() {
 		return false;
@@ -458,209 +574,6 @@ fn is_executable(path: &Path) -> bool {
 		Ok(metadata) => metadata.permissions().mode() & 0o111 != 0,
 		Err(_) => false,
 	}
-}
-
-#[derive(Clone)]
-struct IconCandidate {
-	path: PathBuf,
-	extension: Option<String>,
-	score: i32,
-}
-
-pub(super) struct IconResolver {
-	enabled: bool,
-	cache: HashMap<String, Option<PathBuf>>,
-	index: HashMap<String, Vec<IconCandidate>>,
-}
-
-impl IconResolver {
-	pub(super) fn new(enabled: bool) -> Self {
-		let mut index: HashMap<String, Vec<IconCandidate>> = HashMap::new();
-		if enabled {
-			for root in icon_search_roots() {
-				if !root.exists() {
-					continue;
-				}
-
-				for entry in WalkDir::new(root)
-					.follow_links(true)
-					.into_iter()
-					.filter_map(|entry| entry.ok())
-					.filter(|entry| entry.file_type().is_file())
-				{
-					let path = entry.into_path();
-					if !is_supported_image(&path) {
-						continue;
-					}
-
-					let Some(file_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-						continue;
-					};
-
-					let extension = path.extension().and_then(|ext| ext.to_str()).map(|s| s.to_string());
-					let score = score_icon_path(&path);
-
-					index
-						.entry(file_stem.to_ascii_lowercase())
-						.or_default()
-						.push(IconCandidate { path, extension, score });
-				}
-			}
-		}
-
-		Self {
-			enabled,
-			cache: HashMap::new(),
-			index,
-		}
-	}
-
-	fn resolve(&mut self, icon: Option<&str>, desktop_file: &Path) -> Option<PathBuf> {
-		if !self.enabled {
-			return None;
-		}
-
-		let icon = icon?;
-		if icon.is_empty() {
-			return None;
-		}
-
-		if let Some(path) = self.resolve_icon_path(icon, desktop_file) {
-			return Some(path);
-		}
-
-		if let Some(cached) = self.cache.get(icon) {
-			return cached.clone();
-		}
-
-		let resolved = self.find_icon_by_name(icon);
-		self.cache.insert(icon.to_string(), resolved.clone());
-		resolved
-	}
-
-	fn resolve_icon_path(&self, icon: &str, desktop_file: &Path) -> Option<PathBuf> {
-		let icon_path = Path::new(icon);
-		if icon_path.is_absolute() {
-			return is_supported_image(icon_path).then(|| icon_path.to_path_buf());
-		}
-
-		if icon.contains('/') {
-			let path = desktop_file.parent()?.join(icon);
-			return is_supported_image(&path).then_some(path);
-		}
-
-		None
-	}
-
-	pub(super) fn find_icon_by_name(&self, icon: &str) -> Option<PathBuf> {
-		let icon_stem = Path::new(icon)
-			.file_stem()
-			.and_then(|stem| stem.to_str())
-			.unwrap_or(icon)
-			.to_ascii_lowercase();
-		let icon_ext = Path::new(icon).extension().and_then(|extension| extension.to_str());
-
-		let candidates = self.index.get(&icon_stem)?;
-		let mut best_match = None;
-		let mut best_score = i32::MIN;
-
-		for candidate in candidates {
-			if let Some(icon_ext) = icon_ext {
-				let Some(candidate_ext) = &candidate.extension else {
-					continue;
-				};
-				if !candidate_ext.eq_ignore_ascii_case(icon_ext) {
-					continue;
-				}
-			}
-
-			if candidate.score > best_score {
-				best_score = candidate.score;
-				best_match = Some(candidate.path.clone());
-			}
-		}
-
-		best_match
-	}
-}
-
-fn icon_search_roots() -> Vec<PathBuf> {
-	let mut roots = Vec::new();
-
-	if let Some(data_home) = xdg_data_home() {
-		roots.push(data_home.join("icons"));
-		roots.push(data_home.join("pixmaps"));
-	}
-
-	for data_dir in xdg_data_dirs() {
-		roots.push(data_dir.join("icons"));
-		roots.push(data_dir.join("pixmaps"));
-	}
-
-	roots
-}
-
-fn xdg_data_home() -> Option<PathBuf> {
-	if let Some(data_home) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-		return Some(PathBuf::from(data_home));
-	}
-
-	let home = env::var_os("HOME")?;
-	Some(PathBuf::from(home).join(".local/share"))
-}
-
-fn xdg_data_dirs() -> Vec<PathBuf> {
-	match env::var_os("XDG_DATA_DIRS") {
-		Some(value) if !value.is_empty() => env::split_paths(&value).collect(),
-		_ => vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")],
-	}
-}
-
-fn is_supported_image(path: &Path) -> bool {
-	path.is_file()
-		&& path
-			.extension()
-			.and_then(|extension| extension.to_str())
-			.is_some_and(|extension| {
-				SUPPORTED_IMAGE_EXTENSIONS
-					.iter()
-					.any(|supported| supported.eq_ignore_ascii_case(extension))
-			})
-}
-
-fn score_icon_path(path: &Path) -> i32 {
-	let mut score = 0;
-	let path_string = path.to_string_lossy();
-
-	if path_string.contains("/hicolor/") {
-		score += 50;
-	}
-
-	if path_string.contains("/apps/") {
-		score += 25;
-	}
-
-	if path_string.contains("/scalable/") {
-		score -= 5;
-	}
-
-	for component in path.components() {
-		let component = component.as_os_str().to_string_lossy();
-		let Some((width, height)) = component.split_once('x') else {
-			continue;
-		};
-
-		let Ok(width) = width.parse::<i32>() else {
-			continue;
-		};
-		let Ok(height) = height.parse::<i32>() else {
-			continue;
-		};
-
-		score += std::cmp::min(width, height);
-	}
-
-	score
 }
 
 #[cfg(test)]
@@ -681,6 +594,70 @@ mod tests {
 
 	static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+	fn scan_desktop_applications(config: &DesktopApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
+		Ok(scan(config, &mut IconIndex::new()).applications())
+	}
+
+	const GAME: &str = "[Desktop Entry]\nType=Application\nName=Game\nExec=/usr/bin/game\n";
+
+	/// A user directory listed first overrides the system entry of the same
+	/// ID, and hides it with `Hidden=true`, as in the XDG menu specification.
+	#[test]
+	fn earlier_directories_override_and_hide_entries_with_the_same_id() {
+		let tempdir = tempdir().unwrap();
+		let user = tempdir.path().join("user");
+		let system = tempdir.path().join("system");
+		write_file(&system.join("game.desktop"), GAME);
+		write_file(
+			&system.join("vendor/tool.desktop"),
+			"[Desktop Entry]\nType=Application\nName=Tool\nExec=/usr/bin/tool\n",
+		);
+		write_file(
+			&user.join("game.desktop"),
+			"[Desktop Entry]\nType=Application\nName=Game (custom)\nExec=/usr/bin/game --custom\n",
+		);
+		write_file(
+			&user.join("vendor-tool.desktop"),
+			"[Desktop Entry]\nType=Application\nName=Tool\nExec=/usr/bin/tool\nHidden=true\n",
+		);
+		let result = scan(&scanner_config(vec![user, system]), &mut IconIndex::new());
+		let titles: Vec<_> = result.applications().into_iter().map(|app| app.title).collect();
+		assert_eq!(titles, vec!["Game (custom)"]);
+		let ids: Vec<_> = result
+			.units
+			.iter()
+			.flat_map(|unit| unit.result.as_ref().unwrap())
+			.map(|entry| entry.native_id.clone())
+			.collect();
+		assert_eq!(ids, vec!["game.desktop"]);
+	}
+
+	#[test]
+	fn launcher_shortcuts_name_the_application_they_start() {
+		let tempdir = tempdir().unwrap();
+		let app_dir = tempdir.path().join("applications");
+		write_file(
+			&app_dir.join("Portal 2.desktop"),
+			"[Desktop Entry]\nType=Application\nName=Portal 2\nExec=steam steam://rungameid/620\n",
+		);
+		let result = scan(&scanner_config(vec![app_dir]), &mut IconIndex::new());
+		let entry = &result.units[0].result.as_ref().unwrap()[0];
+		assert_eq!(entry.launches.as_deref(), Some("steam:620"));
+	}
+
+	/// A configured directory that cannot be read is an error of its unit,
+	/// not an empty directory, so its previous entries are kept.
+	#[test]
+	fn missing_directories_are_unavailable_units() {
+		let tempdir = tempdir().unwrap();
+		let present = tempdir.path().join("present");
+		write_file(&present.join("game.desktop"), GAME);
+		let missing = tempdir.path().join("missing");
+		let result = scan(&scanner_config(vec![missing, present]), &mut IconIndex::new());
+		assert!(matches!(result.units[0].result, Err(UnitError::Unavailable(_))));
+		assert_eq!(result.units[1].result.as_ref().unwrap().len(), 1);
+	}
+
 	fn scanner_config(directories: Vec<PathBuf>) -> DesktopApplicationScannerConfig {
 		DesktopApplicationScannerConfig {
 			directories,
@@ -691,6 +668,7 @@ mod tests {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: 10,
+			frame_limit: Default::default(),
 		}
 	}
 

@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
-"""Check that generated dependency bases agree with Cargo manifests and lockfile."""
+"""Check that generated dependency bases agree with the manifests that pin them."""
 from pathlib import Path
+import re
 import sys
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def check_pyrowave(base):
+    """PyroWave is a native library: Rust provenance and Nix name the base."""
+    rust = (ROOT / "moonshine-core/src/session/stream/video/pyrowave.rs").read_text()
+    nix = (ROOT / "nix/pyrowave.nix").read_text()
+    pins = {
+        "pyrowave.rs SOURCE_REVISION": re.search(r'SOURCE_REVISION: &str = "([0-9a-f]{40})"', rust),
+        "nix/pyrowave.nix upstreamRevision": re.search(r'upstreamRevision = "([0-9a-f]{40})"', nix),
+    }
+    for name, match in pins.items():
+        if not match or match.group(1) != base["commit"]:
+            raise ValueError(f"pyrowave: {name} must equal the UPSTREAM commit")
+    if 'SOURCE_URL: &str = "https://github.com/Themaister/pyrowave"' not in rust:
+        raise ValueError("pyrowave: SOURCE_URL must name the upstream repository")
+
+
 def check(dependency):
     base = dict(line.split(" ", 1) for line in
                 (ROOT / f"vendor/{dependency}-patches/UPSTREAM").read_text().splitlines())
+    if dependency == "pyrowave":
+        check_pyrowave(base)
+        return
     core = tomllib.loads((ROOT / "moonshine-core/Cargo.toml").read_text())["dependencies"][dependency]
     workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())
     lock = tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]

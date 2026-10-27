@@ -35,11 +35,13 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--composited` | off | Force the GLES fallback, independent of fullscreen direct-export eligibility |
 | `--cursor <mode>` | off | Emulate client pointer use so the compositor cursor is visible: `static` (one motion) or `moving` (motion every refresh tick). Also applies to `--cycles` and `--reconnect-cycles` |
 | `--conversion-queue <mode>` | `auto` | H.264/HEVC/AV1 conversion queue: `auto`/`compute` (dedicated compute family when present) or `graphics` |
+| `--pyrowave-record` | off | Use PyroWave's record-framed dialect as Nightjar does: SDR frames of an HDR stream are encoded as 10-bit sRGB SDR (BT.709 primaries and matrix) |
 | `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto` (graphics), `graphics`, or explicit `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
 | `--bitrate <N>` | `20000000` | Target bitrate in bits per second |
+| `--rate-change <seconds:bps>` | off | Repeat in time order to change a conventional encoder rate within its startup ceiling; records requested/accepted rate, outcome and first affected frame |
 | `--encrypt-video` | off | Enable the same video AES-GCM path used in streaming |
 | `--fec-mode <mode>` | `fixed` | Select `off`, `fixed`, or `auto` FEC policy |
 | `--fec-percentage <N>` | `20` | Requested parity percentage; effective layout still obeys the protocol limits |
@@ -48,15 +50,21 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, `av1`, or `pyrowave` |
 | `--chroma <mode>` | `420` | Chroma sampling: `420` or `444`, subject to codec support |
 | `--bit-depth <N>` | `8` (SDR), `10` (HDR) | Select `8` or `10` bits; incompatible formats are rejected |
-| `--full-range` | off | Use full-range YCbCr; PyroWave always uses full range |
+| `--full-range` | off | Use full-range YCbCr (PyroWave's default, as Pyrolight requests) |
+| `--limited-range` | off | Use limited-range YCbCr, also for PyroWave (the default of Moonlight clients such as Nightjar) |
 | `--duration <N>` | `0` | Seconds to run before stopping (`0` = run until Ctrl+C) |
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 | `--detach-seconds <N>` | `0` | After the run, measure N s attached, then N s with both media epochs paused by a reconnecting client's ANNOUNCE (no PLAY), then PLAY and time the first frame; reports frames, process CPU and per-engine GPU time of the benchmark process |
 | `--runtime-probe` | off | Run a 1 ms timer task on the session runtime and report its lateness percentiles (scheduling delay caused by packetization and transport) |
+| `--frame-limit <off\|stream\|N>` | `off` | Apply [`[frame_limit]`](CONFIGURATION.md#frame_limit) to the benchmark application: the stream's frame rate or a fixed rate. Also applies to `--cycles` and `--reconnect-cycles` |
+| `--frame-limit-method <method>` | `proton` | Limiter for `--frame-limit`: `proton` or `mangohud` |
 | `--vrr` | off | Act as a client that requested VRR presentation, so the compositor uses presentation-driven capture. With `--reconnect-cycles`, the request alternates per cycle |
 | `--rtp-trace <path>` | none | Write `frame_index,rtp_timestamp,arrival_us` for every received video frame (unencrypted video only), to compare RTP and arrival intervals |
+| `--json <path>` | none | Write a machine-readable result document for the run or matrix; see [machine-readable results](#machine-readable-results) |
+| `--capabilities` | off | Probe the capture GPU exactly as the server does at startup, print its codec profiles, HDR and DMA-BUF support as JSON (also to `--json`) and exit; needs no command |
+| `--skip-unsupported` | off | Probe capabilities first and record workloads the GPU cannot encode as `unsupported` instead of running them; a single unsupported run exits with status 3 |
 
 ### Examples
 
@@ -73,6 +81,19 @@ Run a quick H.264 benchmark at 1080p60 for 30 seconds:
 moonshine-bench --duration 30 --codec h264 /usr/bin/vkcube
 ```
 
+Exercise live rate installation (fixed rate is otherwise unchanged):
+
+```sh
+moonshine-bench --encoder vaapi --duration 15 --warmup 0 \
+  --rate-change 3:10000000 --rate-change 7:20000000 \
+  --rate-change 11:50000000 --json live-rate.json /usr/bin/vkcube
+```
+
+The final request is clamped to the default 20 Mbps startup ceiling. The JSON's
+`rate_updates` distinguishes a staged/timeout result from successful installation;
+measured encoded bytes can remain below the target when the content is simple,
+particularly after rate-control padding is removed. This does not select ABR.
+
 Run the conventional resolution/FPS/codec matrix:
 
 ```sh
@@ -85,6 +106,24 @@ and `--pyrowave-queue graphics` or `compute` for queue comparisons. Omitting
 `MOONSHINE_LOG=debug` enables diagnostic logging.
 
 ### Comparing runs
+
+`scripts/bench_results.py` validates, summarizes and compares `--json`
+documents and baseline directories:
+
+```sh
+python3 scripts/bench_results.py validate ~/pyroshine-baselines/abc1234
+python3 scripts/bench_results.py summarize ~/pyroshine-baselines/abc1234
+python3 scripts/bench_results.py compare ~/pyroshine-baselines/abc1234 ~/pyroshine-baselines/def5678
+python3 scripts/bench_results.py compare BASE NEW --fail-on total_p99_us=10 --fail-on fps=3
+```
+
+`compare` takes the median of each metric over a workload's repeats and prints
+the change for FPS, delivery ratio, total and frame-age latency percentiles,
+conversion and encode wait, arrival-interval p99 and deviation, missed frame
+slots, CPU, GPU engine time and peak RSS. It only reports unless `--fail-on`
+limits are given; there are no built-in thresholds. Derive limits from the
+spread of repeated runs on the same hardware, and compare only baselines whose
+manifests show the same GPU, driver, kernel and governor.
 
 Record the checkout/backend revisions, GPU/driver, source application/scene,
 resolution/FPS, codec/chroma/depth/HDR, bitrate/FEC, capture path, queue preference,
@@ -103,19 +142,45 @@ fixed workload set in one directory outside the checkout:
 python3 scripts/record_baseline.py --out ~/pyroshine-baselines/$(git rev-parse --short HEAD) --netns
 ```
 
-`manifest.json` identifies the commit (refusing an uncommitted tree unless
-`--allow-dirty`), Cargo.lock hash, Git-pinned crates, PyroWave, Inputtino and Pixelforge
-pins, toolchain, kernel, CPU, memory, governor, GPU/driver and the PyroWave
-library found. The script rebuilds `moonshine-bench` immediately before
-measuring and records its hash, so a stale binary is never measured. It then
-runs each named workload `--repeats` times (default three) and 10 lifecycle and
-reconnect cycles, keeping raw logs, parsed final summaries, exit codes and the
-benchmark process's CPU time and peak RSS (the application runs in its own unit).
-The recorded PyroWave library is the one loaded. A workload that cannot run is listed under `not_run`.
-`--metadata-only` records provenance without running anything. It refuses to
-start while `moonshine-session.service` is active, because the benchmark would
-replace a live session; `--netns` keeps its ports and mDNS off the host network.
-Workload names are stable: add new ones rather than changing existing entries.
+`manifest.json` (`pyroshine-baseline/1`) identifies the commit (refusing an
+uncommitted tree unless `--allow-dirty`, which also saves `checkout.diff`),
+Cargo.lock hash, Git-pinned crates, PyroWave, Inputtino and Pixelforge pins,
+toolchain, kernel, CPU, memory, governor, GPU/driver (Vulkan driver name and
+version) and the PyroWave library found. The script rebuilds `moonshine-bench`
+immediately before measuring and records its hash, so a stale binary is never
+measured. It probes the GPU's capabilities (`capabilities.json`), then runs
+each workload of the selected set `--repeats` times (default three) and 10
+lifecycle and reconnect cycles over the codecs the GPU encodes. Every run keeps
+its raw log, its `pyroshine-bench/1` document (validated after the run), exit
+code and the benchmark process's CPU time and peak RSS (the application runs in
+its own unit). On NVIDIA hosts each run also records `nvidia-smi` GPU and
+encoder utilization (CSV beside the log, summarized excluding warmup).
+Workloads the GPU cannot encode are recorded as `unsupported` and listed under
+`not_run`; they are never forced. The recorded PyroWave library is the one loaded.
+`--metadata-only` records provenance without running anything.
+
+Benchmark applications run in `moonshine-bench.service` (`--application-unit`),
+never the live service's unit. The script still refuses to start while
+`moonshine-session.service` is active, because a live session would compete for
+the GPU; `--netns` keeps its ports and mDNS off the host network.
+
+| Set (`--set`) | Workloads |
+| --- | --- |
+| `default` | H.264/HEVC/AV1 1080p60, HEVC 1440p120 and 2160p60, HEVC composited and encrypted+auto-FEC, PyroWave 1080p60 4:4:4 |
+| `phase0` | H.264, HEVC, AV1 and PyroWave (500 Mbps) at 1080p, 1440p and 2160p × 60/120 FPS (SDR 8-bit 4:2:0); 1080p60 4:4:4, 10-bit, HDR10 and 4:4:4 HDR10 variants; composited, moving-cursor (late composition), VRR and encrypted+auto-FEC variants |
+| `all` | every named workload once |
+
+Workload names are stable and mean the same workload in every set: add new
+ones rather than changing existing entries. Conventional codecs use the
+benchmark's default 20 Mbps unless the name says otherwise.
+
+On a host without a Rust toolchain, record provenance where the binary is
+built and run the copied binary; see [testing](TESTING.md#testing-beside-a-live-service-or-without-a-toolchain):
+
+```sh
+python3 scripts/record_baseline.py --bench-binary ./moonshine-bench \
+  --checkout-from provenance/manifest.json --netns --set phase0 --out ~/baselines/nvidia
+```
 
 To benchmark beside a live service on the same account, give the benchmark its
 own application unit and network namespace, for example:
@@ -133,7 +198,9 @@ is ignored with a warning.
 A server test instance beside a live service also cannot own the management
 name on the shared session bus. `MOONSHINE_MANAGEMENT_BUS` (a D-Bus address,
 for example of a private `dbus-daemon`) serves its management interface there
-instead; applications still start through the session bus's systemd.
+instead; applications still start through the session bus's systemd. Set the
+same variable for `pyroshine pair`, `web` and `diag` aimed at the test
+instance: without it they reach the live service on the session bus.
 
 ### Output
 
@@ -148,7 +215,56 @@ Every 5 seconds, a summary is printed with:
 - **Key frames** — number of keyframes emitted
 - **Frame age** — p50/p95/p99/max from the content's capture deadline (or VRR latch) to transport completion, which includes capture deferral that `total` omits; the conventional encoder-slot wait (time a converted frame waited for Pixelforge's input slot, part of `convert`); and how many frames were outstanding when each frame was submitted (`1/2/3/4+`), which shows encode/send overlap
 
-At the end of the run, a final summary covers the entire session (excluding the warmup period).
+At the end of the run, a final summary covers the entire session (excluding the warmup period). It adds:
+
+- **Capture** — frames per capture path (`direct`, `direct_late` with late-composited cursor/notification, `composited`), VRR captures, the content (source) interval distribution and failed/discarded packets
+- **Pacing** — expected frames at the target rate, delivered frames, and the distribution of first-packet arrival intervals at the loopback receiver, with intervals later than 1.5 target intervals and the frame slots they skipped
+
+### Machine-readable results
+
+`--json` writes a `pyroshine-bench/1` document. Fields are only ever added;
+a change of meaning gets a new schema version so stored baselines stay
+comparable. It contains:
+
+| Field | Content |
+| --- | --- |
+| `tool` | benchmark version and exact argv |
+| `host` | kernel, CPU model and count, memory, CPU governor, every render node with driver and PCI vendor/device ids |
+| `environment` | variables that change what is measured (`MOONSHINE_PYROWAVE_LIBRARY`, `MOONSHINE_CONVENTIONAL_FRAMES_IN_FLIGHT`, `MOONSHINE_APPLICATION_UNIT`, `VK_DRIVER_FILES`, `ANV_DEBUG`, `RADV_*`, …) |
+| `capabilities` | probed GPU name, codec profiles, HDR and DMA-BUF support (with `--capabilities` or `--skip-unsupported`) |
+| `runs[].workload` | codec, resolution, FPS, bitrate, negotiated chroma/bit depth/range, HDR, encoder implementation (`pixelforge-vulkan-video` or `pyrowave`), capture mode, VRR, cursor, encryption, FEC, packet size, queue preferences, duration, warmup, application |
+| `runs[].status` | `ok`, `no_frames`, `interrupted`, `failed` (with `error`) or `unsupported` (with `reason`) |
+| `runs[].summary` | frames, FPS, encoded and submitted UDP Mbps, latency distributions (avg/min/p50/p95/p99/max µs) for `total`, `frame_age`, `submit`, `encode_wait`, `slot_wait`, `source_interval`; the average stage breakdown; frame sizes; packets; capture paths and composition reasons |
+| `runs[].pacing` | target interval, expected/delivered frames, delivery ratio, arrival-interval distribution, standard deviation, late intervals and missed frame slots |
+| `runs[].resources` | benchmark-process CPU (percent of one core) and per-engine GPU busy ms/s from DRM fdinfo over the measured window; RSS, peak RSS, threads, descriptors and DMA-BUF descriptors; device-wide busy percentage where the driver exposes it (amdgpu `gpu_busy_percent`) |
+| `runs[].stats_lagged` | per-frame statistics the benchmark missed; nonzero means the summary undercounts |
+
+What the numbers cover:
+
+- `total` starts at direct export or composition completion and ends at the
+  last UDP submission; `frame_age` starts at the content's capture deadline or
+  VRR latch. Neither includes game rendering or client decode/display.
+- Arrival intervals are measured by the benchmark's own receiver task on
+  loopback; they include its scheduling delay and are not a client's display
+  cadence.
+- Process GPU time covers the benchmark's own DRM clients (compositor,
+  conversion, encode). It attributes encode work to the engine the driver
+  reports (amdgpu VCN as `enc`); the application runs in its own unit and is
+  excluded. The proprietary NVIDIA driver publishes no fdinfo counters; the
+  baseline recorder samples `nvidia-smi` for device and encoder utilization.
+- Device-wide busy percentages include every GPU user on the host.
+- Engine names are merged across every DRM device the process opened. On a
+  multi-GPU host the Vulkan loader also opens the other GPUs, whose engines
+  appear with zero time (for example i915 `render`/`video` beside an NVIDIA
+  capture GPU).
+- A light source such as `vkcube` leaves GPU clocks to the driver's power
+  management. NVIDIA in particular may stay near idle clocks for bursty
+  PyroWave work, which lengthens encode time at lower frame rates; the
+  `nvidia-smi` samples record `clocks.gr`. Compare runs only at matching clock
+  behavior, and pin clocks when the comparison needs it.
+
+Sampling happens only inside the benchmark process (procfs/sysfs reads every
+250 ms and the loopback receiver); the server's streaming path is unchanged.
 
 With `--matrix`, each combination prints the same per-run summaries and the command finishes with a consolidated latency distribution table plus an average pipeline breakdown table. Matrix mode uses fixed target FPS values of 60, 120, and 360. If `--duration` is left at `0`, matrix mode defaults to 8 seconds per combination so the matrix completes.
 
@@ -228,17 +344,39 @@ Each cycle changes one property, in order: none (unchanged resume), resolution
 stereo/5.1/7.1, audio quality and 5/10 ms packets. Combinations the Vulkan Video
 backend does not encode (conventional 4:4:4, 10-bit H.264) are normalized to the
 nearest supported format; the `settings` field records what was negotiated.
+The capture GPU is probed as at server startup and `--encoder` applies as in
+any other run: `settings` names the encoder each cycle used (`encoder=vaapi`),
+and with an explicit encoder a profile it cannot encode fails that cycle's
+start rather than falling back to another encoder.
 A cycle passes when the epoch delivers at least a quarter of its target frames
 in `--cycle-seconds` (default 2) and the loopback client receives video bytes.
 Full cycles additionally require a successful stop, a bindable video port, no
-active application unit and no remaining child process (XWayland) afterwards.
-Every cycle records process FD/thread counts and RSS; look for a plateau.
+active application unit (the one the backend uses, including a
+`MOONSHINE_APPLICATION_UNIT` override), no remaining child process (XWayland)
+and no more open DMA-BUF descriptors than before the first session afterwards.
+Every cycle records process FD, DMA-BUF descriptor and thread counts and RSS;
+look for a plateau.
 Add `--composited` to run the cycles through forced scene composition instead
 of direct export.
 
 The benchmark has no Moonlight client: there is no ENet control, audio endpoint
 or client decode. Cycles establish backend ownership and streaming continuity;
 client compatibility still needs the [reconnect matrix](reconnect-validation.md).
+
+### Frame limiting
+
+Compare `--frame-limit off` with `--frame-limit stream` on a game that does not
+wait for the display. Pyroshine's compositor offers FIFO and MAILBOX, so use
+MAILBOX for an unthrottled source (`vkcube --wsi wayland --present_mode 1`; the
+compositor does not offer IMMEDIATE). A native Vulkan source needs
+`--frame-limit-method mangohud`; `proton` covers only DXVK/vkd3d-proton titles.
+Judge the effect by the application, not the stream FPS, which the capture
+pacer holds at the target either way: the `Video capture cadence` log's
+`game_surface_commits` per capture (frames the game rendered per frame sent),
+the application process's GPU engine time and CPU time (`/proc/<pid>/fdinfo`,
+`/proc/<pid>/stat`), whole-device `resources.device_busy`, and the host latency
+and arrival-interval distributions in the JSON result. Run the pair at least
+three times, interleaved.
 
 ## Game interference harness
 

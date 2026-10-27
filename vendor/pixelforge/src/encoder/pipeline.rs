@@ -22,7 +22,8 @@
 //! the timeline; the completion thread only waits on fences and reads bitstream
 //! buffers, so the two never race on the same Vulkan object.
 //!
-//! Slot reuse is coordinated with a per-slot "busy" flag ([`SlotSync`]): a slot
+//! Slot reuse is coordinated with a per-slot "busy" flag
+//! ([`SlotSync`](crate::video::SlotSync)): a slot
 //! is busy from submit until the completion thread has finished reading its
 //! bitstream. The calling thread waits for the current slot to be free before
 //! converting into / recording over it, which also covers the write-after-read
@@ -30,8 +31,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
@@ -39,13 +40,15 @@ use ash::vk::{self, Handle};
 use futures_channel::oneshot;
 
 use crate::encoder::resources::{
-    ClearImageParams, clear_input_image, create_bitstream_buffer,
-    create_encode_feedback_query_pool, create_encode_timestamp_query_pool, create_image,
-    create_timeline_semaphore, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
+    ClearImageParams, allocate_command_buffers, clear_input_image, create_bitstream_buffer,
+    create_encode_feedback_query_pool, create_encode_timestamp_query_pool, create_fence,
+    create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
     wait_and_read_bitstream,
 };
 use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
 use crate::error::{PixelForgeError, Result};
+use crate::sync::TimelinePoint;
+use crate::video::{SlotSync, TimelineChain};
 use crate::vulkan::VideoContext;
 
 /// A handle to the packet a single `EncodePipeline::submit_current` will
@@ -130,49 +133,6 @@ struct WorkItem {
     result_tx: oneshot::Sender<Result<EncodedPacket>>,
 }
 
-/// Cross-thread per-slot readiness. A slot is "busy" from the moment its encode
-/// is submitted until the completion thread has finished reading its bitstream.
-struct SlotSync {
-    busy: Mutex<Vec<bool>>,
-    cv: Condvar,
-}
-
-impl SlotSync {
-    fn new(slot_count: usize) -> Self {
-        Self {
-            busy: Mutex::new(vec![false; slot_count]),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Block until slot `index` is free (its previous encode has been read back).
-    fn wait_free(&self, index: usize) {
-        let mut busy = self.busy.lock().unwrap();
-        while busy[index] {
-            busy = self.cv.wait(busy).unwrap();
-        }
-    }
-
-    /// Block until every slot is free (no submissions in flight).
-    fn wait_all_free(&self) {
-        let mut busy = self.busy.lock().unwrap();
-        while busy.iter().any(|b| *b) {
-            busy = self.cv.wait(busy).unwrap();
-        }
-    }
-
-    /// Mark a slot busy at submit time. No notify: nobody waits to *enter* busy.
-    fn set_busy(&self, index: usize) {
-        self.busy.lock().unwrap()[index] = true;
-    }
-
-    /// Mark a slot free once its bitstream has been read; wake any waiters.
-    fn set_free(&self, index: usize) {
-        self.busy.lock().unwrap()[index] = false;
-        self.cv.notify_all();
-    }
-}
-
 /// All per-frame resources that must be private to a single in-flight encode.
 pub(crate) struct EncodeSlot {
     pub input_image: vk::Image,
@@ -225,11 +185,7 @@ pub(crate) struct EncodePipeline {
     slots: Vec<EncodeSlot>,
     current_slot: usize,
     /// Orders encode submissions that share DPB state.
-    timeline: vk::Semaphore,
-    /// Value the next submit will signal.
-    next_value: u64,
-    /// Value the most recent submit signaled (0 = none yet).
-    last_value: u64,
+    timeline: TimelineChain,
 
     /// Per-slot busy flags shared with the completion thread.
     slot_sync: Arc<SlotSync>,
@@ -247,14 +203,8 @@ impl EncodePipeline {
         let context = config.context;
         let device = context.device();
 
-        let timeline = create_timeline_semaphore(context)?;
-
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(config.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(ENCODE_PIPELINE_DEPTH as u32);
-        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+        let command_buffers =
+            allocate_command_buffers(context, config.command_pool, ENCODE_PIPELINE_DEPTH as u32)?;
 
         // Timestamp queries are only legal on a queue family with non-zero
         // `timestampValidBits` (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
@@ -286,6 +236,7 @@ impl EncodePipeline {
             let (bitstream_buffer, bitstream_buffer_memory) = create_bitstream_buffer(
                 context,
                 config.bitstream_buffer_size,
+                vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR,
                 config.profile_info,
             )?;
             let bitstream_buffer_ptr = map_bitstream_buffer(
@@ -312,10 +263,7 @@ impl EncodePipeline {
 
             // Created signaled so it is safe to wait on before the first encode;
             // `submit_encode_only` resets it before each submit.
-            let fence_create_info =
-                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-            let encode_fence = unsafe { device.create_fence(&fence_create_info, None) }
-                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+            let encode_fence = create_fence(context, true)?;
 
             let mut profile = *config.profile_info;
             let query_pool = create_encode_feedback_query_pool(context, &mut profile)?;
@@ -362,9 +310,7 @@ impl EncodePipeline {
         Ok(Self {
             slots,
             current_slot: 0,
-            timeline,
-            next_value: 1,
-            last_value: 0,
+            timeline: TimelineChain::new(context)?,
             slot_sync,
             work_tx: Some(work_tx),
             completion_thread: Some(completion_thread),
@@ -414,10 +360,12 @@ impl EncodePipeline {
     pub(crate) fn submit_current(
         &mut self,
         device: &ash::Device,
+        sync2: &ash::khr::synchronization2::Device,
         encode_queue: vk::Queue,
+        external_waits: &[TimelinePoint],
     ) -> Result<EncodeFuture> {
-        let wait = (self.last_value > 0).then_some((self.timeline, self.last_value));
-        let signal_value = self.next_value;
+        let wait = self.timeline.wait();
+        let signal = self.timeline.pending_signal();
         let slot_index = self.current_slot;
 
         // Capture the Copy handles + metadata, releasing the slot borrow before
@@ -450,20 +398,32 @@ impl EncodePipeline {
             )
         };
 
+        // The previous encode, which shares the DPB, then whatever the caller
+        // asked this frame to wait for.
+        let waits: Vec<vk::SemaphoreSubmitInfo> = wait
+            .into_iter()
+            .map(|(semaphore, value)| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(value)
+                    .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            })
+            .chain(external_waits.iter().map(TimelinePoint::wait_info))
+            .collect();
         unsafe {
             submit_encode_only(
                 device,
+                sync2,
                 command_buffer,
                 fence,
                 encode_queue,
-                wait,
-                Some((self.timeline, signal_value)),
+                &waits,
+                Some(signal),
             )?;
         }
         let submit_time = std::time::Instant::now();
 
-        self.last_value = signal_value;
-        self.next_value = signal_value + 1;
+        self.timeline.commit();
 
         // Mark busy *before* handing the work off, so the completion thread can
         // never clear the flag before it is set.
@@ -549,7 +509,7 @@ impl EncodePipeline {
             }
         }
         unsafe {
-            device.destroy_semaphore(self.timeline, None);
+            self.timeline.destroy(device);
         }
     }
 }

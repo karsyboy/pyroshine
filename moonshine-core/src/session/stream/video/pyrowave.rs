@@ -1,13 +1,14 @@
 //! Safe, deliberately small wrapper around the PyroWave 1.1 C API (upstream
-//! 1.0 plus the fork's color-metadata and overlay-layer additions).
+//! 1.0 plus the color-metadata and overlay-layer additions of
+//! `vendor/pyrowave-patches/`).
 //!
 //! The shared library is loaded at runtime. This keeps the conventional Vulkan
 //! Video codecs usable on systems where PyroWave is not installed, while the
-//! package definition can still provide and pin the authoritative fork.
+//! package definition still builds and pins the vendored source.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
@@ -20,13 +21,17 @@ use pixelforge::VideoContext;
 use super::format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 };
-use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
+use super::pipeline::dmabuf::{ImportCacheStats, same_buffer};
 use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
+use crate::session::capture::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "b09e1365155e91710497be22eac6500f04bf74ea";
+/// Upstream of the generated `vendor/pyrowave` tree and its base revision
+/// (`vendor/pyrowave-patches/UPSTREAM`, checked by `check-vendor-pins.py`).
+pub(crate) const SOURCE_URL: &str = "https://github.com/Themaister/pyrowave";
+pub(crate) const SOURCE_REVISION: &str = "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b";
+/// Where the local changes on top of [`SOURCE_REVISION`] live.
+pub(crate) const SOURCE_PATCHES: &str = "vendor/pyrowave-patches";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -398,7 +403,7 @@ const ERROR_NOT_IMPLEMENTED: ResultCode = -6;
 ///
 /// `source` is the caller's view of the source buffer when the call fails
 /// with anything but `ERROR_GENERIC`. It relies on the completion contract of
-/// the pinned fork (revision [`SOURCE_REVISION`], documented in `pyrowave.h`):
+/// the vendored library ([`SOURCE_PATCHES`], documented in `pyrowave.h`):
 /// a failed scaled encode has flushed and waited for any scaler pass it
 /// queued, so no source read is outstanding, and the readback calls check
 /// their fence wait. `ERROR_GENERIC` from the encode or the first wait means
@@ -608,7 +613,7 @@ impl ImportedImage {
 			&& desc
 				.planes()
 				.first()
-				.is_some_and(|(fd, _, _)| same_open_file(self.identity_fd.as_raw_fd(), fd.as_raw_fd()))
+				.is_some_and(|&(fd, _, _)| same_buffer(self.identity_fd.as_fd(), fd))
 	}
 }
 
@@ -680,6 +685,18 @@ pub(crate) struct PyroWaveEncoder {
 	consecutive_near_limit_frames: u32,
 	last_limit_warning: Option<std::time::Instant>,
 	scaling_logged: bool,
+	transfer_logged: bool,
+	/// See [`PyroWaveEncoder::set_sdr_content_as_sdr`].
+	sdr_content_as_sdr: bool,
+}
+
+/// Whether a frame of `color_space` is encoded as HDR10 in a stream whose
+/// negotiated format is `format_hdr`. With `sdr_content_as_sdr`, SDR frames
+/// of an HDR10 stream are encoded as 10-bit SDR instead (sRGB transfer,
+/// BT.709 primaries and matrix), as the conventional codecs do; otherwise
+/// PyroWave maps them into HDR10.
+pub(crate) fn encodes_as_hdr(format_hdr: bool, sdr_content_as_sdr: bool, color_space: FrameColorSpace) -> bool {
+	format_hdr && !(sdr_content_as_sdr && !color_space.is_hdr())
 }
 
 impl PyroWaveEncoder {
@@ -738,9 +755,6 @@ impl PyroWaveEncoder {
 		fps: u32,
 		queue_mode: PyroWaveQueueMode,
 	) -> Result<Self, String> {
-		if format.range != ColorRange::Full {
-			return Err("PyroWave's scaled RGB path currently supports full-range output only".to_string());
-		}
 		let maximum_frame_bytes = wire_v1_frame_budget(bitrate, fps).ok_or_else(|| {
 			let bytes = bitrate
 				.checked_div((fps as usize).saturating_mul(8))
@@ -796,6 +810,8 @@ impl PyroWaveEncoder {
 			consecutive_near_limit_frames: 0,
 			last_limit_warning: None,
 			scaling_logged: false,
+			transfer_logged: false,
+			sdr_content_as_sdr: false,
 		})
 	}
 
@@ -814,12 +830,9 @@ impl PyroWaveEncoder {
 		let Some(&(first_fd, _, _)) = desc.planes().first() else {
 			return Err(rejected("compositor exported a DMA-BUF without planes".to_string()));
 		};
-		if desc.planes()[1..]
-			.iter()
-			.any(|(fd, _, _)| !same_open_file(first_fd.as_raw_fd(), fd.as_raw_fd()))
-		{
+		if desc.planes()[1..].iter().any(|&(fd, _, _)| !same_buffer(first_fd, fd)) {
 			return Err(rejected(
-				"PyroWave cannot import a DMA-BUF whose planes use different file descriptions".to_string(),
+				"PyroWave cannot import a DMA-BUF whose planes are in different buffers".to_string(),
 			));
 		}
 		let source_fd = first_fd;
@@ -937,6 +950,25 @@ impl PyroWaveEncoder {
 		Ok(view)
 	}
 
+	/// Encode SDR frames of an HDR10 stream as 10-bit SDR: the sRGB samples
+	/// are kept, with the BT.709 matrix, and the sequence header says so.
+	///
+	/// Only for a record client that presents by the control stream's HDR
+	/// mode (Nightjar, after the Rubylight host; see
+	/// `pyrowave_protocol::record_client_follows_hdr_mode`): it converts the
+	/// planes by that mode rather than by the sequence header, and HDR-off
+	/// shows them on an sRGB surface. Mapped into HDR10 instead, SDR white
+	/// sits at the 203-nit reference white and looks dim beside the device's
+	/// SDR brightness. Pyrolight reads the sequence header and keeps HDR10.
+	pub(crate) fn set_sdr_content_as_sdr(&mut self, enabled: bool) {
+		self.sdr_content_as_sdr = enabled;
+	}
+
+	/// Whether `color_space` frames are encoded as HDR10 by this encoder.
+	pub(crate) fn encodes_as_hdr(&self, color_space: FrameColorSpace) -> bool {
+		encodes_as_hdr(self.format.hdr, self.sdr_content_as_sdr, color_space)
+	}
+
 	/// Encode one frame and read back its bitstream.
 	///
 	/// On every return, including errors, no submitted GPU work still reads the
@@ -974,10 +1006,25 @@ impl PyroWaveEncoder {
 		let imported = std::time::Instant::now();
 		let input_color_space = match frame.color_space {
 			FrameColorSpace::Srgb => vk::ColorSpaceKHR::SRGB_NONLINEAR,
+			FrameColorSpace::Gamma22 | FrameColorSpace::Bt1886 => {
+				// The pinned scaler decodes only sRGB, PQ and linear input.
+				// The isolated compositor composes such surfaces, so only a
+				// desktop capture (Mutter declares gamma 2.2) reaches here;
+				// read as sRGB, near-black differs slightly from the source.
+				if !self.transfer_logged {
+					tracing::warn!(
+						color_space = ?frame.color_space,
+						"PyroWave reads this desktop's SDR transfer as sRGB; the darkest shades \
+						 are slightly brighter than on the host. The conventional codecs convert it exactly."
+					);
+					self.transfer_logged = true;
+				}
+				vk::ColorSpaceKHR::SRGB_NONLINEAR
+			},
 			FrameColorSpace::Bt2020Pq => vk::ColorSpaceKHR::HDR10_ST2084_EXT,
 			FrameColorSpace::ScrgbLinear => vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
 		};
-		let output_color_space = if self.format.hdr {
+		let output_color_space = if self.encodes_as_hdr(frame.color_space) {
 			vk::ColorSpaceKHR::HDR10_ST2084_EXT
 		} else {
 			vk::ColorSpaceKHR::SRGB_NONLINEAR
@@ -999,9 +1046,15 @@ impl PyroWaveEncoder {
 			force_linear_filtering: false,
 			skip_dither: false,
 			crop_rect: ptr::null(),
-			// `new` rejects limited range, so the scaler always writes full range.
-			ycbcr_range: vk::SamplerYcbcrRange::ITU_FULL,
-			ycbcr_range_bit_depth: 0,
+			// The scaler writes the negotiated range and stamps it in the
+			// sequence header. Pyrolight always asks for full range; Moonlight
+			// clients such as Nightjar default to limited and convert with
+			// their own setting rather than the header, so it must be honored.
+			ycbcr_range: match self.format.range {
+				ColorRange::Full => vk::SamplerYcbcrRange::ITU_FULL,
+				ColorRange::Limited => vk::SamplerYcbcrRange::ITU_NARROW,
+			},
+			ycbcr_range_bit_depth: u32::from(self.format.bit_depth.bits()),
 		};
 		let rate = RateControl {
 			maximum_bitstream_size: self.maximum_frame_bytes,
@@ -1205,6 +1258,17 @@ impl PyroWaveEncoder {
 		self.maximum_frame_bytes
 	}
 
+	/// Retarget the per-frame budget for a live bitrate; the next encode uses
+	/// it. PyroWave has no rate controller or references to carry over, so
+	/// this is all a rate change is. Returns the accepted bitrate, which the
+	/// budget's 4-byte alignment may lower slightly.
+	pub(crate) fn set_bitrate(&mut self, bitrate: usize, fps: u32) -> Result<usize, String> {
+		let bytes = wire_v1_frame_budget(bitrate, fps)
+			.ok_or_else(|| format!("a {bitrate} bps PyroWave frame budget is outside 1 KiB to 3 MiB"))?;
+		self.maximum_frame_bytes = bytes;
+		Ok(bytes.saturating_mul(8).saturating_mul(fps as usize))
+	}
+
 	pub(crate) fn import_cache_len(&self) -> usize {
 		self.images.entries.len()
 	}
@@ -1233,6 +1297,21 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Nightjar's HDR10 streams carry SDR frames as 10-bit sRGB SDR; other
+	/// HDR10 streams (Pyrolight) and SDR streams are unchanged.
+	#[test]
+	fn only_record_framed_hdr_streams_carry_sdr_frames_as_sdr() {
+		use FrameColorSpace::{Bt2020Pq, ScrgbLinear, Srgb};
+		for color_space in [Srgb, Bt2020Pq, ScrgbLinear] {
+			assert!(!encodes_as_hdr(false, false, color_space));
+			assert!(!encodes_as_hdr(false, true, color_space));
+			assert!(encodes_as_hdr(true, false, color_space));
+		}
+		assert!(!encodes_as_hdr(true, true, Srgb));
+		assert!(encodes_as_hdr(true, true, Bt2020Pq));
+		assert!(encodes_as_hdr(true, true, ScrgbLinear));
+	}
 
 	#[test]
 	fn import_cache_soak_releases_old_resources_and_preserves_active_buffers() {
@@ -1342,15 +1421,21 @@ mod tests {
 	}
 
 	#[test]
-	fn authoritative_source_is_pinned() {
-		assert_eq!(SOURCE_URL, "https://github.com/karsyboy/pyrowave");
+	fn vendored_source_is_pinned() {
+		assert_eq!(SOURCE_URL, "https://github.com/Themaister/pyrowave");
 		assert_eq!(SOURCE_REVISION.len(), 40);
 		assert!(SOURCE_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
 		assert_eq!(API_VERSION, (1, 1, 0));
+		let base = include_str!("../../../../../vendor/pyrowave-patches/UPSTREAM");
+		assert!(base.lines().any(|line| line == format!("commit {SOURCE_REVISION}")));
 		let nix_dependency = include_str!("../../../../../nix/pyrowave.nix");
 		assert!(nix_dependency.contains(SOURCE_URL));
 		assert!(nix_dependency.contains(SOURCE_REVISION));
-		assert!(!nix_dependency.contains("https://github.com/Themaister/pyrowave"));
+		assert!(nix_dependency.contains("../vendor/pyrowave"));
+		// The API additions exist only in the vendored header.
+		let header = include_str!("../../../../../vendor/pyrowave/pyrowave.h");
+		assert!(header.contains("#define PYROWAVE_API_VERSION_MINOR 1"));
+		assert!(header.contains("pyrowave_encoder_encode_gpu_scaled_layers"));
 	}
 
 	#[test]
@@ -1415,7 +1500,7 @@ mod tests {
 	#[test]
 	#[ignore = "needs a GPU and the pinned PyroWave build: MOONSHINE_TEST_GPU=1 MOONSHINE_TEST_PYROWAVE=1"]
 	fn pyrowave_imports_compositor_dmabufs_on_gpu() {
-		use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+		use crate::session::capture::frame::{ExportedFrame, FrameColorSpace};
 		use crate::session::stream::video::{ColorRange, NegotiatedVideoFormat, VideoCodec};
 		use ash::vk::TaggedStructure;
 		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};

@@ -51,14 +51,14 @@ const VIDEO_FRAME_HEADER_SIZE: usize = 8;
 
 /// Smallest negotiable `packetSize`: the NV packet header plus the video
 /// frame header, so a frame's first shard carries its complete frame header.
-pub(super) const MIN_VIDEO_PACKET_SIZE: usize = NV_VIDEO_PACKET_SIZE + VIDEO_FRAME_HEADER_SIZE;
+pub(crate) const MIN_VIDEO_PACKET_SIZE: usize = NV_VIDEO_PACKET_SIZE + VIDEO_FRAME_HEADER_SIZE;
 
 /// UDP payload bytes of one shard for a negotiated `packetSize`.
 ///
 /// The client's `packetSize` covers the NV header and payload; the packetizer
 /// adds the RTP header and padding, and the encryption prefix when encrypting
 /// (Moonlight already subtracts that prefix from an encrypted stream's size).
-pub(super) fn wire_shard_size(packet_size: usize, encrypted: bool) -> Option<usize> {
+pub(crate) fn wire_shard_size(packet_size: usize, encrypted: bool) -> Option<usize> {
 	let prefix = if encrypted { ENC_PREFIX_SIZE } else { 0 };
 	packet_size
 		.checked_add(RTP_HEADER_SIZE + PADDING_SIZE)?
@@ -208,8 +208,22 @@ impl Packetizer {
 
 	/// Pre-create FEC encoders for all possible block sizes to avoid
 	/// expensive ReedSolomon matrix construction during frame processing.
-	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
+	///
+	/// Building every encoder takes up to a few hundred milliseconds in an
+	/// optimized build and many seconds in a debug one, and runs on the
+	/// pipeline thread before its loop. `stopped` is checked between
+	/// encoders so a session stopped meanwhile (for example before the client
+	/// ever connected) is not held up by it; encoders not built here are
+	/// built on first use. Returns whether the cache was completed.
+	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32, stopped: impl Fn() -> bool) -> bool {
 		for nr_data_shards in 1..MAX_SHARDS {
+			if stopped() {
+				tracing::debug!(
+					"FEC encoder warm-up interrupted by session stop after {} entries.",
+					self.fec_encoders.len()
+				);
+				return false;
+			}
 			if let Some((_, nr_parity_shards)) =
 				block_fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets as usize)
 				&& nr_parity_shards > 0
@@ -219,6 +233,7 @@ impl Packetizer {
 		}
 
 		tracing::debug!("FEC encoder cache warmed with {} entries.", self.fec_encoders.len());
+		true
 	}
 
 	/// Packetize an encoded frame into a batch of network-ready shards.
@@ -1197,6 +1212,32 @@ mod tests {
 		assert_eq!(after.blocks, 4);
 		assert!(after.fec_percentage > 0);
 		assert!(after.fec_percentage <= 20);
+	}
+
+	/// A session stopped while the pipeline warms its FEC cache (seconds in a
+	/// debug build) must not wait for the whole cache; what is missing is built
+	/// on first use with identical output.
+	#[test]
+	fn fec_warm_up_stops_with_the_session_and_encoders_fill_on_demand() {
+		let checks = std::cell::Cell::new(0);
+		let mut interrupted = packetizer_with(false);
+		assert!(!interrupted.warm_up(20, 0, || {
+			checks.set(checks.get() + 1);
+			checks.get() > 3
+		}));
+		assert_eq!(checks.get(), 4, "checked before every encoder");
+		assert!(interrupted.fec_encoders.len() <= 3);
+
+		let mut warmed = packetizer_with(false);
+		assert!(warmed.warm_up(20, 0, || false));
+		assert!(warmed.fec_encoders.len() > interrupted.fec_encoders.len());
+
+		let data: Vec<u8> = (0..200_000).map(|i| (i * 7) as u8).collect();
+		let lazy = interrupted
+			.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 9, 1)
+			.unwrap();
+		let eager = warmed.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 9, 1).unwrap();
+		assert_eq!(lazy.as_bytes(), eager.as_bytes());
 	}
 }
 

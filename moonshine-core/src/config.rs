@@ -2,10 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub use crate::app_scanner::ApplicationScannerConfig;
+pub use crate::app_scanner::LibraryConfig;
 pub use crate::app_scanner::lutris::LutrisApplicationScannerConfig;
 pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
-pub use crate::session::application::ApplicationConfig;
+pub use crate::management::history::HistoryConfig;
+pub use crate::management::web::ManagementConfig;
+pub use crate::session::application::{ApplicationConfig, SessionMode};
+pub use crate::session::capture::portal::DesktopConfig;
 use crate::session::compositor::CompositorConfig;
+pub use crate::session::frame_limit::FrameLimitConfig;
 use crate::session::stream::StreamConfig;
 pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::webserver::WebserverConfig;
@@ -24,6 +29,12 @@ pub struct Config {
 	/// Configuration for the webserver.
 	pub webserver: WebserverConfig,
 
+	/// The web management interface (separate from the GameStream webserver).
+	pub management: ManagementConfig,
+
+	/// The persistent session history.
+	pub history: HistoryConfig,
+
 	/// Configuration for the streams.
 	pub stream: StreamConfig,
 
@@ -36,8 +47,17 @@ pub struct Config {
 	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
+	/// How the application catalog follows launcher changes.
+	pub library: LibraryConfig,
+
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
+
+	/// Desktop Mode: streaming the running desktop (off by default).
+	pub desktop: DesktopConfig,
+
+	/// Optional frame limiting of launched applications (off by default).
+	pub frame_limit: FrameLimitConfig,
 
 	/// Inhibit system sleep (suspend) while a session is active.
 	///
@@ -102,14 +122,28 @@ impl Config {
 	/// Startup and the management interface both apply this check, so a setting
 	/// is rejected with the same reason wherever it is entered.
 	pub fn validate(&self) -> Result<(), String> {
+		if self.desktop.disconnect_grace_secs > 86400 {
+			return Err("desktop.disconnect_grace_secs must be between 0 and 86400".into());
+		}
+
 		self.address
 			.parse::<std::net::IpAddr>()
 			.map_err(|error| format!("address '{}' is not an IP address: {error}", self.address))?;
+		self.management.validate()?;
+		self.history.validate()?;
 		let tcp = [
 			("webserver.port", self.webserver.port),
 			("webserver.port_https", self.webserver.port_https),
 			("stream.port", self.stream.port),
 		];
+		if self.management.enabled
+			&& let Some((name, _)) = tcp.iter().find(|(_, port)| *port == self.management.port)
+		{
+			return Err(format!(
+				"management.port and {name} both use TCP port {}",
+				self.management.port
+			));
+		}
 		let udp = [
 			("stream.video.port", self.stream.video.port),
 			("stream.audio.port", self.stream.audio.port),
@@ -127,6 +161,26 @@ impl Config {
 				}
 			}
 		}
+		let poll = crate::app_scanner::service::POLL_INTERVAL_SECS;
+		if !poll.contains(&self.library.poll_interval_secs) {
+			return Err(format!(
+				"library.poll_interval_secs must be between {} and {} seconds, not {}",
+				poll.start(),
+				poll.end(),
+				self.library.poll_interval_secs
+			));
+		}
+		self.frame_limit.validate()?;
+		for application in &self.applications {
+			application
+				.frame_limit
+				.validate(&format!("application '{}'", application.title))?;
+		}
+		for scanner in &self.application_scanners {
+			scanner
+				.frame_limit()
+				.validate(&format!("the {} scanner", scanner.kind().id()))?;
+		}
 		if !STREAM_TIMEOUT_SECS.contains(&self.stream.timeout) {
 			return Err(format!(
 				"stream.timeout must be between {} and {} seconds, not {}",
@@ -136,6 +190,21 @@ impl Config {
 			));
 		}
 		Ok(())
+	}
+
+	/// The configured entries clients are offered: `[[application]]`, then
+	/// the Desktop Mode entry when `[desktop]` enables it and no application
+	/// entry already streams the desktop.
+	pub fn offered_applications(&self) -> Vec<ApplicationConfig> {
+		let mut applications = self.applications.clone();
+		if self.desktop.enabled && !applications.iter().any(|a| a.mode == SessionMode::Desktop) {
+			applications.push(ApplicationConfig {
+				title: self.desktop.title.clone(),
+				mode: SessionMode::Desktop,
+				..Default::default()
+			});
+		}
+		applications
 	}
 
 	fn resolve_paths(&mut self) -> Result<(), ()> {
@@ -167,6 +236,8 @@ impl Default for Config {
 			// disables IPV6_V6ONLY, so that single address covers both).
 			address: "0.0.0.0".to_string(),
 			webserver: Default::default(),
+			management: Default::default(),
+			history: Default::default(),
 			stream: Default::default(),
 			applications: vec![ApplicationConfig {
 				title: "Steam".to_string(),
@@ -186,8 +257,12 @@ impl Default for Config {
 				stdout: None,
 				stderr: None,
 				launch_timeout_secs: 2,
+				frame_limit: Default::default(),
 			})],
+			library: LibraryConfig::default(),
 			compositor: CompositorConfig::default(),
+			desktop: DesktopConfig::default(),
+			frame_limit: FrameLimitConfig::default(),
 			inhibit_sleep: true,
 		}
 	}
@@ -198,8 +273,87 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn desktop_mode_is_offered_once_after_the_configured_entries_when_enabled() {
+		let mut config = Config::default();
+		assert!(
+			config.offered_applications().iter().all(|a| a.mode.is_game()),
+			"Desktop Mode is off by default"
+		);
+		config.desktop.enabled = true;
+		let offered = config.offered_applications();
+		let last = offered.last().unwrap();
+		assert_eq!((last.title.as_str(), last.mode), ("Desktop Mode", SessionMode::Desktop));
+		assert_eq!(offered.len(), config.applications.len() + 1);
+		// A configured desktop entry is the user's choice of title; no second one.
+		config.applications.push(ApplicationConfig {
+			title: "My desktop".into(),
+			mode: SessionMode::Desktop,
+			..Default::default()
+		});
+		let offered = config.offered_applications();
+		assert_eq!(offered.iter().filter(|a| a.mode == SessionMode::Desktop).count(), 1);
+		assert_eq!(offered.last().unwrap().title, "My desktop");
+	}
+
+	#[test]
+	fn application_mode_round_trips_and_defaults_to_game() {
+		let entry: ApplicationConfig = toml::from_str("title = \"Desk\"\ncommand = []\nmode = \"desktop\"\n").unwrap();
+		assert_eq!(entry.mode, SessionMode::Desktop);
+		let game: ApplicationConfig = toml::from_str("title = \"Game\"\ncommand = [\"/bin/game\"]\n").unwrap();
+		assert_eq!(game.mode, SessionMode::Game);
+		assert!(
+			!toml::to_string(&game).unwrap().contains("mode"),
+			"Game Mode stays implicit"
+		);
+	}
+
+	#[test]
+	fn desktop_grace_defaults_round_trips_and_is_bounded() {
+		assert_eq!(Config::default().desktop.disconnect_grace_secs, 30);
+		for seconds in [0, 30, 86400] {
+			let config: Config = toml::from_str(&format!("[desktop]\ndisconnect_grace_secs = {seconds}")).unwrap();
+			assert_eq!(config.validate(), Ok(()));
+			let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+			assert_eq!(roundtrip.desktop.disconnect_grace_secs, seconds);
+		}
+		let mut config = Config::default();
+		config.desktop.disconnect_grace_secs = 86401;
+		assert!(config.validate().unwrap_err().contains("desktop.disconnect_grace_secs"));
+	}
+
+	#[test]
 	fn default_configuration_is_valid() {
 		assert_eq!(Config::default().validate(), Ok(()));
+	}
+
+	#[test]
+	fn frame_limits_are_off_by_default_validated_and_omitted_when_unset() {
+		let config = Config::default();
+		assert_eq!(
+			config.frame_limit.mode,
+			crate::session::frame_limit::FrameLimitMode::Off
+		);
+		// Existing configurations serialize without any frame limit override.
+		let application = toml::to_string(&config.applications[0]).unwrap();
+		assert!(!application.contains("frame_limit"), "{application}");
+		let parse = |toml: &str| toml::from_str::<Config>(toml).unwrap().validate();
+		assert!(
+			parse("[frame_limit]\nmode = \"custom\"\nfps = 5")
+				.unwrap_err()
+				.contains("frame_limit.fps")
+		);
+		let application = "[[application]]\ntitle = \"Game\"\ncommand = [\"game\"]\nframe_limit_mode = \"custom\"\nframe_limit_fps = 2000";
+		assert!(parse(application).unwrap_err().contains("application 'Game'"));
+		let scanner =
+			"[[application_scanner]]\ntype = \"steam\"\nlibrary = \"/tmp\"\ncommand = [\"steam\"]\nframe_limit_fps = 1";
+		assert!(parse(scanner).unwrap_err().contains("steam scanner"));
+		let valid = "[frame_limit]\nmode = \"stream\"\nmethod = \"mangohud\"\n\n[[application]]\ntitle = \"Game\"\ncommand = [\"game\"]\nframe_limit_mode = \"off\"";
+		let config: Config = toml::from_str(valid).unwrap();
+		assert_eq!(config.validate(), Ok(()));
+		assert_eq!(
+			config.applications[0].frame_limit.frame_limit_mode,
+			Some(crate::session::frame_limit::FrameLimitMode::Off)
+		);
 	}
 
 	/// Review 2026-10-05 CFG-001: a hand-written file is held to the same
@@ -212,6 +366,8 @@ mod tests {
 			("[stream]\ntimeout = 0", "stream.timeout"),
 			("[stream]\ntimeout = 86401", "stream.timeout"),
 			("[stream]\ntimeout = 9223372036854775807", "stream.timeout"),
+			("[library]\npoll_interval_secs = 0", "library.poll_interval_secs"),
+			("[library]\npoll_interval_secs = 86401", "library.poll_interval_secs"),
 			("[stream]\nport = 0", "stream.port"),
 			("[stream.video]\nport = 0", "stream.video.port"),
 			("[stream.audio]\nport = 0", "stream.audio.port"),

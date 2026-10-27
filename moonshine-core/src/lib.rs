@@ -2,9 +2,11 @@
 #![allow(clippy::result_unit_err)]
 
 pub mod app_scanner;
+pub mod calibration;
 pub mod clients;
 pub mod config;
 pub(crate) mod crypto;
+pub mod desktop;
 pub mod discovery;
 pub(crate) mod durable;
 pub(crate) mod gpu;
@@ -36,4 +38,7 @@ pub enum ShutdownReason {
 	RtspShutdown = 4,
 	/// Session manager guard token (trigger_shutdown_token, not a shutdown trigger).
 	SessionManagerShutdown = 5,
+	/// The operator asked for a restart (web interface or session bus): after
+	/// the normal shutdown the process starts its executable again.
+	Restart = 6,
 }

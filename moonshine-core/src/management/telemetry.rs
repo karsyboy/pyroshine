@@ -9,7 +9,7 @@
 //! pipeline never waits on it: a timer drains the channel four times a second
 //! (no per-frame wakeups), and a receiver that falls behind loses the oldest
 //! samples, which are counted. Once per second the window is summarized into a
-//! [`StreamStats`] for the desktop UI and the support bundle's history,
+//! [`StreamStats`] for the web interface and the support bundle's history,
 //! together with one reading of the capture GPU ([`GpuProbe`]) taken on a
 //! blocking thread.
 
@@ -21,8 +21,8 @@ use tokio::sync::watch;
 
 use super::findings::{self, StreamTarget};
 use crate::gpu_sensors::{self, GpuSampler, ProcessGroup};
+use crate::session::capture::frame::CapturePath;
 use crate::session::compositor::DirectReject;
-use crate::session::compositor::frame::CapturePath;
 use crate::session::stream::video::FrameStats;
 
 /// How often buffered samples are read. The channel holds 256 frames, enough
@@ -702,7 +702,7 @@ mod tests {
 	/// listed most frequent first with their operator text.
 	#[test]
 	fn capture_paths_and_composition_reasons_are_counted() {
-		use crate::session::compositor::frame::CaptureOrigin;
+		use crate::session::capture::frame::CaptureOrigin;
 		let start = Instant::now();
 		let mut window = StatsWindow::new(start);
 		let origin = |path, reason| CaptureOrigin {

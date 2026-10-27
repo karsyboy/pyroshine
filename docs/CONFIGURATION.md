@@ -24,11 +24,14 @@ at startup; restart the server after edits. Invalid TOML or missing required
 fields prevents startup. Unknown fields are not rejected by the current parser,
 so check spelling carefully.
 
-The [desktop app](DESKTOP.md#settings) edits every setting below. It validates
+The [web interface](MANAGEMENT.md#settings) edits every setting below. It validates
 the whole configuration before saving, changes only the settings you edit
 (keeping comments, formatting and unrelated entries), refuses to overwrite a
 file changed since it was loaded, and replaces the file atomically. Saving does
-not reload the configuration; restart the server to apply it.
+not reload the configuration; restart the server to apply it (the web
+interface's **Restart now** does). `[[application]]`,
+`[[application_scanner]]` and `[library]` are edited on its **Applications**
+page.
 
 The packaged systemd unit explicitly passes `/home/<user>/.config/moonshine/config.toml`.
 To use another location, run `sudo systemctl edit "pyroshine@$USER"` and add
@@ -86,10 +89,12 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 | `address` | string, `"0.0.0.0"` | Bind address for web and stream listeners. `0.0.0.0` is IPv4; `::` enables dual-stack IPv4/IPv6. With a specific non-loopback address, the pairing PIN page is additionally served on `127.0.0.1` at the HTTP port. |
 | `inhibit_sleep` | boolean, `true` | Ask logind to block suspend while streaming. Requires the shipped polkit rule and `pyroshine` group access; the packaged service grants that group. Failure logs a warning and does not prevent streaming. |
 | `application` | array of tables, Steam entry | Static applications exposed to clients; see below. |
-| `application_scanner` | array of tables, Steam scanner in generated config; `[]` if omitted from an existing file | Discover installed applications at startup and append them to the static list; see below. |
+| `application_scanner` | array of tables, Steam scanner in generated config; `[]` if omitted from an existing file | Discover installed applications and keep them current while Pyroshine runs; see below. |
+| `library` | table | How discovered applications follow installs and removals; see [`[library]`](#library). |
 | `webserver` | table | HTTP/HTTPS ports, pairing, and TLS files. |
 | `stream` | table | RTSP, timeout, video, audio, and control settings. |
 | `compositor` | table | GPU, capture, HDR, window focus, and keyboard settings. |
+| `frame_limit` | table, off | Optional frame limiting of launched games; see [`[frame_limit]`](#frame_limit). |
 
 ## `[webserver]`
 
@@ -107,7 +112,7 @@ private_key = "$HOME/.config/moonshine/key.pem"
 
 | Setting | Type / default when table is omitted | Effect |
 | --- | --- | --- |
-| `port` | integer, `47989` | HTTP GameStream API and pairing PIN page port (TCP). The PIN page only accepts requests from the host itself. Required in an explicit table. |
+| `port` | integer, `47989` | HTTP GameStream API port (TCP), also used for host-local revocation (`POST /unpair`). Required in an explicit table. |
 | `port_https` | integer, `47984` | HTTPS GameStream API port (TCP). Required in an explicit table. |
 | `enable_pairing` | boolean, `true` | Allow new clients to pair. Set `false` after pairing to disable new pairings. |
 | `certificate` | path string, `$HOME/.config/moonshine/cert.pem` | TLS certificate file, created if needed. Required in an explicit table. Supports `~` and environment-variable expansion. |
@@ -120,20 +125,60 @@ they must be fixed), two TCP listeners (`webserver.port`,
 `webserver.port_https`, `stream.port`) or two UDP listeners
 (`stream.video.port`, `stream.audio.port`, `stream.control.port`) share a
 port, `[stream].timeout` is outside 1–86400, or whose `address` is not an IP
-address. The desktop settings editor applies the same checks.
+address. The web interface's settings editor applies the same checks.
 
-Pair through the [desktop app](DESKTOP.md#pair-a-client), or follow the
-[headless/browser procedure](INSTALLATION.md#pair-without-the-desktop-app).
-The page needs the complete logged `/pin?uniqueid=...` URL; bare `/pin` fails.
-It provides the request-specific approval token used by `/submit-pin`, which
-requires `uniqueid`, `pin` and `request`.
-
-Operator approval routes require a loopback peer and a loopback `Host` on the
-configured HTTP port; browser Origin/site checks also apply. For SSH forwarding,
-keep the local and remote port equal to `webserver.port`. A different local
-port is rejected by Host/origin validation. See
+Pair through the [web interface](MANAGEMENT.md#pair-a-client) or
+[from a terminal](INSTALLATION.md#pair-from-a-terminal). See
 [Security administration](SECURITY_ADMINISTRATION.md) for request lifetimes,
 identity recovery and revocation.
+
+## `[management]`
+
+[Source](../moonshine-core/src/management/web/mod.rs). The
+[web management interface](MANAGEMENT.md): a separate listener from the
+GameStream ports, with its own administrator sign-in.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `enabled` | boolean, `true` | Serve the web interface. Without it, manage Pyroshine with the tray and `pyroshine pair`. |
+| `address` | IP string, `"127.0.0.1"` | Listen address. Loopback keeps it on the host; reach it through an SSH tunnel. Any other address (for example `"0.0.0.0"` or `"::"` for all) requires `tls = true`. |
+| `port` | integer, `47990` | TCP port. Must differ from the GameStream TCP ports. |
+| `tls` | boolean, `false` | Serve HTTPS. Required for a non-loopback `address`. |
+| `certificate` | optional path | PEM certificate for HTTPS. Defaults to `[webserver] certificate` (self-signed: browsers warn until you accept it). |
+| `private_key` | optional path | Private key for `certificate`; set both or neither. |
+| `allowed_hosts` | list of strings, `[]` | Further host names browsers may use (`name` or `name:port`), for example `["streambox.lan"]`. IP addresses and `localhost` always work; other names are refused to defeat DNS rebinding. |
+| `web_root` | optional directory | The interface's files. Defaults to `share/pyroshine/web` next to the executable, then `/usr/share/pyroshine/web`. |
+| `tray` | boolean, `true` | Show the [desktop tray](MANAGEMENT.md#desktop-tray) while you are signed in to a desktop. The service starts and stops it with your desktop session; headless hosts never start it. |
+
+```toml
+[management]
+address = "0.0.0.0"
+tls = true
+allowed_hosts = ["streambox.lan"]
+```
+
+Startup logs **Web management interface not started** with the reason when
+the listener cannot start (invalid settings, port in use, unreadable
+certificate); streaming still works. The administrator password is not a
+setting: set it with `pyroshine web setup`.
+
+## `[history]`
+
+[Source](../moonshine-core/src/management/history.rs). The
+[session history](MANAGEMENT.md#session-history), stored in
+`~/.local/share/moonshine/history.sqlite3`.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `enabled` | boolean, `true` | Record sessions. |
+| `retention_days` | integer, `90`; `1`–`3650` | Remove sessions older than this. |
+| `max_sessions` | integer, `1000`; `10`–`100000` | Keep at most this many sessions; the oldest go first. |
+| `record_client_address` | boolean, `true` | Store each session's client IP address and the name you gave that client. |
+
+Only host-side measurements are recorded; no keys, PINs, credentials or stream
+contents. Writing never delays a stream: when storage fails (full or read-only
+disk) the web interface reports it and the stream continues. A damaged database
+is moved aside (`history.sqlite3.corrupt-<time>`) and a new one started.
 
 ## `[stream]`
 
@@ -159,6 +204,7 @@ identity recovery and revocation.
 | `fec_min_percentage` | integer (0–255), `0` | Lower bound for auto FEC. |
 | `fec_max_percentage` | integer (0–255), `25` | Upper bound for auto FEC. Use a value at least as large as the minimum; the controller raises a smaller maximum to the minimum. |
 | `pyrowave_queue` | string, `"auto"` | Prefer graphics for PyroWave. `"auto"` and `"graphics"` select graphics; `"compute"` explicitly requests compute with library fallback to graphics. All modes retain normal Vulkan queue priority. |
+| `encoder` | string, `"auto"` | Encoder implementations for H.264/HEVC/AV1. `"auto"` uses Vulkan Video for every profile it encodes on the capture GPU and VA-API, then NVENC, for the profiles it cannot (for example on Intel GPUs, whose Mesa driver has no Vulkan Video encoder). `"vulkan"`, `"vaapi"` or `"nvenc"` use only that one; profiles it cannot encode are not offered. The startup check decides each profile's encoder, so a change takes effect after a restart. See [GPU compatibility](GPU_COMPATIBILITY.md). |
 | `conversion_queue` | string, `"auto"` | Queue for the H.264/HEVC/AV1 RGB-to-YCbCr conversion. `"auto"` and `"compute"` use the device's dedicated compute family when it has one (otherwise graphics); `"graphics"` uses the graphics family. Normal queue priority in all modes. |
 | `encrypt` | boolean, `false` | Enable AES-128-GCM video encryption when supported by client negotiation. |
 | `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
@@ -327,15 +373,18 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `title` | string, required | Application name shown to clients. Also used to derive its ID, so keep titles distinct and stable. |
-| `command` | array of strings, required | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
-| `boxart` | optional path string, unset | Local cover image. Missing art is resolved automatically when possible. |
+| `title` | string, required | Application name shown to clients. Also used to derive its ID, so keep titles distinct and stable. A discovered game with the same title (ignoring case) is replaced by this entry, which lets you override its command or box art. |
+| `command` | array of strings, required for Game Mode | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
+| `boxart` | optional path string, unset | Local cover image (PNG, JPEG, WebP, BMP or ICO). Missing art is resolved from an icon named like the title when possible. |
 | `output_scale` | optional number, effective `1.0` | Wayland output scale for this application. Finite values from `0.25` through `8.0` are accepted; other values fall back to `1.0`. The physical video resolution stays at the client's requested size. |
 | `pre_command` | array of command arrays, `[]` | Run in order before launching the app, via systemd `ExecStartPre`. A failed command can prevent launch. Every entry must name an executable found in `PATH` (or an absolute path); otherwise the launch fails and the log names the entry (for example `pre_command[1]`). |
 | `post_command` | array of command arrays, `[]` | Run after the session's application unit stops, via systemd `ExecStopPost`. Useful for cleanup. Resolved like `pre_command`; an unresolvable entry fails the launch rather than being skipped. Post commands share the unit's 5-second stop allowance. |
 | `stdout` | optional string, effective `"null"` | systemd `StandardOutput` destination, e.g. `journal`, `file:/path`, or `append:/path`. |
 | `stderr` | optional string, effective `"null"` | systemd `StandardError` destination. Set `journal` to capture errors. |
 | `launch_timeout_secs` | nonnegative integer, `2` | Time allowed for the application to reach an active state after launch; separate from the wait for pre-commands. Increase for slow launchers. |
+| `frame_limit_mode` | optional `"off"`, `"stream"` or `"custom"`; unset uses [`[frame_limit]`](#frame_limit) | Frame limiting for this application. `"off"` opts out of a global limit. |
+| `frame_limit_fps` | optional integer `10`–`1000` | Frame rate for `"custom"`; unset uses `frame_limit.fps`. |
+| `frame_limit_method` | optional `"proton"` or `"mangohud"` | Limiter for this application; unset uses `frame_limit.method`. |
 
 Commands are argument arrays rather than shell scripts. For shell syntax,
 variable expansion, pipes, or redirection, explicitly run a shell, for example
@@ -360,27 +409,89 @@ launch_timeout_secs = 10
 
 Desktop sessions have [session and login-screen limitations](TIPS.md#run-a-desktop-environment-for-a-full-remote-desktop).
 
+## `[desktop]`
+
+[Managed Desktop Mode](DESKTOP_MODE.md) takes over the existing KDE Plasma or
+GNOME Wayland session for the Desktop Mode entry. Library games remain isolated.
+It creates a client-sized SDR virtual display, disables physical outputs, and
+restores display configuration after Stop or a disconnect grace period. Existing
+applications stay open; window placement is best effort.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `enabled` | boolean, `false` | Offer one Desktop Mode entry to clients. |
+| `title` | string, `"Desktop Mode"` | Name of the automatically offered entry. |
+| `input` | boolean, `true` | Authorize remote keyboard/pointer through the host portal and EIS; false permits view-only. |
+| `audio` | boolean, `true` | Route desktop playback to the client and restore destinations on exit; false keeps playback local. |
+| `disconnect_grace_secs` | integer 0–86400, `30` | Retain takeover during reconnect; 0 restores immediately on disconnect. Explicit Stop always restores immediately. |
+
+```toml
+[desktop]
+enabled = true
+disconnect_grace_secs = 30
+```
+
+A manually configured `[[application]]` may use `mode = "desktop"` and
+`command = []` to name the entry explicitly; only one Desktop Mode entry is
+automatically added. `mode` defaults to `"game"`. Desktop Mode executes no
+commands, hooks or application unit. `output_scale` applies to Game Mode;
+managed Desktop Mode remembers the scale chosen by each paired client, starting
+at 100% for a new client. On KDE, adjust the virtual display's scale in
+**Display Configuration** while streaming; see [Desktop Mode](DESKTOP_MODE.md).
+
 ## `[[application_scanner]]`
 
-[Source](../moonshine-core/src/app_scanner/mod.rs). Scanners run at server startup;
-restart after installing games to refresh the list. Each entry requires `type`.
+[Source](../moonshine-core/src/app_scanner/mod.rs). Scanners run when Pyroshine
+starts and again whenever their launcher's metadata changes, so installed,
+removed and renamed games reach clients without a restart (see
+[`[library]`](#library)). Adding, removing or editing a scanner still requires
+a restart. Each entry requires `type`.
 
-All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`, and
-`launch_timeout_secs`, with the same defaults and behavior as applications.
+All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`,
+`launch_timeout_secs` and the `frame_limit_*` overrides, with the same defaults
+and behavior as applications.
 Those values are copied to each discovered application. Scanners do not accept
 `output_scale`, `title`, or `boxart` overrides.
 
 | `type` | Source setting | Launch setting | Discovery |
 | --- | --- | --- | --- |
-| `steam` | `library`: required path string | `command`: required array; `{game_id}` is replaced in each argument | Installed games in the Steam installation and its libraries. |
+| `steam` | `library`: required path string | `command`: required array; `{game_id}` is replaced in each argument | Installed Steam games and non-Steam shortcuts added to the host's Steam Library. |
 | `lutris` | `pga_db`: path string, defaults to the user's data directory + `/lutris/pga.db` (usually `~/.local/share/lutris/pga.db`) | `command`: required array; `{slug}` is replaced | Installed entries from the Lutris database. |
 | `heroic` | `config_dir`: path string, defaults to native Heroic config when present, otherwise an existing Flatpak Heroic config, otherwise the native path | `command`: required array; `{app_name}` and `{runner}` are replaced | Installed games across Heroic stores and sideloaded apps; excludes DLC. Native config is usually `~/.config/heroic`; Flatpak config is `~/.var/app/com.heroicgameslauncher.hgl/config/heroic`. |
+| `bottles` | `data_dir`: path string, defaults to the first of `~/.local/share/bottles` and `~/.var/app/com.usebottles.bottles/data/bottles` that holds a `library.yml` | `command`: required array; `{bottle}`, `{program_id}` and `{name}` are replaced. `umu_command`: optional array for UMU entries; `{umu_game}` and `{name}` are replaced | Programs added to the Bottles Library ("Add to Library"), not every program Bottles finds. UMU entries appear once Bottles reports them ready, and only with `umu_command`; entries Bottles starts through Steam are left to the Steam scanner. |
 | `desktop` | `directories`: required array of path strings | No `command` field; uses the desktop entry's `Exec` | Recursively scan `.desktop` files in the supplied directories. |
 
 Scanner source paths support `~` and environment-variable expansion. Placeholder
 substitution applies to scanner `command` arguments, not pre/post-command hooks.
-Steam, Lutris, and Heroic use their available local cover art; the desktop scanner
-can resolve icons. Scanner launchers must be installed separately.
+Scanner launchers must be installed separately.
+
+The Steam scanner also reads `userdata/*/config/shortcuts.vdf` in the configured
+Steam installation. Add a non-Steam game to Steam on the host, then refresh the
+client's app list after Steam saves the shortcut. If it has not appeared, exit
+Steam normally to save it and use **Rescan** in Pyroshine's web interface.
+Shortcuts launch through Steam, preserving their launch options, working
+directory and Steam Play/Proton settings. They must be available to the Steam
+account used for streaming. `{game_id}` is the full 64-bit launch ID for these
+entries; keep it intact in `steam://rungameid/{game_id}` commands. Native and
+Flatpak installations use the same scanner behavior.
+
+Box art comes from local files only, best first: for Steam, art you set in
+Steam (`userdata/*/config/grid`), then the portrait, capsule and header art
+Steam caches in `appcache/librarycache`, then the icon of a Steam desktop
+shortcut; for Lutris, cover art, banners and its shortcut icon; for Heroic, the
+cover art it cached; for Bottles, the grid art it downloaded, then the
+program's icon; for desktop entries, the entry's icon. If an image cannot
+be read or decoded, the next one is used; clients show a placeholder when none
+works. Nothing is downloaded.
+
+Each discovered game keeps its client-facing ID across rescans, renames,
+reinstalls and restarts (see [Applications](MANAGEMENT.md#applications)). The
+catalog leaves out what clients do not need twice: a desktop shortcut that
+starts a Steam, Lutris, Heroic or Bottles game already in the catalog, the same game
+found by two scanners of one launcher, Steam's Proton and runtime tools, and
+DLC. Games with equal titles from different launchers get the launcher in their
+title, for example `Hades (Steam)` and `Hades (Heroic)`. Individual games can be
+hidden from clients in the web interface's **Applications** page.
 
 The desktop scanner also accepts:
 
@@ -388,6 +499,11 @@ The desktop scanner also accepts:
 | --- | --- | --- |
 | `include_terminal` | boolean, `false` | Include entries marked `Terminal=true`. |
 | `resolve_icons` | boolean, `true` | Resolve desktop entry icons into local boxart paths. |
+
+Desktop entries are identified by their desktop file ID, as in the XDG menu
+specification: an entry in a directory listed earlier overrides the entry with
+the same ID in a later directory, and hides it when marked `Hidden=true` or
+`NoDisplay=true`. List user directories before system ones.
 
 Examples (add only the scanners you want; this list replaces the default scanner):
 
@@ -408,13 +524,94 @@ type = "heroic"
 command = ["/usr/bin/heroic", "heroic://launch?appName={app_name}&runner={runner}"]
 
 [[application_scanner]]
+type = "bottles"
+command = ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"]
+umu_command = ["bottles-cli", "umu", "run", "--game", "{umu_game}"]
+
+[[application_scanner]]
 type = "desktop"
 directories = ["$HOME/.local/share/applications", "/usr/share/applications"]
 include_terminal = false
 resolve_icons = true
 ```
 
-For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-inside-pyroshines-compositor).
+For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-inside-pyroshines-compositor);
+Flatpak Bottles uses [the same wrapper](TIPS.md#run-flatpak-bottles-inside-pyroshines-compositor).
+A bare `bottles-cli` only works for a natively installed Bottles. Bottles starts
+programs that live outside the bottle (for example on a separate game drive)
+through `wine start`, which exits at once, so the session ends shortly after
+launch; games installed inside the bottle are unaffected.
+
+## `[library]`
+
+[Source](../moonshine-core/src/app_scanner/service.rs). Controls how the
+application list follows launcher changes while Pyroshine runs. Discovery never
+interrupts a stream: a game that is removed or hidden while it runs keeps
+running, and clients see the change in their app list.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests, library folders and non-Steam shortcuts, the Lutris database, Heroic library files, the Bottles Library, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
+| `poll_interval_secs` | integer, `300`; `30`–`86400` | Seconds between checks for changes that file notifications cannot report, such as network file systems, a drive that is mounted later or an exhausted inotify watch limit. A check compares file metadata only; a launcher is rescanned only when it changed. |
+
+A launcher location that cannot be read (an unmounted drive holding a Steam
+library, a file the launcher is rewriting) keeps its games offered from the last
+successful scan, for up to seven days, and is retried; the **Applications** page
+shows the error and what to do about it.
+
+```toml
+[library]
+auto_refresh = true
+poll_interval_secs = 300
+```
+
+## `[frame_limit]`
+
+[Source](../moonshine-core/src/session/frame_limit.rs). Asks launched games to
+render no more frames than the stream can send. It is off by default and changes
+nothing when off. Pyroshine already paces games that wait for the display
+(vsync); a game with vsync off renders as fast as the GPU allows and the
+surplus frames are dropped at capture, using GPU time the encoder competes for.
+Capture timing and VRR capture are unchanged either way.
+
+| Setting | Type / default | Effect |
+| --- | --- | --- |
+| `mode` | `"off"`, `"stream"` or `"custom"`; `"off"` | `"stream"` limits to the frame rate of the stream that launches the application; `"custom"` to `fps`. |
+| `fps` | integer `10`–`1000`, `60` | Frame rate for `"custom"`. |
+| `method` | `"proton"` or `"mangohud"`; `"proton"` | `"proton"` sets `DXVK_FRAME_RATE` and `VKD3D_FRAME_RATE`, the limiters built into Proton/Wine's Direct3D translation: Direct3D 8–12 games. Native Linux games are not limited. `"mangohud"` sets `MANGOHUD=1` and `MANGOHUD_CONFIG=no_display,fps_limit=N`: every Vulkan game, including Proton's, with MangoHud's overlay hidden. It needs MangoHud installed (and its 32-bit layer for 32-bit games); when its Vulkan layer is missing, launches use `"proton"` instead. OpenGL games are not limited by either. |
+
+Applications and scanners override these with `frame_limit_mode`,
+`frame_limit_fps` and `frame_limit_method`.
+
+```toml
+[frame_limit]
+mode = "stream"
+method = "proton"
+
+[[application]]
+title = "Desktop"
+command = ["/usr/bin/startplasma-wayland"]
+frame_limit_mode = "off"
+```
+
+- The limit applies only to the application Pyroshine launches and its
+  children (including games started by a Steam client Pyroshine launched). It
+  is set on that application's systemd unit: your desktop Steam, Steam's own
+  settings and games you start locally are never affected, and no helper
+  process runs.
+- It is fixed when the application starts. A reconnect at another frame rate
+  keeps the running game's limit; restart the game to change it.
+- Your own settings win: a `DXVK_FRAME_RATE`, `VKD3D_FRAME_RATE` or MangoHud
+  configuration (`MANGOHUD_CONFIG`, `MANGOHUD_CONFIGFILE`, `DISABLE_MANGOHUD`)
+  in the user manager's environment is kept, and a game's own launch options
+  (Steam's `… %command%`, `env` in the command) apply after Pyroshine's.
+- With `"mangohud"`, MangoHud's own configuration file is not read for these
+  games, so its overlay stays hidden even with `mangohud %command%`. Use
+  `"proton"` for games where you want your MangoHud setup.
+- Gamescope inside a game's launch options has its own limiter (`-r`); set
+  `frame_limit_mode = "off"` for such games, or the two limits may disagree.
+- Settings change at the next launch of a game; `pyroshine healthcheck` and the
+  **Diagnostics** page report what the configured limiter covers on this host.
 
 ## Diagnostics outside config.toml
 

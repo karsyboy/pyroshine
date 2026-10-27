@@ -1,0 +1,121 @@
+//! Encode with pixelforge, then decode the result with pixelforge.
+//!
+//! The decoder must handle anything this project's encoder can produce. That is
+//! not covered by decoding third-party streams: the encoder makes its own
+//! choices (notably explicit reference marking), so it needs its own round trip.
+//! It is also where B-frames will be exercised once the encoder supports them.
+//!
+//! The input is planar YUV420 (I420). The decoded output is NV12 in display
+//! order. The assertion here is that no frame is lost across the round trip;
+//! the decoded file is left in the scratch dir for inspection.
+//!
+//! Ignored by default: requires a Vulkan Video device and ffmpeg. Run with
+//! `cargo test -- --ignored`.
+
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{Read, Write};
+
+#[allow(dead_code)]
+mod common;
+use common::{Readback, decode_stream, write_nv12};
+
+use pixelforge::decoder::{DecodeConfig, Decoder};
+use pixelforge::{
+    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+    VideoContextBuilder,
+};
+
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
+/// The encoder does not support B-frames yet, so this is an I-P GOP.
+const B_FRAMES: u32 = 0;
+const GOP: u32 = 30;
+
+#[test]
+#[ignore = "requires a Vulkan Video device and ffmpeg"]
+fn roundtrip_h264() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let input_path = format!("testdata/test_frames_{WIDTH}x{HEIGHT}_yuv420p.yuv");
+    common::ensure_test_data(WIDTH, HEIGHT, "yuv420p", &input_path)?;
+
+    let dir = common::scratch_dir("roundtrip");
+    let bitstream_path = dir.join("out.h264");
+
+    let context = VideoContextBuilder::new()
+        .app_name("pixelforge-roundtrip")
+        .require_encode(Codec::H264)
+        .require_decode(Codec::H264)
+        .enable_validation(std::env::var("PIXELFORGE_VALIDATION").is_ok())
+        .build()?;
+
+    // --- Encode ---
+    let mut yuv = Vec::new();
+    File::open(&input_path)?.read_to_end(&mut yuv)?;
+    let frame_size = (WIDTH * HEIGHT * 3 / 2) as usize;
+    let frame_count = yuv.len() / frame_size;
+
+    let config = EncodeConfig::h264(WIDTH, HEIGHT)
+        .with_rate_control(RateControlMode::Cqp)
+        .with_quality_level(26)
+        .with_frame_rate(30, 1)
+        .with_gop_size(GOP)
+        .with_b_frames(B_FRAMES);
+
+    let mut input_image = InputImage::new(
+        context.clone(),
+        Codec::H264,
+        WIDTH,
+        HEIGHT,
+        EncodeBitDepth::Eight,
+        PixelFormat::Yuv420,
+    )?;
+    let mut encoder = Encoder::new(context.clone(), config)?;
+
+    let mut bitstream = Vec::new();
+    let mut pending: VecDeque<pixelforge::EncodeFuture> = VecDeque::new();
+    for i in 0..frame_count {
+        input_image.upload_yuv420(&yuv[i * frame_size..(i + 1) * frame_size])?;
+        pending.push_back(encoder.encode(input_image.image())?);
+        while pending.len() > 2 {
+            let packet = pollster::block_on(pending.pop_front().expect("non-empty"))?;
+            bitstream.extend_from_slice(&packet.data);
+        }
+    }
+    encoder.flush()?;
+    while let Some(future) = pending.pop_front() {
+        let packet = pollster::block_on(future)?;
+        bitstream.extend_from_slice(&packet.data);
+    }
+    File::create(&bitstream_path)?.write_all(&bitstream)?;
+    println!(
+        "Encoded {} frames -> {} bytes (b_frames={B_FRAMES}, gop={GOP})",
+        frame_count,
+        bitstream.len()
+    );
+
+    // --- Decode it back ---
+    // Display order by default, so frames come out ready to write; `flush`
+    // drains whatever the reorder buffer still holds at end of stream.
+    let yuv_path = dir.join("out.yuv");
+    let mut out = Some(File::create(&yuv_path)?);
+    let mut readback = Some(Readback::new(&context)?);
+    let mut decoder = Decoder::new(context, DecodeConfig::h264().with_byte_stream())?;
+    let mut decoded_count = 0usize;
+
+    decode_stream(&mut decoder, &bitstream, |frame| {
+        write_nv12(&frame, &mut readback, &mut out)?;
+        decoded_count += 1;
+        Ok(())
+    })?;
+    println!("Decoded {} frames", decoded_count);
+
+    assert_eq!(
+        decoded_count, frame_count,
+        "round trip lost frames: encoded {frame_count} but decoded {decoded_count}"
+    );
+    println!("Wrote decoded frames to {}", yuv_path.display());
+
+    Ok(())
+}

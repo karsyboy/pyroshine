@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 19 Oct 2026 16:12:53 -0400
+Subject: [PATCH] Allow compute-only contexts on a selected device without
+ Vulkan Video encode
+
+Encode support now requires the VK_KHR_video_queue and
+VK_KHR_video_encode_queue extensions in addition to a VIDEO_ENCODE queue
+family: ANV on Xe2 and newer reports such a queue family with
+ANV_DEBUG=video-encode but exposes no encode extensions, and device creation
+failed. Each unsupported codec records the first missing requirement
+(encode_unsupported_reason). allow_without_encode() accepts the selected
+device without encode, creating compute/transfer queues only, so callers
+can still convert and import external memory on it. The video queue
+extension is enabled only with an encode queue.
+---
+ src/vulkan.rs               | 190 ++++++++++++++++++++++++++++++------
+ src/vulkan/encode_device.rs |   1 +
+ 2 files changed, 162 insertions(+), 29 deletions(-)
+
+diff --git a/src/vulkan.rs b/src/vulkan.rs
+index b4d1bc3..865e228 100644
+--- a/src/vulkan.rs
++++ b/src/vulkan.rs
+@@ -113,6 +113,22 @@ impl DeviceSelector {
+     }
+ }
+ 
++/// Why a device's encode queue is unusable: it needs a `VIDEO_ENCODE` queue
++/// family and the extensions the encoder enables on it.
++fn encode_queue_unavailable(
++    encode_queue: Option<u32>,
++    has_encode_extensions: bool,
++) -> Option<&'static str> {
++    match (encode_queue, has_encode_extensions) {
++        (None, _) => Some("no queue family supports Vulkan Video encode"),
++        (Some(_), false) => Some(
++            "a queue family reports video encode, but the driver does not expose \
++             VK_KHR_video_queue and VK_KHR_video_encode_queue",
++        ),
++        (Some(_), true) => None,
++    }
++}
++
+ /// Destroy the instance, and its validation messenger, if context
+ /// initialization fails before ownership transfers.
+ struct InstanceGuard<'a> {
+@@ -150,6 +166,7 @@ pub struct VideoContextBuilder {
+     unified_image_layouts: Option<bool>,
+     queues: QueueOverrides,
+     device_selector: Option<DeviceSelector>,
++    allow_without_encode: bool,
+ }
+ 
+ impl Default for VideoContextBuilder {
+@@ -170,6 +187,7 @@ impl VideoContextBuilder {
+             unified_image_layouts: None,
+             queues: QueueOverrides::default(),
+             device_selector: None,
++            allow_without_encode: false,
+         }
+     }
+ 
+@@ -258,6 +276,20 @@ impl VideoContextBuilder {
+         self
+     }
+ 
++    /// Accept the selected device even when it cannot encode any codec with
++    /// Vulkan Video.
++    ///
++    /// The context then provides only compute and transfer queues (for
++    /// conversion and external-memory interop), plus decode when the device
++    /// has it; [`VideoContext::supports_encode`] is false for every codec and
++    /// [`VideoContext::encode_unsupported_reason`] says why. Applies only
++    /// together with a [`DeviceSelector`] and no required codecs, so it never
++    /// widens selection to another GPU.
++    pub fn allow_without_encode(mut self, allow: bool) -> Self {
++        self.allow_without_encode = allow;
++        self
++    }
++
+     /// Build the VideoContext.
+     pub fn build(self) -> Result<VideoContext> {
+         VideoContext::new(self)
+@@ -706,6 +738,8 @@ struct VideoContextInner {
+     memory_properties: vk::PhysicalDeviceMemoryProperties,
+     device_properties: vk::PhysicalDeviceProperties,
+     supported_encode_codecs: Vec<Codec>,
++    /// Why each codec missing from `supported_encode_codecs` is unavailable.
++    encode_unsupported: Vec<(Codec, String)>,
+     supported_decode_codecs: Vec<Codec>,
+     has_push_descriptor: bool,
+     has_unified_image_layouts: bool,
+@@ -998,6 +1032,7 @@ impl VideoContext {
+         let mut transfer_queue_family = u32::MAX;
+         let mut compute_queue_family = u32::MAX;
+         let mut supported_encode_codecs = Vec::new();
++        let mut encode_unsupported = Vec::new();
+         let mut supported_decode_codecs = Vec::new();
+ 
+         let has_extension =
+@@ -1099,27 +1134,66 @@ impl VideoContext {
+                 continue;
+             }
+ 
+-            // Check codec support for encoding.
++            // A queue family flag alone is not encode support: the driver must
++            // also expose the video queue extensions the encoder enables. ANV on
++            // Xe2 and newer reports VIDEO_ENCODE queues (with
++            // ANV_DEBUG=video-encode) without exposing VK_KHR_video_encode_queue,
++            // and device creation with that extension then fails.
++            let encode_extensions =
++                has_extension(&available_extensions, ash::khr::video_queue::NAME)
++                    && has_extension(&available_extensions, ash::khr::video_encode_queue::NAME);
++            let queue_reason = encode_queue_unavailable(encode_queue, encode_extensions);
++            if queue_reason.is_some() {
++                encode_queue = None;
++            }
++
++            // Check codec support for encoding, keeping why each codec is unusable.
+             let mut encode_codecs = Vec::new();
+-            if let Some(eq) = encode_queue {
+-                // Only check codec support if the extension exists
+-                if has_extension(&available_extensions, ash::khr::video_encode_h264::NAME)
+-                    && Self::check_h264_encode_support(&entry, &instance, physical_device, eq)
+-                {
+-                    encode_codecs.push(Codec::H264);
+-                    debug!("Device {} supports H.264 encode", device_name);
+-                }
+-                if has_extension(&available_extensions, ash::khr::video_encode_h265::NAME)
+-                    && Self::check_h265_encode_support(&entry, &instance, physical_device, eq)
+-                {
+-                    encode_codecs.push(Codec::H265);
+-                    debug!("Device {} supports H.265 encode", device_name);
+-                }
+-                if has_extension(&available_extensions, ash::khr::video_encode_av1::NAME)
+-                    && Self::check_av1_encode_support(&entry, &instance, physical_device, eq)
+-                {
+-                    encode_codecs.push(Codec::AV1);
+-                    debug!("Device {} supports AV1 encode", device_name);
++            let mut device_unsupported = Vec::new();
++            let checks: [(Codec, &CStr); 3] = [
++                (Codec::H264, ash::khr::video_encode_h264::NAME),
++                (Codec::H265, ash::khr::video_encode_h265::NAME),
++                (Codec::AV1, ash::khr::video_encode_av1::NAME),
++            ];
++            for (codec, extension) in checks {
++                let reason = match encode_queue {
++                    // `encode_queue` was cleared exactly when `queue_reason` is set.
++                    None => queue_reason.map(str::to_string),
++                    Some(_) if !has_extension(&available_extensions, extension) => Some(format!(
++                        "the driver does not expose {}",
++                        extension.to_string_lossy()
++                    )),
++                    Some(eq) => {
++                        let supported = match codec {
++                            Codec::H264 => Self::check_h264_encode_support(
++                                &entry,
++                                &instance,
++                                physical_device,
++                                eq,
++                            ),
++                            Codec::H265 => Self::check_h265_encode_support(
++                                &entry,
++                                &instance,
++                                physical_device,
++                                eq,
++                            ),
++                            Codec::AV1 => Self::check_av1_encode_support(
++                                &entry,
++                                &instance,
++                                physical_device,
++                                eq,
++                            ),
++                        };
++                        (!supported)
++                            .then(|| "the 8-bit 4:2:0 Main profile is not supported".to_string())
++                    }
++                };
++                match reason {
++                    None => {
++                        encode_codecs.push(codec);
++                        debug!("Device {} supports {:?} encode", device_name, codec);
++                    }
++                    Some(reason) => device_unsupported.push((codec, reason)),
+                 }
+             }
+ 
+@@ -1155,11 +1229,26 @@ impl VideoContext {
+                 .iter()
+                 .all(|codec| decode_codecs.contains(codec));
+ 
+-            // We need at least one video queue, and compute support.
++            // We need at least one video queue, and compute support, or only
++            // compute support on an explicitly selected device that may lack
++            // video entirely.
+             let has_video_support = encode_queue.is_some() || decode_queue.is_some();
+             let has_compute_support = compute_q != u32::MAX;
+-
+-            if has_video_support && encode_supported && decode_supported && has_compute_support {
++            let accept_without_encode = builder.allow_without_encode
++                && builder.device_selector.is_some()
++                && builder.required_encode_codecs.is_empty();
++
++            if (has_video_support || accept_without_encode)
++                && encode_supported
++                && decode_supported
++                && has_compute_support
++            {
++                if encode_codecs.is_empty() {
++                    info!(
++                        "Selected device {} has no usable Vulkan Video encode",
++                        device_name
++                    );
++                }
+                 selected_device = Some(physical_device);
+                 selected_device_exts = Some(available_extensions);
+                 video_encode_queue_family = encode_queue;
+@@ -1172,6 +1261,7 @@ impl VideoContext {
+                 };
+                 compute_queue_family = compute_q;
+                 supported_encode_codecs = encode_codecs;
++                encode_unsupported = device_unsupported;
+                 supported_decode_codecs = decode_codecs;
+                 info!("Selected device: {}", device_name);
+                 break;
+@@ -1185,7 +1275,10 @@ impl VideoContext {
+                     has_compute_support
+                 );
+                 if !has_video_support {
+-                    warn!("  - No queue with VIDEO_ENCODE_KHR flag found");
++                    warn!("  - No video encode or decode queue family found");
++                }
++                for (codec, reason) in &device_unsupported {
++                    warn!("  - {:?} encode unavailable: {}", codec, reason);
+                 }
+                 if !encode_supported {
+                     warn!(
+@@ -1249,11 +1342,12 @@ impl VideoContext {
+             })
+             .collect();
+ 
+-        // Required device extensions for video encoding.
+-        let mut extension_names = vec![
+-            ash::khr::video_queue::NAME.as_ptr(),
+-            ash::khr::synchronization2::NAME.as_ptr(),
+-        ];
++        // Required device extensions; the video queue extension only with a
++        // video queue (a compute-only context must not require it).
++        let mut extension_names = vec![ash::khr::synchronization2::NAME.as_ptr()];
++        if video_encode_queue_family.is_some() || video_decode_queue_family.is_some() {
++            extension_names.push(ash::khr::video_queue::NAME.as_ptr());
++        }
+ 
+         // External memory extensions for DMA-BUF support (optional, enabled with "dmabuf" feature).
+         #[cfg(feature = "dmabuf")]
+@@ -1466,6 +1560,7 @@ impl VideoContext {
+                 memory_properties,
+                 device_properties,
+                 supported_encode_codecs,
++                encode_unsupported,
+                 supported_decode_codecs,
+                 has_push_descriptor,
+                 has_unified_image_layouts: has_unified_layouts,
+@@ -1570,6 +1665,7 @@ impl VideoContext {
+                 memory_properties,
+                 device_properties,
+                 supported_encode_codecs: Vec::new(),
++                encode_unsupported: Vec::new(),
+                 supported_decode_codecs,
+                 has_push_descriptor: false,
+                 has_unified_image_layouts: declared_unified_image_layouts,
+@@ -1822,6 +1918,27 @@ impl VideoContext {
+         self.inner.supported_encode_codecs.contains(&codec)
+     }
+ 
++    /// Why `codec` cannot be encoded on this device, or `None` when it can.
++    ///
++    /// Describes the first missing requirement found during device selection:
++    /// no encode queue, missing driver extensions, or an unsupported Main
++    /// profile. Profile-specific limits (chroma, bit depth, rate control) are
++    /// reported by encoder creation instead.
++    pub fn encode_unsupported_reason(&self, codec: Codec) -> Option<&str> {
++        if self.supports_encode(codec) {
++            return None;
++        }
++        Some(
++            self.inner
++                .encode_unsupported
++                .iter()
++                .find(|(c, _)| *c == codec)
++                .map_or("Vulkan Video encode is unavailable", |(_, reason)| {
++                    reason.as_str()
++                }),
++        )
++    }
++
+     /// Check if the selected device supports decoding the given codec.
+     pub fn supports_decode(&self, codec: Codec) -> bool {
+         self.inner.supported_decode_codecs.contains(&codec)
+@@ -1903,6 +2020,21 @@ mod selection_tests {
+         );
+     }
+ 
++    #[test]
++    fn encode_queue_flag_without_extensions_is_not_encode_support() {
++        assert_eq!(encode_queue_unavailable(Some(2), true), None);
++        assert!(
++            encode_queue_unavailable(Some(2), false)
++                .unwrap()
++                .contains("VK_KHR_video_encode_queue")
++        );
++        assert!(
++            encode_queue_unavailable(None, true)
++                .unwrap()
++                .contains("no queue family")
++        );
++    }
++
+     #[test]
+     fn codec_support_on_another_gpu_never_satisfies_selection() {
+         let selector = DeviceSelector {
+diff --git a/src/vulkan/encode_device.rs b/src/vulkan/encode_device.rs
+index 3534820..53d2abc 100644
+--- a/src/vulkan/encode_device.rs
++++ b/src/vulkan/encode_device.rs
+@@ -338,6 +338,7 @@ impl VideoContext {
+                 memory_properties,
+                 device_properties,
+                 supported_encode_codecs: plan.codecs.clone(),
++                encode_unsupported: Vec::new(),
+                 supported_decode_codecs: Vec::new(),
+                 has_push_descriptor: plan.push_descriptor,
+                 has_unified_image_layouts: false,

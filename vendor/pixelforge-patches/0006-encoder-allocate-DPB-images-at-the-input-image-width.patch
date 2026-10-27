@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 12 Oct 2026 18:18:43 -0400
-Subject: [PATCH 1/2] encoder: allocate DPB images at the input-image width
+Subject: [PATCH] encoder: allocate DPB images at the input-image width
 
 NVIDIA's encoder (RTX 3080, driver 615.78) writes reconstructed 8-bit
 2-plane 4:4:4 chroma with the pitch it derives from the 64-aligned luma
@@ -19,10 +19,10 @@ extent through each picture resource's codedExtent.
  1 file changed, 11 insertions(+), 1 deletion(-)
 
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index 3d1e337..a3e751a 100644
+index fe0a696..a73b56c 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -519,6 +519,13 @@ pub(crate) fn query_video_caps(
+@@ -545,6 +545,13 @@ pub(crate) fn query_video_caps(
  /// The two differ when `width % 64` is 1..=32 (e.g. 1360, 1440, 2400), and the
  /// decoded chroma comes out sheared. With a 64-aligned image width they are
  /// always equal; other formats and implementations ignore the extra columns.
@@ -36,7 +36,7 @@ index 3d1e337..a3e751a 100644
  pub(crate) fn input_image_width(coded_width: u32, max_coded_width: u32) -> u32 {
      const INPUT_IMAGE_WIDTH_ALIGNMENT: u32 = 64;
      coded_width
-@@ -665,9 +672,12 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+@@ -694,9 +701,12 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
          tracing::info!("Using layered DPB (driver does not support separate reference images)");
      }
  
@@ -50,6 +50,3 @@ index 3d1e337..a3e751a 100644
          aligned_height,
          reference_picture_format,
          dpb_slot_count,
--- 
-2.56.0
-

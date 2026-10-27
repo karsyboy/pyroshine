@@ -59,7 +59,8 @@ impl RtpHeader {}
 
 /// Whether a client can currently receive a stream's media (review
 /// 2026-10-05 PERF-001). Each packet handler clears it on every pause (client
-/// detached or reconnecting) and sets it when an epoch is activated. While it is
+/// detached or reconnecting). Video demand requires an activated epoch, StartB
+/// and the current client's discovered endpoint; audio enables it at activation. While it is
 /// clear, the video encoder requests no captures and replays nothing, and the
 /// audio encoder recycles PCM without encoding it, so capture, conversion,
 /// encoding and packetization stop after in-flight work drains. The compositor

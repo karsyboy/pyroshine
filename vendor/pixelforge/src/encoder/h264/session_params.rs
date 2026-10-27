@@ -75,6 +75,12 @@ impl H264 {
         vui_flags.set_video_signal_type_present_flag(1);
         vui_flags.set_video_full_range_flag(if desc.full_range { 1 } else { 0 });
         vui_flags.set_color_description_present_flag(1);
+        // Chroma position is defined for 4:2:0 (ChromaArrayType 1) only.
+        let chroma_loc_type = desc
+            .chroma_location
+            .h26x_loc_type()
+            .filter(|_| config.pixel_format == PixelFormat::Yuv420);
+        vui_flags.set_chroma_loc_info_present_flag(u32::from(chroma_loc_type.is_some()));
         // Avoid HRD with zeroed bitrates (device loss on some drivers).
         vui_flags.set_nal_hrd_parameters_present_flag(0);
         vui_flags.set_bitstream_restriction_flag(1);
@@ -93,8 +99,8 @@ impl H264 {
             time_scale: 0,
             max_num_reorder_frames: if config.b_frame_count > 0 { 1 } else { 0 },
             max_dec_frame_buffering: max_active + 1,
-            chroma_sample_loc_type_top_field: 0,
-            chroma_sample_loc_type_bottom_field: 0,
+            chroma_sample_loc_type_top_field: chroma_loc_type.unwrap_or(0),
+            chroma_sample_loc_type_bottom_field: chroma_loc_type.unwrap_or(0),
             reserved1: 0,
             pHrdParameters: ptr::null(),
         };

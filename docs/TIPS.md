@@ -8,13 +8,13 @@ If journal access is denied, prefix `journalctl` with `sudo`.
 | --- | --- |
 | Host missing or connection fails | [Check address and firewall](#host-not-found-or-connection-fails). |
 | Server fails to start | Read `journalctl -u "pyroshine@$USER" -b -n 100 --no-pager`, then [check the host](#healthcheck-fails). |
-| Pairing does not finish | [Use a fresh request and correct approval URL](#pairing-does-not-complete). |
-| Launch or stream fails with an error | Read the client's error message, then **Diagnostics → Recent problems** in the desktop app; [details](#read-why-a-launch-or-stream-failed). |
-| Steam opens locally / client reports 503 | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
+| Pairing does not finish | [Use a fresh request and its PIN](#pairing-does-not-complete). |
+| Launch or stream fails with an error | Read the client's error message, then **Diagnostics → Recent problems** in the web interface; [details](#read-why-a-launch-or-stream-failed). |
+| Steam opens locally / "Steam is already running on the host" | Quit desktop Steam, then retry; [Steam workaround](#close-a-desktop-steam-before-streaming-steam). |
 | Steam or games missing / cannot launch | [Check default applications](#steam-or-games-are-missing). |
 | Keyboard, mouse or gamepad unavailable | [Check input access](#keyboard-mouse-or-gamepads-do-not-work). |
-| Desktop app unavailable / no tray | [GUI troubleshooting](DESKTOP.md#troubleshooting); browser pairing still works. |
-| New settings have no effect | Restart the service after saving; this ends an active session. |
+| Web interface unreachable / no tray | [Web interface troubleshooting](MANAGEMENT.md#troubleshooting); `pyroshine pair` still works. |
+| New settings have no effect | Choose **Restart now** after saving (or restart the service); this ends an active session. |
 
 ## Host not found or connection fails
 
@@ -56,9 +56,10 @@ sudo systemctl start "pyroshine@$USER"
 | Render nodes / GPU / EGL / Vulkan / DMA-BUF / Codecs | Install the current hardware driver for your GPU using your distribution's instructions, then repeat the check. A GPU name alone does not guarantee the required capabilities. No usable encode profile or DMA-BUF support means this host cannot stream with the current setup. |
 | Render access denied | Inspect `ls -l /dev/dri/renderD*` and the group named in the check. Give the streaming user that device group's access, then log out/in (reboot if the headless user manager retains old groups). Do not use world-writable device permissions. |
 | Color conversion warning/failure | The GPU converted the check pattern to the listed format with wrong colors, so those profiles are not offered (streams would show wrong colors). This is a Pyroshine or driver bug, not a setting: report it with the check output or **Copy diagnostics**. Meanwhile use the profiles the check still lists, or PyroWave. |
+| Codecs: only PyroWave can stream from this GPU | No encoder for H.264/HEVC/AV1 is usable: the driver has no Vulkan Video encoder (Intel GPUs with Mesa; the **Vulkan** line says why) and VA-API or NVENC is missing or unusable (each profile's reason says which). On Intel, install libva and Intel's media driver (`intel-media-driver`) and restart; otherwise stream with Pyrolight and PyroWave. Moonlight clients are refused with the list of available profiles. See [GPU compatibility](GPU_COMPATIBILITY.md). |
 | Capture/Vulkan device mismatch | The capture and encoder must use the same physical GPU. Follow [GPU selection](CONFIGURATION.md#compositor), using the identities in the error. There is no cross-GPU copy fallback. |
 | Runtime dir / waiting for D-Bus | Use a regular desktop login or enable [lingering](INSTALLATION.md#headless-setup); the packaged wrapper sets the runtime/bus paths. Do not run the server as root. |
-| kcmp(2) blocked/unavailable | Run on the host outside a restrictive sandbox, or correct the kernel/seccomp restriction described in the error. It is required for buffer validation. |
+| kcmp(2) blocked/unavailable | A warning when a seccomp filter blocks it or the kernel lacks `CONFIG_CHECKPOINT_RESTORE`: the DMA-BUF import cache compares inode numbers instead (Linux 5.3 or later), and streaming works. `kcmp(2)` is preferred because a local process cannot fool it; allow it in the seccomp profile if you can. Any other error is a failure. |
 | PyroWave unavailable | Optional if a conventional codec passes; use H.264/HEVC/AV1. For PyroWave, keep the package's matching library and compatible Pyrolight client; see [PyroWave](PYROWAVE.md). |
 | Sleep inhibit warning | The native/portable service grants the `pyroshine` group; a direct terminal check may lack it. See [sleep inhibition](#prevent-the-host-from-suspending-while-streaming). NixOS uses `moonshine`. |
 | input group warning | Needed for gamepads when logged out; follow [headless setup](INSTALLATION.md#headless-setup). Not required with working active-seat ACLs. |
@@ -75,14 +76,12 @@ streams. Each failed check shows what to change.
 - Start pairing in the client first. An empty **Clients** page or "No pending
   pairing request" can mean the request expired, disconnected or was replaced.
   Retry and use the latest PIN/link.
-- Without the GUI, run `pyroshine pair` as the server's user, without sudo.
-  If the command cannot connect, check the service and lingering/session bus.
-  For [browser pairing](INSTALLATION.md#browser-pairing), use the complete
-  logged URL; bare `/pin` cannot select a request.
-- A 403 on approval means loopback/Host/origin validation failed. Open the URL
-  on the host or use an SSH tunnel with the configured HTTP port at both ends.
-  A host LAN address or a different local forwarding port will not work.
-- If new requests are disabled, enable **Allow new pairings** in GUI settings
+- Approve in the web interface's **Clients** page, or run `pyroshine pair` as
+  the server's user, without sudo. If the command cannot connect, check the
+  service and lingering/session bus. A PIN applies to the request it was
+  entered for; after the client sends a new request, enter its new PIN.
+- The host-local `/pin` page of older releases answers 410; use one of the above.
+- If new requests are disabled, enable **Allow new pairings** in the web interface's settings
   (or `webserver.enable_pairing`), save, and restart before retrying.
 - **PIN accepted** is not proof that pairing completed. Wait for the client's
   application list; a wrong PIN can still fail the later handshake.
@@ -141,14 +140,18 @@ changes. See the [reference](CONFIGURATION.md) for command fields and scanners.
 - [Gamescope resolution](#use-gamescope-with-the-clients-resolution)
 - [Game fullscreen resolution](#match-a-games-fullscreen-resolution-to-the-stream)
 - [Flatpak Steam](#run-flatpak-steam-inside-pyroshines-compositor)
+- [Flatpak Bottles](#run-flatpak-bottles-inside-pyroshines-compositor)
 - [A full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Application logs](#debug-a-failing-application)
 
 ## Close a desktop Steam before streaming Steam
 
-Steam is single-instance per user. An existing desktop instance takes over the
-streamed launch, opening Big Picture locally and causing a 503 error.
-Quit it manually, or edit the existing Steam entry to close it automatically:
+Steam is single-instance per user: a Steam already running on the host's
+desktop would take a streamed Steam launch over and open the game locally.
+Pyroshine therefore refuses the launch while another Steam of the service's
+user runs, and the client shows "Steam is already running on the host
+(process N)". It never closes that Steam itself. Quit it manually, or edit the
+existing Steam entry to close it automatically:
 
 ```toml
 [[application]]
@@ -159,7 +162,10 @@ pre_command = [
 ]
 ```
 
-This closes local Steam and waits up to 30 seconds before streaming it.
+This closes local Steam and waits up to 30 seconds before streaming it. An
+entry with a `pre_command` is not checked for a running Steam, since its hook
+runs first; put the same `pre_command` on the `type = "steam"` scanner to
+close a desktop Steam before streamed games too.
 See [upstream issue #134](https://github.com/hgaiser/moonshine/issues/134).
 
 ## Prevent the host from suspending while streaming
@@ -200,6 +206,26 @@ sudo usermod -aG gamemode "$USER"
 ```
 
 Without a working daemon, games may run without the requested optimizations.
+
+## Lower PyroWave latency on a lightly loaded NVIDIA GPU
+
+With only the desktop, a video or a frame-capped game running, an NVIDIA GPU can
+stay at idle clocks while it streams. PyroWave then encodes several milliseconds
+more slowly: on an RTX 3080 at 1080p60, host latency was 8.5 ms instead of 3.5 ms.
+A game that loads the GPU raises the clocks by itself. To hold them while you
+stream lighter content, lock the graphics clock (pick a value your GPU supports,
+listed by `nvidia-smi -q -d SUPPORTED_CLOCKS`):
+
+```sh
+sudo nvidia-smi -lgc 1710,1710
+```
+
+The lock lasts until you reset it or the driver unloads, and the GPU draws more
+power while it holds. Reset it after streaming:
+
+```sh
+sudo nvidia-smi -rgc
+```
 
 ## Use Gamescope with the client's resolution
 
@@ -257,6 +283,28 @@ The separate D-Bus session prevents host portals from redirecting Flatpak to the
 physical desktop. It keeps Pyroshine's display and audio environment effective.
 Quit any existing Flatpak Steam before launching the stream.
 
+## Run Flatpak Bottles inside Pyroshine's compositor
+
+Wrap the Bottles scanner's commands the same way:
+
+```toml
+[[application_scanner]]
+type = "bottles"
+command = [
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+    "run", "-b", "{bottle}", "--program-id", "{program_id}",
+]
+umu_command = [
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+    "umu", "run", "--game", "{umu_game}",
+]
+```
+
+As with Flatpak Steam, the separate D-Bus session keeps the host portal from
+moving the game to the physical desktop.
+
 ## Run a desktop environment for a full remote desktop
 
 Add your installed desktop as an application, for example Plasma:
@@ -301,21 +349,23 @@ Pyroshine reports the cause of a failure where you can see it:
   or signal.
 - **Rejected stream settings** (a codec, 4:4:4 or HDR combination the GPU did not
   pass at startup, invalid audio settings) reach Moonlight only as an RTSP error
-  code. The desktop app's **Diagnostics → Recent problems** lists the exact
+  code. The web interface's **Diagnostics → Recent problems** lists the exact
   request and the profiles that work.
 - **Sessions that end unexpectedly** show the cause on the dashboard: the
   application's exit status or signal and how long after launch it ended, or
   the encoder failure that stopped the stream.
 
-The desktop app also notifies about these when its window is closed.
+The desktop tray also notifies about these. **History** keeps each session's stop
+reason after the page is closed.
 **Copy diagnostics** on the Diagnostics page copies the host checks, session,
 latest stream statistics and recent problems as one JSON report for a bug report;
 it contains no keys, PINs or certificates.
 
 ## Collect a support bundle
 
-For a bug report, attach a support bundle. On a host without the desktop app,
-or over SSH, run as the streaming user (without sudo):
+For a bug report, attach a support bundle. In the web interface, use
+**Diagnostics → Save support bundle**. From a terminal or over SSH, run as the
+streaming user (without sudo):
 
 ```sh
 pyroshine diag
@@ -325,8 +375,8 @@ It writes `pyroshine-diag-<date>-<time>.tar.gz` to the current directory
 (`-o <file or directory>` chooses another place). The bundle holds the
 diagnostic report, the last two minutes of stream statistics with GPU
 readings, host and GPU details, the configuration, the service status and its
-recent log, and `vulkaninfo --summary`. The desktop app's **Diagnostics → Save
-support bundle** saves the same file.
+recent log, and `vulkaninfo --summary`. The web interface downloads the same
+file.
 
 Identifying values are replaced: the home directory, user and host names, the
 server name, client names and IDs, certificate fingerprints, UUIDs and IP

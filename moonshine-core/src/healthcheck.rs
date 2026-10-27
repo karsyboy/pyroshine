@@ -6,12 +6,16 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, VideoContext};
+use ash::vk::TaggedStructure;
+use pixelforge::{
+	Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderCapabilities, PixelFormat, RateControlMode, VideoContext,
+};
 
 use crate::config::Config;
-use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
+use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL};
 use crate::session::stream::video::{
-	BitDepth, ChromaFormat, ConversionQueueMode, NegotiatedVideoFormat, VideoCodec, convert,
+	BitDepth, ChromaFormat, ConversionQueueMode, EncoderBackend, EncoderPreference, EncoderTable, KcmpProbe,
+	NegotiatedVideoFormat, VideoCodec, convert,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +41,43 @@ pub struct HealthReport {
 	pub hdr_supported: bool,
 	pub dma_buf_supported: bool,
 	pub gpu_name: String,
+	pub gpu: GpuDetails,
 	pub duration: Duration,
+}
+
+/// The probed capture GPU in detail: what the advertised capabilities were
+/// derived from, and why each profile that is not advertised failed.
+#[derive(Clone, Debug, Default)]
+pub struct GpuDetails {
+	/// Vulkan driver name and version (`driverName`/`driverInfo`).
+	pub driver: String,
+	/// Vulkan Video encode support of the capture device (see `gpu::encode_status`).
+	pub vulkan_video_encode: String,
+	/// Every profile in [`CODEC_PROFILES`] order that was probed.
+	pub profiles: Vec<ProfileProbe>,
+}
+
+/// The probe result of one codec profile (a [`CODEC_PROFILES`] bit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileProbe {
+	pub bit: u32,
+	/// Why the profile is not advertised, or `None` when it is.
+	pub unavailable: Option<String>,
+	/// The backend that encodes an advertised conventional profile.
+	pub backend: Option<EncoderBackend>,
+}
+
+impl GpuDetails {
+	/// Each advertised conventional profile's backend, for stream setup.
+	pub fn encoder_table(&self) -> EncoderTable {
+		let mut table = EncoderTable::default();
+		for probe in self.profiles.iter().filter(|probe| probe.unavailable.is_none()) {
+			if let Some(backend) = probe.backend {
+				table.insert(probe.bit, backend);
+			}
+		}
+		table
+	}
 }
 
 /// GPU capability results produced by [`probe_capabilities`].
@@ -51,6 +91,7 @@ pub struct Capabilities {
 	pub hdr_supported: bool,
 	pub dma_buf_supported: bool,
 	pub gpu_name: String,
+	pub gpu: GpuDetails,
 }
 
 // Codec mode support bitmask values — single source of truth, also used by the
@@ -103,9 +144,7 @@ pub fn codec_profile_labels(capabilities: u32) -> Vec<&'static str> {
 
 pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -> bool {
 	if format.codec == VideoCodec::PyroWave {
-		if format.range != crate::session::stream::video::ColorRange::Full {
-			return false;
-		}
+		// Range is a scaler setting of the same encoder, so it needs no probe.
 		let chroma_supported = match format.chroma {
 			ChromaFormat::Yuv420 => capabilities & CODEC_PYROWAVE != 0,
 			ChromaFormat::Yuv444 => capabilities & CODEC_PYROWAVE_444 != 0,
@@ -118,7 +157,13 @@ pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -
 		return chroma_supported && dynamic_range_supported;
 	}
 
-	let bit = match (format.codec, format.chroma, format.bit_depth) {
+	profile_bit(format).is_some_and(|bit| capabilities & bit != 0)
+}
+
+/// The [`CODEC_PROFILES`] bit of a conventional format, or `None` for
+/// PyroWave and unsupported combinations (H.264 10-bit).
+pub fn profile_bit(format: NegotiatedVideoFormat) -> Option<u32> {
+	Some(match (format.codec, format.chroma, format.bit_depth) {
 		(VideoCodec::H264, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_H264,
 		(VideoCodec::H264, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_H264_HIGH_8444,
 		(VideoCodec::Hevc, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_HEVC,
@@ -129,12 +174,50 @@ pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -
 		(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_AV1_MAIN10,
 		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_AV1_HIGH_8444,
 		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_AV1_HIGH_10444,
-		_ => return false,
-	};
-	capabilities & bit != 0
+		_ => return None,
+	})
 }
 
 impl HealthReport {
+	fn empty() -> Self {
+		Self {
+			checks: Vec::new(),
+			all_fatal_passed: true,
+			supported_codecs: 0,
+			hdr_supported: false,
+			dma_buf_supported: false,
+			gpu_name: String::new(),
+			gpu: GpuDetails::default(),
+			duration: Duration::ZERO,
+		}
+	}
+
+	/// Record a profile's probe result; a later result for the same profile
+	/// (a withdrawal) replaces the earlier one.
+	fn record_profile(&mut self, bit: u32, unavailable: Option<String>) {
+		match self.gpu.profiles.iter_mut().find(|probe| probe.bit == bit) {
+			Some(probe) => {
+				if unavailable.is_some() {
+					probe.backend = None;
+				}
+				probe.unavailable = unavailable;
+			},
+			None => self.gpu.profiles.push(ProfileProbe {
+				bit,
+				unavailable,
+				backend: None,
+			}),
+		}
+	}
+
+	/// Record an advertised conventional profile and its backend.
+	fn record_profile_backend(&mut self, bit: u32, backend: EncoderBackend) {
+		self.record_profile(bit, None);
+		if let Some(probe) = self.gpu.profiles.iter_mut().find(|probe| probe.bit == bit) {
+			probe.backend = Some(backend);
+		}
+	}
+
 	fn add(&mut self, name: &'static str, outcome: CheckOutcome, message: String, duration_ms: u64) {
 		if outcome == CheckOutcome::Failed {
 			self.all_fatal_passed = false;
@@ -277,17 +360,9 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 	let gpu_config = config.map(|c| c.compositor.gpu.clone()).unwrap_or(None);
 	let conversion_queue = conversion_queue(config);
 
-	let mut report = HealthReport {
-		checks: Vec::new(),
-		all_fatal_passed: true,
-		supported_codecs: 0,
-		hdr_supported: false,
-		dma_buf_supported: false,
-		gpu_name: String::new(),
-		duration: Duration::ZERO,
-	};
+	let mut report = HealthReport::empty();
 
-	run_gpu_checks(&mut report, &gpu_config, conversion_queue);
+	run_gpu_checks(&mut report, &gpu_config, conversion_queue, encoder_preference(config));
 	// --no-health-check discards the report, but identity/selection failures
 	// and profiles withdrawn for wrong colors must still reach the
 	// administrator before the generic startup gate.
@@ -304,7 +379,12 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 		hdr_supported: report.hdr_supported,
 		dma_buf_supported: report.dma_buf_supported,
 		gpu_name: report.gpu_name,
+		gpu: report.gpu,
 	}
+}
+
+fn encoder_preference(config: Option<&Config>) -> EncoderPreference {
+	config.map(|config| config.stream.video.encoder).unwrap_or_default()
 }
 
 fn conversion_queue(config: Option<&Config>) -> ConversionQueueMode {
@@ -314,14 +394,19 @@ fn conversion_queue(config: Option<&Config>) -> ConversionQueueMode {
 }
 
 /// Run the GPU/codec/HDR probes and record their results into `report`.
-fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>, conversion_queue: ConversionQueueMode) {
+fn run_gpu_checks(
+	report: &mut HealthReport,
+	gpu_config: &Option<String>,
+	conversion_queue: ConversionQueueMode,
+	preference: EncoderPreference,
+) {
 	check_render_nodes(report, gpu_config);
 	let render_node_open = check_render_node_open(report, gpu_config);
 	// Prefer the configured/accessible node over the first discovered one, so
 	// the EGL probe (HDR detection) runs on the GPU the compositor will use.
 	let egl_result = check_egl(report, render_node_open.as_ref());
 	let vk_context = check_vulkan(report, render_node_open.as_ref().filter(|_| egl_result.is_some()));
-	check_codecs(report, vk_context.as_ref());
+	check_codecs(report, vk_context.as_ref(), preference);
 	check_color_conversion(report, vk_context.as_ref(), conversion_queue);
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
 
@@ -354,21 +439,13 @@ pub const GPU_CHECKS: &[&str] = &[
 	"DMA-BUF",
 ];
 
-/// Run the checks again inside the running server (the desktop app's
+/// Run the checks again inside the running server (the web interface's
 /// "Run checks"). Unlike [`run_healthcheck`] it never binds the server's own
 /// listeners, and while a session runs it reports the GPU probes of
 /// `previous` instead of creating encoders next to the live stream.
 pub fn recheck_in_server(config: &Config, previous: Option<&HealthReport>, session_active: bool) -> HealthReport {
 	let started = Instant::now();
-	let mut report = HealthReport {
-		checks: Vec::new(),
-		all_fatal_passed: true,
-		supported_codecs: 0,
-		hdr_supported: false,
-		dma_buf_supported: false,
-		gpu_name: String::new(),
-		duration: Duration::ZERO,
-	};
+	let mut report = HealthReport::empty();
 	match previous.filter(|_| session_active) {
 		None if session_active => report.add_warn(
 			"GPU",
@@ -387,8 +464,14 @@ pub fn recheck_in_server(config: &Config, previous: Option<&HealthReport>, sessi
 			report.hdr_supported = previous.hdr_supported;
 			report.dma_buf_supported = previous.dma_buf_supported;
 			report.gpu_name = previous.gpu_name.clone();
+			report.gpu = previous.gpu.clone();
 		},
-		None => run_gpu_checks(&mut report, &config.compositor.gpu, conversion_queue(Some(config))),
+		None => run_gpu_checks(
+			&mut report,
+			&config.compositor.gpu,
+			conversion_queue(Some(config)),
+			encoder_preference(Some(config)),
+		),
 	}
 	check_xwayland(&mut report);
 	check_xdg_runtime(&mut report);
@@ -399,6 +482,7 @@ pub fn recheck_in_server(config: &Config, previous: Option<&HealthReport>, sessi
 	check_uhid(&mut report);
 	check_input_group(&mut report);
 	check_dirs(&mut report, config);
+	check_frame_limit(&mut report, config);
 	report.duration = started.elapsed();
 	report
 }
@@ -408,19 +492,16 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	let gpu_config = config.map(|c| c.compositor.gpu.clone()).unwrap_or(None);
 
-	let mut report = HealthReport {
-		checks: Vec::new(),
-		all_fatal_passed: true,
-		supported_codecs: 0,
-		hdr_supported: false,
-		dma_buf_supported: false,
-		gpu_name: String::new(),
-		duration: Duration::ZERO,
-	};
+	let mut report = HealthReport::empty();
 
 	// --- GPU checks ---
 
-	run_gpu_checks(&mut report, &gpu_config, conversion_queue(config));
+	run_gpu_checks(
+		&mut report,
+		&gpu_config,
+		conversion_queue(config),
+		encoder_preference(config),
+	);
 
 	// --- External dependencies ---
 
@@ -441,6 +522,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	if let Some(config) = config {
 		check_dirs(&mut report, config);
+		check_frame_limit(&mut report, config);
 	}
 
 	report.duration = started.elapsed();
@@ -697,23 +779,23 @@ fn check_vulkan(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<Vid
 			let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
 				.to_string_lossy()
 				.to_string();
-			let driver_version = props.driver_version;
 			let api_version = props.api_version;
+			let driver = vulkan_driver(&ctx);
+			let encode = crate::gpu::encode_status(&ctx);
 			let msg = format!(
-				"{device_name}, driver {}.{}.{}, Vulkan {}.{}.{}",
-				vk_version_major(driver_version),
-				vk_version_minor(driver_version),
-				vk_version_patch(driver_version),
+				"{device_name}, {driver}, Vulkan {}.{}.{}\n  Vulkan Video encode: {encode}",
 				vk_version_major(api_version),
 				vk_version_minor(api_version),
 				vk_version_patch(api_version),
 			);
+			report.gpu.driver = driver;
+			report.gpu.vulkan_video_encode = encode;
 			report.add_passed("Vulkan", msg, start.elapsed().as_millis() as u64);
 			Some(ctx)
 		},
 		Err(e) => {
 			let msg = format!(
-				"  Failed to initialize Vulkan: {e}\n  Ensure Vulkan drivers with video encode support are installed.\n  Requires NVIDIA RTX 20xx+, AMD RDNA2+, or Intel Arc.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install vulkan-loader mesa-vulkan-drivers`\n  Arch: `sudo pacman -S vulkan-icd-loader vulkan-mesa-layer`"
+				"  Failed to initialize Vulkan: {e}\n  Ensure the Vulkan driver for this GPU is installed (Mesa RADV or ANV, or NVIDIA's).\n  Ubuntu: `sudo apt install mesa-vulkan-drivers` (or the NVIDIA driver)\n  Fedora: `sudo dnf install vulkan-loader mesa-vulkan-drivers`\n  Arch: `sudo pacman -S vulkan-icd-loader vulkan-radeon` (AMD) or `vulkan-intel` (Intel)"
 			);
 			report.add_failed("Vulkan", msg, start.elapsed().as_millis() as u64);
 			None
@@ -721,7 +803,7 @@ fn check_vulkan(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<Vid
 	}
 }
 
-fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
+fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>, preference: EncoderPreference) {
 	let start = Instant::now();
 	let ctx = match context {
 		Some(c) => c,
@@ -738,95 +820,36 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	let mut supported = 0u32;
 	let mut names = Vec::new();
 
-	let candidates = [
-		(
-			Codec::H264,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Eight,
-			CODEC_H264,
-			"H.264 4:2:0 8-bit",
-		),
-		(
-			Codec::H264,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Eight,
-			CODEC_H264_HIGH_8444,
-			"H.264 4:4:4 8-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Eight,
-			CODEC_HEVC,
-			"HEVC 4:2:0 8-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Ten,
-			CODEC_HEVC_MAIN10,
-			"HEVC 4:2:0 10-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Eight,
-			CODEC_HEVC_REXT_8444,
-			"HEVC 4:4:4 8-bit",
-		),
-		(
-			Codec::H265,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Ten,
-			CODEC_HEVC_REXT_10444,
-			"HEVC 4:4:4 10-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Eight,
-			CODEC_AV1_MAIN8,
-			"AV1 4:2:0 8-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv420,
-			EncodeBitDepth::Ten,
-			CODEC_AV1_MAIN10,
-			"AV1 4:2:0 10-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Eight,
-			CODEC_AV1_HIGH_8444,
-			"AV1 4:4:4 8-bit",
-		),
-		(
-			Codec::AV1,
-			PixelFormat::Yuv444,
-			EncodeBitDepth::Ten,
-			CODEC_AV1_HIGH_10444,
-			"AV1 4:4:4 10-bit",
-		),
-	];
-
-	for (codec, chroma, depth, bit, label) in candidates {
-		if !ctx.supports_encode(codec) {
-			continue;
+	for &(codec, chroma, depth, bit, label) in CONVENTIONAL_PROFILES {
+		let mut reasons = Vec::new();
+		let mut chosen = None;
+		for &backend in preference.candidates() {
+			match probe_backend(ctx, backend, codec, chroma, depth) {
+				Ok(()) => {
+					chosen = Some(backend);
+					break;
+				},
+				Err(error) => {
+					tracing::debug!(label, backend = backend.label(), %error, "Video profile is not supported");
+					reasons.push(if preference.candidates().len() > 1 {
+						format!("{}: {error}", backend.label())
+					} else {
+						error
+					});
+				},
+			}
 		}
-		let base = match codec {
-			Codec::H264 => EncodeConfig::h264(128, 128),
-			Codec::H265 => EncodeConfig::h265(128, 128),
-			Codec::AV1 => EncodeConfig::av1(128, 128),
-		};
-		match Encoder::new(ctx.clone(), base.with_pixel_format(chroma).with_bit_depth(depth)) {
-			Ok(encoder) => {
-				drop(encoder);
+		match chosen {
+			Some(backend) => {
 				supported |= bit;
-				names.push(label);
+				names.push(if backend == EncoderBackend::Vulkan {
+					label.to_string()
+				} else {
+					format!("{label} ({})", backend.label())
+				});
+				report.record_profile_backend(bit, backend);
 			},
-			Err(error) => tracing::debug!(label, %error, "Video profile is not supported"),
+			None => report.record_profile(bit, Some(reasons.join("; "))),
 		}
 	}
 
@@ -852,7 +875,7 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 					(ChromaFormat::Yuv444, BitDepth::Eight) => pyrowave_444_8 = true,
 					(ChromaFormat::Yuv444, BitDepth::Ten) => pyrowave_444_10 = true,
 				}
-				names.push(label);
+				names.push(label.to_string());
 			},
 			Err(error) => {
 				tracing::debug!(%error, %chroma, bit_depth = depth.bits(), "PyroWave profile is unavailable");
@@ -860,31 +883,56 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 			},
 		}
 	}
-	if pyrowave_420_8 {
-		supported |= CODEC_PYROWAVE;
-	}
-	if pyrowave_444_8 {
-		supported |= CODEC_PYROWAVE_444;
-	}
+	let pyrowave_reason = |chroma: ChromaFormat, depth: BitDepth| {
+		pyrowave_errors
+			.iter()
+			.find(|error| error.starts_with(&format!("{chroma} {}-bit: ", depth.bits())))
+			.cloned()
+			.unwrap_or_else(|| "PyroWave is unavailable".into())
+	};
+	let mut record_pyrowave = |bit: u32, available: bool, reason: String| {
+		if available {
+			supported |= bit;
+		}
+		report.record_profile(bit, (!available).then_some(reason));
+	};
+	record_pyrowave(
+		CODEC_PYROWAVE,
+		pyrowave_420_8,
+		pyrowave_reason(ChromaFormat::Yuv420, BitDepth::Eight),
+	);
+	record_pyrowave(
+		CODEC_PYROWAVE_444,
+		pyrowave_444_8,
+		pyrowave_reason(ChromaFormat::Yuv444, BitDepth::Eight),
+	);
 	// The HDR flag is shared by every advertised chroma mode. Only advertise
 	// it when each SDR-capable mode also passed its 10-bit probe.
-	if (pyrowave_420_8 || pyrowave_444_8)
+	let hdr = (pyrowave_420_8 || pyrowave_444_8)
 		&& (!pyrowave_420_8 || pyrowave_420_10)
-		&& (!pyrowave_444_8 || pyrowave_444_10)
-	{
-		supported |= CODEC_PYROWAVE_HDR;
-	}
+		&& (!pyrowave_444_8 || pyrowave_444_10);
+	record_pyrowave(
+		CODEC_PYROWAVE_HDR,
+		hdr,
+		if pyrowave_420_8 && !pyrowave_420_10 {
+			pyrowave_reason(ChromaFormat::Yuv420, BitDepth::Ten)
+		} else if pyrowave_444_8 && !pyrowave_444_10 {
+			pyrowave_reason(ChromaFormat::Yuv444, BitDepth::Ten)
+		} else {
+			"no SDR PyroWave profile is available".into()
+		},
+	);
 	if pyrowave_errors.is_empty() {
 		report.add_passed(
 			"PyroWave",
-			format!("{SOURCE_URL} @ {SOURCE_REVISION}"),
+			format!("{SOURCE_URL} @ {SOURCE_REVISION} + {SOURCE_PATCHES}"),
 			start.elapsed().as_millis() as u64,
 		);
 	} else {
 		report.add_warn(
 			"PyroWave",
 			format!(
-				"  Optional codec unavailable from {SOURCE_URL} @ {SOURCE_REVISION}:\n  {}",
+				"  Optional codec unavailable from {SOURCE_URL} @ {SOURCE_REVISION} + {SOURCE_PATCHES}:\n  {}",
 				pyrowave_errors.join("\n  ")
 			),
 			start.elapsed().as_millis() as u64,
@@ -893,35 +941,275 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 
 	report.supported_codecs = supported;
 
+	let elapsed = start.elapsed().as_millis() as u64;
+	let not_offered = unavailable_summary(&report.gpu.profiles, CODEC_CONVENTIONAL_MASK);
 	if names.is_empty() {
 		report.add_failed(
 			"Codecs",
-				"  No usable video encode profile detected (H.264, HEVC, AV1).\n  GPU driver may be outdated or missing Vulkan Video extensions.\n  Update to the latest GPU driver.".into(),
-			start.elapsed().as_millis() as u64,
+			format!(
+				"  No usable video encode profile: no H.264/HEVC/AV1 encoder and no PyroWave.\n  Vulkan Video encode: {}\n  Not offered:\n{not_offered}",
+				report.gpu.vulkan_video_encode
+			),
+			elapsed,
 		);
+	} else if supported & CODEC_CONVENTIONAL_MASK == 0 {
+		// Startup proceeds: PyroWave clients can stream. Moonlight clients
+		// without PyroWave are told which profiles exist when they connect.
+		report.add_warn(
+			"Codecs",
+			format!(
+				"  Only PyroWave can stream from this GPU: {}\n  No H.264, HEVC or AV1 for Moonlight clients without PyroWave.\n  Vulkan Video encode: {}\n  Not offered:\n{not_offered}",
+				names.join(", "),
+				report.gpu.vulkan_video_encode
+			),
+			elapsed,
+		);
+	} else if not_offered.is_empty() {
+		report.add_passed("Codecs", names.join(", "), elapsed);
 	} else {
-		report.add_passed("Codecs", names.join(", "), start.elapsed().as_millis() as u64);
+		report.add_passed(
+			"Codecs",
+			format!("{}\n  Not offered:\n{not_offered}", names.join(", ")),
+			elapsed,
+		);
 	}
+}
+
+/// Every conventional profile bit (H.264/HEVC/AV1 on any encoder).
+const CODEC_CONVENTIONAL_MASK: u32 = CODEC_H264
+	| CODEC_H264_HIGH_8444
+	| CODEC_HEVC
+	| CODEC_HEVC_MAIN10
+	| CODEC_HEVC_REXT_8444
+	| CODEC_HEVC_REXT_10444
+	| CODEC_AV1_MAIN8
+	| CODEC_AV1_MAIN10
+	| CODEC_AV1_HIGH_8444
+	| CODEC_AV1_HIGH_10444;
+
+/// Conventional profiles in probe order: codec, chroma, bit depth, capability
+/// bit, label.
+const CONVENTIONAL_PROFILES: &[(VideoCodec, ChromaFormat, BitDepth, u32, &str)] = &[
+	(
+		VideoCodec::H264,
+		ChromaFormat::Yuv420,
+		BitDepth::Eight,
+		CODEC_H264,
+		"H.264 4:2:0 8-bit",
+	),
+	(
+		VideoCodec::H264,
+		ChromaFormat::Yuv444,
+		BitDepth::Eight,
+		CODEC_H264_HIGH_8444,
+		"H.264 4:4:4 8-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv420,
+		BitDepth::Eight,
+		CODEC_HEVC,
+		"HEVC 4:2:0 8-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv420,
+		BitDepth::Ten,
+		CODEC_HEVC_MAIN10,
+		"HEVC 4:2:0 10-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv444,
+		BitDepth::Eight,
+		CODEC_HEVC_REXT_8444,
+		"HEVC 4:4:4 8-bit",
+	),
+	(
+		VideoCodec::Hevc,
+		ChromaFormat::Yuv444,
+		BitDepth::Ten,
+		CODEC_HEVC_REXT_10444,
+		"HEVC 4:4:4 10-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv420,
+		BitDepth::Eight,
+		CODEC_AV1_MAIN8,
+		"AV1 4:2:0 8-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv420,
+		BitDepth::Ten,
+		CODEC_AV1_MAIN10,
+		"AV1 4:2:0 10-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv444,
+		BitDepth::Eight,
+		CODEC_AV1_HIGH_8444,
+		"AV1 4:4:4 8-bit",
+	),
+	(
+		VideoCodec::Av1,
+		ChromaFormat::Yuv444,
+		BitDepth::Ten,
+		CODEC_AV1_HIGH_10444,
+		"AV1 4:4:4 10-bit",
+	),
+];
+
+/// Probe a conventional profile on one backend exactly as a stream would use
+/// it (an encoder instance with constant-bitrate rate control); returns the
+/// first reason it cannot be used.
+fn probe_backend(
+	ctx: &VideoContext,
+	backend: EncoderBackend,
+	codec: VideoCodec,
+	chroma: ChromaFormat,
+	depth: BitDepth,
+) -> Result<(), String> {
+	use crate::session::stream::video::{nvenc, vaapi};
+	match backend {
+		EncoderBackend::Vulkan => probe_vulkan(ctx, codec, chroma, depth),
+		EncoderBackend::Vaapi => vaapi::probe(ctx, codec, chroma, depth),
+		EncoderBackend::Nvenc => nvenc::probe(ctx, codec, chroma, depth),
+	}
+}
+
+/// Well below every encoder's maximum: probes test support, not limits.
+const PROBE_BITRATE: u32 = 10_000_000;
+
+fn vulkan_probe_config(
+	codec: VideoCodec,
+	chroma: ChromaFormat,
+	depth: BitDepth,
+) -> Result<(Codec, EncodeConfig), String> {
+	let (codec, base) = match codec {
+		VideoCodec::H264 => (Codec::H264, EncodeConfig::h264(128, 128)),
+		VideoCodec::Hevc => (Codec::H265, EncodeConfig::h265(128, 128)),
+		VideoCodec::Av1 => (Codec::AV1, EncodeConfig::av1(128, 128)),
+		VideoCodec::PyroWave => return Err("PyroWave is not a Vulkan Video codec".into()),
+	};
+	let config = base
+		.with_pixel_format(match chroma {
+			ChromaFormat::Yuv420 => PixelFormat::Yuv420,
+			ChromaFormat::Yuv444 => PixelFormat::Yuv444,
+		})
+		.with_bit_depth(match depth {
+			BitDepth::Eight => EncodeBitDepth::Eight,
+			BitDepth::Ten => EncodeBitDepth::Ten,
+		})
+		.with_rate_control(RateControlMode::Cbr)
+		.with_target_bitrate(PROBE_BITRATE);
+	Ok((codec, config))
+}
+
+/// Whether Vulkan Video can encode the profile with constant-bitrate rate
+/// control, from capabilities alone (no encoder instance).
+pub(crate) fn probe_vulkan_capabilities(
+	ctx: &VideoContext,
+	codec: Codec,
+	chroma: ChromaFormat,
+	depth: BitDepth,
+) -> Result<(), String> {
+	if let Some(reason) = ctx.encode_unsupported_reason(codec) {
+		return Err(reason.to_string());
+	}
+	let video_codec = match codec {
+		Codec::H264 => VideoCodec::H264,
+		Codec::H265 => VideoCodec::Hevc,
+		Codec::AV1 => VideoCodec::Av1,
+	};
+	let (codec, config) = vulkan_probe_config(video_codec, chroma, depth)?;
+	let caps = EncoderCapabilities::query(ctx, &config).map_err(|error| error.to_string())?;
+	crate::session::stream::video::encode_caps::cbr_target(&caps, codec, u64::from(PROBE_BITRATE)).map(drop)
+}
+
+fn probe_vulkan(ctx: &VideoContext, codec: VideoCodec, chroma: ChromaFormat, depth: BitDepth) -> Result<(), String> {
+	let (pixelforge_codec, config) = vulkan_probe_config(codec, chroma, depth)?;
+	probe_vulkan_capabilities(ctx, pixelforge_codec, chroma, depth)?;
+	Encoder::new(ctx.clone(), config)
+		.map(drop)
+		.map_err(|error| error.to_string())
+}
+
+/// Indented lines naming the unavailable profiles within `mask`, one line per
+/// distinct reason.
+fn unavailable_summary(profiles: &[ProfileProbe], mask: u32) -> String {
+	let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+	for probe in profiles.iter().filter(|probe| probe.bit & mask != 0) {
+		let Some(reason) = probe.unavailable.as_deref() else {
+			continue;
+		};
+		let label = CODEC_PROFILES
+			.iter()
+			.find(|(bit, _, _)| *bit == probe.bit)
+			.map_or("?", |(_, _, label)| *label);
+		match groups.iter_mut().find(|(r, _)| *r == reason) {
+			Some((_, labels)) => labels.push(label),
+			None => groups.push((reason, vec![label])),
+		}
+	}
+	groups
+		.iter()
+		.map(|(reason, labels)| format!("    {}: {reason}", labels.join(", ")))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+/// `driverName driverInfo` of the context's device, e.g. `radv Mesa 26.2.4`.
+fn vulkan_driver(ctx: &VideoContext) -> String {
+	let mut driver = ash::vk::PhysicalDeviceDriverProperties::default();
+	let mut properties = ash::vk::PhysicalDeviceProperties2::default().push(&mut driver);
+	// SAFETY: core Vulkan 1.2 query on the context's live physical device.
+	unsafe {
+		ctx.instance()
+			.get_physical_device_properties2(ctx.physical_device(), &mut properties);
+	}
+	let name = driver
+		.driver_name_as_c_str()
+		.map(CStr::to_string_lossy)
+		.unwrap_or_default();
+	let info = driver
+		.driver_info_as_c_str()
+		.map(CStr::to_string_lossy)
+		.unwrap_or_default();
+	format!("{name} {info}").trim().to_string()
 }
 
 const COLOR_CONVERSION: &str = "Color conversion";
 
 /// The converter output format each conventional profile encodes from.
-const CONVERSION_PROFILES: [(pixelforge::OutputFormat, u32); 4] = [
-	(
-		pixelforge::OutputFormat::NV12,
-		CODEC_H264 | CODEC_HEVC | CODEC_AV1_MAIN8,
-	),
-	(pixelforge::OutputFormat::P010, CODEC_HEVC_MAIN10 | CODEC_AV1_MAIN10),
-	(
-		pixelforge::OutputFormat::YUV444,
-		CODEC_H264_HIGH_8444 | CODEC_HEVC_REXT_8444 | CODEC_AV1_HIGH_8444,
-	),
-	(
-		pixelforge::OutputFormat::YUV444P10,
-		CODEC_HEVC_REXT_10444 | CODEC_AV1_HIGH_10444,
-	),
-];
+/// The converter output each advertised conventional profile encodes from,
+/// which depends on the backend that will encode it, with the profiles that
+/// need each format.
+fn conversion_formats(report: &HealthReport) -> Vec<(convert::ConvertFormat, u32)> {
+	let mut formats: Vec<(convert::ConvertFormat, u32)> = Vec::new();
+	for probe in &report.gpu.profiles {
+		let Some(backend) = probe.backend else {
+			continue;
+		};
+		if report.supported_codecs & probe.bit == 0 {
+			continue;
+		}
+		let Some(&(_, chroma, depth, _, _)) = CONVENTIONAL_PROFILES.iter().find(|profile| profile.3 == probe.bit)
+		else {
+			continue;
+		};
+		let Ok(format) = backend.convert_format(chroma, depth) else {
+			continue;
+		};
+		match formats.iter_mut().find(|(known, _)| *known == format) {
+			Some((_, profiles)) => *profiles |= probe.bit,
+			None => formats.push((format, probe.bit)),
+		}
+	}
+	formats
+}
 
 /// Run the stream converter's known-answer self-check for every output format
 /// a verified profile needs, on the configured conversion queue.
@@ -945,16 +1233,13 @@ fn check_color_conversion(report: &mut HealthReport, context: Option<&VideoConte
 /// [`check_color_conversion`] with the self-check supplied by the caller.
 fn record_color_conversion(
 	report: &mut HealthReport,
-	mut self_check: impl FnMut(pixelforge::OutputFormat) -> Result<(), String>,
+	mut self_check: impl FnMut(convert::ConvertFormat) -> Result<(), String>,
 ) {
 	let start = Instant::now();
 	let mut passed = Vec::new();
 	let mut failures = Vec::new();
 	let mut withdrawn = 0;
-	for (format, profiles) in CONVERSION_PROFILES {
-		if report.supported_codecs & profiles == 0 {
-			continue;
-		}
+	for (format, profiles) in conversion_formats(report) {
 		match self_check(format) {
 			Ok(()) => passed.push(convert::format_label(format)),
 			Err(detail) => {
@@ -975,6 +1260,9 @@ fn record_color_conversion(
 		return;
 	}
 	report.supported_codecs &= !withdrawn;
+	for (bit, _, _) in CODEC_PROFILES.iter().filter(|(bit, _, _)| withdrawn & bit != 0) {
+		report.record_profile(*bit, Some("wrong colors from this GPU's color conversion".into()));
+	}
 	let remaining = codec_profile_labels(report.supported_codecs);
 	let mut message = format!(
 		"  Wrong colors from this GPU's conversion to {}\n  \
@@ -1208,59 +1496,50 @@ fn check_inhibit(report: &mut HealthReport) {
 }
 
 fn check_kcmp(report: &mut HealthReport) {
+	/// Explains the fallback when `kcmp(2)` is unavailable.
+	const FALLBACK: &str = "  The DMA-BUF import cache compares inode numbers instead (needs Linux 5.3 or later).";
+
 	let start = Instant::now();
+	let probe = KcmpProbe::get();
+	let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-	/// `KCMP_FILE` — not exposed by `libc` or glibc.
-	const KCMP_FILE: libc::c_int = 0;
-
-	// SAFETY: uses /dev/null fds; syscall with scalar arguments.
-	let result = unsafe {
-		let a = std::fs::File::open("/dev/null");
-		let b = std::fs::File::open("/dev/null");
-		match (a, b) {
-			(Ok(a), Ok(b)) => libc::syscall(
-				libc::SYS_kcmp,
-				libc::getpid(),
-				libc::getpid(),
-				KCMP_FILE,
-				a.as_raw_fd() as libc::c_ulong,
-				b.as_raw_fd() as libc::c_ulong,
-			),
-			(Err(e), _) | (_, Err(e)) => {
-				report.add_failed(
-					"kcmp(2)",
-					format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
-					start.elapsed().as_millis() as u64,
-				);
-				return;
-			},
-		}
+	let error = match probe {
+		KcmpProbe::Available => {
+			report.add_passed("kcmp(2)", "Available".into(), duration_ms);
+			return;
+		},
+		KcmpProbe::NoProbeFile(e) => {
+			report.add_failed(
+				"kcmp(2)",
+				format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
+				duration_ms,
+			);
+			return;
+		},
+		KcmpProbe::Unavailable(error) => error,
 	};
 
-	if result < 0 {
-		let error = std::io::Error::last_os_error();
-		let hint = match error.raw_os_error() {
-			Some(libc::ENOSYS) => {
-				"  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n  \
-				kcmp(2) is required for DMA-BUF import cache validation.\n  \
-				Rebuild your kernel with CONFIG_CHECKPOINT_RESTORE=y."
-			},
-			Some(libc::EPERM) => {
-				"  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n  \
-				kcmp(2) is required for DMA-BUF import cache validation.\n  \
-				Run outside the sandbox or adjust the seccomp profile."
-			},
-			_ => "  kcmp(2) is required for DMA-BUF import cache validation.",
-		};
-		report.add_failed(
+	match error.raw_os_error() {
+		Some(libc::ENOSYS) => report.add_warn(
 			"kcmp(2)",
-			format!("  kcmp(2) not available: {error}\n{hint}"),
-			start.elapsed().as_millis() as u64,
-		);
-		return;
+			format!(
+				"  kcmp(2) not available: {error}\n  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n{FALLBACK}"
+			),
+			duration_ms,
+		),
+		Some(libc::EPERM) => report.add_warn(
+			"kcmp(2)",
+			format!(
+				"  kcmp(2) not available: {error}\n  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n{FALLBACK}"
+			),
+			duration_ms,
+		),
+		_ => report.add_failed(
+			"kcmp(2)",
+			format!("  kcmp(2) not available: {error}\n  kcmp(2) is required for DMA-BUF import cache validation."),
+			duration_ms,
+		),
 	}
-
-	report.add_passed("kcmp(2)", "Available".into(), start.elapsed().as_millis() as u64);
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,6 +1865,39 @@ pub(crate) fn find_render_node(gpu_config: &Option<String>) -> Result<PathBuf, S
 	Ok(best_node.unwrap_or_else(|| entries[0].path()))
 }
 
+/// Frame limiting status: what the configured limiter covers, and whether a
+/// configured MangoHud limiter is available. Never fatal.
+fn check_frame_limit(report: &mut HealthReport, config: &Config) {
+	use crate::session::frame_limit::{FrameLimitMethod, mangohud_layer_installed, support_summary};
+	let start = Instant::now();
+	let wants_mangohud = config.frame_limit.method == FrameLimitMethod::Mangohud
+		|| config
+			.applications
+			.iter()
+			.any(|a| a.frame_limit.frame_limit_method == Some(FrameLimitMethod::Mangohud))
+		|| config
+			.application_scanners
+			.iter()
+			.any(|s| s.frame_limit().frame_limit_method == Some(FrameLimitMethod::Mangohud));
+	let mangohud = mangohud_layer_installed();
+	let (supported, message) = support_summary(&config.frame_limit, mangohud);
+	let elapsed = start.elapsed().as_millis() as u64;
+	if supported && !(wants_mangohud && !mangohud) {
+		report.add_passed("Frame limiter", message, elapsed);
+	} else if supported {
+		report.add_warn(
+			"Frame limiter",
+			format!(
+				"  {message}\n  An application or scanner selects the MangoHud limiter, which is not installed; \
+				 those launches use the Proton limiters."
+			),
+			elapsed,
+		);
+	} else {
+		report.add_warn("Frame limiter", format!("  {message}"), elapsed);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1593,18 +1905,10 @@ mod tests {
 
 	#[test]
 	fn unavailable_capture_path_advertises_no_video_capabilities() {
-		let mut report = HealthReport {
-			duration: Duration::ZERO,
-			checks: Vec::new(),
-			all_fatal_passed: true,
-			supported_codecs: 0,
-			hdr_supported: false,
-			dma_buf_supported: false,
-			gpu_name: String::new(),
-		};
+		let mut report = HealthReport::empty();
 		let context = check_vulkan(&mut report, None);
 		assert!(context.is_none());
-		check_codecs(&mut report, context.as_ref());
+		check_codecs(&mut report, context.as_ref(), EncoderPreference::Auto);
 		assert!(!check_dmabuf(&mut report, context.as_ref()));
 		assert_eq!(report.supported_codecs, 0);
 		assert!(!report.hdr_supported);
@@ -1650,19 +1954,17 @@ mod tests {
 	}
 
 	#[test]
-	fn pyrowave_profiles_require_chroma_hdr_bits_and_full_range() {
+	fn pyrowave_profiles_require_chroma_and_hdr_bits_in_either_range() {
 		assert_eq!(CODEC_PYROWAVE, 0x00800000);
 		assert_eq!(CODEC_PYROWAVE_444, 0x01000000);
 		assert_eq!(CODEC_PYROWAVE_HDR, 0x02000000);
 		let caps = CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
-		assert!(supports_video_format(
-			caps,
-			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Full,)
-		));
-		assert!(!supports_video_format(
-			caps,
-			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Limited,)
-		));
+		for range in [ColorRange::Full, ColorRange::Limited] {
+			assert!(supports_video_format(
+				caps,
+				NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, range)
+			));
+		}
 		assert!(!supports_video_format(
 			CODEC_PYROWAVE_444,
 			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Full)
@@ -1688,15 +1990,18 @@ mod tests {
 	}
 
 	fn conversion_report(supported_codecs: u32) -> HealthReport {
-		HealthReport {
-			checks: Vec::new(),
-			all_fatal_passed: true,
+		let mut report = HealthReport {
 			supported_codecs,
-			hdr_supported: false,
 			dma_buf_supported: true,
-			gpu_name: String::new(),
-			duration: Duration::ZERO,
+			..HealthReport::empty()
+		};
+		for &(_, _, _, bit, _) in CONVENTIONAL_PROFILES
+			.iter()
+			.filter(|profile| supported_codecs & profile.3 != 0)
+		{
+			report.record_profile_backend(bit, EncoderBackend::Vulkan);
 		}
+		report
 	}
 
 	/// Issue #11: a GPU whose conversion loses chroma samples encodes every
@@ -1704,19 +2009,22 @@ mod tests {
 	/// profiles that convert through the failing format and keeps the rest.
 	#[test]
 	fn wrong_colors_withdraw_the_affected_profiles() {
-		use pixelforge::OutputFormat;
+		use convert::ConvertFormat;
 		let all = CODEC_H264 | CODEC_HEVC | CODEC_HEVC_MAIN10 | CODEC_HEVC_REXT_8444 | CODEC_AV1_MAIN8 | CODEC_PYROWAVE;
 		let mut report = conversion_report(all);
 		let mut checked = Vec::new();
 		record_color_conversion(&mut report, |format| {
 			checked.push(format);
 			match format {
-				OutputFormat::NV12 => Err("Cb 0/4 by column within a 4x2 block".into()),
+				ConvertFormat::Nv12 => Err("Cb 0/4 by column within a 4x2 block".into()),
 				_ => Ok(()),
 			}
 		});
 		// AV1/HEVC 4:4:4 10-bit are not supported: their format is not checked.
-		assert_eq!(checked, [OutputFormat::NV12, OutputFormat::P010, OutputFormat::YUV444]);
+		assert_eq!(
+			checked,
+			[ConvertFormat::Nv12, ConvertFormat::P010, ConvertFormat::Yuv444]
+		);
 		assert_eq!(
 			report.supported_codecs,
 			CODEC_HEVC_MAIN10 | CODEC_HEVC_REXT_8444 | CODEC_PYROWAVE
@@ -1736,6 +2044,35 @@ mod tests {
 				.contains("Clients can still use: HEVC Main10, HEVC 4:4:4, PyroWave.")
 		);
 		assert!(check.message.contains(crate::session::failure::ISSUES_URL));
+		// The withdrawn profiles' probe results now carry the reason.
+		let reason = |bit| {
+			report
+				.gpu
+				.profiles
+				.iter()
+				.find(|probe| probe.bit == bit)
+				.and_then(|probe| probe.unavailable.clone())
+		};
+		assert!(reason(CODEC_H264).unwrap().contains("wrong colors"));
+		assert_eq!(reason(CODEC_HEVC_MAIN10), None);
+	}
+
+	#[test]
+	fn unavailable_profiles_are_listed_once_per_reason() {
+		let mut report = HealthReport::empty();
+		report.record_profile(CODEC_H264, None);
+		report.record_profile(CODEC_HEVC_REXT_8444, Some("no 4:4:4".into()));
+		report.record_profile(CODEC_AV1_HIGH_8444, Some("no 4:4:4".into()));
+		report.record_profile(CODEC_AV1_MAIN8, Some("no AV1 encoder".into()));
+		report.record_profile(CODEC_PYROWAVE, Some("library missing".into()));
+		// A later result replaces the earlier one.
+		report.record_profile(CODEC_H264, Some("withdrawn".into()));
+		assert_eq!(report.gpu.profiles.len(), 5);
+		assert_eq!(
+			unavailable_summary(&report.gpu.profiles, CODEC_CONVENTIONAL_MASK),
+			"    H.264: withdrawn\n    HEVC 4:4:4, AV1 4:4:4: no 4:4:4\n    AV1: no AV1 encoder"
+		);
+		assert_eq!(unavailable_summary(&[], CODEC_CONVENTIONAL_MASK), "");
 	}
 
 	#[test]

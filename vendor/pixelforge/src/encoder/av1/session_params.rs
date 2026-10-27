@@ -29,6 +29,7 @@ impl Av1 {
             _ => ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
         };
         let av1_transfer = match desc.transfer_characteristics {
+            13 => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SRGB,
             16 => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_SMPTE_2084,
             _ => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
         };
@@ -69,7 +70,14 @@ impl Av1 {
             color_primaries: av1_color_primaries,
             transfer_characteristics: av1_transfer,
             matrix_coefficients: av1_matrix,
-            chroma_sample_position: ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
+            // Only 4:2:0 carries a position (AV1 spec 5.5.2).
+            chroma_sample_position: if (subsampling_x, subsampling_y) == (1, 1) {
+                ash::vk::native::StdVideoAV1ChromaSamplePosition::from(
+                    desc.chroma_location.av1_sample_position(),
+                )
+            } else {
+                ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN
+            },
         };
 
         let profile = match config.pixel_format {

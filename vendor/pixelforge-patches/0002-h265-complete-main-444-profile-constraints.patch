@@ -1,4 +1,4 @@
-From 227ae96e60ba00c16785e33e258d4b015b4ca204 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Karsy <karsy@localhost>
 Date: Mon, 12 Oct 2026 15:57:05 -0400
 Subject: [PATCH] h265: complete Main 4:4:4 profile constraints in cached
@@ -270,6 +270,3 @@ index 4deca2f..ffe2ca4 100644
 +        }
      }
  }
--- 
-2.56.0
-

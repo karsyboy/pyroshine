@@ -5,6 +5,7 @@ use async_shutdown::ShutdownManager;
 use clap::Parser;
 use moonshine_core::ShutdownReason;
 use moonshine_core::config::ApplicationConfig;
+use moonshine_core::healthcheck::{self, Capabilities};
 use moonshine_core::session::SessionContext;
 use moonshine_core::session::SessionKeyData;
 use moonshine_core::session::SessionKeys;
@@ -18,7 +19,7 @@ use moonshine_core::session::stream::control::ControlStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
 use moonshine_core::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
-use moonshine_core::session::stream::video::{ConversionQueueMode, FrameStats, PyroWaveQueueMode};
+use moonshine_core::session::stream::video::{ConversionQueueMode, EncoderPreference, FrameStats, PyroWaveQueueMode};
 use moonshine_core::session::{RemoteInputKey, RemoteInputKeyId};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -36,9 +37,23 @@ struct Args {
 	/// H.264/HEVC/AV1 conversion queue; auto prefers a dedicated compute family.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	conversion_queue: String,
+	/// H.264/HEVC/AV1 encoder backends (`stream.video.encoder`): auto prefers
+	/// Vulkan Video and falls back to VA-API, then NVENC, per profile.
+	#[arg(long, default_value = "auto", value_parser = ["auto", "vulkan", "vaapi", "nvenc"])]
+	encoder: String,
+	/// Application frame limit (`[frame_limit]`): off, stream, or a frame rate.
+	#[arg(long, default_value = "off")]
+	frame_limit: String,
+	/// Limiter for `--frame-limit`.
+	#[arg(long, default_value = "proton", value_parser = ["proton", "mangohud"])]
+	frame_limit_method: String,
 	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
+	/// Use PyroWave's record-framed dialect as Nightjar does: SDR frames of an
+	/// HDR stream are encoded as 10-bit sRGB SDR (BT.709 primaries and matrix).
+	#[arg(long)]
+	pyrowave_record: bool,
 	/// Transport measurement controls; encoding bitrate/quality remains unchanged.
 	#[arg(long)]
 	encrypt_video: bool,
@@ -50,6 +65,12 @@ struct Args {
 	minimum_fec_packets: u32,
 	#[arg(long, default_value_t = 1400)]
 	packet_size: usize,
+
+	/// Stream the running desktop (Desktop Mode, through the XDG Desktop
+	/// Portal) instead of launching `command` in the isolated compositor. The
+	/// resolution must match the captured output.
+	#[arg(long)]
+	desktop: bool,
 
 	/// Command to run (application to spawn).
 	command: Vec<String>,
@@ -74,6 +95,11 @@ struct Args {
 	#[arg(long, default_value_t = 20_000_000)]
 	bitrate: usize,
 
+	/// Benchmark-only live conventional rate change, SECONDS:BITS_PER_SECOND;
+	/// repeat in time order. Rates above the startup budget are clamped.
+	#[arg(long, value_parser = parse_rate_change, conflicts_with_all = ["capabilities", "pyrowave_matrix", "cycles", "reconnect_cycles"])]
+	rate_change: Vec<(u64, u32)>,
+
 	/// Video codec.
 	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1", "pyrowave"])]
 	codec: String,
@@ -86,9 +112,13 @@ struct Args {
 	#[arg(long, value_parser = parse_bit_depth)]
 	bit_depth: Option<u8>,
 
-	/// Encode full-range rather than limited-range YCbCr.
-	#[arg(long)]
+	/// Encode full-range rather than limited-range YCbCr (PyroWave's default).
+	#[arg(long, conflicts_with = "limited_range")]
 	full_range: bool,
+
+	/// Encode limited-range YCbCr, also for PyroWave (Moonlight clients' default).
+	#[arg(long)]
+	limited_range: bool,
 
 	/// Seconds to run before stopping (0 = run until Ctrl+C).
 	#[arg(long, default_value_t = 0)]
@@ -154,15 +184,48 @@ struct Args {
 	/// first-packet arrival in microseconds) to this file. Needs unencrypted video.
 	#[arg(long)]
 	rtp_trace: Option<std::path::PathBuf>,
+
+	/// Write a machine-readable result document (schema `pyroshine-bench/1`)
+	/// for the run or matrix to this file.
+	#[arg(long)]
+	json: Option<std::path::PathBuf>,
+
+	/// Probe the capture GPU like the server does at startup, print its
+	/// capabilities as JSON (also to `--json`) and exit.
+	#[arg(long)]
+	capabilities: bool,
+
+	/// Probe capabilities first and record workloads the GPU cannot encode as
+	/// `unsupported` instead of running them. A single unsupported run exits 3.
+	#[arg(long)]
+	skip_unsupported: bool,
 }
 
 #[path = "bench/cycles.rs"]
 mod cycles;
+#[path = "bench/report.rs"]
+mod report;
+
+/// Exit status of a single run the capture GPU cannot encode (`--skip-unsupported`).
+const EXIT_UNSUPPORTED: i32 = 3;
 
 /// Control-stream inactivity timeout. The benchmark has no Moonlight client to
 /// send control pings, so the production timeout would end every run longer
 /// than it (including `--duration 0` and long soak runs) after one minute.
 const STREAM_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+fn parse_rate_change(value: &str) -> Result<(u64, u32), String> {
+	let (time, rate) = value.split_once(':').ok_or("use SECONDS:BITS_PER_SECOND")?;
+	let time = time.parse::<u64>().map_err(|_| "invalid rate-change time")?;
+	if time > 86_400 {
+		return Err("rate changes must be within 24 hours".into());
+	}
+	let rate = rate.parse::<u32>().map_err(|_| "invalid rate-change bitrate")?;
+	if rate == 0 {
+		return Err("rate-change bitrate must be non-zero".into());
+	}
+	Ok((time, rate))
+}
 
 fn parse_codec_list(value: &str) -> Result<String, String> {
 	let valid = value
@@ -223,7 +286,7 @@ fn selected_format(args: &Args, codec: VideoCodec) -> Result<NegotiatedVideoForm
 		10 => BitDepth::Ten,
 		_ => unreachable!(),
 	};
-	let range = if codec == VideoCodec::PyroWave || args.full_range {
+	let range = if args.full_range || (codec == VideoCodec::PyroWave && !args.limited_range) {
 		ColorRange::Full
 	} else {
 		ColorRange::Limited
@@ -307,6 +370,7 @@ impl LatencyDistribution {
 #[derive(Clone, Debug)]
 struct StatsSummary {
 	count: u64,
+	elapsed_s: f64,
 	fps: f64,
 	mbps: f64,
 	wire_mbps: f64,
@@ -330,6 +394,17 @@ struct StatsSummary {
 	avg_send_us: f64,
 	avg_enqueue_us: f64,
 	key_frames: u64,
+	/// Content-time intervals of frames with new content (replays excluded).
+	source_interval: LatencyDistribution,
+	/// Frames by capture path: direct, direct with late layers, composited.
+	capture_paths: [u64; 3],
+	/// Composited frames by the first condition that ruled out direct export.
+	composition_reasons: std::collections::BTreeMap<&'static str, u64>,
+	vrr_frames: u64,
+	attempted_packets: u64,
+	submitted_packets: u64,
+	failed_packets: u64,
+	discarded_packets: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +462,8 @@ struct BenchmarkReport {
 	codec: String,
 	summary: Option<StatsSummary>,
 	interrupted: bool,
+	/// The `--json` record of this run.
+	record: serde_json::Value,
 }
 
 struct MatrixReport {
@@ -429,6 +506,14 @@ struct StatsAccumulator {
 	packet_count: u64,
 	encoded_size_samples: Vec<u64>,
 	stale_frames_dropped: u64,
+	source_interval_us: u128,
+	source_interval_samples_us: Vec<u64>,
+	capture_paths: [u64; 3],
+	composition_reasons: std::collections::BTreeMap<&'static str, u64>,
+	vrr_frames: u64,
+	attempted_packets: u64,
+	failed_packets: u64,
+	discarded_packets: u64,
 	start: Instant,
 	last_print: Instant,
 }
@@ -462,6 +547,14 @@ impl StatsAccumulator {
 			packet_count: 0,
 			encoded_size_samples: Vec::new(),
 			stale_frames_dropped: 0,
+			source_interval_us: 0,
+			source_interval_samples_us: Vec::new(),
+			capture_paths: [0; 3],
+			composition_reasons: std::collections::BTreeMap::new(),
+			vrr_frames: 0,
+			attempted_packets: 0,
+			failed_packets: 0,
+			discarded_packets: 0,
 			start: now,
 			last_print: now,
 		}
@@ -505,6 +598,23 @@ impl StatsAccumulator {
 		self.packet_count += stats.packet_count as u64;
 		self.encoded_size_samples.push(stats.encoded_bytes as u64);
 		self.stale_frames_dropped += u64::from(stats.stale_frames_dropped);
+		if !stats.source_interval.is_zero() {
+			let interval = stats.source_interval.as_micros() as u64;
+			self.source_interval_us += interval as u128;
+			self.source_interval_samples_us.push(interval);
+		}
+		self.capture_paths[match stats.capture_path() {
+			"direct" => 0,
+			"direct_late" => 1,
+			_ => 2,
+		}] += 1;
+		if let Some(reason) = stats.composition_reason() {
+			*self.composition_reasons.entry(reason).or_insert(0) += 1;
+		}
+		self.vrr_frames += u64::from(stats.vrr_capture);
+		self.attempted_packets += stats.attempted_packet_count as u64;
+		self.failed_packets += stats.failed_packet_count as u64;
+		self.discarded_packets += stats.discarded_packet_count as u64;
 	}
 
 	fn summary(&self) -> Option<StatsSummary> {
@@ -530,6 +640,7 @@ impl StatsAccumulator {
 
 		Some(StatsSummary {
 			count: self.count,
+			elapsed_s: elapsed,
 			fps,
 			mbps,
 			wire_mbps,
@@ -550,6 +661,14 @@ impl StatsAccumulator {
 			avg_send_us: self.send_us as f64 / self.count as f64,
 			avg_enqueue_us: self.enqueue_us as f64 / self.count as f64,
 			key_frames: self.key_frames,
+			source_interval: LatencyDistribution::new(self.source_interval_us, &self.source_interval_samples_us),
+			capture_paths: self.capture_paths,
+			composition_reasons: self.composition_reasons.clone(),
+			vrr_frames: self.vrr_frames,
+			attempted_packets: self.attempted_packets,
+			submitted_packets: self.packet_count,
+			failed_packets: self.failed_packets,
+			discarded_packets: self.discarded_packets,
 		})
 	}
 
@@ -643,6 +762,18 @@ impl StatsAccumulator {
 		);
 		tracing::info!("  key_frames: {}", summary.key_frames);
 		tracing::info!("  stale compositor frames dropped: {}", summary.stale_frames_dropped);
+		tracing::info!(
+			"  capture: direct={} direct_late={} composited={} vrr={}  source interval: p50={}us p99={}us max={}us  packets failed/discarded: {}/{}",
+			summary.capture_paths[0],
+			summary.capture_paths[1],
+			summary.capture_paths[2],
+			summary.vrr_frames,
+			summary.source_interval.p50_us,
+			summary.source_interval.p99_us,
+			summary.source_interval.max_us,
+			summary.failed_packets,
+			summary.discarded_packets,
+		);
 
 		Some(summary)
 	}
@@ -661,8 +792,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.init();
 
 	let args = Args::parse();
+	if args.rate_change.len() > 64 || args.rate_change.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+		return Err(boxed_error("at most 64 rate changes, ordered by time"));
+	}
+	if !args.rate_change.is_empty() && args.codec == "pyrowave" {
+		return Err(boxed_error("live rates require a conventional codec"));
+	}
 
-	if args.command.is_empty() {
+	if args.capabilities {
+		return run_capabilities(&args).await;
+	}
+
+	if args.command.is_empty() && !args.desktop {
 		tracing::error!("No command provided. Usage: moonshine-bench [OPTIONS] <COMMAND>");
 		std::process::exit(1);
 	}
@@ -678,9 +819,142 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 }
 
-async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await?;
+fn encoder_preference(args: &Args) -> EncoderPreference {
+	match args.encoder.as_str() {
+		"vulkan" => EncoderPreference::Vulkan,
+		"vaapi" => EncoderPreference::Vaapi,
+		"nvenc" => EncoderPreference::Nvenc,
+		_ => EncoderPreference::Auto,
+	}
+}
+
+/// Probe the capture GPU exactly as the server does at startup. Blocking GPU
+/// work, so it runs off the async runtime.
+async fn probe_capabilities(args: &Args) -> Result<Capabilities, Box<dyn std::error::Error>> {
+	let mut config = moonshine_core::config::Config::default();
+	config.stream.video.encoder = encoder_preference(args);
+	Ok(tokio::task::spawn_blocking(move || healthcheck::probe_capabilities(Some(&config))).await?)
+}
+
+async fn run_capabilities(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+	let capabilities = probe_capabilities(args).await?;
+	let document = report::document(Some(&capabilities), Vec::new(), unix_now());
+	println!("{}", serde_json::to_string_pretty(&document)?);
+	if let Some(path) = &args.json {
+		report::write(path, &document)?;
+	}
 	Ok(())
+}
+
+/// Capabilities to gate workloads with, when `--skip-unsupported` asks for it.
+async fn gating_capabilities(args: &Args) -> Result<Option<Capabilities>, Box<dyn std::error::Error>> {
+	if !args.skip_unsupported {
+		return Ok(None);
+	}
+	let capabilities = probe_capabilities(args).await?;
+	tracing::info!(
+		gpu = capabilities.gpu_name,
+		profiles = ?healthcheck::codec_profile_labels(capabilities.supported_codecs),
+		hdr = capabilities.hdr_supported,
+		dma_buf = capabilities.dma_buf_supported,
+		"Probed capture GPU capabilities"
+	);
+	Ok(Some(capabilities))
+}
+
+fn unix_now() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_secs())
+		.unwrap_or(0)
+}
+
+fn write_json(args: &Args, capabilities: Option<&Capabilities>, runs: Vec<serde_json::Value>, started: u64) {
+	if let Some(path) = &args.json {
+		let document = report::document(capabilities, runs, started);
+		match report::write(path, &document) {
+			Ok(()) => tracing::info!(path = %path.display(), "Wrote benchmark results"),
+			Err(err) => tracing::error!(path = %path.display(), %err, "Failed to write benchmark results"),
+		}
+	}
+}
+
+async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+	let started = unix_now();
+	let capabilities = gating_capabilities(args).await?;
+	let result = run_benchmark(
+		args,
+		"",
+		&args.resolution,
+		args.fps,
+		&args.codec,
+		args.duration,
+		capabilities.as_ref(),
+	)
+	.await;
+	let record = match &result {
+		Ok(report) => report.record.clone(),
+		Err(err) => failed_record(args, &args.resolution, args.fps, &args.codec, args.duration, err),
+	};
+	let unsupported = record["status"] == "unsupported";
+	write_json(args, capabilities.as_ref(), vec![record], started);
+	result?;
+	if unsupported {
+		std::process::exit(EXIT_UNSUPPORTED);
+	}
+	Ok(())
+}
+
+/// The requested workload, with the negotiated format once it is known.
+fn workload(
+	args: &Args,
+	resolution: &str,
+	target_fps: u32,
+	codec: &str,
+	duration: u64,
+	format: Option<NegotiatedVideoFormat>,
+) -> serde_json::Value {
+	serde_json::json!({
+		"codec": codec,
+		"resolution": resolution,
+		"fps": target_fps,
+		"bitrate_bps": args.bitrate,
+		"rate_changes": args.rate_change,
+		"chroma": format.map(|format| format.chroma.to_string()).unwrap_or_else(|| args.chroma.clone()),
+		"bit_depth": format.map(|format| format.bit_depth.bits()),
+		"range": format.map(|format| format!("{:?}", format.range).to_lowercase()),
+		"hdr": args.hdr,
+		"encoder": if codec == "pyrowave" { "pyrowave".to_string() } else { args.encoder.clone() },
+		"capture_mode": if args.composited { "composited" } else { "auto" },
+		"vrr": args.vrr,
+		"cursor": args.cursor,
+		"encrypt_video": args.encrypt_video,
+		"fec_mode": args.fec_mode,
+		"fec_percentage": args.fec_percentage,
+		"minimum_fec_packets": args.minimum_fec_packets,
+		"packet_size": args.packet_size,
+		"conversion_queue": args.conversion_queue,
+		"pyrowave_queue": args.pyrowave_queue,
+		"pyrowave_record": args.pyrowave_record,
+		"duration_s": duration,
+		"warmup_s": args.warmup,
+		"command": args.command,
+	})
+}
+
+fn failed_record(
+	args: &Args,
+	resolution: &str,
+	target_fps: u32,
+	codec: &str,
+	duration: u64,
+	err: &dyn std::fmt::Display,
+) -> serde_json::Value {
+	serde_json::json!({
+		"workload": workload(args, resolution, target_fps, codec, duration, None),
+		"status": "failed",
+		"error": err.to_string(),
+	})
 }
 
 async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -707,7 +981,10 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 		args.duration
 	};
 
+	let started = unix_now();
+	let capabilities = gating_capabilities(args).await?;
 	let mut reports = Vec::new();
+	let mut records = Vec::new();
 	let mut interrupted = false;
 
 	tracing::info!("Starting Moonshine benchmark matrix");
@@ -729,8 +1006,19 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 					codec
 				);
 
-				match run_benchmark(args, resolution_label, resolution, fps, codec, duration).await {
+				match run_benchmark(
+					args,
+					resolution_label,
+					resolution,
+					fps,
+					codec,
+					duration,
+					capabilities.as_ref(),
+				)
+				.await
+				{
 					Ok(report) => {
+						records.push(report.record);
 						interrupted = report.interrupted;
 						let status = if report.interrupted {
 							MatrixStatus::Interrupted(report.summary)
@@ -750,6 +1038,7 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 						}
 					},
 					Err(err) => {
+						records.push(failed_record(args, resolution, fps, codec, duration, &err));
 						tracing::error!(
 							"Matrix run failed: {} {} {}fps {}: {}",
 							resolution_label,
@@ -772,6 +1061,7 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	}
 
 	print_matrix_summary(&reports);
+	write_json(args, capabilities.as_ref(), records, started);
 
 	if interrupted {
 		return Err(boxed_error("Matrix benchmark interrupted"));
@@ -795,10 +1085,26 @@ async fn run_benchmark(
 	target_fps: u32,
 	codec: &str,
 	duration: u64,
+	capabilities: Option<&Capabilities>,
 ) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
 	let (width, height) = parse_resolution(resolution).map_err(boxed_error)?;
 	let video_format = parse_codec(codec);
 	let negotiated_format = selected_format(args, video_format)?;
+	let workload = workload(args, resolution, target_fps, codec, duration, Some(negotiated_format));
+	if let Some(reason) =
+		capabilities.and_then(|capabilities| report::unsupported_reason(capabilities, negotiated_format))
+	{
+		tracing::warn!(resolution, target_fps, codec, reason, "Skipping unsupported workload");
+		return Ok(BenchmarkReport {
+			resolution_label,
+			resolution: resolution.to_string(),
+			target_fps,
+			codec: codec.to_string(),
+			summary: None,
+			interrupted: false,
+			record: serde_json::json!({ "workload": workload, "status": "unsupported", "reason": reason }),
+		});
+	}
 
 	tracing::info!("Starting Moonshine benchmark");
 	tracing::info!("  command:    {}", args.command.join(" "));
@@ -829,6 +1135,7 @@ async fn run_benchmark(
 			bench_pointer: bench_pointer(args),
 			..Default::default()
 		},
+		Default::default(),
 		VideoStreamConfig {
 			fec_percentage: args.fec_percentage,
 			fec_mode: match args.fec_mode.as_str() {
@@ -846,6 +1153,11 @@ async fn run_benchmark(
 				"compute" => PyroWaveQueueMode::Compute,
 				_ => PyroWaveQueueMode::Auto,
 			},
+			encoder: encoder_preference(args),
+			// The probed backend per profile, as the server uses it.
+			encoder_table: capabilities
+				.map(|capabilities| capabilities.gpu.encoder_table())
+				.unwrap_or_default(),
 			..VideoStreamConfig::default()
 		},
 		AudioStreamConfig {
@@ -859,6 +1171,7 @@ async fn run_benchmark(
 		"127.0.0.1".to_string(),
 		STREAM_TIMEOUT_SECS,
 		false,
+		frame_limit(args)?,
 		shutdown.clone(),
 	)
 	.map_err(|_| boxed_error("Failed to create session manager"))?;
@@ -867,6 +1180,11 @@ async fn run_benchmark(
 
 	let app_config = ApplicationConfig {
 		title: "bench".to_string(),
+		mode: if args.desktop {
+			moonshine_core::config::SessionMode::Desktop
+		} else {
+			moonshine_core::config::SessionMode::Game
+		},
 		command: args.command.clone(),
 		..Default::default()
 	};
@@ -883,9 +1201,11 @@ async fn run_benchmark(
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
+		hdr_mode: None,
 		// The benchmark is the local client: it discovers the video endpoint
 		// with a legacy PING from loopback below.
 		client_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+		client_identity: None,
 		vrr_requested: args.vrr,
 	};
 
@@ -902,8 +1222,13 @@ async fn run_benchmark(
 	}
 
 	let video_ctx = VideoStreamContext {
-		pyrowave_dialect: (negotiated_format.codec == VideoCodec::PyroWave)
-			.then_some(moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1),
+		pyrowave_dialect: (negotiated_format.codec == VideoCodec::PyroWave).then_some(if args.pyrowave_record {
+			moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::RecordFramed
+		} else {
+			moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1
+		}),
+		// `--pyrowave-record` emulates Nightjar, which presents by HDR mode.
+		pyrowave_sdr_as_sdr: args.pyrowave_record,
 		width,
 		height,
 		fps: target_fps,
@@ -964,6 +1289,9 @@ async fn run_benchmark(
 			self.0.abort();
 		}
 	}
+	// Frames are measured from here; the arrival trace starts at the same time.
+	let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
+	let arrivals = std::sync::Arc::new(std::sync::Mutex::new(report::ArrivalTrace::default()));
 	let ping_sock = UdpSocket::bind("127.0.0.1:0")?;
 	ping_sock.send_to(b"PING", ping_addr)?;
 	ping_sock.set_nonblocking(true)?;
@@ -976,25 +1304,37 @@ async fn run_benchmark(
 		use std::io::Write;
 		writeln!(trace, "frame_index,rtp_timestamp,arrival_us")?;
 	}
+	let encrypted = args.encrypt_video;
 	let _udp_receiver = DrainGuard(tokio::spawn({
 		let receiver = receiver.clone();
+		let arrivals = arrivals.clone();
 		async move {
 			let mut buffer = [0u8; 65536];
 			let started = Instant::now();
 			let mut last_frame = None;
 			while let Ok((length, _)) = receiver.recv_from(&mut buffer).await {
+				let arrived = Instant::now();
 				// Unencrypted shard: RTP header (timestamp at 4..8, big endian),
 				// four bytes of padding, then NV_VIDEO_PACKET (frame index at 4..8).
+				// Encrypted shard: iv(12), then the frame number in clear.
+				if length < 24 {
+					continue;
+				}
+				let frame_bytes = if encrypted { 12..16 } else { 20..24 };
+				let frame = u32::from_le_bytes(buffer[frame_bytes].try_into().unwrap());
+				if last_frame == Some(frame) {
+					continue;
+				}
+				last_frame = Some(frame);
+				if arrived >= warmup_deadline {
+					arrivals.lock().unwrap().record(arrived);
+				}
 				if let Some(trace) = rtp_trace.as_mut()
-					&& length >= 24
+					&& !encrypted
 				{
-					let frame = u32::from_le_bytes(buffer[20..24].try_into().unwrap());
-					if last_frame != Some(frame) {
-						last_frame = Some(frame);
-						let rtp = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
-						use std::io::Write;
-						let _ = writeln!(trace, "{frame},{rtp},{}", started.elapsed().as_micros());
-					}
+					let rtp = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
+					use std::io::Write;
+					let _ = writeln!(trace, "{frame},{rtp},{}", started.elapsed().as_micros());
 				}
 			}
 			if let Some(mut trace) = rtp_trace {
@@ -1025,10 +1365,11 @@ async fn run_benchmark(
 		(samples, DrainGuard(task))
 	});
 
-	let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
 	let mut accum = StatsAccumulator::new();
 	let mut total = StatsAccumulator::new();
 	let mut warned_no_frames = false;
+	let mut stats_lagged = 0u64;
+	let mut measurement_start: Option<(report::ProcessSnapshot, Option<report::DeviceBusySampler>)> = None;
 
 	let duration_deadline = if duration > 0 {
 		Some(Instant::now() + Duration::from_secs(duration))
@@ -1036,6 +1377,9 @@ async fn run_benchmark(
 		None
 	};
 	let mut interrupted = false;
+	let rate_started = tokio::time::Instant::now();
+	let mut rate_changes = args.rate_change.iter().copied().peekable();
+	let mut rate_results = Vec::new();
 
 	loop {
 		let duration_remaining = duration_deadline
@@ -1043,6 +1387,19 @@ async fn run_benchmark(
 			.unwrap_or(Duration::from_secs(86400 * 365 * 100)); // ~100 years = no limit
 		tokio::select! {
 			biased;
+			_ = tokio::time::sleep_until(rate_started + Duration::from_secs(rate_changes.peek().map_or(86400 * 365, |(seconds, _)| *seconds))), if rate_changes.peek().is_some() => {
+				let (seconds, rate) = rate_changes.next().unwrap();
+				let outcome = match session_manager.bench_set_bitrate(rate).await {
+					Ok(reply) => match tokio::time::timeout(Duration::from_secs(5), reply).await {
+						Ok(Ok(update)) => serde_json::to_value(update)?,
+						Ok(Err(_)) => serde_json::json!({"state": "failed", "error": "rate reply closed"}),
+						Err(_) => serde_json::json!({"state": "pending", "status": session_manager.bench_bitrate_status().await}),
+					},
+					Err(error) => serde_json::json!({"state": "failed", "error": error}),
+				};
+				tracing::info!(?outcome, "Live bitrate benchmark update");
+				rate_results.push(serde_json::json!({"scheduled_s": seconds, "requested_bps": rate, "result": outcome}));
+			},
 			result = stats_rx.recv() => {
 				match result {
 					Ok(stats) => {
@@ -1063,6 +1420,9 @@ async fn run_benchmark(
 									stats.encoded_bytes,
 								);
 							}
+							if measurement_start.is_none() {
+								measurement_start = Some((report::ProcessSnapshot::take(), report::DeviceBusySampler::start()));
+							}
 							accum.add(&stats);
 							total.add(&stats);
 
@@ -1078,6 +1438,7 @@ async fn run_benchmark(
 					},
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 						tracing::warn!("Stats channel lagged, dropped {} frames", n);
+						stats_lagged += n;
 					},
 					Err(tokio::sync::broadcast::error::RecvError::Closed) => {
 						tracing::info!("Stats channel closed (pipeline stopped).");
@@ -1105,12 +1466,42 @@ async fn run_benchmark(
 		}
 	}
 
+	let measurement_end = report::ProcessSnapshot::take();
+	let resources = serde_json::json!({
+		"process": measurement_start
+			.as_ref()
+			.map(|(start, _)| report::process_usage(start, &measurement_end)),
+		"process_counts": report::process_counts(),
+		"device_busy": measurement_start.and_then(|(_, sampler)| sampler).map(report::DeviceBusySampler::finish),
+	});
 	let summary = if total.count == 0 {
 		tracing::warn!("No frames were encoded during the session.");
 		None
 	} else {
 		total.print_summary("Session")
 	};
+	let pacing = summary.as_ref().map(|summary| {
+		let arrivals = arrivals.lock().unwrap();
+		let pacing = report::pacing(
+			&arrivals,
+			target_fps,
+			Duration::from_secs_f64(summary.elapsed_s),
+			summary.count,
+		);
+		tracing::info!(
+			"  pacing: expected={} delivered={} arrival interval p50={}us p95={}us p99={}us max={}us late={} missed slots={}",
+			pacing["expected_frames"],
+			pacing["delivered_frames"],
+			pacing["arrival"]["interval_us"]["p50"],
+			pacing["arrival"]["interval_us"]["p95"],
+			pacing["arrival"]["interval_us"]["p99"],
+			pacing["arrival"]["interval_us"]["max"],
+			pacing["arrival"]["late_intervals"],
+			pacing["arrival"]["missed_frame_slots"],
+		);
+		pacing
+	});
+	let mut runtime_probe = serde_json::Value::Null;
 	if let Some((samples, _task)) = probe {
 		let mut samples = samples.lock().unwrap().clone();
 		samples.sort_unstable();
@@ -1124,8 +1515,22 @@ async fn run_benchmark(
 				at(0.999),
 				samples[samples.len() - 1]
 			);
+			runtime_probe = serde_json::json!({
+				"samples": samples.len(),
+				"lateness_us": { "p50": at(0.5), "p99": at(0.99), "p999": at(0.999), "max": samples[samples.len() - 1] },
+			});
 		}
 	}
+	let record = serde_json::json!({
+		"workload": workload,
+		"status": if interrupted { "interrupted" } else if summary.is_some() { "ok" } else { "no_frames" },
+		"summary": summary.as_ref().map(report::summary),
+		"pacing": pacing,
+		"resources": resources,
+		"stats_lagged": stats_lagged,
+		"runtime_probe": runtime_probe,
+		"rate_updates": rate_results,
+	});
 
 	if args.detach_seconds > 0 && !interrupted {
 		detach_measurement(
@@ -1151,6 +1556,7 @@ async fn run_benchmark(
 		codec: codec.to_string(),
 		summary,
 		interrupted,
+		record,
 	})
 }
 
@@ -1422,4 +1828,28 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 
 fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 	Box::new(std::io::Error::other(message.into()))
+}
+
+/// `[frame_limit]` from `--frame-limit` and `--frame-limit-method`.
+pub(crate) fn frame_limit(
+	args: &Args,
+) -> Result<moonshine_core::session::frame_limit::FrameLimitConfig, Box<dyn std::error::Error>> {
+	use moonshine_core::session::frame_limit::{FrameLimitConfig, FrameLimitMethod, FrameLimitMode};
+	let method = if args.frame_limit_method == "mangohud" {
+		FrameLimitMethod::Mangohud
+	} else {
+		FrameLimitMethod::Proton
+	};
+	let (mode, fps) = match args.frame_limit.as_str() {
+		"off" => (FrameLimitMode::Off, 60),
+		"stream" => (FrameLimitMode::Stream, 60),
+		rate => (
+			FrameLimitMode::Custom,
+			rate.parse()
+				.map_err(|_| boxed_error("--frame-limit must be off, stream or a frame rate"))?,
+		),
+	};
+	let config = FrameLimitConfig { mode, fps, method };
+	config.validate().map_err(boxed_error)?;
+	Ok(config)
 }

@@ -1,5 +1,5 @@
 //! End-to-end tests of the management interface over a private D-Bus
-//! daemon, through the same client proxy the desktop UI uses.
+//! daemon, through the same client proxy the tray and the commands use.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -15,7 +15,7 @@ use moonshine_management::{ManagementError, ManagementProxy, UI_BUS_NAME};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::{Management, ServerFacts, serve};
+use super::{Management, ServerFacts, follow};
 use crate::clients::{ClientManager, PendingClient, new_approval_token};
 use crate::config::Config;
 use crate::session::manager::SessionManager;
@@ -105,6 +105,7 @@ struct Harness {
 	clients: ClientManager,
 	proxy: ManagementProxy<'static>,
 	config_path: std::path::PathBuf,
+	tray_requests: Arc<Notify>,
 	_directory: tempfile::TempDir,
 	_server: tokio::task::JoinHandle<()>,
 }
@@ -118,7 +119,7 @@ impl Harness {
 		let shutdown = async_shutdown::ShutdownManager::new();
 		let sessions = SessionManager::for_test(shutdown.clone());
 		let clients = ClientManager::isolated(directory.path().join("state.toml"));
-		clients.ensure_cleanup(shutdown);
+		clients.ensure_cleanup(shutdown.clone());
 		let mut config = Config::default();
 		config.webserver.enable_pairing = true;
 		config.stream.timeout = 60;
@@ -131,9 +132,21 @@ impl Harness {
 			gpu_name: "Test GPU".into(),
 			health: None,
 		};
-		let management = Arc::new(Management::new(facts, &config, sessions.clone(), clients.clone()));
+		let management = Arc::new(Management::new(
+			facts,
+			&config,
+			crate::app_scanner::Library::fixed(&config.applications),
+			sessions.clone(),
+			clients.clone(),
+			Arc::new(super::auth::Auth::open(directory.path().join("management.json"))),
+			None,
+			shutdown,
+		));
+		let tray_requests = management.tray_requests.clone();
 		let builder = zbus::connection::Builder::address(bus.address.as_str());
-		let server = tokio::spawn(serve(management, builder));
+		let server = tokio::spawn(async move {
+			tokio::join!(follow(&management), super::dbus::serve(management.clone(), builder));
+		});
 		let connection = bus.connect().await;
 		let proxy = ManagementProxy::new(&connection).await.unwrap();
 		// The service owns its name once it answers.
@@ -148,6 +161,7 @@ impl Harness {
 			clients,
 			proxy,
 			config_path,
+			tray_requests,
 			_directory: directory,
 			_server: server,
 		}
@@ -217,6 +231,15 @@ async fn server_session_and_capabilities_are_reported() {
 }
 
 #[tokio::test]
+async fn show_tray_wakes_the_tray_launcher() {
+	let harness = Harness::start().await;
+	harness.proxy.show_tray().await.unwrap();
+	tokio::time::timeout(Duration::from_secs(5), harness.tray_requests.notified())
+		.await
+		.expect("the launcher is woken");
+}
+
+#[tokio::test]
 async fn foreground_only_changes_emit_session_snapshots_without_lifecycle_changes() {
 	use crate::session::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 	use crate::session::stream::audio::AudioChannels;
@@ -241,9 +264,11 @@ async fn foreground_only_changes_emit_session_snapshots_without_lifecycle_change
 			resolution: (1920, 1080),
 			refresh_rate: 60,
 			hdr: false,
+			hdr_mode: None,
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: "127.0.0.1".parse().unwrap(),
+			client_identity: None,
 			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				RemoteInputKey::from_bytes([7; 16]),
@@ -306,9 +331,11 @@ async fn authorization_changes_emit_current_client_address() {
 			resolution: (1920, 1080),
 			refresh_rate: 60,
 			hdr: false,
+			hdr_mode: None,
 			audio_channels: AudioChannels::Stereo,
 			audio_channel_mask: 3,
 			client_ip: "127.0.0.1".parse().unwrap(),
+			client_identity: None,
 			vrr_requested: false,
 			keys: SessionKeys::Keys(SessionKeyData::new(
 				RemoteInputKey::from_bytes([7; 16]),
@@ -554,7 +581,7 @@ async fn the_desktop_ui_name_suppresses_fallback_notifications() {
 	}
 }
 
-/// Rejected launches and negotiations reach the desktop app as events with
+/// Rejected launches and negotiations reach the management clients as events with
 /// their cause and hint, are kept for `GetEvents`, and appear in the
 /// diagnostic report.
 #[tokio::test]

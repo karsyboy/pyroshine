@@ -13,16 +13,17 @@ User-facing configuration lives in [CONFIGURATION.md](CONFIGURATION.md).
 
 | Crate | Output | Role |
 | --- | --- | --- |
-| Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown |
+| Root `moonshine` (`src/main.rs`) | `moonshine` binary, installed as `pyroshine` | CLI, configuration loading, host checks, service wiring, process shutdown; the desktop tray (`src/tray/`, run as a child process) |
 | `moonshine-core` | Library | Every server subsystem: protocol endpoints, pairing, sessions, compositor, encoders, transport, input |
 | `moonshine-tools` | `moonshine-bench` | Developer benchmark that drives the production session stack without a client |
-| `moonshine-management` | Library | Local management API contract: D-Bus names, JSON documents, error names and client proxies |
-| `pyroshine-ui/` (separate workspace) | `pyroshine-ui` | Optional desktop app: tray, notifications, pairing, settings and dashboard |
+| `moonshine-management` | Library | Management contract: JSON documents, D-Bus names, error names and client proxies |
+| `web/` (npm, not Cargo) | Static files in `share/pyroshine/web` | The web management interface's React/Material UI frontend |
 
 Native dependencies cross explicit boundaries: Smithay (compositor), Pixelforge
 (Vulkan Video encoding, vendored at its upstream release plus the patches in
-`vendor/pixelforge-patches/`), the optional PyroWave shared library (loaded at
-runtime), the vendored Inputtino native backend (virtual input devices), and
+`vendor/pixelforge-patches/`), the optional PyroWave shared library, libva and
+the NVIDIA driver's CUDA and NVENC libraries (all loaded at runtime only when
+used), the vendored Inputtino native backend (virtual input devices), and
 systemd/logind over D-Bus. Internal crate names, paths, environment variables
 and protocol identifiers keep the upstream `moonshine` spelling.
 
@@ -67,18 +68,21 @@ flowchart LR
 
 | Component | Responsibility | Does not own |
 | --- | --- | --- |
-| `src/main.rs` | Load config, scan applications, wait for the user D-Bus session, run host checks, construct services, handle SIGTERM/SIGINT | Session state |
-| `config.rs`, `app_scanner/` | Deserialize `config.toml`; discover Steam, Lutris, Heroic and desktop-entry applications at startup | Runtime reconfiguration |
+| `src/main.rs` | Load config, start the application library, wait for the user D-Bus session, run host checks, construct services, handle SIGTERM/SIGINT | Session state |
+| `config.rs` | Deserialize `config.toml` | Runtime reconfiguration |
+| `app_scanner/` | The application catalog: discover Steam, Lutris, Heroic, Bottles and desktop-entry applications, follow their changes, keep stable IDs and visibility choices, render box art | Sessions (a launch copies its entry) |
 | `healthcheck.rs`, `gpu.rs` | Probe GPU, Vulkan, DMA-BUF and encoder profiles; verify the capture and encode devices are the same GPU | Encoding |
 | `discovery.rs` | Advertise `_nvstream._tcp` over mDNS | — |
 | `tls.rs`, `clients.rs`, `state.rs`, `durable.rs` | Server identity, paired-client trust, durable `state.toml` | Session authorization |
 | `webserver/` | GameStream HTTP/HTTPS API: server info, app list, pairing, launch/resume/cancel, PyroWave bandwidth probe | Stream properties |
+| `calibration/` | UDP bandwidth calibration runs on the idle video port through the production sender; yields the port to sessions | Calibration runs |
 | `rtsp.rs` | RTSP OPTIONS/DESCRIBE/SETUP/ANNOUNCE/PLAY; parse and validate negotiated stream contexts | Encoders or sockets |
 | `ingress.rs` | Bounded, cancellable tasks for accepted HTTP, HTTPS and RTSP connections | Protocol semantics |
 | `session/manager.rs` | The single session's lifecycle, transitions, authorization generations, keys and teardown | Resource creation details |
-| `session/mod.rs` (`SystemSession`) | Builds the compositor, application and streams for each transition | Lifecycle decisions |
+| `session/mod.rs` (`SystemSession`) | Builds the capture source, application and streams for each transition | Lifecycle decisions |
 | `session/application.rs` | Run the application, pre/post commands and output routing as the `moonshine-session.service` systemd user unit | — |
-| `session/compositor/` | Wayland/XWayland server, scene, focus, cursor, Steam classification, output mode, capture and frame export | Codec negotiation, transport |
+| `session/capture/` | Capture backend selection, start and readiness contract, capabilities, output mode; the shared frame contract (`frame.rs`) and capture admission (`admission.rs`) | Scene, focus, encoding |
+| `session/compositor/` | The isolated capture backend: Wayland/XWayland server, scene, focus, cursor, Steam classification, output, capture and frame export | Codec negotiation, transport |
 | `session/stream/video/` | Import, convert and encode captured frames; packetize, protect, encrypt, pace and send | Scene composition |
 | `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
 | `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
@@ -112,14 +116,18 @@ runs on dedicated threads that communicate through bounded channels:
 | Control task | ENet service loop, message decoding, input routing, feedback |
 | `gamepad-input` thread | Inputtino virtual controller state and native feedback callbacks |
 | Manager-owned tasks | Session transitions and teardown |
+| `library` thread | Application discovery, change detection and catalog publication, at nice 10 and idle I/O priority |
 
 Every session worker registers a `lifecycle::WorkerGuard` before it is spawned,
 so session completion means every worker has exited and released what it owns.
 
 ## Startup and capability advertisement
 
-`src/main.rs` loads or creates the configuration, scans applications, waits for
-the user D-Bus session, then runs the health check. `pyroshine healthcheck`
+`src/main.rs` loads or creates the configuration, starts the application
+library (its initial scan runs on the `library` thread while the host checks
+run), waits for the user D-Bus session, then runs the health check. Listeners
+start once the initial catalog is published, or after 30 s with the manual
+entries if a scan hangs. `pyroshine healthcheck`
 runs the same checks and exits. `--no-health-check` skips the report but still
 probes GPU capabilities, and the server refuses to start without DMA-BUF import.
 
@@ -131,14 +139,25 @@ a library or extension name:
   used for capture (`VK_EXT_physical_device_drm`, with the complete PCI address
   as a fallback). An unresolvable or mismatched identity advertises no codec,
   HDR or DMA-BUF capability and prevents launch. No cross-device
-  capture-to-encode path exists.
+  capture-to-encode path exists. The context does not require Vulkan Video
+  encode: a GPU without it (Intel Xe2 and newer under Mesa, or any driver that
+  lacks the encode extensions) gets a compute-only context on the same device,
+  so capture, import, PyroWave and the VA-API/NVENC encoders work and no
+  Vulkan Video profile is advertised. Encode support counts only when the driver exposes
+  `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` with a video encode
+  queue, and the probe records why each missing codec is unavailable.
 - The compositor publishes the verified, shared `VideoContext` before it reports
   ready. Conventional encoding, DMA-BUF import and PyroWave device matching use
   that context for the whole session, including reconnects.
-- A conventional codec bit is set only after creating its exact Pixelforge
-  profile and after the stream converter's known-answer self-check passes for
-  the output format that profile encodes from (NV12, P010, YUV444 or
-  YUV444P10), on the configured conversion queue. A GPU that converts with
+- A conventional codec bit is set only after creating its exact profile with
+  constant-bitrate rate control on one of the encoders `stream.video.encoder`
+  allows, tried in the order Vulkan Video (Pixelforge), VA-API, NVENC (a
+  profile without CBR, such as ANV's Gen12 encoder, is not usable; VA-API and
+  NVENC also encode one frame), and after the stream converter's known-answer
+  self-check passes for the input format that encoder takes (NV12, P010,
+  YUV444, YUV444P10, or packed XYUV/Y410 for VA-API and NVENC 4:4:4), on the
+  configured conversion queue. The chosen encoder of each profile is recorded
+  (`EncoderTable`) and used by every stream of that profile until restart. A GPU that converts with
   wrong colors keeps those profiles unadvertised and reports a **Color
   conversion** warning, or a failure when no profile remains. Stream setup runs
   the same self-check and stops the stream with a color-conversion cause
@@ -146,6 +165,13 @@ a library or extension name:
   the pinned C API, matching the Vulkan device and creating each SDR/HDR
   encoder. A missing or incompatible PyroWave library leaves the conventional
   codecs available.
+- Every probed profile keeps its result: the health check lists the profiles
+  not offered with their reasons, and `moonshine-bench --capabilities` reports
+  the driver, Vulkan Video encode support and each profile's reason.
+- A stream's encoder bitrate is the negotiated bitrate limited to the
+  profile's maximum (`maxBitrate`; 120 Mbps for H.264/HEVC on an RTX 3080),
+  logged when it applies; Pixelforge rejects a rate-control mode or bitrate
+  the profile does not support instead of passing it to the driver.
 
 The server then constructs, in order, TLS identity, `SessionManager`,
 `ClientManager`, the management service, the RTSP server, the webserver and
@@ -178,13 +204,19 @@ sequenceDiagram
 ```
 
 1. **Discovery and pairing.** Clients find the host through mDNS or manually.
-   Pairing is approved by the host operator in the desktop app or on the
-   loopback-only `/pin` page; trust is persisted in `state.toml` before it is
-   published. See [Security administration](SECURITY_ADMINISTRATION.md).
+   Pairing is approved by the host operator through the management operations
+   (web interface, tray or `pyroshine pair`); trust is persisted in
+   `state.toml` before it is published. See [Security administration](SECURITY_ADMINISTRATION.md).
 2. **Launch.** An authenticated HTTPS `/launch` validates the request, creates an
    authorization generation and session keys, then initializes and launches the
    session: the compositor starts (with XWayland), and the application starts as
    a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY` and `PULSE_SERVER`.
+   A Steam command without `pre_command` hooks is refused first while another
+   Steam client of the user runs (`session/steam_instance.rs`), since Steam's
+   single-instance hand-off would open the game on the host's desktop. For a
+   Steam game, `session/steam_game.rs` then follows Steam's logs for the
+   game's state (launching, updating, running, exited) for the management
+   interface and `/serverinfo`; the unit itself is the Steam client.
 3. **Negotiation.** RTSP DESCRIBE advertises the probed formats. ANNOUNCE carries
    the client's codec, chroma, dynamic range, resolution, FPS, bitrate, packet
    size, encryption and audio layout; it is validated and stored as a *pending*
@@ -212,7 +244,7 @@ application while resetting or replacing encoders and transport state.
 | RTSP ANNOUNCE | Validates negotiated formats and numeric domains; for an active session, pauses the live epoch, then publishes pending video/audio contexts |
 | RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition. The first PLAY applies the ANNOUNCE output mode (resolution, refresh rate, HDR) to the running compositor before starting streams, or fails; the session context then reports the negotiated mode, as after a reconnect |
 | Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
-| HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
+| HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties. Accepted for a streaming session and for a launched (or launching) one whose client gave up before its first PLAY, where the resuming client's PLAY constructs the initial streams; refused before launch and during the first PLAY |
 | Unchanged reconnect | Pauses both streams, keeps the video pipeline and Pulse sockets, resets client-visible sequencing and encoder state (IDR), and activates transport before PLAY completes |
 | Changed reconnect | Pauses both epochs, reconfigures compositor output only for resolution, refresh rate or HDR changes (configuring existing windows held at the output size to the new size), and commits new video/audio resources before activating delivery |
 | Failed ANNOUNCE pause | One medium may already be paused and a worker no longer answers; the session is handed to teardown |
@@ -340,6 +372,13 @@ client, waits (then `SIGKILL`s via the pidfd), and releases the display lock and
 sockets before the compositor's worker guard drops. A surviving process keeps
 the session `Stopping`. A retained-session reconnect does not touch XWayland.
 
+The **compositor thread** is joined before its worker guard drops, and it holds
+the capture Vulkan device until then. The GPU driver releases the thread's EGL
+state in thread-local destructors after the compositor returns; on NVIDIA,
+destroying a Vulkan device while they run deadlocks inside the driver. Since
+the video pipeline usually drops the last reference to the capture device, the
+device must outlive the thread, not only the compositor loop.
+
 **Teardown** has a single owner per session, started by user cancel, a worker or
 application exit (through a per-session watchdog that only hands over), a failed
 transition, or service shutdown. In order, it stops the application unit while
@@ -375,6 +414,30 @@ Tests: `session/manager/lifecycle_tests.rs` drives the manager through a fake
 backend with barriers and fault injection at every transition await; stream
 workers have socket-release tests in their modules.
 
+## Capture backends
+
+A capture backend produces the frames a session streams; `session/capture/`
+is the seam between it and the rest of the session. `SystemSession` selects a
+backend when it initializes a session (`CaptureBackend`), creates it
+(`CaptureSource`), launches it and waits for readiness, then uses the running
+backend (`LiveCapture`) for the application's display, the capability report
+and output-mode changes. Game Mode uses the session's own Smithay compositor.
+Desktop Mode uses the signed-in desktop's native virtual display, with lifecycle and restoration owned
+by a separately supervised user guard. PipeWire frames reach the same capture
+admission path directly. See [Managed Desktop Mode](DESKTOP_MODE.md) for the
+transaction, adapters, input and audio ownership.
+
+- Every backend runs on a thread started by `start_capture_thread`, which
+  registers its worker guard first, keeps the capture GPU alive until the
+  thread has fully exited and stops the session when the thread ends.
+- Every backend produces `ExportedFrame`s through the same admission channel,
+  so import, conversion, encoding and transport are identical for all of them.
+- Scene, focus, input injection, XWayland and the output stay inside the
+  backend; the session layer never reaches into them.
+
+See [Capture backends](CAPTURE_BACKENDS.md) for the contract, how existing
+desktop and virtual-monitor capture differ, and what a new backend must add.
+
 ## Compositor and presentation
 
 `session/compositor/` embeds a headless Smithay compositor on its own calloop
@@ -388,7 +451,8 @@ thread. It owns:
 - native `wp_color_management_v1` surface descriptions and scene color draws
   (`color_management.rs`, `color_render.rs`);
 - input injection into the Smithay seat (`input.rs`);
-- capture and frame export (`capture.rs`, `admission.rs`, `frame.rs`).
+- capture eligibility, pacing and frame export (`capture.rs`, `state.rs`) into
+  the shared capture contract (`session/capture/`).
 
 Capture pacing is per client epoch. With fixed pacing (every standard client)
 the refresh timer is the only capture clock: each refresh deadline offers at
@@ -423,7 +487,7 @@ compositor capture ─ExportedFrame─▶ video-pipeline thread ─encoded frame
    (admission credit)             import → convert/encode            packetize → FEC → encrypt → pace
 ```
 
-**Admission.** `compositor/admission.rs` gives the consumer receiver-driven
+**Admission.** `capture/admission.rs` gives the consumer receiver-driven
 demand: one credit and one handoff slot. The compositor claims the credit before
 any export or rendering. Two signals are independent:
 
@@ -443,8 +507,36 @@ transfer, primaries, matrix, range and HDR as independent negotiated properties.
 
 | Backend | Formats | Path |
 | --- | --- | --- |
-| Pixelforge (`pipeline/mod.rs`, `pipeline/convert.rs`) | H.264, HEVC, AV1 via Vulkan Video | DMA-BUF import → compute conversion (with optional cursor/notification layers) → asynchronous encode with three bounded in-flight frames → rate-control padding removed (`pipeline/padding.rs`) → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
+| Conventional (`pipeline/mod.rs`, `pipeline/convert.rs`, `pipeline/backend.rs`) | H.264, HEVC, AV1 via Vulkan Video (Pixelforge), VA-API (`pipeline/vaapi/`) or NVENC (`pipeline/nvenc/`) | DMA-BUF import → compute conversion (with optional cursor/notification layers) into the encoder's input (a Vulkan image, an imported VA surface or a CUDA-imported Vulkan buffer) → asynchronous encode with bounded in-flight frames → rate-control padding removed (`pipeline/padding.rs`) → HDR SEI/OBU metadata on keyframes (`pipeline/hdr_sei.rs`) |
 | PyroWave (`pyrowave.rs`, `pyrowave_protocol.rs`) | Intra-only wavelet codec, 4:2:0/4:4:4, SDR/HDR10 | DMA-BUF import into a PyroWave-owned Vulkan device on the same GPU → GPU scale, color transform and encode → one frame at a time through send completion |
+
+The three conventional encoders sit behind `ConventionalEncoder`
+(`pipeline/backend.rs`): the loop asks it for the next input target, converts
+into it and submits; everything after the encoded packet is shared. VA-API
+writes its own SPS/PPS/VPS, slice headers and AV1 OBUs (`vaapi/h264.rs`,
+`hevc.rs`, `av1.rs`) so the VUI, color description and level/tier (frame
+size, rate and bitrate) match the stream, and reads coded buffers on a
+readback thread; NVENC maps the CUDA-imported buffer and recovers from loss
+with reference invalidation. A stream's encoder is the one its profile was
+probed with; it never changes during a stream, and a failure is reported like
+any other encoder failure.
+
+The native encoders share their input with other drivers, so ownership is
+explicit. The NVENC input buffer is released by the converter queue to
+`VK_QUEUE_FAMILY_EXTERNAL` (CUDA belongs to the same driver) before the
+conversion fence. VA surfaces come from another driver and are handed over
+through `VK_QUEUE_FAMILY_FOREIGN_EXT`, so VA-API needs
+`VK_EXT_queue_family_foreign`. Captured DMA-BUFs (game buffers, overlay
+layers) are written by other drivers too and are acquired on first use from
+the foreign queue family where the driver has the extension, else from
+`VK_QUEUE_FAMILY_EXTERNAL`. An input slot is reused only after the
+encoder's work on it completed: a VA submission that failed after the driver
+may have accepted it is synced first, and if completion cannot be established
+the stream ends and the VA objects are left to the driver rather than
+destroyed. A driver-flagged corrupt VA coded buffer fails the frame, which
+forces an IDR. An NVENC color change stays pending until NVENC accepts the
+reconfiguration, so no frame converted for a new color description is encoded
+under the previous one.
 
 PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a
 conventional codec and has no CPU or alternate-codec fallback. `pyrowave.rs`
@@ -459,10 +551,11 @@ Reed-Solomon FEC (`fec.rs`) covers plaintext shards, then optional AES-GCM
 encryption is applied per shard. `fec_mode = "auto"` adjusts parity from the
 client's FEC status feedback. `gso_socket.rs` sends with UDP GSO and a
 per-datagram fallback; raw `WouldBlock` retries must go through Tokio readiness. PyroWave frames are paced across a
-bitrate-derived window anchored to capture time (`pacing_timer.rs`) and rebase
-after backpressure rather than bursting.
+bitrate-derived window anchored to capture time (`pacing_timer.rs`); a frame
+whose window elapsed during encode is sent before the next capture slot, and
+the schedule rebases after backpressure rather than bursting.
 
-**Failures.** Both encoder backends report frame failures through
+**Failures.** All encoder backends report frame failures through
 `pipeline/failure.rs` with the failed stage, a recovery (`DropFrame`,
 `RequestIdr` or `Terminal`) and whether the source's GPU reads are not
 submitted, completed or unknown. Only the first two release the source for
@@ -539,6 +632,8 @@ Input routing on the host is separate from virtual-device delivery. See
 | Server configuration | `config.toml` (`$XDG_CONFIG_HOME/moonshine/` by default), read once at startup | `config.rs` and the owning subsystem's config type |
 | TLS identity | `cert.pem`, `key.pem` (default `~/.config/moonshine/`) | `tls.rs` |
 | Server UUID and paired-client trust | `state.toml` in the data directory (default `~/.local/share/moonshine/`) | `state.rs`, `clients.rs`; atomic replacement through `durable.rs` |
+| Application IDs and visibility choices | `library.toml` beside `state.toml` | `app_scanner/identity.rs`; atomic replacement through `durable.rs` |
+| Last successful scan results, rendered box art | `library-cache.json` and `boxart/` in `$XDG_CACHE_HOME/moonshine/` (regenerable) | `app_scanner/service.rs`, `app_scanner/artwork.rs` |
 | Negotiated stream properties | RTSP ANNOUNCE, per stream epoch | `rtsp.rs`, session manager |
 | Diagnostic switches | `MOONSHINE_*` environment variables | Individual subsystems |
 
@@ -554,52 +649,176 @@ negotiated per session, not configured. The application receives
 
 Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
 (`ingress.rs`) that hold a global shutdown delay token and apply TLS-handshake,
-request-header and RTSP-framing deadlines. Pairing trust changes are serialized,
+request-header and RTSP-framing deadlines. Each listener bounds its connections,
+and any one address to a quarter of them. On the GameStream HTTP and HTTPS
+listeners a new connection over either bound replaces the longest-idle
+connection (no request in progress, no socket I/O for two seconds) instead of
+being refused: Moonlight iOS opens a new connection for every request and
+leaves the previous one idle in keep-alive. Pairing trust changes are serialized,
 written atomically and synced before they take effect; revocation drains
 in-flight launch/resume/cancel requests and stops the active session.
 
-## Desktop management interface
+## Application catalog
 
-`management/` exports `io.github.karsyboy.Pyroshine` (interface
-`…Pyroshine.Management1`) on the service user's D-Bus session bus. The
-optional desktop app (`pyroshine-ui/`) and terminal pairing (`src/pair.rs`) are
-clients; the contract lives in `moonshine-management`. The CLI pins the current
-unique bus owner and matches completion by client ID and request token. A
-restart requires a new invocation; PIN submission alone never reports success.
+`app_scanner/` owns what clients are offered. The `library` thread runs every
+scanner, follows their metadata and publishes immutable `CatalogSnapshot`s
+through a `watch` channel; `/applist`, `/appasset` and `/launch` clone the
+snapshot current when the request starts, and `/launch` copies the chosen
+entry's `ApplicationConfig` into the `SessionContext`. The catalog is therefore
+never consulted by a running session: a refresh cannot stop, restart or
+reconfigure it, and `/serverinfo` keeps reporting the launched ID. The worker
+never takes session-manager locks.
 
 ```text
-pyroshine-ui (desktop session)              pyroshine (service)
-  tray (ksni) · notifications · window        management/ ── SessionManager
-            │                                      │       ── ClientManager / state.toml
-            └──── session bus: methods, signals ───┘       ── config store (config.toml)
-                                                            ── frame stats broadcast
+launcher metadata ──inotify / periodic fingerprint──► library thread
+  (manifests, pga.db,                                  scan changed sources (units)
+   library JSON, .desktop)                             reconcile + identities + visibility
+                                                       ──watch──► CatalogSnapshot (Arc)
+                                                                   ├─ webserver: applist, appasset, launch
+                                                                   └─ management: GetLibrary, LibraryChanged
 ```
 
-The desktop app follows ownership of the bus name and supervises each
-attachment (`pyroshine-ui/src-tauri/src/attach.rs`): while the same owner
-stays, a failed subscription or snapshot is retried with backoff from 0.5 s
-doubling to 30 s; an incompatible or denied daemon is reported and waits for a
-new owner; a new owner abandons the pending attempt. Each attempt carries a
-generation and publishes only while it is current, so an abandoned attempt
-cannot overwrite the new owner's state.
+**Units and failures.** A scanner reports results per unit (a Steam library
+folder, the installation's user shortcuts, a Heroic library file, a desktop-entry
+directory, the Lutris database, the Bottles Library).
+A unit that cannot be read keeps its previous entries, marked stale, for up to
+seven days; a source that cannot list its units keeps all of them; a single
+unreadable Steam manifest keeps that game. Units are dropped only when the
+launcher stops listing them. Results are retained across restarts in the cache
+directory and reused only under an identical scanner configuration.
 
-The interface is a control surface over the existing owners, never a parallel
-implementation:
+**Change detection.** Each scanner names directories and the file names that
+matter in them. They are watched with inotify, non-recursively; unrelated
+activity (downloads, shader caches, API caches) never wakes the worker. A burst
+of changes is scanned once it is quiet for 2 s (at most 10 s after it starts),
+no sooner than 15 s after the source's previous scan, and only that source is
+scanned. Watches are re-armed after every scan, which follows replaced,
+unmounted and newly created directories; a queue overflow marks every source
+changed. Every `[library].poll_interval_secs`, a stat-only fingerprint of each
+source's metadata is compared, covering what inotify cannot report. Units that
+failed to parse are retried after 2, 5, 15, 30 and 60 s. `RescanLibrary` scans
+everything at once.
+
+**Identity.** Manual entries keep the ID earlier releases derived from the title
+(SipHash-1-3 of the title, implemented in `identity.rs` so a toolchain update
+cannot renumber them). Discovered entries are keyed by launcher identity
+(`steam:620`, `heroic:legendary/Fortnite`, `lutris:<slug>`, `bottles:<program ID>`, desktop file ID); a
+new key takes the title-derived ID when it is free, so the first run after an
+upgrade reports the IDs clients already know, and a collision gets a
+SHA-256-derived ID instead. The assignment is recorded in `library.toml`, so
+renames, reinstalls, reordering and restarts keep it. An ID of a removed game is
+not reused for another title; at most 10,000 records are kept, removed visible
+entries first. A file written by a newer version is used but never rewritten; a
+corrupt one is moved aside.
+
+Steam non-Steam shortcuts come from `userdata/*/config/shortcuts.vdf`. Their
+identity is `steam:<64-bit rungameid>`: the saved 32-bit shortcut app ID shifted
+left by 32 bits, with `0x02000000` in the low word. The saved ID is authoritative;
+it must not be recalculated from the executable and title. Scanner commands
+substitute that full launch ID into `{game_id}`, while custom grid art and
+Steam's game-state logs use the saved 32-bit ID. Store games retain their
+existing identities. Steam owns shortcut launch options and Proton setup.
+
+**Reconciliation** (`catalog.rs`): manual entries first; a discovered entry
+with a manual entry's title is shadowed by it; a launcher shortcut to an entry
+another scanner provides, or the same identity found twice, is a duplicate;
+hidden entries keep their ID but are not offered; equal titles from different
+launchers get the launcher's name appended.
+
+**Launcher identities.** `/applist` reports, per offered entry, the launcher
+identities it starts (`<PyroshineSource>steam:620</PyroshineSource>`): a
+discovered entry's own key, or for a manual entry the keys it shadows. Clients
+such as PyroDeck use them to find a game without matching titles; standard
+Moonlight ignores them. See [Client integration](CLIENT_INTEGRATION.md).
+
+**Box art.** Entries carry ordered candidates (launcher art, then icons, then a
+theme icon named like the title). `/appasset` renders the first one that
+decodes on a blocking thread, at most two at a time, letterboxed to Moonlight's
+tile, and caches the PNG keyed by the source's path, size, mtime and inode
+(128 MiB / 2,048 files, least recently used first). Undecodable sources are
+skipped until they change. Nothing is fetched from the network.
+
+## Management
+
+`management/` is the one control surface over the running server. Its
+operations (`management/ops.rs`) call the existing owners; two transports
+expose them, and the contract (`moonshine-management`) is shared by both:
+
+```text
+browser (any device)                     pyroshine (service)
+  web/ (React)  ──────── HTTP/SSE ──▶ web/   ─┐
+                                               ├─ ops ── SessionManager, ClientManager,
+pyroshine tray/pair/web/diag/open              │         config store, Library, history,
+  ── session bus: methods, signals ──▶ dbus.rs┘         updates, telemetry
+                                         hub ◀── follow_* tasks (state changes)
+```
 
 | Operation | Owner and path |
 | --- | --- |
 | End session | `SessionManager::stop_session`, the same teardown as `/cancel` (behind the authorization gate) |
-| Approve / reject pairing | `ClientManager` pending requests; the approval token (`request`) must match the shown request, as on `/pin` |
+| Approve / reject pairing | `ClientManager` pending requests; the approval token (`request`) must match the shown request, and the PIN is decimal, at most 16 digits |
 | Revoke client | `ClientManager::revoke_and_stop_session`, shared with loopback `/unpair` |
 | Name a client | Optional, display-only metadata in `state.toml`, written through the state transaction |
 | Configuration | `config_store` (below) |
-| Run health check | `healthcheck::recheck_in_server` (below), serialized; published with `HealthChanged` |
+| Run health check | `healthcheck::recheck_in_server` (below), serialized |
+| Library, rescan, show/hide, box art | `app_scanner::Library` (see [Application catalog](#application-catalog)); box art is the cached `/appasset` rendering |
+| Restart | Triggers the global shutdown with `ShutdownReason::Restart` after answering; once shutdown completes, `src/restart.rs` marks every descriptor close-on-exec and executes the executable path recorded at startup (an upgrade takes effect) with the original arguments, keeping the PID, so it works without a supervisor |
+| Show tray | Wakes the server's tray launcher (`src/tray/launcher.rs`), which starts a tray hidden from its menu again; `pyroshine open` asks when no tray answers |
+| History, updates | `management/history.rs`, `management/updates.rs` (below; web only) |
+| Web setup code | `management/auth.rs` (D-Bus only: proves control of the streaming account) |
 
-**Access.** The session bus admits only the user running the service; every
-method additionally checks the caller's Unix user. The interface is not
-reachable from the GameStream listeners. Documents are sanitized views: no
-session keys, PINs, pairing secrets or private keys are exposed. The approval
-token and certificate fingerprints are operator identification, as on `/pin`.
+Transports authenticate the caller and map results; they never re-implement a
+rule. Documents are sanitized views: no session keys, PINs, pairing secrets or
+private keys cross either transport.
+
+**Event hub.** The `follow_*` tasks (session, pairing, statistics, problems,
+library) and the history writer publish each change once to `management/hub.rs`,
+a bounded `broadcast`. The D-Bus service turns events into signals; each web
+event stream turns them into Server-Sent Events. A transport that lags loses
+events and resynchronizes from complete snapshots; no publisher waits for a
+consumer. The hub counts open web event streams: statistics and library
+progress are serialized only while a page watches them (the tray shows neither).
+
+**Web transport.** `management/web/` serves the frontend's files and
+`/api/v1/` on a listener of its own (`[management]`, default
+`127.0.0.1:47990`), never on the GameStream ports, with bounded connections
+(`Ingress`), header and body deadlines and body limits. Files under
+`share/pyroshine/web` are read once at startup into a map; request paths are
+only keys into it. Every request passes, in order: the `Host` allow-list (IP
+literals, `localhost`, the host's names on non-loopback listeners and
+`allowed_hosts`, defeating DNS rebinding); same-origin checks (`Origin` equal to
+`scheme://Host`, `Sec-Fetch-Site`); for changes a JSON content type; then the
+session (`auth.rs`) and, for changes, the session's CSRF token. Responses carry
+a strict CSP and are never CORS-enabled. A non-loopback address requires HTTPS
+(browser-facing rustls config without client-certificate requests).
+`GET /api/v1/stream` starts with a complete overview after subscribing to the
+hub, then forwards events with increasing IDs; it re-checks its session on
+revocation and every 20 s heartbeat and closes with an `auth` event when the
+session ends.
+
+**Administrator authentication.** `auth.rs` stores one PBKDF2-HMAC-SHA256
+password verifier and SHA-256 hashes of session tokens in `management.json`
+beside `state.toml` (0600, durable replace). The first password needs a
+one-time setup code, issued only over the same-user D-Bus interface
+(`CreateWebSetupCode`, `pyroshine web setup`), so neither a loopback
+browser nor a paired client can claim the server. Sign-in always issues a new
+token (no fixation); sessions expire idle (7 days) and absolutely (30 days);
+the CSRF token is derived from the session token. Failed attempts lock the peer
+address out progressively within a global budget, and PBKDF2 runs on blocking
+threads, at most two at a time. A damaged credentials file fails closed until
+a reset code replaces it. Sensitive actions are logged under `pyroshine::audit`.
+
+**D-Bus transport.** `dbus.rs` exports `io.github.karsyboy.Pyroshine` (interface
+`…Pyroshine.Management1`) on the service user's session bus (or
+`MOONSHINE_MANAGEMENT_BUS` for a test instance). The bus admits only that user
+and every method also checks the caller's Unix user. zbus serves methods on its
+own executor; work that needs Tokio is handed to the server runtime. The
+interface is optional: without a bus name the server and its web interface run
+unchanged. The `pyroshine pair`, `web` and `diag` commands follow
+`MOONSHINE_MANAGEMENT_BUS` too when it is set. `pyroshine pair` pins the
+current unique bus owner and matches completion by client ID and request
+token; PIN submission alone never reports success. The tray's bus name (`io.github.karsyboy.PyroshineUi`) marks it
+present, which hands pairing notifications to it.
 
 **Session status.** `SessionManager` publishes a `ManagerStatus` snapshot when
 its mutex is released after a change (the guard publishes, so no transition can
@@ -622,8 +841,8 @@ streaming, and a peer of a replaced generation cannot make it so.
 current `StreamAuthorization`, falling back to the launch context only during
 initialization before the first grant exists. An accepted HTTPS resume rotates
 that authorization and publishes its new generation through `ManagerStatus`,
-so management emits `SessionChanged` with the new address through the existing
-Tauri/React bridge. The launch address stays in `SessionContext`; the session
+so management publishes a session event with the new address to both
+transports. The launch address stays in `SessionContext`; the session
 epoch, start time and application lifetime survive client changes. A rejected
 resume does not rotate authorization. An accepted resume owns the reported
 address even if the client has not completed ANNOUNCE/PLAY.
@@ -633,7 +852,7 @@ compositor's primary application metadata. The compositor publishes only
 changed values on primary-focus selection and title/class/app-ID events.
 Management subscribes before reading session details and also waits on that
 receiver, so focus-only changes produce `SessionChanged` without a lifecycle
-transition. The existing Tauri signal bridge updates React state and the tray.
+transition; the event reaches the web interface and the tray.
 `SessionDetails.application` remains the configured Moonlight entry and ID;
 the additive, optional `foreground_application` contains only a display title.
 The channel belongs to the session lifetime, surviving disconnect/resume and
@@ -660,8 +879,8 @@ serialized from the Rust enums.
 benchmark's `broadcast` channel. The management service subscribes while a
 client is streaming, drains the channel on a 250 ms timer (no per-frame
 wakeups) and summarizes one-second windows. It keeps the last 120 windows for
-support bundles and signals each one (`StatsUpdated`) while the desktop UI owns
-its bus name. `broadcast::send` never blocks: a receiver that falls behind
+support bundles, feeds each to the session history and publishes it while a
+web page observes (see the event hub). `broadcast::send` never blocks: a receiver that falls behind
 loses the oldest samples, which are counted, and with no receiver (no
 streaming client) it remains a no-op. Each sample also carries the frame's
 capture pacing, content age and content-time interval since the previous new
@@ -744,24 +963,78 @@ instead of creating encoders next to the live stream. Capabilities advertised
 to clients stay those probed at startup; a recheck whose verified profiles
 differ adds a warning that a restart applies them.
 
-**Notifications.** While the UI owns `io.github.karsyboy.PyroshineUi` it
-receives `PairingRequested` and notifies the operator; the daemon's own
-notify-rust notification (coalesced to one per 30 s) is the fallback when no
-UI runs. The bus releases the UI's name when it exits or crashes.
+**Support bundles over the web.** `POST /api/v1/diagnostics/bundle` returns the
+same archive as an attachment; it needs the CSRF token like a change because it
+is expensive and holds logs.
 
-**Desktop app.** Tauri 2 (WebKitGTK) with a React/Material UI frontend, chosen
-for permissive licensing, a complete Material component set and a browser
-preview for UI development; the tray uses `ksni` (StatusNotifierItem) rather
-than Tauri's appindicator tray, for click activation and runtime icons. The app
-follows the daemon's bus name instead of polling, subscribes before reading
-snapshots, and creates its window on demand (closing destroys the webview), so
-the tray-only app holds no web content process. On Wayland it raises the window
-with the XDG activation token of the user's click (notification
-`ActivationToken`, tray `ProvideXdgActivationToken`, launcher
-`XDG_ACTIVATION_TOKEN`, forwarded by `Activate` to a running instance) through
-`gtk_window_set_startup_id`; GTK's own token request would be refused because
-the click did not happen in the app. Its Cargo workspace is
-separate, so server builds never compile GTK or WebKitGTK.
+**Session history.** `history.rs` keeps a `Recorder` that follows the session
+snapshots and statistics windows in memory and produces a row write when a
+session opens, its client disconnects or resumes, and when it ends (with the
+stop record and a summary of the windows: frame rate, bitrates, drops,
+per-stage averages and worst p95, GPU load and temperature, finding counts).
+Writes go to one writer thread owning SQLite (`history.sqlite3`, bundled
+`rusqlite`) over a bounded channel with `try_send`: a slow disk drops a write
+and counts it; nothing on a management task, let alone a media path, waits for
+storage. The writer applies age and count retention after each write, migrates
+by `user_version` (records are versioned JSON, so fields can be added), moves a
+database that fails `quick_check` aside and starts a new one, closes rows left
+open by a previous run as `interrupted`, and reports storage failures to the
+page. Only host measurements are stored; client addresses and labels only when
+`record_client_address` is on.
+
+**Release notifications.** `updates.rs` fetches GitHub's release list over
+HTTPS (hyper client, rustls with the system trust store, 20 s and 2 MiB bounds)
+only when the operator asks or enabled daily checks (preferences in
+`updates.json`, not configuration). Versions are compared by semver precedence
+on the stable or prerelease channel; the release link is built from the
+validated version, never taken from the response. Update steps follow the
+detected installation (package databases, executable location). Nothing is
+downloaded or installed.
+
+**Notifications.** While the tray owns `io.github.karsyboy.PyroshineUi` it
+follows pairing snapshots and notifies the operator; the daemon's own
+notify-rust notification (coalesced to one per 30 s) is the fallback when no
+tray runs. The bus releases the tray's name when it exits or crashes. Neither
+notification carries a link that approves anything.
+
+**Web frontend.** `web/` is React/Material UI built by Vite into static files
+at release time (Node.js only then). A typed `Backend` contract
+(`src/api/backend.ts`) is implemented over HTTP (`http.ts`: JSON requests with
+the session cookie and CSRF token, the event stream). State
+follows the event stream: every (re)connection starts with an overview that
+replaces whatever was missed, so a lost connection, a server restart or a
+reload never leaves stale state. Pages are hash routes (`#/clients?request=…`)
+the tray and notifications can open. The build writes `pyroshine-web.json`
+with its version; the server logs a mismatch and the page asks to reload.
+
+**Desktop tray.** The server starts the tray (`src/tray/launcher.rs`) while
+the user's desktop session runs, as a child process of its own executable
+(`/proc/self/exe tray --attached`, so an upgrade never mixes versions). A
+service starts before any login, so the session is read from the user's
+systemd manager environment (the desktop exports `WAYLAND_DISPLAY`/`DISPLAY`
+there), with the process environment as fallback; it counts while its display
+socket answers and the session bus has a tray host or a notification server.
+The launcher checks every 10 s: a logout or new login stops or replaces the
+tray, a crash restarts it after 5 s doubling to 5 min, and a clean exit
+(**Hide Tray Icon**) keeps it hidden until the next session or server start.
+The child exits when its standard-input pipe from the server closes; the
+service cgroup also ends it. Headless hosts never start it, and
+`[management] tray = false` disables it.
+
+The tray shows the server's state as a StatusNotifierItem (`ksni` on
+async-io, matching the server's zbus executor) and owns no streaming
+resources. Process isolation keeps a tray fault away from streaming. It follows the server's bus
+name with the supervision of `attach.rs`: while the same owner stays, a failed
+subscription or snapshot is retried with backoff from 0.5 s doubling to 30 s;
+an incompatible or denied daemon is reported and waits for a new owner; a new
+owner abandons the pending attempt, and each attempt publishes only while its
+generation is current. Clicks open web pages through the portal's `OpenURI`
+with the click's XDG activation token (`xdg-open` as an argv fallback); the
+address comes from `GetWebUrl` and is limited to known routes, so no credential
+is ever in it. End Session calls the server directly. One tray runs per session
+(its bus name); it exits without an answering Wayland/X11 socket and when the
+session bus closes. `pyroshine open [page]` (the application-menu entry) asks
+the running tray to open a page, or opens it directly.
 
 ## Architectural invariants
 
@@ -784,16 +1057,25 @@ Changes must preserve these properties unless a task explicitly redesigns them:
   narrow `unsafe` scopes, explicit ownership and child-before-parent cleanup.
 - The management interface observes and calls the owning components; it never
   holds session, pairing or trust state of its own, and nothing on a media path
-  waits for it. The server runs unchanged without it or without a desktop UI.
+  waits for it (history writes included). The server streams unchanged without
+  a browser, the tray, the D-Bus name or the web listener.
+- Management access is authenticated per transport: the session bus by Unix
+  user, the web interface by administrator session plus same-origin and CSRF
+  checks. A loopback address or a paired client certificate never grants it.
+- Catalog refreshes never reach a session: launches copy their entry, request
+  handlers read one immutable snapshot, and the library worker takes no
+  session locks. Application IDs, once offered, do not change.
 
 ## Where to go next
 
 | Topic | Guide |
 | --- | --- |
+| Capture backend contract, frame contract and future capture modes | [Capture backends](CAPTURE_BACKENDS.md) |
 | Scene eligibility, cursor, late composition, Steam focus and input | [Compositor](COMPOSITOR.md) |
 | Capture admission, encoder queues and transport accounting | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC, pacing and GPU matrix | [PyroWave](PYROWAVE.md) |
 | PyroWave dialects and authenticated bandwidth calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
+| UDP bandwidth calibration | [Bandwidth calibration](BANDWIDTH_CALIBRATION.md) |
 | Native color descriptions and Wine/Proton setup | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity and report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
 | Measurements, diagnostics and reconnect acceptance | [Benchmarking](BENCHMARKING.md), [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md), [Reconnect validation](reconnect-validation.md) |

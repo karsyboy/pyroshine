@@ -10,7 +10,9 @@ Related repositories:
 - [Pyrolight](https://github.com/karsyboy/pyrolight):
   the client fork. Protocol, capability-bit and PyroWave wire changes must stay
   compatible with it (and its `moonlight-common-c` submodule fork).
-- [`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave): the pinned codec fork.
+- [`Themaister/pyrowave`](https://github.com/Themaister/pyrowave): the codec, vendored
+  in `vendor/pyrowave/` with a numbered patch series; Pyrolight builds its decoder
+  from the same tree.
 
 ## Working approach
 
@@ -45,41 +47,53 @@ unless explicitly marked as root. `docs/ARCHITECTURE.md` explains how they fit t
 | Area | Responsibility |
 | --- | --- |
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown; `pair.rs` and `diag.rs` subcommands |
+| `desktop/` | Independently supervised existing-desktop output/audio guard, native KDE/GNOME adapters, private lifecycle RPC, durable recovery and reconnect grace |
 | `config.rs`, `healthcheck.rs`, `gpu.rs` | Config loading/defaults; host/codec capability checks; capture/encode GPU identity |
-| `app_scanner/` | Steam, Lutris, Heroic and desktop-entry discovery |
+| `app_scanner/` | Application catalog: Steam, Lutris, Heroic, Bottles and desktop-entry discovery, change watching (`watch.rs`), stable IDs and visibility (`identity.rs`, `library.toml`), reconciliation (`catalog.rs`), box art cache (`artwork.rs`), worker (`service.rs`) |
 | `clients.rs`, `state.rs`, `durable.rs`, `tls.rs`, `crypto.rs` | Paired-client trust, durable `state.toml`, atomic private writes, TLS identity, AES helpers |
 | `webserver/` (`mod.rs`, `pairing.rs`, `bandwidth.rs`) | GameStream HTTP/HTTPS API, operator pairing, PyroWave bandwidth probe |
+| `calibration/` | Authenticated UDP bandwidth calibration: plan, wire format, run sender, recommendation, reference receiver; video-port arbitration with sessions |
 | `rtsp.rs`, `ingress.rs`, `discovery.rs` | RTSP negotiation; bounded connection supervision; mDNS |
 | `session/manager.rs`, `session/mod.rs`, `session/lifecycle.rs` | Session states, transitions, teardown ownership, worker guards and start latches |
 | `session/application.rs`, `session/inhibit.rs` | Application systemd unit and environment; logind sleep inhibition |
 | `session/authorization.rs`, `session/keys.rs`, `session/negotiation.rs` | Authorization generations; validated keys and nonce ownership; shared numeric domains |
-| `session/compositor/` | Headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, native color-management protocols, capture admission and DMA-BUF export |
+| `session/capture/` | Capture backend seam: selection, start/readiness contract (`start_capture_thread`), capabilities, output mode and pacing; the shared frame contract (`frame.rs`) and capture admission (`admission.rs`) |
+| `session/compositor/` | Isolated Game Mode capture backend, a headless Smithay compositor: scene, focus, cursor, Steam classification, input injection, XWayland ownership, native color-management protocols, capture eligibility and DMA-BUF export |
 | `session/stream/audio/` | Embedded PulseAudio-compatible server, Opus encoding, audio FEC/encryption, UDP |
 | `session/stream/control/` | ENet control protocol, peer authorization (`peers.rs`), input decoding/routing, Inputtino devices, ownership and feedback |
 | `session/stream/video/` | Negotiated formats, stream epochs, packetization, FEC, GSO/pacing, diagnostics |
-| `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), Pixelforge encoding, HDR metadata, failure classification |
+| `session/stream/video/pipeline/` | DMA-BUF import, compute conversion (`convert.rs`, `shaders/`), conventional encoders behind `backend.rs` (Pixelforge/Vulkan Video, `vaapi/`, `nvenc/`, runtime-loaded with generated `sys.rs` bindings), HDR metadata, padding removal, failure classification |
 | `session/stream/video/pyrowave.rs`, `pyrowave_protocol.rs` | Dynamic PyroWave C API, ABI/provenance checks, native resource ownership; dialect/profile negotiation |
 | `session/status.rs` | Public session phase from manager status and control-stream peer ownership |
-| `management/` | Session-bus management interface for the desktop app: status, pairing, clients, config store (`config_store.rs`), editor schema (`schema.rs`), telemetry aggregation |
+| `management/` | Management of the running server: shared operations (`ops.rs`), event hub (`hub.rs`), web interface (`web/`: HTTP API, SSE, static files) with administrator auth (`auth.rs`), session-bus adapter (`dbus.rs`), config store (`config_store.rs`), editor schema (`schema.rs`), telemetry, session history (`history.rs`), release checks (`updates.rs`) |
 | `gpu_sensors/` | Capture GPU readings for telemetry: sysfs/hwmon sensors, per-process DRM fdinfo engine time, runtime-loaded NVML |
 | `support/` | Redacted support bundles (`pyroshine diag`, `GetSupportBundle`): collection, redaction, tar writer |
 
 Other workspace and integration areas:
 
-- `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark.
+- `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark and
+  `moonshine-library` (scan launchers with isolated state, report timing and follow changes), and
+  `moonshine-udp-probe` (UDP bandwidth calibration client for real-network measurements).
 - `moonshine-management/`: the management API contract (D-Bus names, JSON documents,
-  error names, proxies) shared by the daemon and the desktop app.
-- `pyroshine-ui/`: optional desktop app (Tauri 2, React/Material UI, `ksni` tray) in a
-  separate Cargo workspace and npm project, packaged by `nfpm-ui.yaml`. It is a client of
-  the management interface only; server crates must never depend on it.
-- `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration
-  (`build-shaders.sh`), changelog tooling/tests, measurement harnesses.
+  error names, proxies) shared by the daemon, the web interface, the tray and the CLI.
+- `web/`: the web management interface (React/Material UI, npm only), built into
+  static files the server serves (packaged with the server).
+- Root `src/tray/`: the desktop tray (`ksni` StatusNotifierItem, notifications, browser
+  launcher; no GUI toolkit), run by the server as a child process in desktop sessions
+  (`launcher.rs`). The web interface and the tray are clients of the management
+  interface only; `moonshine-core` and `moonshine-management` must never depend on them.
+- `scripts/`: vendored PyroWave build helper, embedded SPIR-V regeneration
+  (`build-shaders.sh`), VA-API/NVENC binding regeneration
+  (`generate-encoder-ffi.sh`), changelog tooling/tests, measurement harnesses, the
+  baseline recorder and result comparison (`record_baseline.py`,
+  `bench_results.py`) and the hardware-test registry/runner
+  (`hardware_tests.toml`, `hardware_tests.py`).
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
   installers, systemd, device permissions and system policy. The Arch
-  `pyroshine-bin`/`pyroshine-ui-bin` PKGBUILDs live in `karsyboy/pyrowave-packages`.
+  `pyroshine-bin` PKGBUILD lives in `karsyboy/pyrowave-packages`.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.
-- `vendor/inputtino/`, `vendor/pixelforge/`: generated dependencies with numbered
-  patch series; shared maintenance workflow in `vendor/README.md`.
+- `vendor/inputtino/`, `vendor/pixelforge/`, `vendor/pyrowave/`: generated dependencies
+  with numbered patch series; shared maintenance workflow in `vendor/README.md`.
 
 ## Choose the source of truth
 
@@ -89,19 +103,27 @@ Other workspace and integration areas:
 | Build, install locally, contribute, release | `CONTRIBUTING.md`; CI commands in `.github/workflows/ci.yaml` |
 | Configuration fields, defaults or semantics | `docs/CONFIGURATION.md` and the owning Rust config/default implementations |
 | PyroWave, codec negotiation, GPU ownership, FEC or transport | `docs/PYROWAVE.md`, `docs/PYROWAVE_COMPATIBILITY.md` |
+| Capture backends, the frame contract or future capture modes | `docs/CAPTURE_BACKENDS.md` |
+| Existing Wayland desktop takeover, native outputs, remote audio or recovery | `docs/DESKTOP_MODE.md` |
 | Capture, cursor lifetime, focus, Steam surfaces/overlays or input | `docs/COMPOSITOR.md` |
 | Native presentation, HDR/color management and Wine/Proton setup | `docs/NATIVE_PRESENTATION.md` |
 | Capture admission, completion or pipeline backpressure | `docs/PIPELINE_OPTIMIZATION.md` |
 | Performance measurements | `docs/BENCHMARKING.md`; lifetime/soak diagnostics in `docs/LONG_SESSION_PERFORMANCE.md` |
+| Test tiers, hardware tests, baselines and regression gates | `docs/TESTING.md`; feature status and coverage in `docs/CAPABILITIES.md` |
+| GPU/driver support, encoder requirements, capture-device probing | `docs/GPU_COMPATIBILITY.md`, `gpu.rs`, `healthcheck.rs` `check_codecs` |
 | Reconnect or stream reconfiguration | `docs/reconnect-validation.md` |
 | Native controller backend/Edge mapping | `docs/DUALSENSE_EDGE.md`, `vendor/inputtino/LOCAL_CHANGES.md` |
 | Pairing, trust state, TLS identity | `docs/SECURITY_ADMINISTRATION.md` |
-| Management interface, desktop app | `docs/ARCHITECTURE.md` (Desktop management interface), `docs/DESKTOP.md`, `pyroshine-ui/README.md` |
+| Web interface, management API, tray | `docs/ARCHITECTURE.md` (Management), `docs/MANAGEMENT.md`, `docs/SECURITY_ADMINISTRATION.md` (Web management), `web/README.md` |
 | Packaging, service or host integration | `docs/INSTALLATION.md`, `CONTRIBUTING.md`; `docs/NIXOS.md` for Nix |
 | Release notes and inherited history | `docs/CHANGELOG.md`; `docs/UPSTREAM_CHANGELOG.md` is the upstream archive |
 
 ## Architectural boundaries
 
+- Managed Desktop Mode display/audio control belongs to the separately supervised
+  user guard in `desktop/`. Frames travel directly through PipeWire and capture
+  admission; never route media payloads through its administrative RPC. A desktop
+  teardown is not Idle until restoration is verified.
 - Keep protocol/session orchestration, compositor scene decisions, encoding,
   packet transport, input/control and packaging in their owning
   layers. Extend existing interfaces rather than coupling unrelated layers or
@@ -140,9 +162,11 @@ Other workspace and integration areas:
   `--test` runs the dependency's regression tests). Inputtino's public Rust crate
   has an explicit revision matching its vendored native base.
 - For PyroWave pins, C API assumptions or build changes, follow the pinned
-  dependency process in `docs/PYROWAVE.md`. Keep Rust provenance/API requirements,
-  `scripts/build-pyrowave.sh`, `nix/pyrowave.nix` and documented pins synchronized.
-  Keep dependency patches under `nix/patches/` consistent across build paths;
+  dependency process in `docs/PYROWAVE.md`. PyroWave is a generated vendor tree
+  like Pixelforge: change it only through `vendor/pyrowave-patches/` and
+  `scripts/vendor-pyrowave.sh`; Granite changes are patch files inside that
+  series (`vendor/pyrowave/patches/`). Keep Rust provenance/API requirements,
+  `nix/pyrowave.nix` and documented pins synchronized (`--check` verifies them);
   never substitute another PyroWave source or ABI. Check that the client's
   pinned decoder still accepts the bitstream family before changing pins.
 - Configuration additions/removals/renames/default or behavior changes must update
@@ -168,7 +192,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 
 CI also runs `cargo machete` (install with `cargo install cargo-machete`),
 `python3 scripts/changelog.py check`,
-`python3 -m unittest discover -s scripts -p 'test_changelog.py'`, and
+`python3 -m unittest discover -s scripts -p 'test_changelog.py'`,
+`python3 -m unittest discover -s scripts -p 'test_bench_results.py'`,
+`python3 scripts/hardware_tests.py check-registry` (every `#[ignore]`d test
+must be listed in `scripts/hardware_tests.toml` with its requirements; add the
+entry with the test), and
 `python3 scripts/known_defects.py` (known-defect characterizations must still
 fail for their recorded reason; native controller tests under ASan/UBSan).
 When fixing a listed finding, un-ignore its tests and remove their entries in
@@ -179,10 +207,15 @@ Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs the
 `MOONSHINE_PYROWAVE_LIBRARY` pointing to the built library; use the full
 invocation in `CONTRIBUTING.md` or CI. Hardware-dependent tests are ignored by
 default so a run without hardware reports them as not executed, never as passed.
+On GPU hosts run them with `python3 scripts/hardware_tests.py run --json <file>`
+and record baselines with `scripts/record_baseline.py`; `docs/TESTING.md` has
+the full command set, including hosts without a toolchain.
 
-- Desktop app changes run the `pyroshine-ui` checks listed in `CONTRIBUTING.md`
-  (npm typecheck/test/build, and fmt/clippy/test with `--manifest-path
-  pyroshine-ui/src-tauri/Cargo.toml`). Management-interface tests need `dbus-daemon`.
+- Web interface changes run the `web/` checks listed in `CONTRIBUTING.md`
+  (npm typecheck/test/build); the tray is checked with the workspace.
+  Management-interface tests need `dbus-daemon`. Management HTTP changes keep
+  `management/web/tests.rs` (authentication, CSRF, Host/origin, limits) passing;
+  never weaken a web protection to make a client work.
 - Documentation-only work needs Markdown, relative-link and path checks and
   `git diff --check`, not a full native build. Select other checks according to
   the affected behavior.
@@ -237,8 +270,8 @@ Upstream is [Moonshine](https://github.com/hgaiser/moonshine), configured as
 the `upstream` remote (branch `main`); `origin` is the fork. Verify with
 `git remote -v` rather than assuming. Fork history begins after upstream
 v0.16.1 (see `docs/UPSTREAM_CHANGELOG.md`). Pinned third-party sources have
-their own upstreams: PyroWave (`karsyboy/pyrowave`, derived from
-`Themaister/pyrowave`; see `docs/PYROWAVE.md`), Inputtino
+their own upstreams: PyroWave (`Themaister/pyrowave`, vendored with local
+patches; see `vendor/pyrowave/LOCAL_CHANGES.md`), Inputtino
 (`games-on-whales/inputtino`; see `vendor/inputtino/LOCAL_CHANGES.md`), Pixelforge
 (`hgaiser/pixelforge`, vendored with local patches; see
 `vendor/pixelforge/LOCAL_CHANGES.md`), and the Git-pinned Smithay and ash

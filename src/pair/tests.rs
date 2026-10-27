@@ -338,6 +338,27 @@ async fn absent_server_has_an_actionable_error() {
 }
 
 #[tokio::test]
+async fn a_test_instance_bus_is_used_instead_of_the_session_bus() {
+	let harness = Harness::start(State::default()).await;
+	// A live service may own the management name on the session bus; the
+	// command must bind to the test instance's server, not merely to any owner.
+	let connection = open(Some(&harness.bus.address)).await.unwrap();
+	let proxy = connect(&connection).await.unwrap();
+	assert_eq!(
+		proxy.inner().destination().as_str(),
+		harness._server.unique_name().unwrap().as_str()
+	);
+}
+
+#[tokio::test]
+async fn an_unreachable_test_instance_bus_does_not_fall_back() {
+	let directory = tempfile::tempdir().unwrap();
+	let address = format!("unix:path={}", directory.path().join("missing").display());
+	let error = open(Some(&address)).await.err().unwrap();
+	assert!(error.starts_with("Cannot reach your session bus"));
+}
+
+#[tokio::test]
 async fn proxy_does_not_switch_to_a_restarted_server() {
 	let harness = Harness::start(State {
 		requests: vec![request("client", "token")],

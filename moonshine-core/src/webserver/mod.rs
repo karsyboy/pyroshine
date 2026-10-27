@@ -3,11 +3,10 @@ use std::{
 	convert::Infallible,
 	net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
 	path::PathBuf,
-	str::FromStr,
 };
 
 use async_shutdown::ShutdownManager;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::{
 	Method, Request, Response, StatusCode,
 	body::Bytes,
@@ -15,8 +14,6 @@ use hyper::{
 	service::service_fn,
 };
 use hyper_util::rt::tokio::{TokioIo, TokioTimer};
-use image::ImageFormat;
-use image::imageops::FilterType;
 use network_interface::NetworkInterfaceConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,14 +22,17 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
+	app_scanner::Library,
 	clients::{ClientManager, RevokeError},
-	ingress::Ingress,
+	ingress::{ActivityIo, ConnectionActivity, Ingress},
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
-		application::ApplicationConfig,
+		application::SessionMode,
 		failure::{Problem, SessionFailure},
-		manager::SessionManager,
+		frame_limit::{FrameLimitConfig, FrameLimitMode},
+		manager::{LiveBitrateRefusal, SessionManager},
 		negotiation::{self, DisplayMode},
+		stream::video::rate::{RateState, RateUpdate},
 	},
 	tls::TlsAcceptor,
 };
@@ -42,6 +42,7 @@ use self::pairing::handle_pair_request;
 use super::session::stream::audio::AudioChannels;
 
 mod bandwidth;
+pub(crate) use bandwidth::routed_link_mbps;
 #[cfg(test)]
 mod bandwidth_tests;
 mod pairing;
@@ -94,13 +95,19 @@ pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
-	applications: Vec<ApplicationConfig>,
+	/// The application catalog. Each request reads the snapshot current when
+	/// it starts; a refresh never changes a request (or a session) in flight.
+	library: Library,
 	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
 	server_certs: String,
 	supported_codecs: u32,
 	hdr_supported: bool,
+	/// Configured default frame limit, described in `/serverinfo`.
+	frame_limit: FrameLimitConfig,
+	/// Pending confirmations of `/launch` replacing the running application.
+	replacements: std::sync::Arc<std::sync::Mutex<ReplacementConfirmations>>,
 	shutdown: ShutdownManager<ShutdownReason>,
 	limits: WebLimits,
 }
@@ -111,8 +118,6 @@ const MAX_HTTP_CONNECTIONS: usize = 64;
 /// Hyper read buffer bound per connection. Pairing requests carry a hex PEM
 /// certificate in the query string, which fits comfortably.
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
-/// Bound for operator PIN submission bodies.
-const MAX_PIN_BODY_BYTES: usize = 1024;
 
 /// Deadlines applied to every accepted HTTP/HTTPS connection.
 #[derive(Clone, Copy, Debug)]
@@ -122,8 +127,6 @@ pub(crate) struct WebLimits {
 	/// Time to receive request headers. Hyper also applies it while a keep-alive
 	/// connection waits for the next request, bounding idle connections.
 	pub header_read_timeout: std::time::Duration,
-	/// Time to receive a request body the server reads (PIN submission).
-	pub body_read_timeout: std::time::Duration,
 	/// Time an operator has to approve a pairing request.
 	pub pairing_approval_timeout: std::time::Duration,
 }
@@ -133,7 +136,6 @@ impl Default for WebLimits {
 		Self {
 			tls_handshake_timeout: std::time::Duration::from_secs(10),
 			header_read_timeout: std::time::Duration::from_secs(30),
-			body_read_timeout: std::time::Duration::from_secs(10),
 			pairing_approval_timeout: std::time::Duration::from_secs(300),
 		}
 	}
@@ -147,7 +149,7 @@ impl Webserver {
 		address: String,
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
-		applications: Vec<ApplicationConfig>,
+		library: Library,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		unique_id: String,
@@ -155,6 +157,7 @@ impl Webserver {
 		server_certs: String,
 		client_manager: ClientManager,
 		session_manager: SessionManager,
+		frame_limit: FrameLimitConfig,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let server = Self {
@@ -162,13 +165,15 @@ impl Webserver {
 			name,
 			rtsp_port,
 			webserver_config,
-			applications,
+			library,
 			unique_id,
 			client_manager,
 			session_manager,
 			server_certs,
 			supported_codecs,
 			hdr_supported,
+			frame_limit,
+			replacements: Default::default(),
 			shutdown: shutdown.clone(),
 			limits: WebLimits::default(),
 		};
@@ -177,10 +182,10 @@ impl Webserver {
 		let http_address = resolve_listen_address(&address, server.webserver_config.port)?;
 		server.spawn_listener("http", http_address, None, ShutdownReason::HttpShutdown);
 
-		// PIN approval is restricted to loopback peers. When the configured
-		// address does not accept loopback connections, give the operator a
-		// loopback-only listener on the same port. Failing to bind it only
-		// disables local approval, not the GameStream service.
+		// Operator revocation (`POST /unpair`) is restricted to loopback peers.
+		// When the configured address does not accept loopback connections,
+		// give the operator a loopback-only listener on the same port. Failing
+		// to bind it only disables local revocation, not the GameStream service.
 		if let Some(operator_address) = operator_listen_address(http_address) {
 			tokio::spawn({
 				let server = server.clone();
@@ -190,10 +195,10 @@ impl Webserver {
 						.wrap_cancel(async move {
 							let listener = bind_listener(operator_address).map_err(|e| {
 								tracing::warn!(
-									"Failed to bind the local pairing approval listener on {operator_address}: {e}"
+									"Failed to bind the local revocation listener on {operator_address}: {e}"
 								)
 							})?;
-							tracing::debug!("Local pairing approval available on {operator_address}");
+							tracing::debug!("Local revocation available on {operator_address}");
 							let ingress = Ingress::new("http-operator", MAX_HTTP_CONNECTIONS, server.shutdown.clone());
 							server.serve_listener(listener, None, ingress).await
 						})
@@ -234,7 +239,8 @@ impl Webserver {
 					let listener = bind_listener(address)
 						.map_err(|e| tracing::error!("Failed to bind to address {address}: {e}"))?;
 					tracing::debug!("{name} server listening for connections on {address}");
-					let ingress = Ingress::new(name, MAX_HTTP_CONNECTIONS, server.shutdown.clone());
+					let ingress =
+						Ingress::new(name, MAX_HTTP_CONNECTIONS, server.shutdown.clone()).with_idle_eviction();
 					server.serve_listener(listener, tls, ingress).await
 				}))
 				.await;
@@ -262,7 +268,8 @@ impl Webserver {
 			};
 			let server = self.clone();
 			let tls = tls.clone();
-			permit.spawn(async move { server.serve_connection(connection, address, tls).await });
+			let activity = permit.activity();
+			permit.spawn(async move { server.serve_connection(connection, address, tls, activity).await });
 		}
 	}
 
@@ -271,10 +278,12 @@ impl Webserver {
 		connection: tokio::net::TcpStream,
 		address: SocketAddr,
 		tls: Option<std::sync::Arc<TlsAcceptor>>,
+		activity: std::sync::Arc<ConnectionActivity>,
 	) {
 		let peer_address = unmap_v4_mapped(address);
 		let local_address = connection.local_addr().ok().map(unmap_v4_mapped);
 		let mac_address = local_address.and_then(|address| get_mac_address(address.ip()).unwrap_or(None));
+		let connection = ActivityIo::new(connection, activity.clone());
 
 		let Some(acceptor) = tls else {
 			self.serve_http(
@@ -284,20 +293,25 @@ impl Webserver {
 				mac_address,
 				false,
 				None,
+				activity,
 			)
 			.await;
 			return;
 		};
 
-		let connection =
-			match tokio::time::timeout(self.limits.tls_handshake_timeout, acceptor.accept(connection)).await {
-				Ok(Ok(connection)) => connection,
-				Ok(Err(())) => return,
-				Err(_) => {
-					tracing::debug!("TLS handshake from {peer_address} timed out.");
-					return;
-				},
-			};
+		let connection = match tokio::time::timeout(
+			self.limits.tls_handshake_timeout,
+			acceptor.accept(connection, peer_address),
+		)
+		.await
+		{
+			Ok(Ok(connection)) => connection,
+			Ok(Err(())) => return,
+			Err(_) => {
+				tracing::debug!("TLS handshake from {peer_address} timed out.");
+				return;
+			},
+		};
 
 		// Extract peer certificate fingerprint from TLS connection for mTLS verification.
 		let peer_cert_fingerprint = connection
@@ -314,11 +328,13 @@ impl Webserver {
 			mac_address,
 			true,
 			peer_cert_fingerprint,
+			activity,
 		)
 		.await;
 	}
 
 	/// Serve HTTP/1.1 requests on an established (optionally TLS) connection.
+	#[allow(clippy::too_many_arguments)]
 	async fn serve_http<I>(
 		&self,
 		io: I,
@@ -327,6 +343,7 @@ impl Webserver {
 		mac_address: Option<String>,
 		https: bool,
 		peer_cert_fingerprint: Option<String>,
+		activity: std::sync::Arc<ConnectionActivity>,
 	) where
 		I: hyper::rt::Read + hyper::rt::Write + Unpin,
 	{
@@ -337,14 +354,22 @@ impl Webserver {
 			.serve_connection(
 				io,
 				service_fn(|request| {
-					self.serve(
+					// In progress until the response is produced: a waiting
+					// request (a pairing PIN, an app launch) is never evicted.
+					let request_guard = activity.request();
+					let response = self.serve(
 						request,
 						local_address,
 						peer_address,
 						mac_address.clone(),
 						https,
 						peer_cert_fingerprint.clone(),
-					)
+					);
+					async move {
+						let response = response.await;
+						drop(request_guard);
+						response
+					}
 				}),
 			)
 			.await;
@@ -414,6 +439,47 @@ impl Webserver {
 					};
 					return Ok(bandwidth::response(permit));
 				},
+				// UDP bandwidth calibration (see `crate::calibration`). Like the HTTPS
+				// probe it is refused during a session; a session start preempts it.
+				(&Method::GET, "/pyroshine-udp-probe") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					if !matches!(self.session_manager.get_session_context().await, Ok(None)) {
+						return Ok(
+							xml_error(409, "End the stream before bandwidth calibration").map(BodyExt::boxed_unsync)
+						);
+					}
+					let link = crate::calibration::host_link_mbps(local_address, peer_address.ip());
+					match self
+						.session_manager
+						.calibration()
+						.start(
+							&params,
+							peer_cert_fingerprint.as_deref().unwrap_or_default(),
+							peer_address,
+							link,
+						)
+						.await
+					{
+						Ok(reply) => xml_response(reply.to_xml()),
+						Err(error) => xml_error(error.status, &error.message),
+					}
+				},
+				(&Method::GET, "/pyroshine-udp-probe-result") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					match self
+						.session_manager
+						.calibration()
+						.result(&params, peer_cert_fingerprint.as_deref().unwrap_or_default())
+						.await
+					{
+						Ok(xml) => xml_response(xml),
+						Err(error) => xml_error(error.status, &error.message),
+					}
+				},
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
@@ -424,7 +490,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.app_asset(params)
+					self.app_asset(params).await
 				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
@@ -438,7 +504,6 @@ impl Webserver {
 						peer_address,
 						&self.server_certs,
 						&self.client_manager,
-						self.webserver_config.port,
 						self.limits.pairing_approval_timeout,
 						&self.shutdown,
 					)
@@ -456,19 +521,27 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.launch(params, local_address, peer_address).await
+					self.launch(params, local_address, peer_address, peer_cert_fingerprint.clone())
+						.await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.resume(params, local_address, peer_address).await
+					self.resume(params, local_address, peer_address, peer_cert_fingerprint.clone())
+						.await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.cancel().await
+					self.cancel(params).await
+				},
+				(&Method::GET, "/bitrate") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					self.set_live_bitrate(params, peer_address).await
 				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
@@ -500,30 +573,15 @@ impl Webserver {
 						peer_address,
 						&self.server_certs,
 						&self.client_manager,
-						self.webserver_config.port,
 						self.limits.pairing_approval_timeout,
 						&self.shutdown,
 					)
 					.await
 				},
-				(&Method::GET, "/pin") => {
-					if !self.webserver_config.enable_pairing {
-						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
-					}
-					if let Some(response) = self.verify_operator(&request, peer_address) {
-						return Ok(response.map(BodyExt::boxed_unsync));
-					}
-					self.pin(params)
-				},
-				(&Method::POST, "/submit-pin") => {
-					if !self.webserver_config.enable_pairing {
-						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
-					}
-					if let Some(response) = self.verify_operator(&request, peer_address) {
-						return Ok(response.map(BodyExt::boxed_unsync));
-					}
-					self.submit_pin(request).await
-				},
+				// The loopback PIN page trusted any local process and user; approval
+				// now needs the web interface's administrator sign-in, the tray or
+				// `pyroshine pair` (all through the management operations).
+				(&Method::GET, "/pin") | (&Method::POST, "/submit-pin") => self.operator_page_moved(),
 				(&Method::POST, "/unpair") => {
 					if let Some(resp) = self.verify_operator(&request, peer_address) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
@@ -545,20 +603,7 @@ impl Webserver {
 	}
 
 	fn app_list(&self) -> Response<Full<Bytes>> {
-		let mut response = "<root status_code=\"200\">".to_string();
-		for application in self.applications.iter() {
-			response += "<App>";
-
-			let hdr_supported = u8::from(self.hdr_supported);
-			response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
-			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&application.title)).as_ref();
-			response += format!("<ID>{}</ID>", application.id()).as_ref();
-
-			response += "</App>";
-		}
-
-		response += "</root>";
-
+		let response = app_list_xml(&self.library.catalog(), self.hdr_supported);
 		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response
 			.headers_mut()
@@ -566,7 +611,7 @@ impl Webserver {
 		response
 	}
 
-	fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
 			None => {
@@ -584,72 +629,33 @@ impl Webserver {
 			},
 		};
 
-		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
-			Some(application) => application,
+		let catalog = self.library.catalog();
+		let entry = match catalog.find(application_id) {
+			Some(entry) => entry,
 			None => {
-				let message = format!("Couldn't find application with ID {}.", application_id - 1);
+				let message = format!("Couldn't find application with ID {application_id}.");
 				tracing::warn!("{message}");
 				return bad_request(message);
 			},
 		};
-
-		let boxart_path = match &application.boxart {
-			Some(boxart) => boxart,
-			None => {
-				let message = format!("No boxart defined for app '{}'.", application.title);
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-		let boxart_path = boxart_path.to_string_lossy();
-		let boxart_path = match shellexpand::full(&boxart_path) {
-			Ok(boxart_path) => boxart_path,
-			Err(e) => {
-				let message = format!("Failed to expand boxart path: {e}");
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-		let boxart_path = match PathBuf::from_str(&boxart_path) {
-			Ok(boxart_path) => boxart_path,
-			Err(e) => {
-				let message = format!("Failed to create boxart path: {e}");
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		let image_bytes = match std::fs::read(&boxart_path) {
-			Ok(bytes) => bytes,
-			Err(e) => {
-				let message = format!("Failed to read boxart at '{}': {e}", boxart_path.display());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		let asset = match image::load_from_memory(&image_bytes) {
-			Ok(asset) => asset,
-			Err(e) => {
-				let message = format!("Failed to load boxart at '{}': {e}", boxart_path.display());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		// Moonlight displays box art at a fixed 200x267 pixel area using stretch mode.
-		// Icons that don't match this ratio (e.g. square desktop icons) get distorted.
-		// Fit the image into a 600x801 canvas (same ratio as 200:267), preserving aspect ratio, centered.
-		let asset = fit_to_boxart(asset);
-
-		let mut buffer = std::io::Cursor::new(vec![]);
-		if let Err(e) = asset.write_to(&mut buffer, ImageFormat::Png) {
-			let message = format!("Failed to encode boxart: {e}");
-			tracing::warn!("{message}");
+		if entry.artwork.is_empty() {
+			let message = format!("No boxart defined for app '{}'.", entry.application.title);
+			tracing::debug!("{message}");
 			return bad_request(message);
 		}
 
-		let mut response = Response::new(Full::new(Bytes::from(buffer.into_inner())));
+		// Decoding and resizing run on a blocking thread, bounded and cached
+		// (see `app_scanner::artwork`), never on the network runtime.
+		let buffer = match self.library.render_artwork(entry.artwork.clone()).await {
+			Ok(buffer) => buffer,
+			Err(reason) => {
+				let message = format!("No usable boxart for app '{}': {reason}", entry.application.title);
+				tracing::warn!("{message}");
+				return bad_request(message);
+			},
+		};
+
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response
 			.headers_mut()
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
@@ -708,12 +714,20 @@ impl Webserver {
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
 		);
-		if https
+		let paired_peer = https
 			&& peer_cert_fingerprint.is_some_and(|fp| {
 				self.verify_paired_client(&Some(fp.clone()), peer_address.ip())
 					.is_none()
-			}) && self.supported_codecs & 0x01800000 != 0
-		{
+			});
+		if paired_peer {
+			// UDP calibration works for every codec; clients without it ignore these.
+			response += &format!(
+				"<PyroshineUdpProbeVersion>{}</PyroshineUdpProbeVersion><PyroshineUdpProbeMaxKbps>{}</PyroshineUdpProbeMaxKbps>",
+				crate::calibration::plan::PROTOCOL_VERSION,
+				crate::calibration::plan::MAX_RATE_KBPS
+			);
+		}
+		if paired_peer && self.supported_codecs & 0x01800000 != 0 {
 			let speed = local_address
 				.map(|a| bandwidth::routed_link_mbps(a.ip(), peer_address.ip()))
 				.unwrap_or(0);
@@ -722,12 +736,32 @@ impl Webserver {
 				bandwidth::PROBE_BYTES
 			);
 		}
+		if paired_peer && let Some((current, negotiated)) = self.session_manager.video_bitrate().await {
+			// Rubylight's names; Nightjar's automatic bitrate starts from the
+			// live encoder rate and treats the negotiated one as its ceiling.
+			response += &format!(
+				"<RustHostEncoderBitrateKbps>{}</RustHostEncoderBitrateKbps><RustHostInitialEncoderBitrateKbps>{}</RustHostInitialEncoderBitrateKbps>",
+				current.div_ceil(1000),
+				negotiated.div_ceil(1000)
+			);
+		}
+		response += &frame_limiter_fields(&self.frame_limit);
+		// Public like the rest of this document: it only tells an integration
+		// whether `/applist` (paired clients only) carries launcher identities.
+		response += &format!("<PyroshineAppSources>{APP_SOURCES_VERSION}</PyroshineAppSources>");
 		response += "<SupportedDisplayMode></SupportedDisplayMode>";
 		response += &format!("<PairStatus>{paired}</PairStatus>");
 		response += &format!(
 			"<currentgame>{}</currentgame>",
 			session_context.clone().map(|s| s.application_id).unwrap_or(0)
 		);
+		// Public like `currentgame`, which it qualifies: what Steam reports
+		// about the running game (launching, updating, running, exited).
+		if session_context.is_some()
+			&& let Some(game) = self.session_manager.steam_game().await
+		{
+			response += &format!("<PyroshineGameState>{}</PyroshineGameState>", game.state.as_str());
+		}
 		response += &format!(
 			"<state>{}</state>",
 			session_context
@@ -743,79 +777,20 @@ impl Webserver {
 		response
 	}
 
-	fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let Some(unique_id) = params.get("uniqueid").filter(|id| !id.is_empty() && id.len() <= 256) else {
-			return bad_request("A valid pending client ID is required.".to_string());
+	fn operator_page_moved(&self) -> Response<Full<Bytes>> {
+		let message = match self.client_manager.operator_page() {
+			Some(page) => format!(
+				"Pairing requests are approved in the Pyroshine web interface: open {page} on the host, \
+				 or run `pyroshine pair`."
+			),
+			None => "Pairing requests are approved with `pyroshine pair` on the host.".to_string(),
 		};
-
-		// The page approves one specific pending request: its approval token is
-		// required on submission, so a request that replaces it (same client ID)
-		// cannot inherit the operator's PIN. Show the requester so the operator
-		// can recognize it.
-		let Some(pending) = self.client_manager.pending_approval(unique_id) else {
-			return Response::builder()
-				.status(StatusCode::NOT_FOUND)
-				.header(header::CACHE_CONTROL, "no-store")
-				.body(Full::new(Bytes::from("No pending pairing request for this client.")))
-				.unwrap();
-		};
-		let content = include_bytes!("../../../assets/pin.html");
-		let html = String::from_utf8_lossy(content);
-		let html = html
-			.replace("{{REQUEST}}", &pending.approval)
-			.replace("{{REQUESTER}}", &escape_xml(pending.requester.to_string()))
-			.replace(
-				"{{FINGERPRINT}}",
-				&escape_xml(pending.fingerprint.as_deref().unwrap_or("unknown")),
-			)
-			.replace("{{UNIQUE_ID}}", &escape_xml(unique_id));
-		let mut response = Response::new(Full::new(Bytes::from(html)));
-		let headers = response.headers_mut();
-		headers.insert(
-			header::CONTENT_TYPE,
-			HeaderValue::from_static("text/html; charset=UTF-8"),
-		);
-		headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-		headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-		headers.insert(
-			header::CONTENT_SECURITY_POLICY,
-			HeaderValue::from_static("frame-ancestors 'none'"),
-		);
-		headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-
-		response
-	}
-
-	async fn submit_pin(&self, request: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-		// Enforce a hard size limit and deadline while reading the body.
-		let body = Limited::new(request.into_body(), MAX_PIN_BODY_BYTES).collect();
-		let body = match tokio::time::timeout(self.limits.body_read_timeout, body).await {
-			Ok(Ok(body)) => body.to_bytes(),
-			Ok(Err(e)) => {
-				tracing::warn!("Failed to read request body: {e}");
-				return bad_request("Bad request.".to_string());
-			},
-			Err(_) => {
-				tracing::warn!("Timed out reading PIN submission.");
-				return bad_request("Bad request.".to_string());
-			},
-		};
-
-		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-		let (Some(unique_id), Some(pin), Some(approval)) =
-			(params.get("uniqueid"), params.get("pin"), params.get("request"))
-		else {
-			tracing::warn!("PIN submission requires 'uniqueid', 'pin' and 'request'.");
-			return bad_request("Bad request.".to_string());
-		};
-
-		match self.client_manager.register_pin(unique_id, pin, approval) {
-			Ok(()) => {
-				tracing::info!("PIN registered successfully.");
-				Response::new(Full::new(Bytes::from("PIN accepted.")))
-			},
-			Err(()) => bad_request("Failed to register PIN.".to_string()),
-		}
+		Response::builder()
+			.status(StatusCode::GONE)
+			.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+			.header(header::CACHE_CONTROL, "no-store")
+			.body(Full::new(Bytes::from(message)))
+			.unwrap()
 	}
 
 	async fn unpair(&self, id: Option<&str>, fingerprint: Option<&str>) -> Response<Full<Bytes>> {
@@ -858,6 +833,7 @@ impl Webserver {
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
+		client_identity: Option<String>,
 	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
@@ -922,24 +898,72 @@ impl Webserver {
 			},
 		};
 
-		let hdr = match params.remove("hdrMode").map(|value| value.parse::<u32>()) {
-			None => false,
-			Some(Ok(value)) => value != 0,
+		let hdr_mode = match params.remove("hdrMode").map(|value| value.parse::<u32>()) {
+			None => None,
+			Some(Ok(value)) => Some(value != 0),
 			Some(Err(error)) => return xml_error(400, &format!("Invalid hdrMode in launch request: {error}.")),
 		};
+		let hdr = hdr_mode == Some(true);
 		let vrr_requested = match client_vrr_requested(&mut params) {
 			Ok(requested) => requested,
 			Err(error) => return xml_error(400, &format!("Invalid clientVrrRequested in launch request: {error}.")),
 		};
 
-		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
-			Some(application) => application,
+		// The session takes its own copy of the entry: later catalog refreshes
+		// cannot change or stop what this launch starts.
+		let catalog = self.library.catalog();
+		let application = match catalog.find(application_id) {
+			Some(entry) => &entry.application,
 			None => {
-				let message = format!("Couldn't find application with ID {}.", application_id - 1);
+				let message = format!("Couldn't find application with ID {application_id}.");
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
 		};
+
+		// Another application runs: replace it only once this client confirms
+		// by repeating the request (Vibepollo's protocol, which Nightjar follows
+		// instead of cancelling first). Other clients cancel first and never
+		// reach this; without confirmation the launch reports the session.
+		if let Some(running) = self.session_manager.session_view().await
+			&& running.application_id != application_id
+			&& let Some(client) = client_identity.as_deref()
+		{
+			let now = std::time::Instant::now();
+			let confirmed = self
+				.replacements
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.arm_or_confirm(client, running.epoch, application_id, now);
+			if !confirmed {
+				tracing::info!(
+					running = running.application_id,
+					requested = application_id,
+					"Launch of another application awaits the client's confirmation"
+				);
+				return xml_error(410, REPLACEMENT_CONFIRMATION);
+			}
+			tracing::info!(
+				running = running.application_id,
+				requested = application_id,
+				"Client confirmed replacing the running application"
+			);
+			if self
+				.session_manager
+				.stop_session_if_application(running.application_id)
+				.await
+				.is_err()
+			{
+				return xml_error(503, "Failed to stop the running application");
+			}
+		}
+
+		if application.mode == SessionMode::Desktop && hdr {
+			// The client negotiates its codec profile before it launches. The
+			// stream keeps that format and carries the desktop's SDR frames
+			// (see `LaunchedSession::apply_output_mode`).
+			tracing::info!("Desktop Mode streams SDR content; the client's HDR request falls back to SDR");
+		}
 
 		let initialize_result = self
 			.session_manager
@@ -952,7 +976,9 @@ impl Webserver {
 				audio_channels,
 				audio_channel_mask,
 				hdr,
+				hdr_mode,
 				client_ip: peer_address.ip(),
+				client_identity,
 				vrr_requested,
 			})
 			.await;
@@ -1014,6 +1040,7 @@ impl Webserver {
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
+		client_identity: Option<String>,
 	) -> Response<Full<Bytes>> {
 		// The whole request is validated before the session manager publishes
 		// keys or rotates authorization, so a malformed resume changes nothing.
@@ -1025,7 +1052,10 @@ impl Webserver {
 			},
 		};
 
-		let mut resume_request = crate::session::ResumeRequest::default();
+		let mut resume_request = crate::session::ResumeRequest {
+			client_identity,
+			..Default::default()
+		};
 		if let Some(mode) = params.remove("mode") {
 			match DisplayMode::parse(&mode) {
 				Ok(mode) => {
@@ -1089,8 +1119,23 @@ impl Webserver {
 		response
 	}
 
-	async fn cancel(&self) -> Response<Full<Bytes>> {
-		if self.session_manager.stop_session().await.is_err() {
+	async fn cancel(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
+		let stopped = if let Some(expected) = params.get("expectedAppId") {
+			let Ok(expected) = expected.parse::<i32>() else {
+				return xml_error(400, "Invalid expectedAppId");
+			};
+			if expected <= 0 {
+				return xml_error(400, "Invalid expectedAppId");
+			}
+			match self.session_manager.stop_session_if_application(expected).await {
+				Ok(false) => return xml_error(409, "The running application changed"),
+				Ok(true) => Ok(()),
+				Err(()) => Err(()),
+			}
+		} else {
+			self.session_manager.stop_session().await
+		};
+		if stopped.is_err() {
 			let message = "Failed to stop session".to_string();
 			tracing::warn!("{message}");
 			return bad_request(message);
@@ -1105,6 +1150,69 @@ impl Webserver {
 			.headers_mut()
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
+	}
+
+	/// `GET /bitrate?bitrate=KBPS`: change the encoder bitrate of the requesting
+	/// client's own stream without reconnecting. This is the runtime call that
+	/// Vibepollo and Foundation Sunshine define and their clients (Nightjar,
+	/// Moonlight V+ and its client-side adaptive bitrate) send; the reply's
+	/// `<bitrate>` is the accepted kbps, which the profile's maximum (or
+	/// PyroWave's word-aligned frame budget) may lower, and `0` with an error
+	/// status otherwise.
+	async fn set_live_bitrate(
+		&self,
+		params: HashMap<String, String>,
+		peer_address: SocketAddr,
+	) -> Response<Full<Bytes>> {
+		let Some(kbps) = params
+			.get("bitrate")
+			.and_then(|value| value.parse::<u32>().ok())
+			.filter(|kbps| (1..=MAX_LIVE_BITRATE_KBPS).contains(kbps))
+		else {
+			return bitrate_reply(
+				400,
+				Some(&format!(
+					"Expected bitrate in kbps between 1 and {MAX_LIVE_BITRATE_KBPS}"
+				)),
+				0,
+			);
+		};
+		let update = match self
+			.session_manager
+			.client_set_bitrate(peer_address.ip(), kbps * 1000)
+			.await
+		{
+			Ok(update) => update,
+			Err(refusal @ LiveBitrateRefusal::NoStream) => return bitrate_reply(404, Some(&refusal.to_string()), 0),
+			Err(refusal) => return bitrate_reply(409, Some(&refusal.to_string()), 0),
+		};
+		match tokio::time::timeout(LIVE_BITRATE_REPLY_TIMEOUT, update).await {
+			Ok(Ok(RateUpdate {
+				state: RateState::Applied,
+				accepted_bps: Some(accepted),
+				..
+			})) => {
+				let accepted = accepted.div_ceil(1000);
+				tracing::info!(
+					requested_kbps = kbps,
+					accepted_kbps = accepted,
+					"Client changed the live bitrate"
+				);
+				bitrate_reply(200, None, accepted)
+			},
+			Ok(Ok(update)) => {
+				let message = update
+					.error
+					.unwrap_or_else(|| "The bitrate was replaced by a newer request or a reconnect".into());
+				tracing::info!(requested_kbps = kbps, state = ?update.state, "Live bitrate not applied: {message}");
+				bitrate_reply(409, Some(&message), 0)
+			},
+			Ok(Err(_)) => bitrate_reply(409, Some("The video encoder stopped"), 0),
+			// No picture was encoded in time (a static VRR scene sends none): the
+			// request stays staged for this generation and applies with the next
+			// one, unless a newer request or a reconnect replaces it first.
+			Err(_) => bitrate_reply(200, Some("Applies with the next frame"), kbps),
+		}
 	}
 
 	/// Operator approval is a host-local administrative action served on the
@@ -1154,14 +1262,51 @@ impl Webserver {
 	}
 }
 
-/// Authorize a request to the operator PIN approval routes.
+/// Version of the `<PyroshineSource>` application metadata in `/applist`,
+/// advertised as `<PyroshineAppSources>` in `/serverinfo`. Bump it only for
+/// an incompatible change; adding elements is compatible.
+pub(crate) const APP_SOURCES_VERSION: u32 = 1;
+
+/// The `/applist` document for `catalog`.
 ///
-/// - The peer must be loopback: only the host operator may approve pairing.
-///   First pairing cannot rely on a paired client certificate.
+/// Besides Moonlight's fields, each `<App>` carries one `<PyroshineSource>`
+/// per launcher identity it starts (`steam:892970`; see
+/// [`CatalogSnapshot::launcher_identities`]), so an integration such as
+/// PyroDeck can find a Steam game by its app ID instead of by title.
+/// Moonlight clients ignore unknown elements. The list is only served to
+/// paired clients, like the titles themselves.
+fn app_list_xml(catalog: &crate::app_scanner::CatalogSnapshot, hdr_supported: bool) -> String {
+	let identities = catalog.launcher_identities();
+	let mut response = "<root status_code=\"200\">".to_string();
+	for entry in catalog.offered() {
+		response += "<App>";
+
+		// Desktop Mode streams what the desktop shares, which is SDR on
+		// the desktops tested. Moonlight clients ignore this and may still
+		// ask for HDR; such a stream falls back to SDR content.
+		let hdr_supported = u8::from(hdr_supported && entry.application.mode.is_game());
+		response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
+		response += format!("<AppTitle>{}</AppTitle>", escape_xml(&entry.application.title)).as_ref();
+		response += format!("<ID>{}</ID>", entry.id).as_ref();
+		for source in identities.get(entry.key.as_str()).into_iter().flatten() {
+			response += format!("<PyroshineSource>{}</PyroshineSource>", escape_xml(source)).as_ref();
+		}
+
+		response += "</App>";
+	}
+
+	response += "</root>";
+	response
+}
+
+/// Authorize a request to the operator route (`POST /unpair`). It can only
+/// remove trust, never grant it.
+///
+/// - The peer must be loopback.
 /// - `Host` must name a loopback host on our port, defeating DNS rebinding of
 ///   an attacker domain to 127.0.0.1.
 /// - Browser metadata, when present, must describe a same-origin request on a
-///   loopback origin, so another website cannot submit a PIN through the
+///   loopback origin, so another website cannot revoke a client through the
 ///   operator's browser (CSRF). Non-browser clients (curl) send neither header.
 fn authorize_operator_request(peer: SocketAddr, headers: &header::HeaderMap, port: u16) -> Result<(), &'static str> {
 	if !peer.ip().to_canonical().is_loopback() {
@@ -1222,7 +1367,7 @@ fn resolve_listen_address(address: &str, port: u16) -> Result<SocketAddr, ()> {
 		.ok_or_else(|| tracing::error!("Failed to resolve address '{address}' port {port}"))
 }
 
-/// Address of the loopback listener for operator PIN approval, needed only when
+/// Address of the loopback listener for operator revocation, needed only when
 /// the configured HTTP listener cannot accept loopback connections.
 fn operator_listen_address(http_address: SocketAddr) -> Option<SocketAddr> {
 	let ip = http_address.ip();
@@ -1298,6 +1443,99 @@ fn request_keys(params: &mut HashMap<String, String>, request: &str) -> Result<S
 		.map_err(|error| format!("Invalid key parameters in {request} request: {error}."))
 }
 
+fn xml_response(xml: String) -> Response<Full<Bytes>> {
+	let mut response = Response::new(Full::new(Bytes::from(xml)));
+	response
+		.headers_mut()
+		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+	response
+		.headers_mut()
+		.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+	response
+}
+
+/// Vibepollo's prompt for replacing the running application. Clients match
+/// this text exactly to ask the user, then repeat the launch to confirm.
+const REPLACEMENT_CONFIRMATION: &str =
+	"An app is already running. Launch this app again within 60 seconds to confirm that you want to close it.";
+
+/// How long a client has to confirm a replacement.
+const REPLACEMENT_CONFIRMATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One pending replacement per client certificate.
+#[derive(Default)]
+struct ReplacementConfirmations(HashMap<String, PendingReplacement>);
+
+struct PendingReplacement {
+	/// Session epoch of the application to be replaced.
+	epoch: u64,
+	requested: i32,
+	expires: std::time::Instant,
+}
+
+impl ReplacementConfirmations {
+	/// True when `client` repeats an unexpired request for `requested` against
+	/// the same session; otherwise (re)arm the confirmation and return false.
+	fn arm_or_confirm(&mut self, client: &str, epoch: u64, requested: i32, now: std::time::Instant) -> bool {
+		self.0.retain(|_, pending| pending.expires > now);
+		if self
+			.0
+			.remove(client)
+			.is_some_and(|pending| pending.epoch == epoch && pending.requested == requested)
+		{
+			return true;
+		}
+		self.0.insert(
+			client.to_string(),
+			PendingReplacement {
+				epoch,
+				requested,
+				expires: now + REPLACEMENT_CONFIRMATION_WINDOW,
+			},
+		);
+		false
+	}
+}
+
+/// Vibepollo's description of the configured default frame limit. Clients
+/// built for Vibepollo (Nightjar) also read the presence of
+/// `FrameLimiterSupported` as the marker of Vibepollo's stream extensions:
+/// they then send `clientVrrRequested`, decimal refresh rates and the runtime
+/// `/bitrate` call, and `/launch` a different application without `/cancel`,
+/// expecting the host to confirm the replacement. Pyroshine serves all four.
+fn frame_limiter_fields(config: &FrameLimitConfig) -> String {
+	let enabled = config.mode != FrameLimitMode::Off;
+	let stream_rate = config.mode == FrameLimitMode::Stream;
+	let millihertz = match config.mode {
+		FrameLimitMode::Custom => config.fps.saturating_mul(1000),
+		FrameLimitMode::Off | FrameLimitMode::Stream => 0,
+	};
+	format!(
+		"<FrameLimiterSupported>1</FrameLimiterSupported><FrameLimiterEnabled>{}</FrameLimiterEnabled>\
+		 <VirtualDisplayFrameLimiterEnabled>{}</VirtualDisplayFrameLimiterEnabled>\
+		 <FrameLimiterFpsLimitMilliHz>{millihertz}</FrameLimiterFpsLimitMilliHz>",
+		u8::from(enabled),
+		u8::from(stream_rate)
+	)
+}
+
+/// Largest live bitrate: the encoder's rate is in bits per second as a `u32`.
+const MAX_LIVE_BITRATE_KBPS: u32 = u32::MAX / 1000;
+
+/// How long `/bitrate` waits for the encoder to apply a rate before answering.
+const LIVE_BITRATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A `/bitrate` reply. Errors keep the `<bitrate>0</bitrate>` element the
+/// reference hosts send, which the clients read before the status.
+fn bitrate_reply(status_code: u16, message: Option<&str>, kbps: u32) -> Response<Full<Bytes>> {
+	let message = message
+		.map(|message| format!(" status_message=\"{}\"", escape_xml(message)))
+		.unwrap_or_default();
+	xml_response(format!(
+		"<root status_code=\"{status_code}\"{message}><bitrate>{kbps}</bitrate></root>"
+	))
+}
+
 fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {
 	// Always return HTTP 200 so that Moonlight (Qt) reads the response body.
 	// Qt treats HTTP 4xx/5xx as network errors and never reads the body,
@@ -1322,34 +1560,6 @@ fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {
 			bad_request("Failed to build error response.".to_string())
 		},
 	}
-}
-
-const BOXART_WIDTH: u32 = 600;
-const BOXART_HEIGHT: u32 = 801;
-
-fn fit_to_boxart(asset: image::DynamicImage) -> image::DynamicImage {
-	let (w, h) = (asset.width(), asset.height());
-
-	// Already the right aspect ratio (within a small tolerance), return as-is.
-	let target_ratio = BOXART_WIDTH as f64 / BOXART_HEIGHT as f64;
-	let image_ratio = w as f64 / h as f64;
-	if (image_ratio - target_ratio).abs() < 0.01 {
-		return asset;
-	}
-
-	// Scale the image to fit within the box art dimensions while preserving aspect ratio.
-	let scale = f64::min(BOXART_WIDTH as f64 / w as f64, BOXART_HEIGHT as f64 / h as f64);
-	let new_w = (w as f64 * scale).round() as u32;
-	let new_h = (h as f64 * scale).round() as u32;
-	let resized = asset.resize_exact(new_w, new_h, FilterType::Lanczos3);
-
-	// Center the resized image on a transparent canvas.
-	let mut canvas = image::RgbaImage::new(BOXART_WIDTH, BOXART_HEIGHT);
-	let offset_x = (BOXART_WIDTH - new_w) / 2;
-	let offset_y = (BOXART_HEIGHT - new_h) / 2;
-	image::imageops::overlay(&mut canvas, &resized.to_rgba8(), offset_x as i64, offset_y as i64);
-
-	image::DynamicImage::ImageRgba8(canvas)
 }
 
 fn unauthorized(message: &str) -> Response<Full<Bytes>> {
@@ -1387,7 +1597,7 @@ fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
 	Ok(None)
 }
 
-fn escape_xml(input: impl AsRef<str>) -> String {
+pub(crate) fn escape_xml(input: impl AsRef<str>) -> String {
 	input
 		.as_ref()
 		.replace("&", "&amp;")
@@ -1395,4 +1605,63 @@ fn escape_xml(input: impl AsRef<str>) -> String {
 		.replace(">", "&gt;")
 		.replace("\"", "&quot;")
 		.replace("'", "&apos;")
+}
+
+#[cfg(test)]
+mod app_list_tests {
+	use super::*;
+	use crate::app_scanner::{CatalogEntry, CatalogSnapshot, EntryState, Origin, ScannerKind};
+	use crate::session::application::ApplicationConfig;
+
+	fn entry(key: &str, id: i32, title: &str, origin: Origin, state: EntryState) -> CatalogEntry {
+		CatalogEntry {
+			key: key.into(),
+			id,
+			origin,
+			application: ApplicationConfig {
+				title: title.into(),
+				command: vec!["/usr/bin/steam".into()],
+				..Default::default()
+			},
+			artwork: Vec::new(),
+			artwork_origin: None,
+			state,
+		}
+	}
+
+	fn steam(native_id: &str) -> Origin {
+		Origin::Discovered {
+			scanner: 0,
+			kind: ScannerKind::Steam,
+			native_id: native_id.into(),
+			unit: "/home/u/.local/share/Steam".into(),
+		}
+	}
+
+	#[test]
+	fn applist_reports_launcher_identities_beside_moonlight_fields() {
+		let catalog = CatalogSnapshot::new(
+			1,
+			vec![
+				entry(
+					"manual:0",
+					11,
+					"Desktop & More",
+					Origin::Manual { index: 0 },
+					EntryState::Available,
+				),
+				entry("steam:892970", 22, "Valheim", steam("892970"), EntryState::Available),
+				entry("steam:620", 0, "Portal 2", steam("620"), EntryState::Hidden),
+			],
+		);
+		let xml = app_list_xml(&catalog, true);
+		assert_eq!(
+			xml,
+			"<root status_code=\"200\">\
+			 <App><IsHdrSupported>1</IsHdrSupported><AppTitle>Desktop &amp; More</AppTitle><ID>11</ID></App>\
+			 <App><IsHdrSupported>1</IsHdrSupported><AppTitle>Valheim</AppTitle><ID>22</ID>\
+			 <PyroshineSource>steam:892970</PyroshineSource></App>\
+			 </root>"
+		);
+	}
 }

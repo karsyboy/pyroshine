@@ -58,9 +58,12 @@ impl Gate {
 /// Counts live fake resources; each `Resource` is one socket/thread/GPU owner.
 #[derive(Default)]
 struct Counters {
+	desktop_cleanup_failed: AtomicBool,
 	resources: AtomicUsize,
 	workers_started: AtomicUsize,
 	unit_created: AtomicBool,
+	/// Transient units systemd accepted, across all sessions.
+	unit_creates: AtomicUsize,
 	unit_stops: AtomicUsize,
 	/// Set if a new session was initialized while an old one still owned resources.
 	overlapped: AtomicBool,
@@ -183,6 +186,13 @@ fn injected() -> SessionFailure {
 }
 
 impl SessionBackend for FakeBackend {
+	async fn verify_desktop_cleanup(&self) -> Result<(), ()> {
+		if self.counters.desktop_cleanup_failed.load(Ordering::SeqCst) {
+			Err(())
+		} else {
+			Ok(())
+		}
+	}
 	type Initialized = FakeSession;
 	type Launched = FakeSession;
 	type Active = FakeSession;
@@ -210,6 +220,7 @@ impl SessionBackend for FakeBackend {
 	async fn launch(&self, session: FakeSession) -> Result<FakeSession, SessionFailure> {
 		// systemd accepted the transient unit; the start job is still running.
 		self.counters.unit_created.store(true, Ordering::SeqCst);
+		self.counters.unit_creates.fetch_add(1, Ordering::SeqCst);
 		self.gate(Op::Launch).await.map_err(|()| injected())?;
 		if self.stop_on_launch_return.load(Ordering::SeqCst) {
 			let _ = session.stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
@@ -321,6 +332,14 @@ impl Harness {
 
 	fn release(&self, op: Op) {
 		self.backend().gates[&op].released.send_replace(true);
+	}
+
+	fn clear_failure(&self, op: Op) {
+		self.backend().gates[&op].fail.store(false, Ordering::SeqCst);
+	}
+
+	fn session_stop(&self) -> ShutdownManager<SessionShutdownReason> {
+		self.backend().session_stop.lock().unwrap().clone().unwrap()
 	}
 
 	fn calls(&self, op: Op) -> usize {
@@ -445,8 +464,40 @@ fn context() -> SessionContext {
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: false,
+		hdr_mode: None,
 		client_ip: "127.0.0.1".parse().unwrap(),
+		client_identity: None,
 		vrr_requested: false,
+	}
+}
+
+/// ANNOUNCE reads the explicit `hdrMode` of the request that authorized it:
+/// the latest resume that sent one, else the launch.
+#[tokio::test]
+async fn requested_hdr_mode_follows_the_launch_then_each_resume() {
+	let h = Harness::new();
+	assert_eq!(h.core.requested_hdr_mode().await, None);
+	let mut launch = context();
+	launch.hdr_mode = Some(false);
+	h.core.initialize_session(launch).await.unwrap();
+	assert_eq!(h.core.requested_hdr_mode().await, Some(false));
+	h.core.launch_session().await.unwrap();
+	let grant = h.grant().await;
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.core.requested_hdr_mode().await, Some(false));
+
+	for (requested, expected) in [
+		(Some(true), Some(true)),
+		(None, Some(false)),
+		(Some(false), Some(false)),
+	] {
+		let request = ResumeRequest {
+			hdr: requested,
+			..ResumeRequest::default()
+		};
+		h.core.resume_session(keys(), request, h.client).await.unwrap();
+		assert_eq!(h.core.requested_hdr_mode().await, expected, "{requested:?}");
 	}
 }
 
@@ -551,6 +602,7 @@ async fn foreground_changes_are_session_scoped_and_survive_reconnect() {
 fn video() -> VideoStreamContext {
 	VideoStreamContext {
 		pyrowave_dialect: None,
+		pyrowave_sdr_as_sdr: false,
 		width: 1920,
 		height: 1080,
 		fps: 60,
@@ -843,7 +895,8 @@ async fn retained_session_reports_current_authorized_client() {
 #[tokio::test]
 async fn rejected_resume_preserves_reported_client_and_authorization() {
 	let h = Harness::new();
-	h.launched().await;
+	// Initialized, not yet launched: there is nothing to resume.
+	h.initialize().await.unwrap();
 	let grant = h.grant().await;
 	let original = h.core.session_view().await.unwrap();
 	let mut status = h.core.subscribe_status();
@@ -860,6 +913,60 @@ async fn rejected_resume_preserves_reported_client_and_authorization() {
 	let view = h.core.session_view().await.unwrap();
 	assert_eq!(view.client_ip, original.client_ip);
 	assert_eq!(view.epoch, original.epoch);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// A client that gives up while connecting leaves the session launched with
+/// no ANNOUNCE/PLAY. Its next attempt resumes, because the host reports the
+/// game as running; the resume's ANNOUNCE/PLAY starts the streams with the
+/// resume's keys, and the abandoned attempt can no longer start them.
+#[tokio::test]
+async fn resume_starts_a_launched_session_whose_client_gave_up() {
+	let h = Harness::new();
+	h.launched().await;
+	let abandoned = h.grant().await;
+	h.core
+		.resume_session(keys_with_id(7), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	let grant = h.grant().await;
+	assert!(grant.generation() > abandoned.generation());
+	assert!(
+		h.announce(&abandoned).await.is_err(),
+		"the abandoned attempt was replaced"
+	);
+	assert_eq!(h.phase().await, "launched");
+	let published = h.core.inner.lock().await.keys_tx.as_ref().unwrap().borrow().clone();
+	assert_eq!(published.key_id().get(), 7);
+
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.phase().await, "active");
+	assert_eq!(h.calls(Op::Start), 1);
+	assert_eq!(h.calls(Op::Resume), 0);
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+}
+
+/// The same while the application is still launching: the launch commits and
+/// the resuming client starts the streams.
+#[tokio::test]
+async fn resume_during_launch_is_accepted() {
+	let h = Harness::new();
+	let launch = hold_at(&h, Op::Launch).await;
+	let abandoned = h.grant().await;
+	h.core
+		.resume_session(keys(), ResumeRequest::default(), h.client)
+		.await
+		.unwrap();
+	h.release(Op::Launch);
+	launch.await.unwrap().unwrap();
+	let grant = h.grant().await;
+	assert!(grant.generation() > abandoned.generation());
+	h.announce(&grant).await.unwrap();
+	h.core.start_session(&grant).await.unwrap();
+	assert_eq!(h.phase().await, "active");
 	h.core.stop_session().await.unwrap();
 	h.assert_released().await;
 }
@@ -1413,6 +1520,7 @@ impl Matrix {
 		VideoStreamContext {
 			pyrowave_dialect: (codec == VideoCodec::PyroWave)
 				.then_some(crate::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1),
+			pyrowave_sdr_as_sdr: false,
 			width,
 			height,
 			fps: self.fps(),
@@ -1443,6 +1551,7 @@ impl Matrix {
 			resolution: self.resolution(),
 			refresh_rate: self.fps(),
 			hdr: self.hdr,
+			hdr_mode: None,
 			audio_channels,
 			audio_channel_mask,
 			..context()
@@ -1628,6 +1737,132 @@ async fn service_shutdown_during_every_transition_completes() {
 	}
 }
 
+/// A completed session's identifiers and signals cannot reach its successor:
+/// its grant can neither ANNOUNCE nor PLAY, authorization generations are
+/// never reused, a late teardown request from its watchdog is a no-op, and a
+/// cause recorded through its slot is never reported as the successor's.
+#[tokio::test]
+async fn completed_session_cannot_affect_its_successor() {
+	use crate::session::failure::StopCause;
+	let h = Harness::new();
+	let status = h.core.subscribe_status();
+	let old_grant = h.active().await;
+	let old_epoch = h.core.session_view().await.unwrap().epoch;
+	let old_stop = h.session_stop();
+	let old_cause = h.backend().session_cause.lock().unwrap().clone().unwrap();
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+
+	let grant = h.active().await;
+	assert!(h.core.session_view().await.unwrap().epoch > old_epoch);
+	assert!(
+		grant.generation() > old_grant.generation(),
+		"generations are never reused"
+	);
+	assert!(h.announce(&old_grant).await.is_err(), "stale ANNOUNCE");
+	assert!(h.core.start_session(&old_grant).await.is_err(), "stale PLAY");
+	{
+		// The old watchdog handing a late worker failure to teardown.
+		let mut guard = h.core.lock().await;
+		assert!(
+			h.core
+				.begin_teardown(&mut guard, Some(old_epoch), SessionShutdownReason::VideoEncoderStopped)
+				.is_none()
+		);
+	}
+	let _ = old_stop.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped);
+	old_cause.record(StopCause {
+		detail: "stale".into(),
+		hint: None,
+		unexpected: true,
+		reported: false,
+	});
+	for _ in 0..10 {
+		tokio::task::yield_now().await;
+	}
+	assert_eq!(h.phase().await, "active");
+	assert_eq!(h.core.authorize_stream(h.client).await, Some(grant));
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 1);
+
+	h.core.stop_session().await.unwrap();
+	let last = status.borrow().last_stop.clone().unwrap();
+	assert_eq!(last.reason, SessionShutdownReason::UserStopped);
+	assert_eq!(last.cause, None, "a stale cause was reported for its successor");
+	h.assert_released().await;
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 2);
+}
+
+/// Sessions that end every way — a user stop, several stop sources at once,
+/// and a failure at each transition after the unit exists — stop every
+/// application unit the backend created exactly once and release every
+/// resource before the next session starts.
+#[tokio::test]
+async fn every_application_unit_is_stopped_exactly_once() {
+	let h = Harness::new();
+	for cycle in 0..36 {
+		match cycle % 6 {
+			0 => {
+				h.active().await;
+				h.core.stop_session().await.unwrap();
+			},
+			1 => {
+				// The user stops while the application exits and an encoder fails.
+				h.active().await;
+				h.backend().exit_on_stop.store(true, Ordering::SeqCst);
+				let stop = h.session_stop();
+				let user = {
+					let core = h.core.clone();
+					tokio::spawn(async move { core.stop_session().await })
+				};
+				let _ = stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+				let _ = stop.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped);
+				user.await.unwrap().unwrap();
+				h.wait_idle().await;
+				h.backend().exit_on_stop.store(false, Ordering::SeqCst);
+			},
+			2 => {
+				h.fail(Op::Launch);
+				h.initialize().await.unwrap();
+				assert!(h.core.launch_session().await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Launch);
+			},
+			3 => {
+				h.fail(Op::Start);
+				h.launched().await;
+				let grant = h.grant().await;
+				h.announce(&grant).await.unwrap();
+				assert!(h.core.start_session(&grant).await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Start);
+			},
+			4 => {
+				// A reconnect whose reconfiguration (encoder) fails.
+				let grant = h.resumed().await;
+				h.fail(Op::Resume);
+				assert!(h.core.start_session(&grant).await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Resume);
+			},
+			_ => {
+				let grant = h.active().await;
+				h.fail(Op::Pause);
+				assert!(h.announce(&grant).await.is_err());
+				h.wait_idle().await;
+				h.clear_failure(Op::Pause);
+			},
+		}
+		h.assert_released().await;
+		assert_eq!(
+			h.counters().unit_stops.load(Ordering::SeqCst),
+			h.counters().unit_creates.load(Ordering::SeqCst),
+			"cycle {cycle}: every created unit is stopped exactly once"
+		);
+	}
+	assert_eq!(h.counters().unit_creates.load(Ordering::SeqCst), 36);
+	assert!(!h.counters().overlapped.load(Ordering::SeqCst));
+}
+
 mod status {
 	use super::*;
 	use crate::session::status::{ClientPresence, SessionPhase, derive_phase};
@@ -1803,4 +2038,110 @@ mod status {
 		);
 		h.backend().worker_exit.send_replace(true);
 	}
+}
+
+/// Desktop Mode launches nothing: the manager records no application unit,
+/// so no teardown (user stop, reconnect, capture loss) ever stops one, and
+/// the desktop's own applications are not Pyroshine's to end.
+mod desktop_mode {
+	use super::*;
+	use crate::session::application::SessionMode;
+
+	fn desktop_context() -> SessionContext {
+		let mut context = context();
+		context.application.mode = SessionMode::Desktop;
+		context.application.title = "Desktop Mode".into();
+		context
+	}
+
+	#[tokio::test]
+	async fn desktop_restore_failure_blocks_idle_and_launch_without_killing_daemon() {
+		let h = Harness::new();
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		h.backend()
+			.counters
+			.desktop_cleanup_failed
+			.store(true, Ordering::SeqCst);
+		assert!(h.core.stop_session().await.is_err());
+		let status = h.core.subscribe_status();
+		assert_eq!(
+			status.borrow().last_stop.as_ref().unwrap().failure,
+			Some(TeardownFailure::DesktopNotRestored)
+		);
+		assert!(!h.core.shutdown.is_shutdown_triggered());
+		assert!(h.core.initialize_session(context()).await.is_err());
+		assert_eq!(h.backend().counters.resources.load(Ordering::SeqCst), 0);
+		assert_eq!(h.backend().counters.unit_stops.load(Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn no_application_unit_is_stopped_across_stream_reconnect_and_stop() {
+		let h = Harness::new();
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		// A reconnect at another resolution keeps the session.
+		let request = ResumeRequest {
+			resolution: Some((1280, 720)),
+			refresh_rate: Some(60),
+			..ResumeRequest::default()
+		};
+		h.core.resume_session(keys(), request, h.client).await.unwrap();
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		h.core.stop_session().await.unwrap();
+		assert_eq!(h.backend().counters.unit_stops.load(Ordering::SeqCst), 0);
+	}
+
+	#[tokio::test]
+	async fn a_lost_desktop_capture_tears_down_with_its_cause_and_stops_no_unit() {
+		use crate::session::failure::StopCause;
+		let h = Harness::new();
+		let status = h.core.subscribe_status();
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		let grant = h.grant().await;
+		h.announce(&grant).await.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		// The capture thread records why before its exit stops the session.
+		let cause = h.backend().session_cause.lock().unwrap().clone().unwrap();
+		cause.record(StopCause {
+			detail: "Screen sharing was stopped on the host desktop.".into(),
+			hint: None,
+			unexpected: false,
+			reported: false,
+		});
+		let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+		stop.trigger_shutdown(SessionShutdownReason::DesktopCaptureStopped)
+			.unwrap();
+		h.wait_idle().await;
+		let last = status.borrow().last_stop.clone().unwrap();
+		assert_eq!(last.reason, SessionShutdownReason::DesktopCaptureStopped);
+		assert_eq!(
+			last.cause.map(|cause| cause.detail).as_deref(),
+			Some("Screen sharing was stopped on the host desktop.")
+		);
+		assert_eq!(h.backend().counters.unit_stops.load(Ordering::SeqCst), 0);
+		// The next session starts normally.
+		h.core.initialize_session(desktop_context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		h.core.stop_session().await.unwrap();
+	}
+}
+
+#[tokio::test]
+async fn conditional_stop_preserves_an_unrelated_application() {
+	let h = Harness::new();
+	h.active().await;
+	assert!(!h.core.stop_session_if_application(99).await.unwrap());
+	assert_eq!(h.core.get_session_context().await.unwrap().application_id, 1);
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 0);
+	assert!(h.core.stop_session_if_application(1).await.unwrap());
+	h.assert_released().await;
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 1);
+	assert!(!h.core.stop_session_if_application(1).await.unwrap());
 }

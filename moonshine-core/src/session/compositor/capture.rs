@@ -501,31 +501,6 @@ pub(super) fn next_refresh_deadline(
 	now + interval - std::time::Duration::from_nanos(remainder as u64)
 }
 
-/// How capture opportunities and frame callbacks are scheduled.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum CapturePacing {
-	/// The refresh tick at the negotiated rate is the only capture clock.
-	#[default]
-	Fixed,
-	/// Presentation-driven capture for a client that paces playback itself
-	/// (it requested VRR presentation). Each latched commit opens a capture
-	/// opportunity at once, limited by a [`PresentationLimiter`] at the
-	/// negotiated rate; frame callbacks follow those "flips" like a VRR panel
-	/// whose maximum refresh is the stream rate. The refresh timer only
-	/// services an idle output. Frames are stamped with the time their newest
-	/// content was latched, so the RTP timeline carries the source cadence.
-	Vrr,
-}
-
-impl CapturePacing {
-	pub(crate) fn as_str(self) -> &'static str {
-		match self {
-			Self::Fixed => "fixed",
-			Self::Vrr => "vrr",
-		}
-	}
-}
-
 /// Rate limit for presentation-driven capture.
 ///
 /// The negotiated stream rate is a ceiling on *average* output, not a minimum
@@ -1237,8 +1212,8 @@ mod cadence_tests {
 #[cfg(test)]
 mod scheduling_tests {
 	use super::*;
-	use crate::session::compositor::admission::{CaptureReceiver, CaptureSender, capture_channel};
-	use crate::session::compositor::frame::ExportedFrame;
+	use crate::session::capture::admission::{CaptureReceiver, CaptureSender, capture_channel};
+	use crate::session::capture::frame::ExportedFrame;
 	use std::time::Instant;
 
 	const INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -1307,7 +1282,7 @@ mod scheduling_tests {
 				}
 			}
 		}
-		fn publish(&mut self, credit: crate::session::compositor::admission::CaptureCredit, trigger: CaptureTrigger) {
+		fn publish(&mut self, credit: crate::session::capture::admission::CaptureCredit, trigger: CaptureTrigger) {
 			if self.tx.try_send(ExportedFrame::for_test(), credit).is_ok() {
 				self.dirty = false;
 				self.schedule.captured();

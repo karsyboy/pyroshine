@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Mon, 26 Oct 2026 10:22:28 -0400
+Subject: [PATCH] context: keep a graphics queue beside the compute-only family
+
+v0.10.0 picks a compute family without graphics when the device has one
+(RADV, NVIDIA), so a context that creates its own device no longer has a
+queue on the graphics family. Pyroshine's colour conversion can run on the
+graphics queue to avoid compute-queue starvation under a GPU-bound game;
+create a queue on the first graphics-and-compute family as well, expose it
+as graphics_queue_family()/graphics_queue(), and share encoder input
+images with it. Adopted devices report their compute family.
+---
+ src/encoder/resources.rs    |  1 +
+ src/vulkan.rs               | 77 +++++++++++++++++++++++++++++++++++++
+ src/vulkan/encode_device.rs |  2 +
+ 3 files changed, 80 insertions(+)
+
+diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
+index b79943f..c101d83 100644
+--- a/src/encoder/resources.rs
++++ b/src/encoder/resources.rs
+@@ -65,6 +65,7 @@ pub(crate) fn create_image(
+             families.push(encode_family);
+             families.push(context.transfer_queue_family());
+             families.push(context.compute_queue_family());
++            families.push(context.graphics_queue_family());
+         }
+         (
+             vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
+diff --git a/src/vulkan.rs b/src/vulkan.rs
+index 60aaf71..512eb3b 100644
+--- a/src/vulkan.rs
++++ b/src/vulkan.rs
+@@ -507,6 +507,25 @@ fn find_compute_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Op
+         .map(|(idx, _)| idx as u32)
+ }
+ 
++/// The family a caller's graphics-queue work shares with this context: the
++/// first family that does graphics and compute, else the compute family.
++///
++/// [`find_compute_queue_family`] prefers a family without graphics, so on
++/// devices that have one (RADV, NVIDIA) the context would otherwise create no
++/// graphics queue at all. Callers that convert on the graphics queue to avoid
++/// compute-queue starvation under a GPU-bound application need it.
++fn find_graphics_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Option<u32> {
++    queue_families
++        .iter()
++        .position(|props| {
++            props
++                .queue_flags
++                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
++        })
++        .map(|idx| idx as u32)
++        .or_else(|| find_compute_queue_family(queue_families))
++}
++
+ /// The families [`scan_queue_families`] found.
+ struct ScannedFamilies {
+     /// The last family with the requested video flag, if any.
+@@ -735,6 +754,10 @@ struct VideoContextInner {
+     transfer_queue: vk::Queue,
+     compute_queue_family: u32,
+     compute_queue: vk::Queue,
++    /// Equals the compute family and queue unless the device has a separate
++    /// graphics family and this context created the device.
++    graphics_queue_family: u32,
++    graphics_queue: vk::Queue,
+     memory_properties: vk::PhysicalDeviceMemoryProperties,
+     device_properties: vk::PhysicalDeviceProperties,
+     supported_encode_codecs: Vec<Codec>,
+@@ -868,6 +891,21 @@ impl VideoContext {
+         self.inner.compute_queue
+     }
+ 
++    /// Get the graphics-and-compute queue family index.
++    ///
++    /// The compute family prefers a family without graphics, so this differs
++    /// from [`Self::compute_queue_family`] on devices that have one. Encoder
++    /// input images are shared with it. An adopted device reports its compute
++    /// family here.
++    pub fn graphics_queue_family(&self) -> u32 {
++        self.inner.graphics_queue_family
++    }
++
++    /// Get the graphics-and-compute queue; see [`Self::graphics_queue_family`].
++    pub fn graphics_queue(&self) -> vk::Queue {
++        self.inner.graphics_queue
++    }
++
+     pub(crate) fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+         &self.inner.memory_properties
+     }
+@@ -1041,6 +1079,7 @@ impl VideoContext {
+         let mut video_decode_queue_family = None;
+         let mut transfer_queue_family = u32::MAX;
+         let mut compute_queue_family = u32::MAX;
++        let mut graphics_queue_family = u32::MAX;
+         let mut supported_encode_codecs = Vec::new();
+         let mut encode_unsupported = Vec::new();
+         let mut supported_decode_codecs = Vec::new();
+@@ -1274,6 +1313,8 @@ impl VideoContext {
+                     encode_queue.unwrap_or(0)
+                 };
+                 compute_queue_family = compute_q;
++                graphics_queue_family =
++                    find_graphics_queue_family(&queue_families).unwrap_or(compute_q);
+                 supported_encode_codecs = encode_codecs;
+                 encode_unsupported = device_unsupported;
+                 supported_decode_codecs = decode_codecs;
+@@ -1346,6 +1387,9 @@ impl VideoContext {
+         if !unique_families.contains(&compute_queue_family) {
+             unique_families.push(compute_queue_family);
+         }
++        if !unique_families.contains(&graphics_queue_family) {
++            unique_families.push(graphics_queue_family);
++        }
+ 
+         let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
+             .iter()
+@@ -1547,6 +1591,7 @@ impl VideoContext {
+             video_decode_queue_family.map(|family| unsafe { device.get_device_queue(family, 0) });
+         let transfer_queue = unsafe { device.get_device_queue(transfer_queue_family, 0) };
+         let compute_queue = unsafe { device.get_device_queue(compute_queue_family, 0) };
++        let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
+ 
+         if let Some(family) = video_encode_queue_family {
+             info!("Video encode queue family: {}", family);
+@@ -1556,6 +1601,7 @@ impl VideoContext {
+         }
+         info!("Transfer queue family: {}", transfer_queue_family);
+         info!("Compute queue family: {}", compute_queue_family);
++        info!("Graphics queue family: {}", graphics_queue_family);
+         info!("Created Vulkan device with video support");
+ 
+         instance_guard.armed = false;
+@@ -1576,6 +1622,8 @@ impl VideoContext {
+                 transfer_queue,
+                 compute_queue_family,
+                 compute_queue,
++                graphics_queue_family,
++                graphics_queue,
+                 memory_properties,
+                 device_properties,
+                 supported_encode_codecs,
+@@ -1682,6 +1730,8 @@ impl VideoContext {
+                 transfer_queue,
+                 compute_queue_family: compute.family,
+                 compute_queue,
++                graphics_queue_family: compute.family,
++                graphics_queue: compute_queue,
+                 memory_properties,
+                 device_properties,
+                 supported_encode_codecs: Vec::new(),
+@@ -1989,6 +2039,33 @@ impl VideoContext {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn graphics_family_is_the_first_with_graphics_and_compute() {
++        let graphics =
++            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
++        let compute = vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
++        let transfer = vk::QueueFlags::TRANSFER;
++        let encode = vk::QueueFlags::VIDEO_ENCODE_KHR;
++
++        let layouts: [(&str, &[vk::QueueFlags], u32); 4] = [
++            ("RADV", &[graphics, compute, encode], 0),
++            ("NVIDIA", &[graphics, transfer, compute, encode], 0),
++            ("ANV", &[graphics, encode], 0),
++            ("compute only", &[transfer, compute, encode], 1),
++        ];
++        for (driver, flags, expected) in layouts {
++            let families: Vec<_> = flags
++                .iter()
++                .map(|&flags| vk::QueueFamilyProperties::default().queue_flags(flags))
++                .collect();
++            assert_eq!(
++                find_graphics_queue_family(&families),
++                Some(expected),
++                "{driver}"
++            );
++        }
++    }
++
+     #[test]
+     fn compute_family_is_one_without_graphics_when_the_device_has_one() {
+         let graphics =
+diff --git a/src/vulkan/encode_device.rs b/src/vulkan/encode_device.rs
+index f16240e..8068e44 100644
+--- a/src/vulkan/encode_device.rs
++++ b/src/vulkan/encode_device.rs
+@@ -335,6 +335,8 @@ impl VideoContext {
+                 transfer_queue,
+                 compute_queue_family: compute.family,
+                 compute_queue,
++                graphics_queue_family: compute.family,
++                graphics_queue: compute_queue,
+                 memory_properties,
+                 device_properties,
+                 supported_encode_codecs: plan.codecs.clone(),

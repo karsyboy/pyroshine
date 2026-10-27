@@ -10,10 +10,12 @@
 use moonshine_management::dto::{ChoiceOption, ConfigSchema, FieldKind, FieldSpec, ScannerVariant, SchemaSection};
 use serde::Serialize;
 
+use crate::session::application::SessionMode;
 use crate::session::compositor::{CaptureMode, VirtualConnectorStrategy, VrrCapture};
+use crate::session::frame_limit::{FrameLimitMethod, FrameLimitMode};
 use crate::session::stream::audio::AudioQuality;
 use crate::session::stream::control::input::gamepad::{GamepadEmulation, HomeTrigger};
-use crate::session::stream::video::{ConversionQueueMode, FecMode, PyroWaveQueueMode};
+use crate::session::stream::video::{ConversionQueueMode, EncoderPreference, FecMode, PyroWaveQueueMode};
 
 /// Paths of the list settings edited as structured entries.
 pub(crate) const APPLICATIONS: &str = "application";
@@ -127,6 +129,18 @@ fn queue_mode(mode: PyroWaveQueueMode) -> (&'static str, &'static str) {
 	}
 }
 
+fn encoder_preference(preference: EncoderPreference) -> (&'static str, &'static str) {
+	match preference {
+		EncoderPreference::Auto => (
+			"Automatic",
+			"Vulkan Video where the GPU supports a profile, otherwise VA-API or NVENC (recommended).",
+		),
+		EncoderPreference::Vulkan => ("Vulkan Video", "Only Vulkan Video."),
+		EncoderPreference::Vaapi => ("VA-API", "Only VA-API (Intel, AMD)."),
+		EncoderPreference::Nvenc => ("NVENC", "Only NVENC (NVIDIA)."),
+	}
+}
+
 fn conversion_mode(mode: ConversionQueueMode) -> (&'static str, &'static str) {
 	match mode {
 		ConversionQueueMode::Auto => (
@@ -213,6 +227,53 @@ fn connector_strategy(strategy: VirtualConnectorStrategy) -> (&'static str, &'st
 	}
 }
 
+fn session_mode(mode: SessionMode) -> (&'static str, &'static str) {
+	match mode {
+		SessionMode::Game => ("Game Mode", "Launch the command in an isolated display (default)."),
+		SessionMode::Desktop => ("Desktop Mode", "Stream the running desktop; the command is not run."),
+	}
+}
+
+fn frame_limit_mode(mode: FrameLimitMode) -> (&'static str, &'static str) {
+	match mode {
+		FrameLimitMode::Off => ("Off", "Launch applications unchanged."),
+		FrameLimitMode::Stream => (
+			"Match stream FPS",
+			"Limit to the frame rate of the stream that launches the application.",
+		),
+		FrameLimitMode::Custom => ("Custom FPS", "Limit to the frame rate set below."),
+	}
+}
+
+fn frame_limit_method(method: FrameLimitMethod) -> (&'static str, &'static str) {
+	match method {
+		FrameLimitMethod::Proton => (
+			"Proton (DXVK, vkd3d-proton)",
+			"Direct3D games under Proton or Wine. Native Linux games are not limited.",
+		),
+		FrameLimitMethod::Mangohud => (
+			"MangoHud",
+			"Vulkan games, including Proton's, through MangoHud's layer with its overlay hidden. Needs MangoHud installed; OpenGL is not limited.",
+		),
+	}
+}
+
+fn optional(kind: FieldKind, unset: &str) -> FieldKind {
+	match kind {
+		FieldKind::Choice { options, .. } => FieldKind::Choice {
+			options,
+			unset_label: Some(unset.into()),
+		},
+		FieldKind::Integer { min, max, unit, .. } => FieldKind::Integer {
+			min,
+			max,
+			unit,
+			optional: true,
+		},
+		kind => kind,
+	}
+}
+
 const OUTPUT_SUGGESTIONS: &[&str] = &["null", "journal", "inherit", "file:/path/to/log", "append:/path/to/log"];
 
 /// Settings shared by applications and every scanner type.
@@ -270,6 +331,42 @@ fn launch_fields(section: &str, scanner: bool) -> Vec<FieldSpec> {
 		)
 		.advanced()
 		.0,
+		Field::new(
+			"frame_limit_mode",
+			section,
+			"Frame limit",
+			&format!("Frame limiting for {of}. Unset uses the global frame limit setting. Takes effect at the next launch."),
+			optional(
+				choices(
+					&[FrameLimitMode::Off, FrameLimitMode::Stream, FrameLimitMode::Custom],
+					frame_limit_mode,
+				),
+				"Global setting",
+			),
+		)
+		.advanced()
+		.0,
+		Field::new(
+			"frame_limit_fps",
+			section,
+			"Frame limit FPS",
+			"Frame rate for a custom frame limit. Unset uses the global value.",
+			optional(integer(10.0, 1000.0, Some("FPS")), ""),
+		)
+		.advanced()
+		.0,
+		Field::new(
+			"frame_limit_method",
+			section,
+			"Frame limiter",
+			"Limiter used for this application. Unset uses the global limiter.",
+			optional(
+				choices(&[FrameLimitMethod::Proton, FrameLimitMethod::Mangohud], frame_limit_method),
+				"Global setting",
+			),
+		)
+		.advanced()
+		.0,
 	]
 }
 
@@ -295,6 +392,14 @@ fn application_fields() -> Vec<FieldSpec> {
 			},
 		)
 		.required()
+		.0,
+		Field::new(
+			"mode",
+			section,
+			"Mode",
+			"Game Mode launches the command in Pyroshine's own isolated display; Desktop Mode streams your running desktop and launches nothing.",
+			choices(&[SessionMode::Game, SessionMode::Desktop], session_mode),
+		)
 		.0,
 		Field::new(
 			"boxart",
@@ -399,6 +504,32 @@ fn scanner_variants() -> Vec<ScannerVariant> {
 			],
 		),
 		variant(
+			"bottles",
+			"Bottles",
+			"Programs added to the Bottles Library, and its UMU games once they are ready.",
+			vec![
+				Field::new(
+					"data_dir",
+					section,
+					"Bottles data directory",
+					"Defaults to the native data directory when it holds a library, otherwise the Flatpak one (~/.var/app/com.usebottles.bottles/data/bottles).",
+					path(false, true, true),
+				)
+				.0,
+				scanner_command(&["{bottle}", "{program_id}", "{name}"]),
+				Field::new(
+					"umu_command",
+					section,
+					"UMU launch command",
+					"Command for Library entries managed through Bottles' UMU integration. Without it, those entries are not offered.",
+					FieldKind::Command {
+						placeholders: vec!["{umu_game}".into(), "{name}".into()],
+					},
+				)
+				.0,
+			],
+		),
+		variant(
 			"desktop",
 			"Desktop entries",
 			"Recursively scan .desktop launchers; each entry's Exec line is its command.",
@@ -462,9 +593,29 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		section("keyboard", "Keyboard", "XKB layout of the streaming session."),
 		section("applications", "Applications", "Applications offered to clients."),
 		section(
+			"desktop",
+			"Desktop Mode",
+			"Stream the desktop you are logged in to, with its applications, as its own entry.",
+		),
+		section(
 			"scanners",
 			"Application discovery",
-			"Scanners that add installed games when Pyroshine starts.",
+			"Scanners that find installed games and keep the application list current.",
+		),
+		section(
+			"web",
+			"Web management",
+			"This management interface: its address, HTTPS and the host names browsers may use.",
+		),
+		section(
+			"history",
+			"Session history",
+			"How long finished sessions are kept and what is recorded about them.",
+		),
+		section(
+			"frame_limit",
+			"Frame limiting",
+			"Optional limits that stop launched games rendering frames the stream cannot send.",
 		),
 		section("diagnostics", "Diagnostics", "Logging for performance investigation."),
 	];
@@ -490,7 +641,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"address",
 			"network",
 			"Bind address",
-			"IP address for the web and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
+			"IP address for the GameStream and stream listeners. 0.0.0.0 is IPv4 only; :: listens on IPv4 and IPv6.",
 			text(false, Some("0.0.0.0"), &["0.0.0.0", "::"]),
 		)
 		.caution("Clients must be able to reach this address."),
@@ -498,7 +649,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"webserver.port",
 			"network",
 			"HTTP port",
-			"GameStream HTTP API and host-local pairing page (TCP).",
+			"GameStream HTTP API and host-local revocation (TCP).",
 		)
 		.caution("Clients and firewalls expect the default ports unless reconfigured."),
 		port(
@@ -518,6 +669,117 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"Client timeout",
 			"Seconds a streaming client may go without a ping before it is treated as disconnected. The session and application keep running for a resume.",
 			integer(1.0, 86_400.0, Some("s")),
+		),
+		Field::new(
+			"management.tray",
+			"general",
+			"Desktop tray icon",
+			"Show the status icon and pairing notifications while you are signed in to a desktop. Headless hosts never show it.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"management.enabled",
+			"web",
+			"Web management interface",
+			"Serve this interface. Without it, manage Pyroshine with the tray and `pyroshine pair`.",
+			FieldKind::Bool,
+		)
+		.caution("Turning it off closes this page after the restart."),
+		Field::new(
+			"management.address",
+			"web",
+			"Listen address",
+			"127.0.0.1 keeps it on this computer; reach it from elsewhere through an SSH tunnel or VPN. \
+			 Any other address requires HTTPS.",
+			text(false, Some("127.0.0.1"), &["127.0.0.1", "::1", "0.0.0.0", "::"]),
+		)
+		.caution("Another address shows the sign-in page to your network; use a strong password."),
+		port(
+			"management.port",
+			"web",
+			"Port",
+			"TCP port of this interface (default 47990).",
+		),
+		Field::new(
+			"management.tls",
+			"web",
+			"HTTPS",
+			"Serve HTTPS. Required when the listen address is not a loopback address.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"management.certificate",
+			"web",
+			"HTTPS certificate",
+			"PEM certificate for HTTPS. Empty uses the server's own certificate, which browsers show a \
+			 warning for until you accept it.",
+			path(true, true, false),
+		)
+		.advanced(),
+		Field::new(
+			"management.private_key",
+			"web",
+			"HTTPS private key",
+			"Private key of the HTTPS certificate (PEM).",
+			path(true, true, false),
+		)
+		.advanced(),
+		Field::new(
+			"management.allowed_hosts",
+			"web",
+			"Allowed host names",
+			"Further names browsers use to reach this interface, such as streambox.lan or a reverse \
+			 proxy's name (name or name:port). Addresses and localhost always work.",
+			FieldKind::TextList {
+				placeholder: Some("streambox.lan".into()),
+			},
+		)
+		.advanced(),
+		Field::new(
+			"management.web_root",
+			"web",
+			"Interface files",
+			"Directory holding this interface's files. Empty uses the packaged location.",
+			path(true, true, true),
+		)
+		.advanced(),
+		Field::new(
+			"history.enabled",
+			"history",
+			"Record session history",
+			"Keep a record of each session: application, client, negotiated mode, reconnects, how it \
+			 ended and a performance summary measured on this host.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"history.retention_days",
+			"history",
+			"Keep sessions for",
+			"Sessions older than this are removed.",
+			integer(
+				f64::from(*crate::management::history::RETENTION_DAYS.start()),
+				f64::from(*crate::management::history::RETENTION_DAYS.end()),
+				Some("days"),
+			),
+		),
+		Field::new(
+			"history.max_sessions",
+			"history",
+			"Most sessions kept",
+			"The oldest sessions are removed beyond this count.",
+			integer(
+				f64::from(*crate::management::history::MAX_SESSIONS.start()),
+				f64::from(*crate::management::history::MAX_SESSIONS.end()),
+				None,
+			),
+		)
+		.advanced(),
+		Field::new(
+			"history.record_client_address",
+			"history",
+			"Record client addresses",
+			"Store each session's client IP address and the name you gave that client.",
+			FieldKind::Bool,
 		),
 		Field::new(
 			"webserver.enable_pairing",
@@ -608,6 +870,22 @@ pub(crate) fn config_schema() -> ConfigSchema {
 					PyroWaveQueueMode::Compute,
 				],
 				queue_mode,
+			),
+		)
+		.advanced(),
+		Field::new(
+			"stream.video.encoder",
+			"video",
+			"H.264/HEVC/AV1 encoder",
+			"Which encoder implementations encode the conventional codecs. Takes effect after a restart: the startup check decides each codec profile's encoder.",
+			choices(
+				&[
+					EncoderPreference::Auto,
+					EncoderPreference::Vulkan,
+					EncoderPreference::Vaapi,
+					EncoderPreference::Nvenc,
+				],
+				encoder_preference,
 			),
 		)
 		.advanced(),
@@ -739,6 +1017,63 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		.advanced()
 		.caution("Always compositing costs GPU time; use it to diagnose capture problems."),
 		Field::new(
+			"desktop.enabled",
+			"desktop",
+			"Offer Desktop Mode",
+			"Offer managed Desktop Mode on KDE Plasma or GNOME Wayland: use a client-sized virtual display, disable physical displays, and restore their configuration afterward. Authorize input on the host before unattended use.",
+			FieldKind::Bool,
+		),
+        Field::new(
+            "desktop.disconnect_grace_secs", "desktop", "Reconnect grace",
+            "Seconds to retain the virtual display after client loss. Reconnecting cancels restoration; zero restores immediately. Explicit Stop always restores immediately.",
+            integer(0.0,86400.0,Some("s")),
+        ),
+		Field::new(
+			"desktop.title",
+			"desktop",
+			"Entry title",
+			"Name of the Desktop Mode entry in Moonlight. It also derives the entry's ID.",
+			text(false, Some("Desktop Mode"), &[]),
+		),
+		Field::new(
+			"desktop.input",
+			"desktop",
+			"Remote control",
+			"Let the client use the desktop's keyboard and pointer. Off streams the desktop view-only.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"desktop.audio",
+			"desktop",
+			"Desktop audio",
+			"Route desktop playback to a streaming sink while Desktop Mode runs, then restore its previous routing. Off leaves host audio unchanged.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"frame_limit.mode",
+			"frame_limit",
+			"Frame limit",
+			"Ask launched games to render at most this many frames per second. Capture pacing is unchanged; this saves GPU time games spend on frames the stream drops. Applies only to applications Pyroshine launches, at their next launch. Applications can override it.",
+			choices(
+				&[FrameLimitMode::Off, FrameLimitMode::Stream, FrameLimitMode::Custom],
+				frame_limit_mode,
+			),
+		),
+		Field::new(
+			"frame_limit.fps",
+			"frame_limit",
+			"Custom FPS",
+			"Frame rate for the custom frame limit.",
+			integer(10.0, 1000.0, Some("FPS")),
+		),
+		Field::new(
+			"frame_limit.method",
+			"frame_limit",
+			"Limiter",
+			"How the limit is enforced. Values set in your user environment (DXVK_FRAME_RATE, VKD3D_FRAME_RATE, MangoHud configuration) and game launch options take precedence. See the health check for what is available.",
+			choices(&[FrameLimitMethod::Proton, FrameLimitMethod::Mangohud], frame_limit_method),
+		),
+		Field::new(
 			"compositor.vrr_capture",
 			"display",
 			"VRR capture",
@@ -778,7 +1113,7 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			APPLICATIONS,
 			"applications",
 			"Applications",
-			"Static applications. Discovered applications are added to this list when Pyroshine starts.",
+			"Applications you define. Discovered games are listed with them; a discovered game with the same title as one of these is replaced by it.",
 			FieldKind::Applications {
 				item: application_fields(),
 			},
@@ -787,11 +1122,30 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			SCANNERS,
 			"scanners",
 			"Scanners",
-			"Scanners run at startup; restart Pyroshine after installing games.",
+			"Launchers whose installed games are offered to clients. Adding or editing a scanner takes effect after a restart; installed and removed games do not need one.",
 			FieldKind::Scanners {
 				variants: scanner_variants(),
 			},
 		),
+		Field::new(
+			"library.auto_refresh",
+			"scanners",
+			"Follow installs automatically",
+			"Update the application list when games are installed, removed or renamed, without restarting Pyroshine. When off, use Rescan on the Applications page.",
+			FieldKind::Bool,
+		),
+		Field::new(
+			"library.poll_interval_secs",
+			"scanners",
+			"Periodic check",
+			"Seconds between checks for changes that file notifications miss (network drives, libraries that appear later). Only metadata is compared; a launcher is scanned again only if it changed.",
+			integer(
+				*crate::app_scanner::service::POLL_INTERVAL_SECS.start() as f64,
+				*crate::app_scanner::service::POLL_INTERVAL_SECS.end() as f64,
+				Some("s"),
+			),
+		)
+		.advanced(),
 		Field::new(
 			"stream.video.log_stats",
 			"diagnostics",
@@ -829,6 +1183,10 @@ pub(crate) mod tests {
 	pub(crate) fn complete_config() -> Value {
 		let mut config = serde_json::to_value(Config::default()).unwrap();
 		config["compositor"]["gpu"] = json!("/dev/dri/renderD128");
+		config["management"]["certificate"] = json!("/tmp/web.pem");
+		config["management"]["private_key"] = json!("/tmp/web.key");
+		config["management"]["web_root"] = json!("/usr/share/pyroshine/web");
+		config["management"]["allowed_hosts"] = json!(["streambox.lan"]);
 		config["compositor"]["keyboard"]["options"] = json!("caps:escape");
 		config["stream"]["control"]["gamepad"]["home_button"]["trigger"] = json!("back_start");
 		let launch = json!({
@@ -837,9 +1195,13 @@ pub(crate) mod tests {
 			"stdout": "journal",
 			"stderr": "journal",
 			"launch_timeout_secs": 5,
+			"frame_limit_mode": "custom",
+			"frame_limit_fps": 90,
+			"frame_limit_method": "mangohud",
 		});
 		let mut application = json!({
 			"title": "Game",
+			"mode": "desktop",
 			"command": ["/usr/bin/game"],
 			"boxart": "/tmp/art.png",
 			"output_scale": 1.5,
@@ -850,6 +1212,7 @@ pub(crate) mod tests {
 			json!({"type": "steam", "library": "~/.steam", "command": ["steam"]}),
 			json!({"type": "lutris", "pga_db": "/tmp/pga.db", "command": ["lutris"]}),
 			json!({"type": "heroic", "config_dir": "/tmp/heroic", "command": ["heroic"]}),
+			json!({"type": "bottles", "data_dir": "/tmp/bottles", "command": ["bottles-cli"], "umu_command": ["bottles-cli", "umu"]}),
 			json!({"type": "desktop", "directories": ["/tmp"], "include_terminal": true, "resolve_icons": false}),
 		];
 		config["application_scanner"] = Value::Array(
@@ -966,13 +1329,13 @@ pub(crate) mod tests {
 		}
 	}
 
-	/// The desktop app renders forms from this schema. Its tests and browser
+	/// The web interface renders forms from this schema. Its tests and browser
 	/// preview read a committed copy, which must match the daemon's schema.
 	/// Regenerate it with `MOONSHINE_UPDATE_UI_FIXTURES=1 cargo test -p
 	/// moonshine-core ui_schema_fixture_is_current`.
 	#[test]
 	fn ui_schema_fixture_is_current() {
-		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../pyroshine-ui/src/api/schema.fixture.json");
+		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/src/api/schema.fixture.json");
 		let fixture = serde_json::to_string_pretty(&json!({
 			"schema": config_schema(),
 			"defaults": Config::default(),
@@ -984,7 +1347,7 @@ pub(crate) mod tests {
 		let committed = std::fs::read_to_string(&path).unwrap_or_default();
 		assert!(
 			committed == fixture,
-			"{} is out of date; regenerate it with MOONSHINE_UPDATE_UI_FIXTURES=1 and check the desktop app renders the change",
+			"{} is out of date; regenerate it with MOONSHINE_UPDATE_UI_FIXTURES=1 and check the web interface renders the change",
 			path.display()
 		);
 	}

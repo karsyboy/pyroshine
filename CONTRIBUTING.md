@@ -20,6 +20,7 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   build-essential clang cmake dbus libc++-dev libc++abi-dev libclang-dev \
   libdrm-dev libevdev-dev libgbm-dev libopus-dev libwayland-dev \
+  libpipewire-0.3-dev libspa-0.2-dev libpulse-dev \
   libxkbcommon-dev patchelf pkg-config
 ```
 
@@ -56,9 +57,10 @@ MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.1 \
   ./target/release/moonshine healthcheck
 ```
 
-The optional desktop app is a separate workspace under `pyroshine-ui/` with its
-own Node.js and WebKitGTK prerequisites; see [pyroshine-ui/README.md](pyroshine-ui/README.md).
-Building the server never compiles it.
+The server binary includes the desktop tray (`src/tray/`, run as `moonshine
+tray`); it links no GUI toolkit. The web interface's files are built separately
+with Node.js (`cd web && npm ci && npm run build`); point a local server at
+them with `MOONSHINE_WEB_ROOT=$PWD/web/dist`. See [web/README.md](web/README.md).
 
 A successful compile alone does not install device rules.
 Use the installation steps below before validating streaming. When the optional
@@ -96,6 +98,7 @@ install the artifacts and integration files:
 ```sh
 sudo install -Dm755 target/release/moonshine /usr/bin/pyroshine
 sudo install -Dm755 dist/start-pyroshine.sh /usr/bin/start-pyroshine.sh
+sudo install -Dm644 dist/pyroshine-desktop-guard.service /usr/lib/systemd/user/pyroshine-desktop-guard.service
 sudo install -Dm755 /tmp/pyrowave-install/lib/libpyrowave-shared.so.1 /usr/lib/libpyrowave-shared.so.1
 sudo install -Dm644 dist/pyroshine@.service /usr/lib/systemd/system/pyroshine@.service
 sudo install -Dm644 dist/60-pyroshine.rules /usr/lib/udev/rules.d/60-pyroshine.rules
@@ -146,6 +149,18 @@ startup log. Use your overridden config path for the check if it differs.
 Remove the old layer artifacts and session environment on upgrade as described
 in [native presentation migration](docs/NATIVE_PRESENTATION.md#upgrade-migration).
 
+For managed Desktop Mode, restore the desktop and stop its separate user guard
+before replacing binaries, then reload the user manager after installation:
+
+```sh
+pyroshine desktop restore
+systemctl --user stop pyroshine-desktop-guard.service
+systemctl --user daemon-reload
+```
+
+The unit is started on demand. See [Desktop Mode](docs/DESKTOP_MODE.md) for native
+compositor requirements and live acceptance checks.
+
 Repeat the build, stop, install, and start steps for subsequent manual upgrades.
 Do not replace your config or pairing state with defaults. If validation fails,
 stop the service, restore the previous binaries and matching libraries, then
@@ -162,14 +177,12 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 ```
 
-The desktop app has its own checks (CI runs them in the `Desktop app` job):
+The web interface has its own checks (CI runs them in the `Web interface`
+job); the tray is checked with the workspace above:
 
 ```sh
-cd pyroshine-ui
+cd web
 npm ci && npm run typecheck && npm test && npm run build
-cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
 Hardware-dependent tests are `#[ignore]`d, so an ordinary run reports them as
@@ -268,7 +281,7 @@ receive new fork release entries.
 The release workflow validates the exact tagged commit before building it:
 formatting, Clippy, rustdoc, the workspace tests, the pinned PyroWave FFI
 check (it must run, not be skipped), `scripts/known_defects.py` with the
-native sanitizer tests, and the desktop app checks. It records the commit,
+native sanitizer tests, and the web interface checks. It records the commit,
 `Cargo.lock` hash, Git and native pins, toolchain and every suite's result in
 `release-validation.json`, published with the release and included in
 `SHA256SUMS`. Building and publishing then waits for approval in the GitHub
@@ -280,9 +293,10 @@ real clients) passed on that commit. A skipped or unexecuted hardware check is
 not a pass; list it in the release notes instead.
 
 Before releasing, update `[workspace.package].version` in `Cargo.toml`. It is the
-only version to edit: `prepare` (below) writes it to every other copy — both
-`Cargo.lock` files, the desktop app's `src-tauri/Cargo.toml`, `package.json` and
-`package-lock.json` — and `check` fails while any copy differs. To synchronize
+only version to edit: `prepare` (below) writes it to every other copy — the
+workspace members in `Cargo.lock` and the web interface's `package.json` and
+`package-lock.json` (its build stamps the version the server checks) — and
+`check` fails while any copy differs. To synchronize
 without preparing a release, run `python3 scripts/changelog.py sync-versions`.
 Then prepare the changelog using Python 3.11 or newer (no additional packages
 are needed):
@@ -333,21 +347,42 @@ It can also be run with `workflow_dispatch` for an existing tag. Check that the
 workflow succeeded and all assets are attached, then test installation and an
 upgrade from the previous release.
 
-Packaging is defined in [nfpm.yaml](nfpm.yaml), [nfpm-ui.yaml](nfpm-ui.yaml)
-(the separate desktop app package) and [dist/](dist/). Keep the
-portable and native package integration files consistent when changing service,
-udev or policy paths.
+### Prereleases
+
+A prerelease follows the same steps with a `-prerelease` or `-prerelease.N`
+version, for example `0.18.0-prerelease.1` in `Cargo.toml` and a dated
+`## [v0.18.0-prerelease.1]` changelog entry:
+
+```sh
+git tag -a v0.18.0-prerelease.1 -m "Pyroshine v0.18.0-prerelease.1"
+git push origin v0.18.0-prerelease.1
+```
+
+The [prerelease workflow](.github/workflows/prerelease.yaml) runs the release
+workflow for these tags, with the same validation, `release` environment
+approval and assets, and marks the GitHub release as a prerelease; the
+release workflow itself ignores them. It can also be run with
+`workflow_dispatch` for an existing prerelease tag. Other suffixed tags such as
+`v1.2.3-rc.1` go through the release workflow as before and are not published
+to the pacman repository.
+
+Packaging is defined in [nfpm.yaml](nfpm.yaml) (one package: the server with
+its tray, the web interface's files and the application-menu entry; it replaces
+the former `pyroshine-ui` package) and [dist/](dist/).
+Keep the portable and native package integration files consistent when
+changing service, udev, policy or desktop-entry paths.
 
 ### Pacman repository
 
 The [`[pyrowave]` pacman repository](https://github.com/karsyboy/pyrowave-packages) publishes
-`pyroshine-bin` and `pyroshine-ui-bin`, which repackage the release's Arch
-packages. After a stable release is published, the release workflow's `pacman`
-job starts that repository's **Publish** workflow, so a release needs no further
-step; prereleases are not published. The job needs the `PACKAGES_DISPATCH_TOKEN`
+`pyroshine-bin`, which repackages the newest stable release's Arch package, and
+`pyroshine-prerelease-bin`, which follows the newest release including
+prereleases. After a stable release or a prerelease is published, the release
+workflow's `pacman` job starts that repository's **Publish** workflow, so a
+release needs no further step. The job needs the `PACKAGES_DISPATCH_TOKEN`
 secret: a fine-grained token with access to `pyrowave-packages` only and the
 **Actions: Read and write** permission. If the job fails, run **Publish** in
 `pyrowave-packages` by hand.
 
-When changing the `archlinux` dependencies in the nfpm files, update the
-PKGBUILD there to match.
+When changing the `archlinux` dependencies in the nfpm files, update both
+PKGBUILDs there to match.

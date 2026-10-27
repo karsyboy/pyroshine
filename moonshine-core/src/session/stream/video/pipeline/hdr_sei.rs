@@ -7,45 +7,45 @@
 //!
 //! Metadata is injected on key frames only, before the first VCL NAL unit.
 
-use crate::session::compositor::frame::HdrMetadata;
+use crate::session::capture::frame::Hdr10Metadata;
 use crate::session::stream::video::VideoFormat;
 
 /// Build an H.264/H.265 MDCV SEI NAL unit.
 ///
 /// H.265 SEI uses **GBR order** for display primaries (Green, Blue, Red),
-/// while HdrMetadata stores them in RGB order.
-fn build_mdcv_sei_payload(m: &HdrMetadata, is_hevc: bool) -> Vec<u8> {
+/// while Hdr10Metadata stores them in RGB order.
+fn build_mdcv_sei_payload(m: &Hdr10Metadata, is_hevc: bool) -> Vec<u8> {
 	let mut payload = Vec::with_capacity(24);
 
 	if is_hevc {
 		// H.265: GBR order (Green, Blue, Red).
 		let order = [1, 2, 0]; // index into display_primaries
 		for &i in &order {
-			let (x, y) = m.display_primaries[i];
+			let (x, y) = m.mastering.display_primaries[i];
 			payload.extend(x.to_be_bytes());
 			payload.extend(y.to_be_bytes());
 		}
 	} else {
-		// H.264: RGB order (same as HdrMetadata).
-		for &(x, y) in &m.display_primaries {
+		// H.264: RGB order (same as Hdr10Metadata).
+		for &(x, y) in &m.mastering.display_primaries {
 			payload.extend(x.to_be_bytes());
 			payload.extend(y.to_be_bytes());
 		}
 	}
 
 	// White point.
-	payload.extend(m.white_point.0.to_be_bytes());
-	payload.extend(m.white_point.1.to_be_bytes());
+	payload.extend(m.mastering.white_point.0.to_be_bytes());
+	payload.extend(m.mastering.white_point.1.to_be_bytes());
 
 	// Max and min luminance (already in 0.0001 cd/m² units, big-endian u32).
-	payload.extend(m.max_luminance.to_be_bytes());
-	payload.extend(m.min_luminance.to_be_bytes());
+	payload.extend(m.mastering.max_luminance.to_be_bytes());
+	payload.extend(m.mastering.min_luminance.to_be_bytes());
 
 	payload
 }
 
 /// Build an H.264/H.265 CLLI SEI NAL unit payload.
-fn build_clli_sei_payload(m: &HdrMetadata) -> Vec<u8> {
+fn build_clli_sei_payload(m: &Hdr10Metadata) -> Vec<u8> {
 	let mut payload = Vec::with_capacity(4);
 	payload.extend(m.max_cll.to_be_bytes());
 	payload.extend(m.max_fall.to_be_bytes());
@@ -130,7 +130,7 @@ fn build_sei_nal(payload_type: u8, payload: &[u8], is_hevc: bool) -> Vec<u8> {
 }
 
 /// Build AV1 OBU metadata for HDR CLL (metadata_type = 1).
-fn build_av1_cll_obu(m: &HdrMetadata) -> Vec<u8> {
+fn build_av1_cll_obu(m: &Hdr10Metadata) -> Vec<u8> {
 	// OBU payload: metadata_type (leb128) + max_cll (u16 BE) + max_fall (u16 BE).
 	let mut payload = Vec::new();
 	// metadata_type = 1 (METADATA_TYPE_HDR_CLL), leb128 encoded.
@@ -142,21 +142,21 @@ fn build_av1_cll_obu(m: &HdrMetadata) -> Vec<u8> {
 }
 
 /// Convert a chromaticity coordinate from the 0.00002 steps of H.26x MDCV SEI
-/// (the `HdrMetadata` scale) to AV1's 0.16 fixed-point scale.
+/// (the `Hdr10Metadata` scale) to AV1's 0.16 fixed-point scale.
 fn av1_chromaticity(value: u16) -> u16 {
 	// value / 50000 * 65536, rounded; 50000 (chromaticity 1.0) does not fit
 	// 16 bits and saturates.
 	((u64::from(value) * 65536 + 25000) / 50000).min(u64::from(u16::MAX)) as u16
 }
 
-/// Convert a luminance from 0.0001 cd/m² units (the `HdrMetadata` scale) to
+/// Convert a luminance from 0.0001 cd/m² units (the `Hdr10Metadata` scale) to
 /// AV1's 24.8 fixed-point `luminance_max`. The scale shrinks by 10000/256, so
 /// unlike [`av1_luminance_min`] no input can overflow the field.
 fn av1_luminance_max(value: u32) -> u32 {
 	((u64::from(value) * 256 + 5000) / 10000) as u32
 }
 
-/// Convert a luminance from 0.0001 cd/m² units (the `HdrMetadata` scale) to
+/// Convert a luminance from 0.0001 cd/m² units (the `Hdr10Metadata` scale) to
 /// AV1's 18.14 fixed-point `luminance_min`.
 fn av1_luminance_min(value: u32) -> u32 {
 	((u64::from(value) * 16384 + 5000) / 10000).min(u64::from(u32::MAX)) as u32
@@ -164,21 +164,21 @@ fn av1_luminance_min(value: u32) -> u32 {
 
 /// Build AV1 OBU metadata for HDR MDCV (metadata_type = 2), converting the
 /// values into AV1's units (spec 6.7.4).
-fn build_av1_mdcv_obu(m: &HdrMetadata) -> Vec<u8> {
+fn build_av1_mdcv_obu(m: &Hdr10Metadata) -> Vec<u8> {
 	let mut payload = Vec::new();
 	// metadata_type = 2 (METADATA_TYPE_HDR_MDCV), leb128 encoded.
 	payload.push(2);
 	// Display primaries (RGB order, u16 BE each).
-	for &(x, y) in &m.display_primaries {
+	for &(x, y) in &m.mastering.display_primaries {
 		payload.extend(av1_chromaticity(x).to_be_bytes());
 		payload.extend(av1_chromaticity(y).to_be_bytes());
 	}
 	// White point.
-	payload.extend(av1_chromaticity(m.white_point.0).to_be_bytes());
-	payload.extend(av1_chromaticity(m.white_point.1).to_be_bytes());
+	payload.extend(av1_chromaticity(m.mastering.white_point.0).to_be_bytes());
+	payload.extend(av1_chromaticity(m.mastering.white_point.1).to_be_bytes());
 	// Luminance (u32 BE).
-	payload.extend(av1_luminance_max(m.max_luminance).to_be_bytes());
-	payload.extend(av1_luminance_min(m.min_luminance).to_be_bytes());
+	payload.extend(av1_luminance_max(m.mastering.max_luminance).to_be_bytes());
+	payload.extend(av1_luminance_min(m.mastering.min_luminance).to_be_bytes());
 
 	build_av1_metadata_obu(&payload)
 }
@@ -314,11 +314,62 @@ fn leb128_decode(data: &[u8]) -> (u64, usize) {
 	(value, data.len())
 }
 
+/// Schedules the key frame that carries changed HDR metadata.
+///
+/// Metadata travels in SEI/OBUs on key frames, and decoders keep the last
+/// values until the next ones; with an infinite GOP a metadata-only change
+/// (same PQ color description, so no header change forces an IDR) would
+/// otherwise wait for an unrelated IDR. Each frame's own metadata snapshot is
+/// what its key frame carries, so a refresh only needs a key frame at the
+/// first frame of the new metadata. Refreshes are spaced at least
+/// [`Self::MIN_INTERVAL`] apart so an application that rewrites its
+/// metadata continuously cannot turn the stream into IDRs; the latest
+/// metadata still goes out once the interval passes.
+#[derive(Debug, Default)]
+pub(crate) struct MetadataRefresh {
+	pending: bool,
+	last: Option<std::time::Instant>,
+}
+
+impl MetadataRefresh {
+	pub(crate) const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+	/// Called for every HDR10 frame before it is encoded, with whether its
+	/// metadata differs from the previous frame's. Returns true when this
+	/// frame must be encoded as a key frame.
+	pub(crate) fn due(&mut self, changed: bool, now: std::time::Instant) -> bool {
+		self.pending |= changed;
+		if !self.pending
+			|| self
+				.last
+				.is_some_and(|last| now.duration_since(last) < Self::MIN_INTERVAL)
+		{
+			return false;
+		}
+		self.pending = false;
+		self.last = Some(now);
+		true
+	}
+
+	/// The key frame requested by [`Self::due`] was not encoded: request it
+	/// again with the next frame instead of waiting out the interval.
+	pub(crate) fn failed(&mut self) {
+		self.pending = true;
+		self.last = None;
+	}
+
+	/// SDR frames carry no HDR metadata, and the next HDR frame changes the
+	/// color description, which forces its own IDR.
+	pub(crate) fn cancel(&mut self) {
+		self.pending = false;
+	}
+}
+
 /// Inject HDR metadata into an encoded bitstream for a key frame.
 ///
 /// Returns a new bitstream with MDCV and CLLI metadata prepended before
 /// the first VCL NAL unit (H.264/H.265) or frame OBU (AV1).
-pub(crate) fn inject_hdr_metadata(data: &[u8], metadata: &HdrMetadata, format: VideoFormat) -> Vec<u8> {
+pub(crate) fn inject_hdr_metadata(data: &[u8], metadata: &Hdr10Metadata, format: VideoFormat) -> Vec<u8> {
 	match format {
 		VideoFormat::H264 => inject_h264_sei(data, metadata),
 		VideoFormat::Hevc => inject_h265_sei(data, metadata),
@@ -328,7 +379,7 @@ pub(crate) fn inject_hdr_metadata(data: &[u8], metadata: &HdrMetadata, format: V
 	}
 }
 
-fn inject_h264_sei(data: &[u8], m: &HdrMetadata) -> Vec<u8> {
+fn inject_h264_sei(data: &[u8], m: &Hdr10Metadata) -> Vec<u8> {
 	let mdcv_payload = build_mdcv_sei_payload(m, false);
 	let clli_payload = build_clli_sei_payload(m);
 
@@ -346,7 +397,7 @@ fn inject_h264_sei(data: &[u8], m: &HdrMetadata) -> Vec<u8> {
 	result
 }
 
-fn inject_h265_sei(data: &[u8], m: &HdrMetadata) -> Vec<u8> {
+fn inject_h265_sei(data: &[u8], m: &Hdr10Metadata) -> Vec<u8> {
 	let mdcv_payload = build_mdcv_sei_payload(m, true);
 	let clli_payload = build_clli_sei_payload(m);
 
@@ -364,7 +415,7 @@ fn inject_h265_sei(data: &[u8], m: &HdrMetadata) -> Vec<u8> {
 	result
 }
 
-fn inject_av1_metadata(data: &[u8], m: &HdrMetadata) -> Vec<u8> {
+fn inject_av1_metadata(data: &[u8], m: &Hdr10Metadata) -> Vec<u8> {
 	let cll_obu = build_av1_cll_obu(m);
 	let mdcv_obu = build_av1_mdcv_obu(m);
 
@@ -382,19 +433,48 @@ fn inject_av1_metadata(data: &[u8], m: &HdrMetadata) -> Vec<u8> {
 mod tests {
 	use super::*;
 
-	fn test_metadata() -> HdrMetadata {
-		HdrMetadata {
-			display_primaries: [
-				(34000, 16000), // Red
-				(13250, 34500), // Green
-				(7500, 3000),   // Blue
-			],
-			white_point: (15635, 16450),
-			max_luminance: 10_000_000, // 1000 nits
-			min_luminance: 500,        // 0.05 nits
+	fn test_metadata() -> Hdr10Metadata {
+		Hdr10Metadata {
+			mastering: crate::session::capture::frame::MasteringDisplay {
+				display_primaries: [
+					(34000, 16000), // Red
+					(13250, 34500), // Green
+					(7500, 3000),   // Blue
+				],
+				white_point: (15635, 16450),
+				max_luminance: 10_000_000, // 1000 nits
+				min_luminance: 500,        // 0.05 nits
+			},
 			max_cll: 1000,
 			max_fall: 400,
 		}
+	}
+
+	#[test]
+	fn metadata_refresh_requests_one_key_frame_per_change_within_the_interval() {
+		use std::time::{Duration, Instant};
+		let start = Instant::now();
+		let mut refresh = MetadataRefresh::default();
+		// Unchanged metadata never requests a key frame.
+		assert!(!refresh.due(false, start));
+		// The first frame of new metadata does.
+		assert!(refresh.due(true, start));
+		assert!(!refresh.due(false, start + Duration::from_millis(16)));
+		// A second change inside the interval waits, then goes out with the
+		// latest metadata once the interval has passed.
+		assert!(!refresh.due(true, start + Duration::from_millis(100)));
+		assert!(!refresh.due(false, start + Duration::from_millis(500)));
+		assert!(refresh.due(false, start + MetadataRefresh::MIN_INTERVAL));
+		assert!(!refresh.due(false, start + Duration::from_secs(5)));
+		// A failed key frame is retried at once.
+		let later = start + Duration::from_secs(10);
+		assert!(refresh.due(true, later));
+		refresh.failed();
+		assert!(refresh.due(false, later + Duration::from_millis(16)));
+		// Switching to SDR drops a pending refresh.
+		assert!(!refresh.due(true, later + Duration::from_millis(32)));
+		refresh.cancel();
+		assert!(!refresh.due(false, later + Duration::from_secs(3)));
 	}
 
 	#[test]

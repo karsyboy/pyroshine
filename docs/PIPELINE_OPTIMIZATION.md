@@ -5,7 +5,7 @@ For the system context see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Capture admission and presentation
 
-`compositor/admission.rs` provides receiver-driven demand, one owned credit and
+`capture/admission.rs` provides receiver-driven demand, one owned credit and
 one handoff slot. The receiver requests a capture only when useful; the compositor
 claims the credit before direct export, fd duplication, scene-element construction
 or GLES rendering. Without demand it retains dirty state and skips capture work.
@@ -149,6 +149,14 @@ path of H.264, HEVC and AV1: one compute dispatch writes NV12, P010, 4:4:4 or
 invocation, no atomics or buffer clear), optionally compositing the cursor and
 a notification, then one buffer-to-image copy fills the encoder input slot.
 
+4:2:0 chroma is generated where the encoder signals it. H.264 and HEVC use
+the 2x2 mean, centered in the block, and signal `chroma_sample_loc_type` 1.
+AV1 has no code for centered chroma, so it uses left siting (a [1 2 1]/4 filter
+across the even column, averaged over both rows; one extra source column per
+4x2 block) and signals `CSP_VERTICAL`. Decoders that ignore the signaling
+assume left siting, which AV1 now matches. The creation-time self-check
+verifies both positions on every subsampled format.
+
 The converter keeps three extents apart. The *frame* is the negotiated stream
 size. The *conversion extent* rounds it up to the codec's block size
 (macroblock, CTB or superblock); it always fits Pixelforge's input image, whose
@@ -258,7 +266,10 @@ Rejecting capture before encoding preserves predictive reference
 chains; discarding encoded reference frames can break decoding until an IDR.
 PyroWave completes one encode and send before requesting the next capture.
 This bounds latency but can limit FPS when capture + encode + paced send consumes
-a refresh interval; enlarging queues is not a free throughput improvement.
+a refresh interval; enlarging queues is not a free throughput improvement. A
+frame whose encode outlasted its bitrate-derived send window is therefore paced
+to finish before the next capture slot (at up to four times the bitrate) rather
+than over a fresh full window.
 PyroWave uses a lazily allocated, reusable CLOCK_MONOTONIC timerfd through Tokio
 AsyncFd for precise packet deadlines. A mutable send borrow enforces one wait
 per timer; cancellation and rearming cannot leak a prior frame's expiry. There
@@ -295,6 +306,56 @@ Conventional packetization of frames of 128 KiB or more runs inside
 `tokio::task::block_in_place`, so its FEC and encryption work (about 1 ms for
 a 1 MB encrypted 4K frame) does not delay other tasks queued on that runtime
 worker. Frames are still packetized one at a time in order.
+
+## Live conventional bitrate and reference recovery
+
+Fixed negotiated bitrate remains the default. Conventional encoders accept an
+internal generation-scoped request with requested/accepted bits per second,
+staged/applied outcome and first affected encoder display order. The bounded
+mailbox coalesces commands; the empty encoding path reads one atomic. Status is
+applied only after a successful picture submission, and a failed installation
+reports failure and restores the previously accepted rate. Reconnect clears stale
+commands and restores the negotiated rate before its new IDR. Display order is
+queried from each encoder, since a failed Vulkan attempt can consume an order.
+
+Accepted rates stay within the startup budget (and the Vulkan profile's
+`maxBitrate`). This keeps bitstream storage, sequence level and receiver capacity
+valid while allowing decreases and increases back to the original ceiling.
+Vulkan changes rate control at a video coding boundary without RESET; VA-API
+sends RC/HRD parameters on the following picture with reset clear; NVENC submits
+a candidate bitrate/VBV configuration with resetEncoder and forceIDR clear and
+commits it only after SDK acceptance. Changes neither rebuild the encoder nor
+request an IDR. Existing color/epoch changes retain their own IDR requirements.
+Conventional UDP transmission has no bitrate pacer to retarget; PyroWave's paced
+budget is unaffected and rejects this conventional-only control. This is exposed
+through the existing benchmark API and `--rate-change`, with no ABR, operator
+setting or new client protocol.
+
+VA-API H.264/HEVC retain up to four reconstructed short-term references, one
+active prediction reference and no reorder delay. Storage has an additional free
+reconstruction; codec headers and VA picture lists describe the retained DPB.
+H.264 uses explicit PicNum selection for an older parent; HEVC carries the retained
+negative-POC set and marks only the selected parent as used. Loss taints every
+submitted descendant, including queued pictures; recovery chooses the newest
+trusted retained parent strictly before that loss. Further loss can taint a
+recovery picture. IDR clears trust; unsupported/unknown active-reference capability
+keeps the one-reference fallback. AV1 retains its existing keyframe recovery.
+
+NVENC invalidates through the submitted head and records only a successful native
+interval. Covered feedback coalesces native calls but still requests a recovery
+picture, including on a static desktop. An explicit preset DPB depth bounds safe
+anchors; a driver-managed zero depth keeps SDK anchor selection without treating
+the 16-call cost bound as retention. Invalid/future requests, exhausted known
+anchors or SDK failure request IDR. Neither the default preset nor its reference
+depth changes. Loss at the epoch IDR, and wrapped/ambiguous client feedback,
+also fall back to IDR.
+
+The moving-picture loss fixtures drop dependent pictures and the first recovery
+picture, then compare surviving decoded output with its own source. Set
+`MOONSHINE_TEST_RFI_FRAMES=270` at 1280x720 to exercise picture-number/POC wrap.
+Continuous codec fixtures also lower, restore and clamp live rates and check that
+rate changes add no keyframes. Real Moonlight/Pyrolight packet-loss, long-run VBV
+settling and GNOME capture remain separate hardware/client acceptance checks.
 
 ## Transport ownership and outcomes
 

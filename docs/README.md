@@ -2,10 +2,11 @@
 
 ## Getting started
 
-- [README quick start](../README.md): requirements and **Install → Start → Pair → Play** for a standard desktop.
+- [README quick start](../README.md): requirements and **Install → Start → Set up → Pair → Play**.
 - [Installation](INSTALLATION.md): platform compatibility, SteamOS/portable setup, headless use, networking and upgrades.
-- [Desktop app](DESKTOP.md): open the app, pair devices, manage clients, save settings and read stream status.
-- [Pair without the GUI](INSTALLATION.md#pair-without-the-desktop-app): `pyroshine pair`, including over SSH; browser fallback.
+- [Web interface and tray](MANAGEMENT.md): sign in locally or over SSH, pair devices, manage clients, save settings, read stream status, history and updates; the desktop tray.
+- [Manage a headless host](INSTALLATION.md#manage-a-headless-host) and [pair from a terminal](INSTALLATION.md#pair-from-a-terminal): `pyroshine web setup` and `pyroshine pair`, including over SSH.
+- [Managed Desktop Mode](DESKTOP_MODE.md): existing Wayland desktop takeover, input authorization, remote audio and restoration.
 - [NixOS](NIXOS.md): declarative installation, Steam configuration and the `moonshine` service.
 
 ## Advanced configuration and troubleshooting
@@ -27,14 +28,20 @@ the guide for the area being changed:
 | --- | --- |
 | Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
 | Inputtino and Pixelforge patch maintenance | [Vendored dependencies](../vendor/README.md) |
-| Management interface and desktop app | [Architecture](ARCHITECTURE.md#desktop-management-interface), [pyroshine-ui](../pyroshine-ui/README.md) |
+| Web management interface, tray and management API | [Architecture](ARCHITECTURE.md#management), [web interface](../web/README.md) |
+| Capture backends, the frame contract and future capture modes | [Capture backends](CAPTURE_BACKENDS.md) |
 | Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
 | Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
 | PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |
 | Cross-fork framing and authenticated calibration | [PyroWave compatibility](PYROWAVE_COMPATIBILITY.md) |
+| UDP bandwidth calibration protocol, safety and bitrate suggestion | [Bandwidth calibration](BANDWIDTH_CALIBRATION.md) |
+| Launcher identities in the app list and launch error codes for integrations (PyroDeck) | [Client integration](CLIENT_INTEGRATION.md) |
 | Native Wayland/XWayland presentation, HDR and Wine/Proton | [Native presentation](NATIVE_PRESENTATION.md) |
 | Native controller identity/report mapping | [Native controllers](NATIVE_CONTROLLERS.md), [DualSense Edge](DUALSENSE_EDGE.md) |
 | Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
+| Test tiers, CI gates, hardware tests and baselines | [Testing](TESTING.md) |
+| What each codec, format, GPU and lifecycle feature does and how it is tested | [Capability inventory](CAPABILITIES.md) |
+| Supported GPUs and drivers, encoder requirements and device limits | [GPU compatibility](GPU_COMPATIBILITY.md) |
 | Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |
 | Mode changes, epochs and teardown | [Reconnect validation](reconnect-validation.md) |
 | Coding-agent rules and upstream policy | [AGENTS.md](../AGENTS.md) |

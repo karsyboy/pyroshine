@@ -1,12 +1,10 @@
-use std::{
-	path::{Path, PathBuf},
-	str::FromStr,
-};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use steamlocate::SteamDir;
-use walkdir::WalkDir;
+use steamlocate::{Library, SteamDir};
 
+use super::watch::{Filter, WatchTarget};
+use super::{ArtworkOrigin, Discovered, SourceScan, Unit, UnitError, expand_path};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,127 +34,521 @@ pub struct SteamApplicationScannerConfig {
 	/// Seconds to wait for each scanned application to reach an active state after launch.
 	#[serde(default = "crate::session::application::default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Overrides of `[frame_limit]` for each discovered application.
+	#[serde(flatten)]
+	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
 }
 
-pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
-	// Expand the library path.
-	let library_str = config.library.to_string_lossy();
-	let library = shellexpand::full(&library_str)
-		.map_err(|e| tracing::warn!("Failed to expand library path {:?}: {e}", config.library))?;
+/// Steam tools that are installed like games but cannot be played.
+const TOOL_PREFIXES: [&str; 3] = ["Proton", "Steam Linux Runtime", "Steamworks Common Redistributables"];
 
-	// Create SteamDir from the expanded path.
-	let steam_dir = SteamDir::from_dir(Path::new(&*library))
-		.map_err(|e| tracing::warn!("Failed to locate Steam directory at {:?}: {e}", library))?;
+/// Box art Steam caches per app, best first: portrait capsules, then the
+/// landscape header art (letterboxed into Moonlight's portrait tile).
+const LIBRARY_CACHE_ART: [(&str, bool); 4] = [
+	("library_600x900.jpg", true),
+	("library_capsule.jpg", true),
+	("library_header.jpg", false),
+	("header.jpg", false),
+];
 
-	// Iterate over all libraries.
-	let mut applications = Vec::new();
-	for library_result in steam_dir
-		.libraries()
-		.map_err(|e| tracing::warn!("Failed to list Steam libraries: {e}"))?
-	{
-		let library = match library_result {
-			Ok(lib) => lib,
-			Err(e) => {
-				tracing::warn!("Failed to read library: {e}");
-				continue;
-			},
-		};
+/// Scan every library folder and the installation's non-Steam shortcuts.
+pub(crate) fn scan(config: &SteamApplicationScannerConfig) -> SourceScan {
+	let Some(root) = expand_path(&config.library) else {
+		return SourceScan::failed(UnitError::Unavailable(format!(
+			"Cannot expand the Steam library path {}",
+			config.library.display()
+		)));
+	};
+	let steam_dir = match SteamDir::from_dir(&root) {
+		Ok(steam_dir) => steam_dir,
+		Err(error) => {
+			tracing::warn!("Failed to locate Steam directory at {}: {error}", root.display());
+			return SourceScan::failed(UnitError::Unavailable(format!(
+				"No Steam installation at {}: {error}",
+				root.display()
+			)));
+		},
+	};
+	let library_paths = match steam_dir.library_paths() {
+		Ok(paths) => paths,
+		Err(error) => {
+			// Usually Steam rewriting libraryfolders.vdf; retried shortly.
+			tracing::warn!("Failed to list Steam libraries: {error}");
+			return SourceScan::failed(UnitError::Corrupt(format!(
+				"Cannot read Steam's library folder list: {error}"
+			)));
+		},
+	};
+	let art = ArtLocations::new(&root);
 
-		// Iterate over all installed apps in this library.
-		for app_result in library.apps() {
-			let app = match app_result {
-				Ok(app) => app,
-				Err(e) => {
-					tracing::warn!("Failed to read app manifest: {e}");
-					continue;
+	let mut units: Vec<Unit> = library_paths
+		.iter()
+		.map(|path| {
+			let key = path.display().to_string();
+			let library = match Library::from_dir(path) {
+				Ok(library) => library,
+				Err(error) => {
+					tracing::warn!("Failed to read Steam library {}: {error}", path.display());
+					return Unit::failed(
+						key,
+						UnitError::Unavailable(format!("Steam library {} is not accessible: {error}", path.display())),
+					);
 				},
 			};
-
-			// Skip apps without a name.
-			let title = match &app.name {
-				Some(name) => name.clone(),
-				None => {
+			let mut unit = Unit::ok(key, Vec::new());
+			let mut entries = Vec::new();
+			for &app_id in library.app_ids() {
+				let app = match library.app(app_id) {
+					Some(Ok(app)) => app,
+					Some(Err(error)) => {
+						tracing::warn!("Failed to read the manifest of Steam app {app_id}: {error}");
+						unit.retain.push(app_id.to_string());
+						continue;
+					},
+					None => continue,
+				};
+				// Skip apps without a name.
+				let Some(title) = app.name.clone() else {
 					tracing::debug!("Skipping app {} without a name.", app.app_id);
 					continue;
-				},
-			};
-
-			// Skip Proton, Steam Linux Runtime, and Steamworks Common Redistributables.
-			if title.starts_with("Proton")
-				|| title.starts_with("Steam Linux Runtime")
-				|| title.starts_with("Steamworks Common Redistributables")
-			{
-				continue;
-			}
-
-			// Build the ApplicationConfig.
-			let mut application = ApplicationConfig {
-				title,
-				pre_command: config.pre_command.clone(),
-				post_command: config.post_command.clone(),
-				command: config
-					.command
-					.iter()
-					.map(|cmd| cmd.replace("{game_id}", &app.app_id.to_string()))
-					.collect(),
-				output_scale: None,
-				boxart: None,
-				stdout: config.stdout.clone(),
-				stderr: config.stderr.clone(),
-				launch_timeout_secs: config.launch_timeout_secs,
-			};
-
-			// Search for boxart.
-			let game_dir = config
-				.library
-				.join("appcache/librarycache")
-				.join(app.app_id.to_string());
-			if let Some(boxart) =
-				search_file(&game_dir, "library_600x900.jpg").or_else(|| search_file(&game_dir, "library_capsule.jpg"))
-			{
-				if boxart.exists() {
-					application.boxart = Some(boxart);
-				} else {
-					tracing::warn!("No boxart for game '{}' at '{}'.", application.title, boxart.display());
+				};
+				if TOOL_PREFIXES.iter().any(|prefix| title.starts_with(prefix)) {
+					continue;
 				}
-			} else {
-				tracing::debug!(
-					"No boxart found for game '{}' in directory '{}'.",
-					application.title,
-					game_dir.display()
-				);
+				entries.push(discovered(config, title, app.app_id.to_string(), app.app_id, &art));
 			}
-
-			applications.push(application);
-		}
+			entries.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+			unit.result = Ok(entries);
+			unit
+		})
+		.collect();
+	if let Some(unit) = scan_shortcuts(config, &steam_dir, &art) {
+		units.push(unit);
 	}
 
-	Ok(applications)
+	SourceScan { units, failure: None }
 }
 
-fn search_file(directory: &Path, filename: &str) -> Option<PathBuf> {
-	let binding = directory.to_string_lossy();
-	let directory = match shellexpand::full(&binding) {
-		Ok(directory) => directory,
-		Err(_) => return None,
+fn discovered(
+	config: &SteamApplicationScannerConfig,
+	title: String,
+	game_id: String,
+	art_id: u32,
+	art: &ArtLocations,
+) -> Discovered {
+	let application = ApplicationConfig {
+		title,
+		mode: crate::session::application::SessionMode::Game,
+		pre_command: config.pre_command.clone(),
+		post_command: config.post_command.clone(),
+		command: config
+			.command
+			.iter()
+			.map(|cmd| cmd.replace("{game_id}", &game_id))
+			.collect(),
+		output_scale: None,
+		boxart: None,
+		stdout: config.stdout.clone(),
+		stderr: config.stderr.clone(),
+		launch_timeout_secs: config.launch_timeout_secs,
+		frame_limit: config.frame_limit.clone(),
 	};
+	let (candidates, origin) = art.find(art_id);
+	Discovered::new(game_id, application).with_artwork(candidates, origin)
+}
 
-	let directory = match PathBuf::from_str(&directory) {
-		Ok(directory) => directory,
-		Err(_) => return None,
+fn scan_shortcuts(config: &SteamApplicationScannerConfig, steam_dir: &SteamDir, art: &ArtLocations) -> Option<Unit> {
+	let userdata = steam_dir.path().join("userdata");
+	let key = userdata.display().to_string();
+	match userdata.try_exists() {
+		Ok(false) => return None, // Steam has not created any user profiles yet.
+		Err(error) => return Some(Unit::failed(key, UnitError::Unavailable(error.to_string()))),
+		Ok(true) => {},
+	}
+	let entries = (|| {
+		let mut entries = Vec::new();
+		for shortcut in steam_dir.shortcuts()? {
+			let shortcut = shortcut?;
+			if shortcut.app_name.trim().is_empty() || shortcut.app_id < 0x8000_0000 {
+				continue;
+			}
+			// Modern Steam assigns shortcut app IDs independently of the name
+			// and executable. Use the saved ID, not Shortcut::steam_id()'s CRC.
+			// The low word marks a shortcut; Steam retains its launch options,
+			// working directory and Proton configuration when it launches it.
+			let game_id = ((u64::from(shortcut.app_id) << 32) | 0x0200_0000).to_string();
+			entries.push(discovered(config, shortcut.app_name, game_id, shortcut.app_id, art));
+		}
+		entries.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+		Ok::<_, steamlocate::Error>(entries)
+	})();
+	Some(match entries {
+		Ok(entries) => Unit::ok(key, entries),
+		// Keep the previous shortcut catalog during a failed/partial rewrite;
+		// installed Steam games are independent units and still refresh.
+		Err(error) => Unit::failed(key, UnitError::Corrupt(format!("Cannot read Steam shortcuts: {error}"))),
+	})
+}
+
+/// `libraryfolders.vdf`, every library's manifests and user shortcuts, plus art locations
+/// for the periodic check.
+pub(crate) fn watch_targets(config: &SteamApplicationScannerConfig) -> Vec<WatchTarget> {
+	let Some(root) = expand_path(&config.library) else {
+		return Vec::new();
 	};
+	let mut targets = vec![WatchTarget::directory(
+		root.join("steamapps"),
+		Filter::Manifests(&["libraryfolders.vdf"], ".acf"),
+	)];
+	if let Ok(paths) = SteamDir::from_dir(&root).and_then(|steam_dir| steam_dir.library_paths()) {
+		for path in paths {
+			let steamapps = path.join("steamapps");
+			if steamapps != root.join("steamapps") {
+				targets.push(WatchTarget::directory(steamapps, Filter::Suffix(".acf")));
+			}
+		}
+	}
+	let userdata = root.join("userdata");
+	targets.push(WatchTarget::directory(root.clone(), Filter::Names(&["userdata"])));
+	targets.push(WatchTarget::directory(userdata.clone(), Filter::Names(&[])).with_subdirectories());
+	if let Ok(users) = std::fs::read_dir(userdata) {
+		let mut users: Vec<_> = users.flatten().map(|user| user.path()).collect();
+		users.sort();
+		for user in users {
+			targets.push(WatchTarget::directory(user.clone(), Filter::Names(&["config"])));
+			targets.push(WatchTarget::directory(
+				user.join("config"),
+				Filter::Names(&["shortcuts.vdf"]),
+			));
+		}
+	}
+	// Steam downloads art when the library first shows a game; the periodic
+	// check notices a new per-app directory or custom grid image.
+	targets.push(WatchTarget::probe(root.join("appcache/librarycache")));
+	for grid in ArtLocations::new(&root).grids {
+		targets.push(WatchTarget::probe(grid));
+	}
+	targets
+}
 
-	for entry in WalkDir::new(&directory)
-		.follow_links(true)
-		.into_iter()
-		.filter_map(|e| e.ok())
-	{
-		let entry_filename = entry.file_name().to_string_lossy();
+/// Where Steam keeps box art.
+struct ArtLocations {
+	librarycache: PathBuf,
+	/// `userdata/<account>/config/grid`: art the user set in Steam.
+	grids: Vec<PathBuf>,
+	/// `$XDG_DATA_HOME/icons/hicolor`, where Steam puts shortcut icons.
+	icons: Option<PathBuf>,
+}
 
-		if entry_filename == filename {
-			return Some(entry.into_path());
+impl ArtLocations {
+	fn new(root: &Path) -> Self {
+		let mut grids: Vec<PathBuf> = std::fs::read_dir(root.join("userdata"))
+			.map(|entries| {
+				entries
+					.flatten()
+					.map(|entry| entry.path().join("config/grid"))
+					.filter(|grid| grid.is_dir())
+					.collect()
+			})
+			.unwrap_or_default();
+		grids.sort();
+		Self {
+			librarycache: root.join("appcache/librarycache"),
+			grids,
+			icons: super::icons::xdg_data_home().map(|home| home.join("icons/hicolor")),
 		}
 	}
 
-	None
+	/// Existing art for `app_id`, best first.
+	fn find(&self, app_id: u32) -> (Vec<PathBuf>, ArtworkOrigin) {
+		let mut candidates = Vec::new();
+		let mut origin = ArtworkOrigin::Steam;
+		for grid in &self.grids {
+			for extension in ["png", "jpg", "jpeg", "webp"] {
+				let path = grid.join(format!("{app_id}p.{extension}"));
+				if path.is_file() {
+					if candidates.is_empty() {
+						origin = ArtworkOrigin::SteamCustom;
+					}
+					candidates.push(path);
+				}
+			}
+		}
+		// Current clients keep art in `<app_id>/` or one hashed directory
+		// below it; older ones as `<app_id>_<name>` next to the directories.
+		let directory = self.librarycache.join(app_id.to_string());
+		let mut directories = vec![directory.clone()];
+		if let Ok(entries) = std::fs::read_dir(&directory) {
+			let mut nested: Vec<PathBuf> = entries
+				.flatten()
+				.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+				.map(|entry| entry.path())
+				.collect();
+			nested.sort();
+			directories.extend(nested);
+		}
+		for (name, _portrait) in LIBRARY_CACHE_ART {
+			if let Some(path) = directories
+				.iter()
+				.map(|directory| directory.join(name))
+				.chain(std::iter::once(self.librarycache.join(format!("{app_id}_{name}"))))
+				.find(|path| path.is_file())
+			{
+				candidates.push(path);
+			}
+		}
+		// Last resort: the icon Steam installs for a game's desktop shortcut.
+		if let Some(icons) = &self.icons
+			&& let Some(icon) = STEAM_ICON_SIZES
+				.iter()
+				.map(|size| icons.join(format!("{size}/apps/steam_icon_{app_id}.png")))
+				.find(|path| path.is_file())
+		{
+			candidates.push(icon);
+		}
+		(candidates, origin)
+	}
+}
+
+/// Sizes Steam installs shortcut icons in, largest first.
+const STEAM_ICON_SIZES: [&str; 6] = ["256x256", "128x128", "96x96", "64x64", "48x48", "32x32"];
+
+#[cfg(test)]
+pub(crate) mod tests {
+	use std::fs;
+
+	use super::*;
+
+	fn manifest(app_id: u32, name: &str) -> String {
+		format!(
+			"\"AppState\"\n{{\n\t\"appid\"\t\t\"{app_id}\"\n\t\"Universe\"\t\t\"1\"\n\t\"name\"\t\t\"{name}\"\n\t\"StateFlags\"\t\t\"4\"\n\t\"installdir\"\t\t\"{name}\"\n}}\n"
+		)
+	}
+
+	/// A Steam root with `libraries` as library folders (the first is the root).
+	pub(crate) fn steam_root(root: &Path, libraries: &[&Path]) {
+		fs::create_dir_all(root.join("steamapps")).unwrap();
+		let mut vdf = String::from("\"libraryfolders\"\n{\n");
+		for (index, library) in libraries.iter().enumerate() {
+			fs::create_dir_all(library.join("steamapps")).unwrap();
+			vdf += &format!(
+				"\t\"{index}\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t\t\"apps\"\n\t\t{{\n\t\t}}\n\t}}\n",
+				library.display()
+			);
+		}
+		vdf += "}\n";
+		fs::write(root.join("steamapps/libraryfolders.vdf"), vdf).unwrap();
+	}
+
+	pub(crate) fn install(library: &Path, app_id: u32, name: &str) {
+		fs::write(
+			library.join(format!("steamapps/appmanifest_{app_id}.acf")),
+			manifest(app_id, name),
+		)
+		.unwrap();
+	}
+
+	pub(crate) fn config(root: &Path) -> SteamApplicationScannerConfig {
+		SteamApplicationScannerConfig {
+			library: root.to_path_buf(),
+			command: vec!["steam".into(), "steam://rungameid/{game_id}".into()],
+			pre_command: vec![],
+			post_command: vec![],
+			stdout: None,
+			stderr: None,
+			launch_timeout_secs: 2,
+			frame_limit: Default::default(),
+		}
+	}
+
+	/// Binary KeyValues, including fields Steam handles when launching.
+	pub(crate) fn shortcuts(root: &Path, user: &str, apps: &[(u32, &str)]) -> PathBuf {
+		let path = root.join("userdata").join(user).join("config/shortcuts.vdf");
+		fs::create_dir_all(path.parent().unwrap()).unwrap();
+		let mut bytes = b"\x00shortcuts\x00".to_vec();
+		for (index, (app_id, name)) in apps.iter().enumerate() {
+			bytes.extend_from_slice(format!("\x00{index}\x00\x02appid\x00").as_bytes());
+			bytes.extend_from_slice(&app_id.to_le_bytes());
+			for (key, value) in [
+				("AppName", *name),
+				("Exe", "\"/games/My Game.exe\""),
+				("StartDir", "\"/games\""),
+				("LaunchOptions", "--custom-option"),
+			] {
+				bytes.extend_from_slice(format!("\x01{key}\x00{value}\x00").as_bytes());
+			}
+			bytes.extend_from_slice(b"\x00tags\x00\x01\x30\x00Favorites\x00\x08\x08");
+		}
+		bytes.extend_from_slice(b"\x08\x08");
+		fs::write(&path, bytes).unwrap();
+		path
+	}
+
+	#[test]
+	fn non_steam_shortcuts_use_saved_ids_and_the_scanners_steam_command() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		steam_root(&root, &[&root]);
+		install(&root, 620, "Portal 2");
+		shortcuts(
+			&root,
+			"1234",
+			&[(0xf123_4567, "Non-Steam Game"), (0xf123_4568, "Proton custom app")],
+		);
+		shortcuts(
+			&root,
+			"5678",
+			&[(0xf123_4569, "Another user's game"), (0xf123_456a, " ")],
+		);
+		let grid = root.join("userdata/1234/config/grid");
+		fs::create_dir_all(&grid).unwrap();
+		let cover = grid.join(format!("{}p.png", 0xf123_4567_u32));
+		fs::write(&cover, "png").unwrap();
+		let mut config = config(&root);
+		config.command = vec![
+			"flatpak".into(),
+			"run".into(),
+			"com.valvesoftware.Steam".into(),
+			"steam://rungameid/{game_id}".into(),
+		];
+		config.pre_command = vec![vec!["prepare".into()]];
+		let result = scan(&config);
+		let apps = result.applications();
+		assert_eq!(apps.len(), 4);
+		let entries = result.units.last().unwrap().result.as_ref().unwrap();
+		let entry = entries
+			.iter()
+			.find(|entry| entry.application.title == "Non-Steam Game")
+			.unwrap();
+		let game_id = (0xf123_4567_u64 << 32) | 0x0200_0000;
+		assert_eq!(entry.native_id, game_id.to_string());
+		assert_eq!(
+			entry.application.command.last().unwrap(),
+			&format!("steam://rungameid/{game_id}")
+		);
+		assert_eq!(entry.application.pre_command, config.pre_command);
+		assert_eq!(entry.application.boxart, Some(cover));
+		assert_eq!(
+			super::super::launcher_target(&entry.application.command),
+			Some(format!("steam:{game_id}"))
+		);
+	}
+
+	#[test]
+	fn shortcut_watch_targets_notice_profile_creation_edits_and_removal() {
+		use super::super::watch::fingerprint;
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		steam_root(&root, &[&root]);
+		let config = config(&root);
+		let initial = watch_targets(&config);
+		let before = fingerprint(&initial);
+		let path = shortcuts(&root, "1234", &[(0xf123_4567, "Game")]);
+		assert_ne!(fingerprint(&initial), before);
+		let targets = watch_targets(&config);
+		assert!(
+			targets.iter().any(|target| target.path == path.parent().unwrap()
+				&& target.filter == Some(Filter::Names(&["shortcuts.vdf"])))
+		);
+		let before = fingerprint(&targets);
+		shortcuts(&root, "1234", &[(0xf123_4567, "Renamed Game")]);
+		assert_ne!(fingerprint(&targets), before);
+		let before = fingerprint(&targets);
+		fs::remove_file(&path).unwrap();
+		assert_ne!(fingerprint(&targets), before);
+		assert!(scan(&config).units.last().unwrap().result.as_ref().unwrap().is_empty());
+	}
+
+	#[test]
+	fn scans_every_library_folder_and_skips_tools() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		let second = directory.path().join("Games");
+		steam_root(&root, &[&root, &second]);
+		install(&root, 620, "Portal 2");
+		install(&root, 1493710, "Proton Experimental");
+		install(&second, 400, "Portal");
+
+		let result = scan(&config(&root));
+		assert!(result.failure.is_none());
+		assert_eq!(result.units.len(), 2);
+		let titles: Vec<_> = result.applications().into_iter().map(|app| app.title).collect();
+		assert_eq!(titles, vec!["Portal 2", "Portal"]);
+		assert_eq!(
+			result.applications()[0].command,
+			vec!["steam".to_string(), "steam://rungameid/620".to_string()]
+		);
+	}
+
+	/// An inaccessible library folder is an error of its unit only; a
+	/// half-written manifest keeps that one game.
+	#[test]
+	fn unreadable_libraries_and_manifests_are_reported_not_dropped() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		let unmounted = directory.path().join("Unmounted");
+		steam_root(&root, &[&root, &unmounted]);
+		install(&root, 620, "Portal 2");
+		fs::write(
+			root.join("steamapps/appmanifest_400.acf"),
+			"\"AppState\"\n{\n\t\"appid\"",
+		)
+		.unwrap();
+		fs::remove_dir_all(&unmounted).unwrap();
+
+		let result = scan(&config(&root));
+		assert_eq!(result.units[0].retain, vec!["400".to_string()]);
+		assert_eq!(result.units[0].result.as_ref().unwrap().len(), 1);
+		assert!(matches!(result.units[1].result, Err(UnitError::Unavailable(_))));
+	}
+
+	#[test]
+	fn a_half_written_library_list_fails_the_whole_source() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		steam_root(&root, &[&root]);
+		fs::write(
+			root.join("steamapps/libraryfolders.vdf"),
+			"\"libraryfolders\"\n{\n\t\"0\"\n\t{",
+		)
+		.unwrap();
+		let result = scan(&config(&root));
+		assert!(result.failure.is_some(), "{result:?}");
+	}
+
+	#[test]
+	fn prefers_custom_grid_art_then_portrait_cache_art() {
+		let directory = tempfile::tempdir().unwrap();
+		let root = directory.path().join("Steam");
+		steam_root(&root, &[&root]);
+		install(&root, 620, "Portal 2");
+		install(&root, 400, "Portal");
+		install(&root, 70, "Half-Life");
+		let cache = root.join("appcache/librarycache");
+		fs::create_dir_all(cache.join("620/0123abcd")).unwrap();
+		fs::write(cache.join("620/0123abcd/library_600x900.jpg"), "jpg").unwrap();
+		fs::write(cache.join("620/header.jpg"), "jpg").unwrap();
+		fs::create_dir_all(cache.join("400")).unwrap();
+		fs::write(cache.join("400/header.jpg"), "jpg").unwrap();
+		let grid = root.join("userdata/1234/config/grid");
+		fs::create_dir_all(&grid).unwrap();
+		fs::write(grid.join("620p.png"), "png").unwrap();
+
+		let result = scan(&config(&root));
+		let entries = result.units[0].result.as_ref().unwrap();
+		let entry = |id: &str| entries.iter().find(|entry| entry.native_id == id).unwrap();
+		assert_eq!(entry("620").application.boxart, Some(grid.join("620p.png")));
+		assert_eq!(entry("620").artwork_origin, Some(ArtworkOrigin::SteamCustom));
+		assert_eq!(
+			entry("620").artwork_fallbacks,
+			vec![
+				cache.join("620/0123abcd/library_600x900.jpg"),
+				cache.join("620/header.jpg")
+			]
+		);
+		assert_eq!(entry("400").application.boxart, Some(cache.join("400/header.jpg")));
+		assert_eq!(entry("70").application.boxart, None);
+		assert_eq!(entry("70").artwork_origin, None);
+	}
 }

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Tue, 27 Oct 2026 11:41:40 -0400
+Subject: [PATCH] granite: re-runnable Granite patching inside other work trees
+
+checkout_granite.sh applied each Granite patch with git apply from the
+PyroWave directory, accepting an already applied patch by its reverse
+check. Two cases broke once the tree is vendored instead of a checkout
+of its own:
+
+- A re-run failed: the 203-nit patch edits lines the normalization patch
+  added, so on a patched tree the first patch neither applies nor
+  reverses.
+- Inside another Git work tree (deps/PyroWave in a client checkout, a
+  build directory in the host repository) git apply resolves the patch
+  paths against that work tree's root and skips files outside the
+  current directory.
+
+Restore Granite's pinned files first, then apply every patch in
+Granite's own checkout with -p2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ checkout_granite.sh | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/checkout_granite.sh b/checkout_granite.sh
+index e4fbde8..37bbed8 100755
+--- a/checkout_granite.sh
++++ b/checkout_granite.sh
+@@ -29,12 +29,13 @@ update third_party/khronos/vulkan-headers
+ # earlier ones): HDR-to-SDR normalization, 1:1 scaler overlays, then the
+ # BT.2408 reference white. shaders/slangmosh_scaler.hpp is generated from the
+ # patched scaler; the last patch changes only host code.
+-cd ..
++#
++# Every run starts from the pinned files: a later patch edits lines an earlier
++# one added, so an already patched tree can neither take nor reverse them.
++# The patches are applied inside Granite's own checkout (-p2 strips
++# a/Granite/): run from this directory, git apply would resolve their paths
++# against any work tree this directory is nested in and skip the files.
++git checkout -- .
+ for name in granite-sdr-normalization.patch granite-scaler-overlay.patch granite-sdr-reference-white-203.patch; do
+-	patch_file="$PWD/patches/$name"
+-	if git apply --check "$patch_file"; then
+-		git apply "$patch_file"
+-	else
+-		git apply --reverse --check "$patch_file" || exit 1
+-	fi
++	git apply -p2 "../patches/$name" || exit 1
+ done

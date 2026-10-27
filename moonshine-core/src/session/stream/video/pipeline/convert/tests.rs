@@ -4,6 +4,7 @@
 
 use super::reference::{self, Color, Planes};
 use super::*;
+use crate::session::stream::video::pipeline::EncoderBackend;
 
 /// The 4x2 block that wrote each 32-bit word of a layout, following the
 /// shader's indexing. Returns per-word owners (`None`: never written) or the
@@ -72,19 +73,30 @@ fn copied_bytes(layout: &Layout) -> Vec<std::ops::Range<u64>> {
 	ranges
 }
 
-const FORMATS: [OutputFormat; 4] = [
-	OutputFormat::NV12,
-	OutputFormat::P010,
-	OutputFormat::YUV444,
-	OutputFormat::YUV444P10,
+const FORMATS: [ConvertFormat; 4] = [
+	ConvertFormat::Nv12,
+	ConvertFormat::P010,
+	ConvertFormat::Yuv444,
+	ConvertFormat::Yuv444P10,
 ];
 
-fn subsampled(format: OutputFormat) -> bool {
-	format_info(format).unwrap().subsampled
+/// The multi-planar Vulkan image format of a 2-plane conversion format.
+fn vulkan_format(format: ConvertFormat) -> vk::Format {
+	match format {
+		ConvertFormat::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+		ConvertFormat::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+		ConvertFormat::Yuv444 => vk::Format::G8_B8R8_2PLANE_444_UNORM,
+		ConvertFormat::Yuv444P10 => vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
+		ConvertFormat::Xyuv | ConvertFormat::Y410 => vk::Format::UNDEFINED,
+	}
+}
+
+fn subsampled(format: ConvertFormat) -> bool {
+	format_info(format).subsampled
 }
 
 /// The smallest valid conversion extent covering a frame.
-fn tight_extent(format: OutputFormat, (w, h): (u32, u32)) -> (u32, u32) {
+fn tight_extent(format: ConvertFormat, (w, h): (u32, u32)) -> (u32, u32) {
 	if subsampled(format) {
 		(w.next_multiple_of(2), h.next_multiple_of(2))
 	} else {
@@ -93,9 +105,39 @@ fn tight_extent(format: OutputFormat, (w, h): (u32, u32)) -> (u32, u32) {
 }
 
 #[test]
+fn captured_dmabufs_are_acquired_from_a_foreign_producer_when_supported() {
+	assert_eq!(dmabuf_producer_family(true), vk::QUEUE_FAMILY_FOREIGN_EXT);
+	assert_eq!(dmabuf_producer_family(false), vk::QUEUE_FAMILY_EXTERNAL);
+}
+
+#[test]
+fn external_buffers_are_handed_over_through_queue_family_ownership() {
+	use ash::vk::Handle as _;
+	let buffer = vk::Buffer::from_raw(0x1234);
+	let [acquire, release] = external_buffer_handoff(buffer, 2);
+	// Acquired from the external reader for the copy, released back after it.
+	assert_eq!(
+		(acquire.src_queue_family_index, acquire.dst_queue_family_index),
+		(vk::QUEUE_FAMILY_EXTERNAL, 2)
+	);
+	assert_eq!(acquire.dst_access_mask, vk::AccessFlags::TRANSFER_WRITE);
+	assert_eq!(
+		(release.src_queue_family_index, release.dst_queue_family_index),
+		(2, vk::QUEUE_FAMILY_EXTERNAL)
+	);
+	assert_eq!(release.src_access_mask, vk::AccessFlags::TRANSFER_WRITE);
+	for barrier in [acquire, release] {
+		assert_eq!(
+			(barrier.buffer, barrier.offset, barrier.size),
+			(buffer, 0, vk::WHOLE_SIZE)
+		);
+	}
+}
+
+#[test]
 fn layout_matches_hand_computed_planes() {
 	// 1080p NV12 is the tightly packed classic layout.
-	let l = Layout::new(OutputFormat::NV12, (1920, 1080)).unwrap();
+	let l = Layout::new(ConvertFormat::Nv12, (1920, 1080)).unwrap();
 	assert_eq!((l.luma_pitch, l.chroma_offset, l.chroma_pitch), (480, 480 * 1080, 480));
 	assert_eq!(l.size, 1920 * 1080 * 3 / 2);
 	let [y, c] = l.copy_regions();
@@ -114,7 +156,7 @@ fn layout_matches_hand_computed_planes() {
 	);
 
 	// 1366 is not a multiple of four: rows are padded to 1368 bytes.
-	let l = Layout::new(OutputFormat::NV12, (1366, 768)).unwrap();
+	let l = Layout::new(ConvertFormat::Nv12, (1366, 768)).unwrap();
 	assert_eq!((l.luma_pitch, l.chroma_offset, l.chroma_pitch), (342, 342 * 768, 342));
 	let [y, c] = l.copy_regions();
 	assert_eq!((y.buffer_row_length, y.image_extent.width), (1368, 1366));
@@ -123,7 +165,7 @@ fn layout_matches_hand_computed_planes() {
 	assert_eq!(l.size, 1368 * 768 + 1368 * 384);
 
 	// P010: 16-bit luma, 32-bit CbCr texels.
-	let l = Layout::new(OutputFormat::P010, (1366, 768)).unwrap();
+	let l = Layout::new(ConvertFormat::P010, (1366, 768)).unwrap();
 	let [y, c] = l.copy_regions();
 	assert_eq!((l.luma_pitch, y.buffer_row_length), (684, 1368));
 	assert_eq!(
@@ -132,7 +174,7 @@ fn layout_matches_hand_computed_planes() {
 	);
 
 	// 4:4:4 at an odd extent: rows padded to whole blocks (1368 x 768).
-	let l = Layout::new(OutputFormat::YUV444, (1365, 767)).unwrap();
+	let l = Layout::new(ConvertFormat::Yuv444, (1365, 767)).unwrap();
 	let [y, c] = l.copy_regions();
 	assert_eq!((l.luma_pitch, l.chroma_offset, l.chroma_pitch), (342, 342 * 768, 684));
 	assert_eq!(
@@ -145,7 +187,7 @@ fn layout_matches_hand_computed_planes() {
 	);
 
 	// One pixel still occupies a whole 4x2 block.
-	let l = Layout::new(OutputFormat::YUV444P10, (1, 1)).unwrap();
+	let l = Layout::new(ConvertFormat::Yuv444P10, (1, 1)).unwrap();
 	assert_eq!(
 		(l.blocks, l.luma_pitch, l.chroma_offset, l.chroma_pitch, l.size),
 		((1, 1), 2, 4, 4, 48)
@@ -154,18 +196,20 @@ fn layout_matches_hand_computed_planes() {
 
 #[test]
 fn layout_rejects_unrepresentable_extents() {
-	assert!(Layout::new(OutputFormat::NV12, (0, 2)).is_err());
-	assert!(Layout::new(OutputFormat::NV12, (1365, 768)).is_err(), "odd 4:2:0 width");
+	assert!(Layout::new(ConvertFormat::Nv12, (0, 2)).is_err());
 	assert!(
-		Layout::new(OutputFormat::P010, (1366, 767)).is_err(),
+		Layout::new(ConvertFormat::Nv12, (1365, 768)).is_err(),
+		"odd 4:2:0 width"
+	);
+	assert!(
+		Layout::new(ConvertFormat::P010, (1366, 767)).is_err(),
 		"odd 4:2:0 height"
 	);
-	assert!(Layout::new(OutputFormat::YUV444, (1365, 767)).is_ok());
-	assert!(Layout::new(OutputFormat::I420, (2, 2)).is_err());
+	assert!(Layout::new(ConvertFormat::Yuv444, (1365, 767)).is_ok());
 	// Word indices must fit the shader's 32-bit arithmetic.
-	assert!(Layout::new(OutputFormat::YUV444P10, (1 << 20, 1 << 20)).is_err());
-	assert!(Layout::new(OutputFormat::NV12, (u32::MAX - 1, u32::MAX - 1)).is_err());
-	assert!(Layout::new(OutputFormat::YUV444P10, (16_384, 16_384)).is_ok());
+	assert!(Layout::new(ConvertFormat::Yuv444P10, (1 << 20, 1 << 20)).is_err());
+	assert!(Layout::new(ConvertFormat::Nv12, (u32::MAX - 1, u32::MAX - 1)).is_err());
+	assert!(Layout::new(ConvertFormat::Yuv444P10, (16_384, 16_384)).is_ok());
 }
 
 /// Every word a copy region reads is written by exactly one block, no block
@@ -224,7 +268,7 @@ fn conversion_extent_rounds_to_codec_blocks() {
 	// Always a valid 4:2:0 extent.
 	for codec in [Codec::H264, Codec::H265, Codec::AV1] {
 		let (w, h) = conversion_extent(codec, 1365, 767).unwrap();
-		assert!(Layout::new(OutputFormat::NV12, (w, h)).is_ok());
+		assert!(Layout::new(ConvertFormat::Nv12, (w, h)).is_ok());
 	}
 }
 
@@ -232,6 +276,7 @@ const BT709_LIMITED: Color = Color {
 	space: ColorSpace::Bt709,
 	full_range: false,
 	sdr_white_nits: 203.0,
+	siting: ChromaSiting::Center,
 };
 
 #[test]
@@ -269,13 +314,96 @@ fn reference_matches_published_code_values() {
 	assert_eq!((cb, cr), (512, 512));
 }
 
+/// A gamma 2.2 source is re-encoded with the sRGB transfer the stream
+/// signals: mid-grey and near-black land where the compositor's gamma 2.2
+/// decode puts them, not where a pass-through would.
+#[test]
+fn gamma22_sources_are_reencoded_as_srgb() {
+	let gamma22 = Color {
+		space: ColorSpace::Gamma22ToSrgb,
+		..BT709_LIMITED
+	};
+	let srgb_encode = |linear: f64| {
+		if linear <= 0.003_130_8 {
+			linear * 12.92
+		} else {
+			1.055 * linear.powf(1.0 / 2.4) - 0.055
+		}
+	};
+	for signal in [0.02f32, 0.1, 0.5, 0.9] {
+		let [y, cb, cr] = reference::ycbcr([signal; 3], gamma22);
+		let expected = srgb_encode(f64::from(signal).powf(2.2));
+		assert!((y - expected).abs() < 1e-9, "signal {signal}: {y} vs {expected}");
+		assert!((cb - 0.5).abs() < 1e-9 && (cr - 0.5).abs() < 1e-9);
+	}
+	// Near black differs strongly from a pass-through: gamma 2.2 0.02 is
+	// 0.000183 linear, which sRGB encodes as about 0.0024, not 0.02.
+	let [y, _, _] = reference::ycbcr([0.02; 3], gamma22);
+	assert!(y < 0.003, "{y}");
+	// Black and white are fixed points.
+	assert_eq!(reference::ycbcr([0.0; 3], gamma22)[0], 0.0);
+	assert!((reference::ycbcr([1.0; 3], gamma22)[0] - 1.0).abs() < 1e-12);
+	// BT.1886 (gamma 2.4) video transfer, likewise.
+	let bt1886 = Color {
+		space: ColorSpace::Bt1886ToSrgb,
+		..BT709_LIMITED
+	};
+	let [y, _, _] = reference::ycbcr([0.5; 3], bt1886);
+	assert!((y - srgb_encode(0.5f64.powf(2.4))).abs() < 1e-9, "{y}");
+}
+
+/// Centered chroma is the 2x2 mean; left-sited chroma is centered on the even
+/// column. A one-pixel vertical line in an odd column shows where each puts
+/// its weight.
+#[test]
+fn chroma_siting_places_samples_where_signaled() {
+	let frame = (16, 4);
+	let rgb = |x: u32, _y: u32| if x == 7 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+	let neutral = reference::chroma_code(0.5, 8, false);
+	let cr = |siting| {
+		let color = Color {
+			siting,
+			..BT709_LIMITED
+		};
+		let planes = reference::convert(ConvertFormat::Nv12, color, frame, frame, &rgb, &|_| true);
+		(0..frame.0 / 2)
+			.map(|cx| i32::from(planes.chroma[cx as usize][1]) - i32::from(neutral))
+			.collect::<Vec<_>>()
+	};
+	// Centered: only the block holding the line (columns 6-7).
+	let center = cr(ChromaSiting::Center);
+	assert!(
+		center[3] > 0 && center.iter().enumerate().all(|(i, &v)| i == 3 || v == 0),
+		"{center:?}"
+	);
+	// Left: the samples at columns 6 and 8 each take a quarter of the line,
+	// so the reconstructed centroid stays on column 7.
+	let left = cr(ChromaSiting::Left);
+	assert!(left[3] > 0 && (left[3] - left[4]).abs() <= 1, "{left:?}");
+	assert!(
+		left.iter().enumerate().all(|(i, &v)| i == 3 || i == 4 || v == 0),
+		"{left:?}"
+	);
+	// The first left-sited sample replicates the frame's left edge: a frame
+	// whose first column is the only colored one weighs it 3/4.
+	let edge = |x: u32, _y: u32| if x == 0 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 0.0] };
+	let color = Color {
+		siting: ChromaSiting::Left,
+		..BT709_LIMITED
+	};
+	let planes = reference::convert(ConvertFormat::Nv12, color, frame, frame, &edge, &|_| true);
+	let [_, red_cb, red_cr] = reference::ycbcr([1.0, 0.0, 0.0], BT709_LIMITED);
+	let expected = [red_cb, red_cr].map(|c| reference::chroma_code(0.5 + (c - 0.5) * 0.75, 8, false));
+	assert_eq!(planes.chroma[0], expected);
+}
+
 /// The comparison must flag the exact corruption the NVIDIA report showed:
 /// intact luma, and the second chroma sample of every 4x2 block wrong.
 #[test]
 fn comparison_detects_lost_second_chroma_sample() {
 	let frame = (64, 16);
 	let rgb = |x: u32, y: u32| [(x % 7) as f32 / 7.0, (y % 5) as f32 / 5.0, ((x + y) % 3) as f32 / 3.0];
-	for format in [OutputFormat::NV12, OutputFormat::P010] {
+	for format in [ConvertFormat::Nv12, ConvertFormat::P010] {
 		let expected = reference::convert(format, BT709_LIMITED, frame, frame, &rgb, &|_| true);
 		assert!(reference::compare(&expected, &expected, 0, &|_| true).is_ok());
 		let mut corrupted = expected.clone();
@@ -297,7 +425,7 @@ fn comparison_detects_lost_second_chroma_sample() {
 #[test]
 fn reference_replicates_edges_into_padding() {
 	let rgb = |x: u32, y: u32| [x as f32 / 4.0, y as f32 / 4.0, 0.5];
-	let planes = reference::convert(OutputFormat::YUV444, BT709_LIMITED, (3, 2), (8, 4), &rgb, &|_| true);
+	let planes = reference::convert(ConvertFormat::Yuv444, BT709_LIMITED, (3, 2), (8, 4), &rgb, &|_| true);
 	for y in 0..4 {
 		for x in 0..8 {
 			let edge = (x.min(2) + 8 * y.min(1)) as usize;
@@ -317,11 +445,7 @@ fn self_check_pattern_has_no_neutral_or_repeated_chroma() {
 	for format in FORMATS {
 		let extent = tight_extent(format, (w, h));
 		let planes = reference::convert(format, BT709_LIMITED, (w, h), extent, &rgb, &|_| true);
-		let neutral = if format_info(format).unwrap().luma_bytes == 2 {
-			512
-		} else {
-			128
-		};
+		let neutral = if format_info(format).luma_bytes == 2 { 512 } else { 128 };
 		let mut chroma = planes.chroma.clone();
 		assert!(chroma.iter().all(|c| *c != [neutral, neutral]), "{format:?}");
 		// Neighbouring chroma samples differ, so a lost or duplicated sample is
@@ -331,7 +455,17 @@ fn self_check_pattern_has_no_neutral_or_repeated_chroma() {
 		}
 		chroma.dedup();
 	}
-	assert_eq!(std::mem::size_of::<PushConstants>(), 112);
+}
+
+#[test]
+fn push_constants_match_the_shader_viewport_and_overlay_layout() {
+	// std430 offsets in shaders/convert.comp. The viewport follows both
+	// overlays; checking its offset also catches omitted alignment padding.
+	assert_eq!(std::mem::size_of::<PushConstants>(), 128);
+	assert_eq!(std::mem::offset_of!(PushConstants, layer_rect), 64);
+	assert_eq!(std::mem::offset_of!(PushConstants, layer_opacity), 96);
+	assert_eq!(std::mem::offset_of!(PushConstants, layer_opaque), 104);
+	assert_eq!(std::mem::offset_of!(PushConstants, viewport), 112);
 }
 
 #[test]
@@ -372,6 +506,44 @@ fn stream_encode_decode_matches_reference_on_gpu() {
 	gpu::encode_decode_matrix(true);
 }
 
+/// The VA-API backend end to end: convert into the imported VA surfaces,
+/// encode with the stream's CBR configuration (with an IDR request and a
+/// reference invalidation mid-stream), decode with `ffmpeg` and compare with
+/// the reference for every profile its startup probe accepts.
+/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core vaapi_encode_decode -- --ignored --nocapture`
+#[test]
+#[ignore = "needs a VA-API encoder and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn vaapi_encode_decode_matches_reference_on_gpu() {
+	gpu::require();
+	gpu::native_encode_decode_matrix(EncoderBackend::Vaapi, false);
+}
+
+/// [`vaapi_encode_decode_matches_reference_on_gpu`] for the NVENC backend
+/// (CUDA-imported input buffers, reference invalidation through NVENC).
+/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core nvenc_encode_decode -- --ignored --nocapture`
+#[test]
+#[ignore = "needs an NVIDIA GPU with NVENC and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn nvenc_encode_decode_matches_reference_on_gpu() {
+	gpu::require();
+	gpu::native_encode_decode_matrix(EncoderBackend::Nvenc, false);
+}
+
+/// Drop three distinct moving pictures, including the first recovery AU.
+/// A later recovery must use a decoder-retained safe parent or an IDR.
+#[test]
+#[ignore = "needs a VA-API encoder and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn vaapi_loss_recovery_decodes_on_gpu() {
+	gpu::require();
+	gpu::native_encode_decode_matrix(EncoderBackend::Vaapi, true);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with NVENC and ffmpeg: MOONSHINE_TEST_GPU=1"]
+fn nvenc_loss_recovery_decodes_on_gpu() {
+	gpu::require();
+	gpu::native_encode_decode_matrix(EncoderBackend::Nvenc, true);
+}
+
 /// Pins the Pixelforge input-slot contract modelled by `FakeSlots` in the
 /// pipeline tests: two slots, `encode` advances to the next one. A change in
 /// the pinned encoder must fail here rather than silently change recovery.
@@ -393,6 +565,18 @@ fn encoder_input_slots_rotate_on_gpu() {
 fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
 	gpu::require();
 	gpu::static_recovery_decode();
+}
+
+/// Each codec's 8-bit 4:2:0 profile on this GPU: an encoder is created at
+/// exactly the profile's maximum bitrate, one above it is rejected before the
+/// driver sees it, and a profile without constant-bitrate rate control
+/// cannot create the stream's CBR encoder (Pixelforge patch 0009).
+/// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encoder_rate_control_limits -- --ignored --nocapture`
+#[test]
+#[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
+fn encoder_rate_control_limits_on_gpu() {
+	gpu::require();
+	gpu::rate_control_limits();
 }
 
 /// Informational: GPU and wall time per conversion for aligned and
@@ -427,6 +611,48 @@ mod gpu {
 				.wrapping_add(1442695040888963407);
 			(self.0 >> 33) as u32
 		}
+	}
+
+	pub(super) fn rate_control_limits() {
+		use crate::session::stream::video::pipeline::encode_caps::cbr_target;
+		let context = context();
+		let mut checked = 0;
+		for codec in [Codec::H264, Codec::H265, Codec::AV1] {
+			if !context.supports_encode(codec) {
+				continue;
+			}
+			let base = match codec {
+				Codec::H264 => EncodeConfig::h264(1920, 1080),
+				Codec::H265 => EncodeConfig::h265(1920, 1080),
+				Codec::AV1 => EncodeConfig::av1(1920, 1080),
+			}
+			.with_rate_control(RateControlMode::Cbr);
+			let caps = EncoderCapabilities::query(&context, &base).unwrap();
+			let cbr = caps
+				.rate_control_modes
+				.contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR);
+			eprintln!(
+				"{codec:?}: rate control {:?}, max {} bps",
+				caps.rate_control_modes, caps.max_bitrate
+			);
+			if !cbr {
+				assert!(cbr_target(&caps, codec, 10_000_000).is_err());
+				assert!(Encoder::new(context.clone(), base.with_target_bitrate(10_000_000)).is_err());
+				checked += 1;
+				continue;
+			}
+			let max = cbr_target(&caps, codec, u64::MAX).unwrap();
+			assert_eq!(u64::from(max), caps.max_bitrate.min(u64::from(u32::MAX)));
+			drop(Encoder::new(context.clone(), base.clone().with_target_bitrate(max)).expect("maximum bitrate"));
+			if let Some(above) = max.checked_add(1).filter(|_| caps.max_bitrate < u64::from(u32::MAX)) {
+				let error = Encoder::new(context.clone(), base.with_target_bitrate(above))
+					.err()
+					.expect("a bitrate above the maximum must be rejected");
+				assert!(error.to_string().contains("at most"), "{error}");
+			}
+			checked += 1;
+		}
+		assert!(checked > 0, "no Vulkan Video codec on this GPU");
 	}
 
 	/// Use the opened capture GPU, exactly as production setup does.
@@ -799,7 +1025,7 @@ mod gpu {
 
 	/// One converter run compared with the reference.
 	struct Case {
-		format: OutputFormat,
+		format: ConvertFormat,
 		frame: (u32, u32),
 		extent: (u32, u32),
 		color: Color,
@@ -835,11 +1061,13 @@ mod gpu {
 			case.frame,
 			case.extent,
 			case.format,
+			4,
 			case.color.space,
 			case.color.full_range,
 			true,
 		)?;
 		converter.set_color(case.color.space, case.color.full_range, case.color.sdr_white_nits);
+		converter.set_chroma_siting(case.color.siting);
 		// SAFETY: host-coherent mapping of the whole buffer; no GPU work uses it.
 		unsafe { std::ptr::write_bytes(converter.readback.cast_mut(), 0xa5, converter.layout.size as usize) };
 		let view = converter.source_view(source, case.source_format)?;
@@ -849,6 +1077,7 @@ mod gpu {
 					image: source.image(),
 					view,
 					extent: case.source_extent,
+					scaled: false,
 					first_use: false,
 				},
 				layers.0,
@@ -908,6 +1137,7 @@ mod gpu {
 				(1365, 767),
 				extent,
 				format,
+				4,
 				ColorSpace::Bt709,
 				false,
 				false,
@@ -930,6 +1160,7 @@ mod gpu {
 				(1365, 767),
 				extent,
 				format,
+				4,
 				ColorSpace::Bt709,
 				false,
 			) {
@@ -1002,30 +1233,39 @@ mod gpu {
 					ColorSpace::Bt2020,
 					ColorSpace::SrgbToBt2020Pq,
 					ColorSpace::Bt709LinearToBt2020Pq,
+					ColorSpace::Gamma22ToSrgb,
+					ColorSpace::Bt1886ToSrgb,
 				] {
 					for full_range in [false, true] {
-						let case = Case {
-							format,
-							frame,
-							extent: tight_extent(format, frame),
-							color: Color {
-								space,
-								full_range,
-								sdr_white_nits: if space == ColorSpace::Bt709LinearToBt2020Pq {
-									80.0
-								} else {
-									203.0
+						for siting in [ChromaSiting::Center, ChromaSiting::Left] {
+							if siting == ChromaSiting::Left && !format.subsampled() {
+								continue;
+							}
+							let case = Case {
+								format,
+								frame,
+								extent: tight_extent(format, frame),
+								color: Color {
+									space,
+									full_range,
+									sdr_white_nits: if space == ColorSpace::Bt709LinearToBt2020Pq {
+										80.0
+									} else {
+										203.0
+									},
+									siting,
 								},
-							},
-							source_format,
-							source_extent: frame,
-						};
-						let label = format!("{format:?} {source_format:?} {space:?} full={full_range}");
-						assert_agreement(
-							&label,
-							check(&context, &case, &image, &source, (&[None, None], &[])),
-							&mut failures,
-						);
+								source_format,
+								source_extent: frame,
+							};
+							let label =
+								format!("{format:?} {source_format:?} {space:?} full={full_range} {siting:?} chroma");
+							assert_agreement(
+								&label,
+								check(&context, &case, &image, &source, (&[None, None], &[])),
+								&mut failures,
+							);
+						}
 					}
 				}
 			}
@@ -1052,7 +1292,84 @@ mod gpu {
 
 		layers_at_frame_edges(&context, &mut rng, &mut failures);
 		copy_into_planar_images(&context, &mut rng, &mut failures);
+		scaled_sources(&context, &mut rng, &mut failures);
 		assert!(failures.is_empty(), "converter mismatches: {failures:#?}");
+	}
+
+	/// Desktop Mode's scaled path (`ExportedFrame::scale_to_stream`): at an
+	/// exact 2:1 downscale the four bilinear taps fall on texel centers, so
+	/// every output pixel is the box average of its 2x2 source texels, for
+	/// odd frames and every output format; a source of another aspect ratio
+	/// keeps it, centered between black bars.
+	fn scaled_sources(context: &VideoContext, rng: &mut Rng, failures: &mut Vec<String>) {
+		// Same aspect ratio (fills the frame), then a 4:1 source letterboxed
+		// into 16:9 (black bars above and below the 320x80 viewport).
+		for (frame, source_extent) in [((321, 181), (642, 362)), ((320, 180), (640, 160))] {
+			let viewport = crate::session::capture::frame::fit_viewport(source_extent, frame);
+			let source_format = vk::Format::B8G8R8A8_UNORM;
+			let bytes = pattern(rng, source_format, source_extent);
+			let image = source_image(context, source_extent, source_format, &bytes);
+			let texel_size = texel_bytes(source_format);
+			let texel = |x: u32, y: u32| {
+				let offset = (y as usize * source_extent.0 as usize + x as usize) * texel_size;
+				decode_texel(source_format, &bytes[offset..offset + texel_size])
+			};
+			for format in FORMATS {
+				let extent = tight_extent(format, frame);
+				let label = format!(
+					"{format:?} scaled {}x{} -> {}x{} (viewport {viewport:?})",
+					source_extent.0, source_extent.1, frame.0, frame.1
+				);
+				let result = (|| -> Result<reference::Agreement, String> {
+					let mut converter = InputConverter::create(
+						context.clone(),
+						ConversionQueueMode::Auto,
+						frame,
+						extent,
+						format,
+						4,
+						BT709_LIMITED.space,
+						BT709_LIMITED.full_range,
+						true,
+					)?;
+					let view = converter.source_view(&image, source_format)?;
+					converter
+						.dispatch(
+							&SourceBinding {
+								image: image.image(),
+								view,
+								extent: source_extent,
+								scaled: true,
+								first_use: false,
+							},
+							&[None, None],
+							None,
+						)
+						.map_err(|e| format!("dispatch: {e}"))?;
+					let actual = converter.layout.read_planes(converter.readback())?;
+					let (vx, vy, vw, vh) = viewport;
+					let rgb = |x: u32, y: u32| {
+						// Padding replicates the frame's edge pixel.
+						let (x, y) = (x.min(frame.0 - 1), y.min(frame.1 - 1));
+						if x < vx || y < vy || x >= vx + vw || y >= vy + vh {
+							return [0.0; 3];
+						}
+						let (x, y) = (x - vx, y - vy);
+						let taps = [
+							texel(2 * x, 2 * y),
+							texel(2 * x + 1, 2 * y),
+							texel(2 * x, 2 * y + 1),
+							texel(2 * x + 1, 2 * y + 1),
+						];
+						std::array::from_fn(|c| taps.iter().map(|t| t[c]).sum::<f32>() / 4.0)
+					};
+					let row = rows(extent);
+					let expected = reference::convert(format, BT709_LIMITED, frame, extent, &rgb, &row);
+					reference::compare(&expected, &actual, 1, &row)
+				})();
+				assert_agreement(&label, result, failures);
+			}
+		}
 	}
 
 	/// A notification (imported BGRX, alpha ignored, 75% window opacity)
@@ -1218,19 +1535,19 @@ mod gpu {
 	/// them with the reference, and the untouched padding with its sentinel.
 	fn copy_into_planar_images(context: &VideoContext, rng: &mut Rng, failures: &mut Vec<String>) {
 		for (format, frame, image_extent) in [
-			(OutputFormat::NV12, (1366, 768), (1376, 768)),
-			(OutputFormat::NV12, (1920, 1080), (1920, 1088)),
-			(OutputFormat::P010, (1365, 767), (1408, 768)),
-			(OutputFormat::P010, (3, 5), (64, 64)),
-			(OutputFormat::YUV444, (1365, 767), (1376, 768)),
-			(OutputFormat::YUV444P10, (5, 7), (16, 16)),
+			(ConvertFormat::Nv12, (1366, 768), (1376, 768)),
+			(ConvertFormat::Nv12, (1920, 1080), (1920, 1088)),
+			(ConvertFormat::P010, (1365, 767), (1408, 768)),
+			(ConvertFormat::P010, (3, 5), (64, 64)),
+			(ConvertFormat::Yuv444, (1365, 767), (1376, 768)),
+			(ConvertFormat::Yuv444P10, (5, 7), (16, 16)),
 		] {
 			let label = format!(
 				"{format:?} {}x{} copied into {}x{}",
 				frame.0, frame.1, image_extent.0, image_extent.1
 			);
-			let Some(target) = planar_image(context, image_extent, format.vulkan_format()) else {
-				eprintln!("{label}: skipped, {:?} images unsupported", format.vulkan_format());
+			let Some(target) = planar_image(context, image_extent, vulkan_format(format)) else {
+				eprintln!("{label}: skipped, {:?} images unsupported", vulkan_format(format));
 				continue;
 			};
 			let source_bytes = pattern(rng, vk::Format::R8G8B8A8_UNORM, frame);
@@ -1280,6 +1597,7 @@ mod gpu {
 				frame,
 				extent,
 				format,
+				4,
 				ColorSpace::Bt709,
 				false,
 			)
@@ -1289,8 +1607,9 @@ mod gpu {
 					&source,
 					vk::Format::R8G8B8A8_UNORM,
 					false,
+					false,
 					&[None, None],
-					Target {
+					Target::Image {
 						image: target.0,
 						layout: vk::ImageLayout::GENERAL,
 					},
@@ -1402,7 +1721,7 @@ mod gpu {
 		codec: Codec,
 		depth: EncodeBitDepth,
 		pixel_format: PixelFormat,
-		output: OutputFormat,
+		output: ConvertFormat,
 		demuxer: &'static str,
 		/// ffmpeg raw pixel format of the decoded planes.
 		pix_fmt: &'static str,
@@ -1413,7 +1732,7 @@ mod gpu {
 			codec: Codec::H264,
 			depth: EncodeBitDepth::Eight,
 			pixel_format: PixelFormat::Yuv420,
-			output: OutputFormat::NV12,
+			output: ConvertFormat::Nv12,
 			demuxer: "h264",
 			pix_fmt: "yuv420p",
 		},
@@ -1421,7 +1740,7 @@ mod gpu {
 			codec: Codec::H264,
 			depth: EncodeBitDepth::Eight,
 			pixel_format: PixelFormat::Yuv444,
-			output: OutputFormat::YUV444,
+			output: ConvertFormat::Yuv444,
 			demuxer: "h264",
 			pix_fmt: "yuv444p",
 		},
@@ -1429,7 +1748,7 @@ mod gpu {
 			codec: Codec::H265,
 			depth: EncodeBitDepth::Eight,
 			pixel_format: PixelFormat::Yuv420,
-			output: OutputFormat::NV12,
+			output: ConvertFormat::Nv12,
 			demuxer: "hevc",
 			pix_fmt: "yuv420p",
 		},
@@ -1437,7 +1756,7 @@ mod gpu {
 			codec: Codec::H265,
 			depth: EncodeBitDepth::Ten,
 			pixel_format: PixelFormat::Yuv420,
-			output: OutputFormat::P010,
+			output: ConvertFormat::P010,
 			demuxer: "hevc",
 			pix_fmt: "yuv420p10le",
 		},
@@ -1445,7 +1764,7 @@ mod gpu {
 			codec: Codec::H265,
 			depth: EncodeBitDepth::Eight,
 			pixel_format: PixelFormat::Yuv444,
-			output: OutputFormat::YUV444,
+			output: ConvertFormat::Yuv444,
 			demuxer: "hevc",
 			pix_fmt: "yuv444p",
 		},
@@ -1453,7 +1772,7 @@ mod gpu {
 			codec: Codec::H265,
 			depth: EncodeBitDepth::Ten,
 			pixel_format: PixelFormat::Yuv444,
-			output: OutputFormat::YUV444P10,
+			output: ConvertFormat::Yuv444P10,
 			demuxer: "hevc",
 			pix_fmt: "yuv444p10le",
 		},
@@ -1461,7 +1780,7 @@ mod gpu {
 			codec: Codec::AV1,
 			depth: EncodeBitDepth::Eight,
 			pixel_format: PixelFormat::Yuv420,
-			output: OutputFormat::NV12,
+			output: ConvertFormat::Nv12,
 			demuxer: "obu",
 			pix_fmt: "yuv420p",
 		},
@@ -1469,7 +1788,7 @@ mod gpu {
 			codec: Codec::AV1,
 			depth: EncodeBitDepth::Ten,
 			pixel_format: PixelFormat::Yuv420,
-			output: OutputFormat::P010,
+			output: ConvertFormat::P010,
 			demuxer: "obu",
 			pix_fmt: "yuv420p10le",
 		},
@@ -1477,7 +1796,7 @@ mod gpu {
 			codec: Codec::AV1,
 			depth: EncodeBitDepth::Ten,
 			pixel_format: PixelFormat::Yuv444,
-			output: OutputFormat::YUV444P10,
+			output: ConvertFormat::Yuv444P10,
 			demuxer: "obu",
 			pix_fmt: "yuv444p10le",
 		},
@@ -1744,24 +2063,46 @@ mod gpu {
 					frame,
 					extent,
 					case.output,
+					4,
 					ColorSpace::Bt709,
 					color.full_range,
 				)
 				.unwrap();
 				let mut stream = Vec::new();
 				let mut padding_bytes = 0;
-				for _ in 0..frame_count {
+				for index in 0..frame_count {
+					if stream_config {
+						let ceiling = encoder_config(case, frame, true).target_bitrate;
+						let requested = match index {
+							2 => Some(ceiling / 2),
+							5 => Some(ceiling),
+							7 => Some(u32::MAX),
+							_ => None,
+						};
+						if let Some(rate) = requested {
+							assert_eq!(encoder.set_bitrate(rate).unwrap(), rate.min(ceiling));
+						}
+					}
 					converter
 						.convert(
 							&source,
 							vk::Format::R8G8B8A8_UNORM,
+							false,
 							false,
 							&[None, None],
 							Target::encoder_input(encoder.input_image()),
 						)
 						.unwrap();
 					let image = encoder.input_image();
-					let mut data = block_on(encoder.encode(image).unwrap()).unwrap().data;
+					let packet = block_on(encoder.encode(image).unwrap()).unwrap();
+					if stream_config {
+						assert_eq!(
+							packet.is_key_frame,
+							index == 0,
+							"rate change must preserve references ({label}, frame {index})"
+						);
+					}
+					let mut data = packet.data;
 					// Decode what production transmits.
 					padding_bytes +=
 						crate::session::stream::video::pipeline::padding::strip(&mut data, video_format(case.codec));
@@ -1801,79 +2142,381 @@ mod gpu {
 					continue;
 				}
 				let expected = reference::convert(case.output, color, frame, coded, &decoded_rgb, &|_| true);
-				let expected_planes = [
-					expected.luma.clone(),
-					expected.chroma.iter().map(|c| c[0]).collect::<Vec<_>>(),
-					expected.chroma.iter().map(|c| c[1]).collect::<Vec<_>>(),
-				];
-				let scale = if case.depth == EncodeBitDepth::Ten { 4.0 } else { 1.0 };
-				for (index, decoded) in frames.iter().enumerate() {
-					let mut line = format!("{label} frame {index}:");
-					let mut failed = false;
-					for plane in 0..3 {
-						let (want, got) = (&expected_planes[plane], &decoded[plane]);
-						if want.len() != got.len() {
-							failures.push(format!(
-								"{label}: plane {plane} has {} samples, expected {}",
-								got.len(),
-								want.len()
-							));
-							continue;
-						}
-						let n = want.len() as f64;
-						let mean = |v: &[u16]| v.iter().map(|&s| f64::from(s)).sum::<f64>() / n;
-						let errors = || want.iter().zip(got).map(|(&a, &b)| f64::from(a.abs_diff(b)));
-						let mae = errors().sum::<f64>() / n;
-						let (worst, max) = errors()
-							.enumerate()
-							.fold((0, 0.0), |best, (i, e)| if e > best.1 { (i, e) } else { best });
-						let width = if want.len() == expected_planes[0].len() {
-							coded.0
-						} else {
-							coded.0.div_ceil(2)
-						} as usize;
-						let bias = mean(got) - mean(want);
-						line += &format!(
-							" {} mae {:.2} max {:.0} at {:?} bias {:+.2};",
-							["Y", "Cb", "Cr"][plane],
-							mae / scale,
-							max / scale,
-							(worst % width, worst / width),
-							bias / scale
-						);
-						// Lossy coding error only: a green tint shifts mean chroma
-						// by tens of codes, a layout defect raises the MAE, and a
-						// corrupted block or an unencoded padding row is off by
-						// ~200 codes in a few samples (lossy coding stays within
-						// ~32 codes at color-bar edges). The mean is only
-						// meaningful over enough samples: below one 8x8 transform
-						// block (a 2x2 4:2:0 frame has one chroma sample) it is a
-						// single DC quantization error, up to 8 codes at the rate
-						// controller's starting QP of 24 (AMD H.264).
-						let wrong = max / scale > 64.0
-							|| (n >= 64.0 && mae / scale > 2.5)
-							|| (n >= 4096.0 && bias.abs() / scale > 1.0);
-						if wrong {
-							failed = true;
-							if plane > 0 && index == 0 {
-								let dims = if want.len() == expected_planes[0].len() {
-									coded
-								} else {
-									(coded.0.div_ceil(2), coded.1.div_ceil(2))
-								};
-								eprintln!("{label}: {}", diagnose(want, got, &expected_planes[0], dims));
-							}
-						}
-					}
-					if failed {
-						failures.push(line.clone());
-					}
-					eprintln!("{line}");
-				}
+				compare_decoded(
+					&label,
+					&expected,
+					&frames,
+					coded,
+					case.depth == EncodeBitDepth::Ten,
+					&mut failures,
+				);
 			}
 		}
 		assert!(checked > 0, "no conventional codec could be checked");
 		assert!(failures.is_empty(), "encode/decode mismatches: {failures:#?}");
+	}
+
+	/// Native (VA-API or NVENC) counterpart of [`encode_decode_matrix`] with
+	/// the stream configuration: CBR, full range, one IDR request at frame 4
+	/// and a reference invalidation at frame 8.
+	pub(super) fn native_encode_decode_matrix(backend: EncoderBackend, loss_injection: bool) {
+		use crate::session::stream::video::pipeline::backend::{ConventionalEncoder, EncoderInput, NativeFormat};
+		use crate::session::stream::video::pipeline::{nvenc, vaapi};
+		use crate::session::stream::video::{BitDepth, ChromaFormat, VideoCodec};
+
+		let frame_count = std::env::var("MOONSHINE_TEST_RFI_FRAMES")
+			.ok()
+			.map(|v| v.parse::<usize>().unwrap())
+			.unwrap_or(12);
+		assert!((12..=300).contains(&frame_count));
+		let loss_start = if frame_count > 264 { 260 } else { 6 };
+		let lost = |index: usize| loss_injection && (loss_start..=loss_start + 2).contains(&index);
+		let mut failures = Vec::new();
+		let mut checked = 0;
+		let capture_context = context();
+		eprintln!("{} on {}", backend.label(), device_name(&capture_context));
+		let color = Color {
+			full_range: true,
+			..BT709_LIMITED
+		};
+		let frames: Vec<(u32, u32)> = match std::env::var("MOONSHINE_TEST_E2E_FRAMES") {
+			Ok(list) => list
+				.split(',')
+				.filter_map(|f| f.split_once('x'))
+				.map(|(w, h)| (w.trim().parse().unwrap(), h.trim().parse().unwrap()))
+				.collect(),
+			Err(_) => vec![
+				(1920, 1080),
+				(1366, 768),
+				(1440, 768),
+				(1280, 720),
+				(2880, 1920),
+				(256, 144),
+			],
+		};
+		let profiles = [
+			(VideoCodec::H264, ChromaFormat::Yuv420, BitDepth::Eight),
+			(VideoCodec::H264, ChromaFormat::Yuv444, BitDepth::Eight),
+			(VideoCodec::Hevc, ChromaFormat::Yuv420, BitDepth::Eight),
+			(VideoCodec::Hevc, ChromaFormat::Yuv420, BitDepth::Ten),
+			(VideoCodec::Hevc, ChromaFormat::Yuv444, BitDepth::Eight),
+			(VideoCodec::Hevc, ChromaFormat::Yuv444, BitDepth::Ten),
+			(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Eight),
+			(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Ten),
+		];
+		for (codec, chroma, depth) in profiles {
+			let probe = match backend {
+				EncoderBackend::Vaapi => vaapi::probe(&capture_context, codec, chroma, depth),
+				EncoderBackend::Nvenc => nvenc::probe(&capture_context, codec, chroma, depth),
+				EncoderBackend::Vulkan => unreachable!("covered by encode_decode_matrix"),
+			};
+			let profile = format!("{} {codec:?} {chroma:?} {depth:?}", backend.label());
+			if let Err(error) = probe {
+				eprintln!("{profile}: not encoded ({error}); skipped");
+				continue;
+			}
+			let case = CODEC_CASES
+				.into_iter()
+				.find(|case| {
+					let pixel_format = match chroma {
+						ChromaFormat::Yuv420 => PixelFormat::Yuv420,
+						ChromaFormat::Yuv444 => PixelFormat::Yuv444,
+					};
+					let bits = match depth {
+						BitDepth::Eight => EncodeBitDepth::Eight,
+						BitDepth::Ten => EncodeBitDepth::Ten,
+					};
+					let case_codec = match case.codec {
+						Codec::H264 => VideoCodec::H264,
+						Codec::H265 => VideoCodec::Hevc,
+						Codec::AV1 => VideoCodec::Av1,
+					};
+					case_codec == codec && case.pixel_format == pixel_format && case.depth == bits
+				})
+				.expect("a decoder case for every native profile");
+			for &frame in &frames {
+				let label = format!("{profile} {}x{}", frame.0, frame.1);
+				if std::env::var("MOONSHINE_TEST_E2E_FILTER").is_ok_and(|filter| !label.contains(&filter)) {
+					continue;
+				}
+				let format = NativeFormat {
+					codec,
+					chroma,
+					bit_depth: depth,
+					width: frame.0,
+					height: frame.1,
+					fps: 60,
+					// Abrupt moving-picture color changes need enough bits for
+					// the strict reference tolerance, before any loss is injected.
+					bitrate: if loss_injection { 100_000_000 } else { 50_000_000 },
+					color: pixelforge::ColorDescription::bt709().with_full_range(true),
+				};
+				let created = match backend {
+					EncoderBackend::Vaapi => vaapi::VaapiEncoder::new(&capture_context, format).map(|encoder| {
+						let (format, extent) = encoder.conversion();
+						(ConventionalEncoder::Vaapi(encoder), format, extent, 4)
+					}),
+					_ => nvenc::NvencEncoder::new(&capture_context, format).map(|encoder| {
+						let (format, extent, alignment) = encoder.conversion();
+						(ConventionalEncoder::Nvenc(encoder), format, extent, alignment)
+					}),
+				};
+				let (mut encoder, output, extent, alignment) = match created {
+					Ok(created) => created,
+					// The probe accepted the profile: a stream-sized encoder must work.
+					Err(error) if frame == (1920, 1080) => {
+						failures.push(format!("{label}: encoder creation failed: {error}"));
+						continue;
+					},
+					Err(error) => {
+						eprintln!("{label}: encoder creation failed ({error}); skipped");
+						continue;
+					},
+				};
+				let retained = match &encoder {
+					ConventionalEncoder::Vaapi(e) => e.reference_capacity(),
+					_ => 0,
+				};
+				eprintln!("{label}: decoder-retained reference capacity {retained}");
+				checked += 1;
+				let rgb = smooth(frame);
+				let moving = |index: usize, x, y| {
+					let mut pixel = rgb(x, y);
+					if loss_injection {
+						pixel[index % 3] = 0.15 + 0.7 * ((index % 4) as f32 / 3.0);
+					}
+					pixel.map(|c| (c * 255.0).round() / 255.0)
+				};
+				let bytes: Vec<u8> = (0..frame.1)
+					.flat_map(|y| (0..frame.0).map(move |x| (x, y)))
+					.flat_map(|(x, y)| rgb(x, y).map(|c| (c * 255.0).round() as u8).into_iter().chain([255]))
+					.collect();
+				let decoded_rgb = |x: u32, y: u32| {
+					let offset = (y as usize * frame.0 as usize + x as usize) * 4;
+					decode_texel(vk::Format::R8G8B8A8_UNORM, &bytes[offset..offset + 4])
+				};
+				let source = source_image(&capture_context, frame, vk::Format::R8G8B8A8_UNORM, &bytes);
+				let mut converter = InputConverter::new(
+					capture_context.clone(),
+					ConversionQueueMode::Auto,
+					frame,
+					extent,
+					output,
+					alignment,
+					ColorSpace::Bt709,
+					color.full_range,
+				)
+				.unwrap();
+				let mut stream = Vec::new();
+				let mut keys = Vec::new();
+				let mut error = None;
+				for index in 0..frame_count {
+					match index {
+						2 => {
+							assert_eq!(encoder.set_bitrate(format.bitrate / 2).unwrap(), format.bitrate / 2);
+						},
+						5 => {
+							assert_eq!(encoder.set_bitrate(format.bitrate).unwrap(), format.bitrate);
+						},
+						7 => {
+							assert_eq!(encoder.set_bitrate(u32::MAX).unwrap(), format.bitrate);
+						},
+						4 => encoder.request_idr(),
+						8 => encoder.invalidate_reference_frames(6),
+						_ => {},
+					}
+					if loss_injection && index == loss_start + 2 {
+						encoder.invalidate_reference_frames(loss_start as u64);
+					}
+					if loss_injection && index == loss_start + 3 {
+						encoder.invalidate_reference_frames(loss_start as u64 + 2);
+					}
+					let moving_source = loss_injection.then(|| {
+						let bytes: Vec<u8> = (0..frame.1)
+							.flat_map(|y| (0..frame.0).map(move |x| (x, y)))
+							.flat_map(|(x, y)| {
+								moving(index, x, y)
+									.map(|c| (c * 255.0).round() as u8)
+									.into_iter()
+									.chain([255])
+							})
+							.collect();
+						source_image(&capture_context, frame, vk::Format::R8G8B8A8_UNORM, &bytes)
+					});
+					let packet = encoder.input_target().map_err(|e| e.to_string()).and_then(|target| {
+						converter
+							.convert(
+								moving_source.as_ref().unwrap_or(&source),
+								vk::Format::R8G8B8A8_UNORM,
+								false,
+								false,
+								&[None, None],
+								target,
+							)
+							.map_err(|e| format!("convert: {e:?}"))?;
+						let future = encoder.encode(target).map_err(|e| e.to_string())?;
+						block_on(future).map_err(|e| e.to_string())
+					});
+					match packet {
+						Ok(mut packet) => {
+							crate::session::stream::video::pipeline::padding::strip(
+								&mut packet.data,
+								video_format(case.codec),
+							);
+							keys.push(packet.is_key_frame);
+							if !(lost(index)) {
+								stream.extend(packet.data);
+							}
+						},
+						Err(e) => {
+							error = Some(format!("{label} frame {index}: {e}"));
+							break;
+						},
+					}
+				}
+				drop(converter);
+				drop(encoder);
+				if let Some(error) = error {
+					failures.push(error);
+					continue;
+				}
+				if !keys[0] || !keys[4] || keys[1..4].iter().chain(&keys[5..8]).any(|&key| key) {
+					failures.push(format!("{label}: key frames {keys:?}, expected frames 0 and 4"));
+				}
+				if retained > 1 && (keys[8] || loss_injection && (keys[loss_start + 2] || keys[loss_start + 3])) {
+					failures.push(format!("{label}: retained safe parent should avoid IDR: {keys:?}"));
+				}
+				let key_frames: Vec<usize> = (0..keys.len()).filter(|&i| keys[i]).collect();
+				eprintln!("{label}: {} bytes, key frames {key_frames:?}", stream.len());
+				if let Some(directory) = std::env::var_os("MOONSHINE_TEST_E2E_SAVE_DIR") {
+					std::fs::create_dir_all(&directory).unwrap();
+					let path =
+						std::path::Path::new(&directory).join(format!("{}.{}", label.replace(' ', "-"), case.demuxer));
+					std::fs::write(path, &stream).unwrap();
+				}
+				let (w, h, decoded) = match decode(&stream, case) {
+					Ok(decoded) => decoded,
+					Err(e) => {
+						failures.push(format!("{label}: {e}"));
+						continue;
+					},
+				};
+				let expected_count = if loss_injection { frame_count - 3 } else { frame_count };
+				if (w, h) != frame || decoded.len() != expected_count {
+					failures.push(format!(
+						"{label}: decoded {} frames of {w}x{h}, expected {expected_count} of {frame:?}",
+						decoded.len()
+					));
+					continue;
+				}
+				if loss_injection {
+					for (index, decoded) in (0..frame_count).filter(|i| !lost(*i)).zip(&decoded) {
+						let expected =
+							reference::convert(output, color, frame, frame, &|x, y| moving(index, x, y), &|_| true);
+						compare_decoded(
+							&format!("{label} surviving AU {index}"),
+							&expected,
+							std::slice::from_ref(decoded),
+							frame,
+							depth == BitDepth::Ten,
+							&mut failures,
+						);
+					}
+				} else {
+					let expected = reference::convert(output, color, frame, frame, &decoded_rgb, &|_| true);
+					compare_decoded(
+						&label,
+						&expected,
+						&decoded,
+						frame,
+						depth == BitDepth::Ten,
+						&mut failures,
+					);
+				}
+			}
+		}
+		assert!(checked > 0, "{} encoded no profile on this GPU", backend.label());
+		assert!(failures.is_empty(), "encode/decode mismatches: {failures:#?}");
+	}
+
+	/// Compare decoded frames with the reference planes: lossy coding error
+	/// only (see the thresholds below), per plane and frame.
+	fn compare_decoded(
+		label: &str,
+		expected: &Planes,
+		frames: &[DecodedFrame],
+		coded: (u32, u32),
+		ten: bool,
+		failures: &mut Vec<String>,
+	) {
+		let expected_planes = [
+			expected.luma.clone(),
+			expected.chroma.iter().map(|c| c[0]).collect::<Vec<_>>(),
+			expected.chroma.iter().map(|c| c[1]).collect::<Vec<_>>(),
+		];
+		let scale = if ten { 4.0 } else { 1.0 };
+		for (index, decoded) in frames.iter().enumerate() {
+			let mut line = format!("{label} frame {index}:");
+			let mut failed = false;
+			for plane in 0..3 {
+				let (want, got) = (&expected_planes[plane], &decoded[plane]);
+				if want.len() != got.len() {
+					failures.push(format!(
+						"{label}: plane {plane} has {} samples, expected {}",
+						got.len(),
+						want.len()
+					));
+					continue;
+				}
+				let n = want.len() as f64;
+				let mean = |v: &[u16]| v.iter().map(|&s| f64::from(s)).sum::<f64>() / n;
+				let errors = || want.iter().zip(got).map(|(&a, &b)| f64::from(a.abs_diff(b)));
+				let mae = errors().sum::<f64>() / n;
+				let (worst, max) = errors()
+					.enumerate()
+					.fold((0, 0.0), |best, (i, e)| if e > best.1 { (i, e) } else { best });
+				let width = if want.len() == expected_planes[0].len() {
+					coded.0
+				} else {
+					coded.0.div_ceil(2)
+				} as usize;
+				let bias = mean(got) - mean(want);
+				line += &format!(
+					" {} mae {:.2} max {:.0} at {:?} bias {:+.2};",
+					["Y", "Cb", "Cr"][plane],
+					mae / scale,
+					max / scale,
+					(worst % width, worst / width),
+					bias / scale
+				);
+				// Lossy coding error only: a green tint shifts mean chroma
+				// by tens of codes, a layout defect raises the MAE, and a
+				// corrupted block or an unencoded padding row is off by
+				// ~200 codes in a few samples (lossy coding stays within
+				// ~32 codes at color-bar edges). The mean is only
+				// meaningful over enough samples: below one 8x8 transform
+				// block (a 2x2 4:2:0 frame has one chroma sample) it is a
+				// single DC quantization error, up to 8 codes at the rate
+				// controller's starting QP of 24 (AMD H.264).
+				let wrong =
+					max / scale > 64.0 || (n >= 64.0 && mae / scale > 2.5) || (n >= 4096.0 && bias.abs() / scale > 1.0);
+				if wrong {
+					failed = true;
+					if plane > 0 && index == 0 {
+						let dims = if want.len() == expected_planes[0].len() {
+							coded
+						} else {
+							(coded.0.div_ceil(2), coded.1.div_ceil(2))
+						};
+						eprintln!("{label}: {}", diagnose(want, got, &expected_planes[0], dims));
+					}
+				}
+			}
+			if failed {
+				failures.push(line.clone());
+			}
+			eprintln!("{line}");
+		}
 	}
 
 	/// Locate a wrong decoded plane: the best integer shift against the
@@ -1964,10 +2607,12 @@ mod gpu {
 			.into_iter()
 			.flat_map(|case| [1usize, 2, 5].map(|preceding| (case, preceding)))
 		{
-			let Some((context, mut encoder, (w, h))) = recovery_encoder(case) else {
+			let Some((context, encoder, (w, h))) = recovery_encoder(case) else {
 				eprintln!("{case:?}: not encoded by this GPU; skipped");
 				continue;
 			};
+			// Through the production encoder interface, as the loop uses it.
+			let mut encoder = super::super::super::backend::ConventionalEncoder::Vulkan(encoder);
 			checked += 1;
 			let extent = conversion_extent(case.codec, w, h).unwrap();
 			let mut converter = InputConverter::new(
@@ -1976,6 +2621,7 @@ mod gpu {
 				(w, h),
 				extent,
 				case.output,
+				4,
 				ColorSpace::Bt709,
 				true,
 			)
@@ -1985,25 +2631,22 @@ mod gpu {
 				let pixels: Vec<u8> = (0..w * h).flat_map(|_| [level, level, level, 255]).collect();
 				let source = source_image(&context, (w, h), vk::Format::R8G8B8A8_UNORM, &pixels);
 				// The conventional loop's per-frame step.
+				use super::super::super::backend::EncoderInput;
+				let target = encoder.input_target().unwrap();
 				converter
-					.convert(
-						&source,
-						vk::Format::R8G8B8A8_UNORM,
-						false,
-						&[None, None],
-						Target::encoder_input(encoder.input_image()),
-					)
+					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 					.unwrap();
-				let image = encoder.input_image();
-				stream.extend(block_on(encoder.encode(image).unwrap()).unwrap().data);
+				stream.extend(block_on(encoder.encode(target).unwrap()).unwrap().data);
 			}
 			// Static scene: two recovery keyframes in a row, no new conversion.
 			for _ in 0..2 {
 				encoder.request_idr();
-				let restore = |_: &mut Encoder, target| match converter.copy_last_output(target) {
+				let restore = |_: &mut _, target| match converter.copy_last_output(target) {
 					Ok(true) => Ok(()),
 					Ok(false) => panic!("a conversion completed"),
-					Err(e) => Err(pixelforge::PixelForgeError::Vulkan(e)),
+					Err(e) => Err(super::super::super::backend::EncodeError::Vulkan(
+						pixelforge::PixelForgeError::Vulkan(e),
+					)),
 				};
 				let recovery =
 					block_on(super::super::super::encode_static_recovery(&mut encoder, restore).unwrap()).unwrap();
@@ -2046,8 +2689,8 @@ mod gpu {
 			((1365, 767), Codec::AV1),
 		] {
 			for (format, depth) in [
-				(OutputFormat::NV12, EncodeBitDepth::Eight),
-				(OutputFormat::P010, EncodeBitDepth::Ten),
+				(ConvertFormat::Nv12, EncodeBitDepth::Eight),
+				(ConvertFormat::P010, EncodeBitDepth::Ten),
 			] {
 				let case = CodecCase {
 					codec,
@@ -2069,12 +2712,20 @@ mod gpu {
 				let extent = conversion_extent(codec, frame.0, frame.1).unwrap();
 				let target = Target::encoder_input(encoder.input_image());
 				for mode in [ConversionQueueMode::Graphics, ConversionQueueMode::Auto] {
-					let mut converter =
-						InputConverter::new(context.clone(), mode, frame, extent, format, ColorSpace::Bt709, false)
-							.unwrap();
+					let mut converter = InputConverter::new(
+						context.clone(),
+						mode,
+						frame,
+						extent,
+						format,
+						4,
+						ColorSpace::Bt709,
+						false,
+					)
+					.unwrap();
 					for _ in 0..20 {
 						converter
-							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
+							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 							.unwrap();
 					}
 					const N: u32 = 300;
@@ -2082,7 +2733,7 @@ mod gpu {
 					for _ in 0..N {
 						let t = std::time::Instant::now();
 						gpu_ns += converter
-							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
+							.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 							.unwrap()
 							.gpu_ns
 							.unwrap_or(0);
