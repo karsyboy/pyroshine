@@ -34,8 +34,6 @@ use super::backend::{EncodeError, NativeFormat, PROBE_EXTENT, Packet, PacketFutu
 use super::convert::{ConvertFormat, Layout, Target};
 use crate::session::stream::video::{BitDepth, ChromaFormat, VideoCodec};
 
-/// Input buffers: one being converted, one encoding, one read back.
-const INPUT_BUFFERS: usize = 3;
 /// Row pitch alignment of the input buffers.
 const ROW_ALIGNMENT: u32 = 256;
 const SLOT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -545,6 +543,8 @@ pub(crate) struct NvencEncoder {
 	recovery: recovery::Recovery,
 	bitrate_ceiling: u32,
 	pending_bitrate: u32,
+	/// Input buffers: see `conventional_input_slots`.
+	input_slots: usize,
 	current: usize,
 	submitted: u64,
 	idr_pending: bool,
@@ -581,12 +581,13 @@ impl NvencEncoder {
 			}
 			session
 		};
+		let input_slots = super::conventional_input_slots();
 		let shared = Arc::new(Shared {
 			api,
 			session,
 			cuda,
 			lock: Mutex::new(()),
-			busy: Mutex::new(vec![false; INPUT_BUFFERS]),
+			busy: Mutex::new(vec![false; input_slots]),
 			freed: Condvar::new(),
 		});
 
@@ -615,6 +616,7 @@ impl NvencEncoder {
 			recovery: recovery::Recovery::default(),
 			bitrate_ceiling: format.bitrate,
 			pending_bitrate: format.bitrate,
+			input_slots,
 			current: 0,
 			submitted: 0,
 			idr_pending: true,
@@ -857,7 +859,7 @@ impl NvencEncoder {
 		let _current = shared.cuda.push()?;
 		let device = self.vulkan.device();
 		let external_memory_fd = ash::khr::external_memory_fd::Device::load(self.vulkan.instance(), device);
-		for _ in 0..INPUT_BUFFERS {
+		for _ in 0..self.input_slots {
 			let mut slot = Slot {
 				buffer: vk::Buffer::null(),
 				memory: vk::DeviceMemory::null(),

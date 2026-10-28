@@ -296,7 +296,10 @@ mod fake {
 				vendor: "fake".into(),
 			}),
 			lock: Mutex::new(()),
-			busy: Mutex::new(vec![true; INPUT_SURFACES]),
+			busy: Mutex::new(vec![
+				true;
+				crate::session::stream::video::pipeline::conventional_input_slots()
+			]),
 			freed: Condvar::new(),
 			lost: AtomicBool::new(false),
 		})

@@ -220,6 +220,11 @@ IDR replays use the same gate. The consumer moves each credit into its batch
 rather than freeing it at enqueue. RAII also covers queued encoder messages,
 packetization errors, sender failure, cancellation and discarded epochs.
 
+VA-API and NVENC keep one input slot (input surface plus coded buffer) per
+credit. A slot is held from conversion until its bitstream is read back, inside
+one credit, and slots are used in order, so the slot a newly admitted frame
+converts into is always free; a further slot was never used.
+
 Two credits let one frame encode while the previous one is read back,
 packetized and sent. A third credit cannot add throughput once the encoder or
 the link is the bottleneck: its capture waits for one of Pixelforge's two input

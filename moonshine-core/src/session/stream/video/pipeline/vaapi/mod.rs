@@ -48,8 +48,6 @@ use super::backend::{EncodeError, NativeFormat, PROBE_EXTENT, Packet, PacketFutu
 use super::convert::{ConvertFormat, Target};
 use crate::session::stream::video::{BitDepth, ChromaFormat, VideoCodec};
 
-/// Input surfaces: one being converted, one encoding, one read back.
-const INPUT_SURFACES: usize = 3;
 /// How long `input_target`/`flush` wait for the readback thread before the
 /// encoder is declared hung.
 const SLOT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -499,6 +497,8 @@ pub(crate) struct VaapiEncoder {
 	installed_bitrate: u32,
 	packed_headers: u32,
 	convert: ConvertFormat,
+	/// Input surfaces with their coded buffers: see `conventional_input_slots`.
+	input_slots: usize,
 	current: usize,
 	submitted: u64,
 	index_since_idr: u64,
@@ -743,10 +743,11 @@ impl VaapiEncoder {
 		};
 		display.check(status, "create config").map_err(|e| e.to_string())?;
 
+		let input_slots = super::conventional_input_slots();
 		let shared = Arc::new(Shared {
 			display,
 			lock: Mutex::new(()),
-			busy: Mutex::new(vec![false; INPUT_SURFACES]),
+			busy: Mutex::new(vec![false; input_slots]),
 			freed: Condvar::new(),
 			lost: AtomicBool::new(false),
 		});
@@ -765,6 +766,7 @@ impl VaapiEncoder {
 			setup,
 			packed_headers: wanted,
 			convert: profile.convert,
+			input_slots,
 			current: 0,
 			submitted: 0,
 			index_since_idr: 0,
@@ -823,7 +825,7 @@ impl VaapiEncoder {
 				},
 			},
 		];
-		let mut surfaces = vec![VA_INVALID_SURFACE; INPUT_SURFACES + self.setup.max_references + 1];
+		let mut surfaces = vec![VA_INVALID_SURFACE; self.input_slots + self.setup.max_references + 1];
 		// SAFETY: valid display, output array and attributes.
 		let status = unsafe {
 			(va.create_surfaces)(
@@ -841,8 +843,8 @@ impl VaapiEncoder {
 			.display
 			.check(status, "create surfaces")
 			.map_err(|e| e.to_string())?;
-		self.recon = surfaces[INPUT_SURFACES..].to_vec();
-		for &surface in &surfaces[..INPUT_SURFACES] {
+		self.recon = surfaces[self.input_slots..].to_vec();
+		for &surface in &surfaces[..self.input_slots] {
 			self.slots.push(Slot {
 				surface,
 				coded: VA_INVALID_ID,
@@ -874,7 +876,7 @@ impl VaapiEncoder {
 		let samples = u64::from(width) * u64::from(height);
 		let bytes_per_sample = if self.setup.chroma_444 { 3 } else { 2 } * if self.setup.bit_depth > 8 { 2 } else { 1 };
 		let coded_size = (samples * bytes_per_sample).clamp(1 << 20, 256 << 20) as c_uint;
-		for index in 0..INPUT_SURFACES {
+		for index in 0..self.input_slots {
 			let mut coded = VA_INVALID_ID;
 			// SAFETY: valid display and context; no initial data.
 			let status = unsafe {

@@ -86,6 +86,15 @@ const MAX_FRAMES_IN_FLIGHT: usize = 3;
 /// measurement on other hardware; not a user setting.
 const FRAMES_IN_FLIGHT_ENV: &str = "MOONSHINE_CONVENTIONAL_FRAMES_IN_FLIGHT";
 
+/// Input slots of the native (VA-API, NVENC) encoders. A slot is held from
+/// conversion until its bitstream is read back, all inside one credit, and
+/// slots are used in order, so the slot a newly admitted frame converts into
+/// is always free: a slot beyond the credit bound was never used (12 MiB of
+/// NV12 to 50 MiB of 10-bit 4:4:4 at 4K).
+fn conventional_input_slots() -> usize {
+	conventional_credit_limit()
+}
+
 fn conventional_credit_limit() -> usize {
 	match std::env::var(FRAMES_IN_FLIGHT_ENV) {
 		Err(_) => DEFAULT_FRAMES_IN_FLIGHT,
