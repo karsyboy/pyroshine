@@ -385,7 +385,9 @@ transition, or service shutdown. In order, it stops the application unit while
 the compositor and audio still serve it (if a transition is in flight, that is
 cancelled first and the unit is stopped after it hands back), triggers the
 session stop, drops the owned state, waits for every worker and transition,
-drops state handed back by transitions, then reports `Idle`. The
+drops state handed back by transitions, then reports `Idle` and returns freed
+heap memory to the system (`malloc_trim` on a blocking thread: each session's
+threads get their own glibc arenas, which otherwise keep it). The
 unit name is recorded before a launch starts, so a launch cancelled after
 systemd accepted the unit is still stopped. `Application` drop never blocks;
 stopping the unit is an awaited, bounded D-Bus job.

@@ -24,6 +24,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Video error correction uses four dedicated threads instead of one per CPU. At PyroWave 4K120 this halves Pyroshine's CPU use and stops it waking every core thousands of times a second, with no added latency.
 - VA-API and NVENC streams allocate one fewer input frame (12 MiB at 4K 4:2:0, up to 50 MiB at 4K 4:4:4 10-bit).
 - While no client is connected, the encoders let go of the game's frame buffers, so a game that changes resolution meanwhile frees its old buffers.
+- The service returns memory to the system after each session. Its memory use no longer grows by about 12 MiB per session (to about 240 MiB after 20 sessions); it now stays near 80 MiB.
 
 ## [v0.18.0-prerelease.1] - 2026-10-27
 

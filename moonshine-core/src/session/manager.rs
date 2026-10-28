@@ -908,6 +908,7 @@ impl<B: SessionBackend> SessionCore<B> {
 				drop(guard);
 				tracing::info!(epoch, "Session stopped; ready for a new session.");
 				done.send_replace(TeardownStatus::Completed);
+				release_freed_memory();
 			},
 			Err(detail) => {
 				// Workers may still own ports, the Pulse socket or GPU objects, or the
@@ -2208,6 +2209,18 @@ fn spawn_desktop_deadlines(
 				_ = async { match deadline { Some(d) => tokio::time::sleep_until(d.into()).await, None => std::future::pending::<()>().await } } => {},
 			}
 		}
+	});
+}
+
+/// Return memory freed by the stopped session to the system. Each session's
+/// threads get their own glibc arenas, which keep freed memory: without this a
+/// long-running service grew about 12 MiB per session up to a ~240 MiB plateau
+/// (30 sessions). Runs off the runtime; trimming walks every arena.
+fn release_freed_memory() {
+	#[cfg(target_env = "gnu")]
+	tokio::task::spawn_blocking(|| {
+		// SAFETY: `malloc_trim` only releases free memory and is thread-safe.
+		unsafe { libc::malloc_trim(0) };
 	});
 }
 
