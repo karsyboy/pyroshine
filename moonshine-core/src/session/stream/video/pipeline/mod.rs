@@ -1628,6 +1628,8 @@ impl VideoPipelineInner {
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let wakes = self.demand.wakes();
+			// Tells the compositor whether anyone watches (detached_frame_rate).
+			frame_rx.set_delivering(self.demand.wanted());
 			if let Some(mut rate) = self.rate_rx.take() {
 				match encoder.set_bitrate(rate.requested() as usize, ctx.fps) {
 					Ok(accepted) => {
@@ -2078,6 +2080,8 @@ impl VideoPipelineInner {
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let wakes = self.demand.wakes();
+			// Tells the compositor whether anyone watches (detached_frame_rate).
+			frame_rx.set_delivering(self.demand.wanted());
 			if let Ok(command) = reconfigure_rx.try_recv() {
 				self.rate_rx.activate(command.generation);
 				frame_rx.reset();

@@ -37,6 +37,10 @@ struct Args {
 	/// H.264/HEVC/AV1 conversion queue; auto prefers a dedicated compute family.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	conversion_queue: String,
+	/// Frame callbacks per second while no client receives the stream
+	/// (`compositor.detached_frame_rate`); 0 keeps the stream rate.
+	#[arg(long, default_value_t = 0)]
+	detached_frame_rate: u32,
 	/// FEC threads per stream (`stream.video.fec_threads`); 0 scales with the host.
 	#[arg(long, default_value_t = 0)]
 	fec_threads: usize,
@@ -938,6 +942,7 @@ fn workload(
 		"packet_size": args.packet_size,
 		"conversion_queue": args.conversion_queue,
 		"fec_threads": args.fec_threads,
+		"detached_frame_rate": args.detached_frame_rate,
 		"pyrowave_queue": args.pyrowave_queue,
 		"pyrowave_record": args.pyrowave_record,
 		"duration_s": duration,
@@ -1137,6 +1142,7 @@ async fn run_benchmark(
 				CaptureMode::Auto
 			},
 			bench_pointer: bench_pointer(args),
+			detached_frame_rate: args.detached_frame_rate,
 			..Default::default()
 		},
 		Default::default(),

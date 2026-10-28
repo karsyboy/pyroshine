@@ -151,6 +151,10 @@ pub struct CompositorConfig {
 	/// Keyboard configuration for the compositor's XKB state.
 	pub keyboard: KeyboardConfig,
 
+	/// Frame callbacks per second while no client receives the stream, to
+	/// slow a game nobody watches. `0` (default) keeps the stream's rate.
+	pub detached_frame_rate: u32,
+
 	/// Benchmark diagnostic: emulate client pointer use so cursor capture
 	/// paths can be measured without a Moonlight control stream.
 	#[serde(skip)]
@@ -167,6 +171,7 @@ impl Default for CompositorConfig {
 			steam_mode: true,
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
+			detached_frame_rate: 0,
 			bench_pointer: None,
 		}
 	}
@@ -580,6 +585,7 @@ fn run_compositor(
 		config.capture_mode,
 		context.log_stats,
 	)?;
+	state.detached_frame_rate = config.detached_frame_rate;
 
 	// Insert the Wayland display as a calloop event source so client
 	// messages (including XWayland's protocol handshake) are dispatched

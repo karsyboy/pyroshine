@@ -26,6 +26,7 @@
     ],
     "compositor": {
       "capture_mode": "auto",
+      "detached_frame_rate": 0,
       "gpu": null,
       "hdr": true,
       "keyboard": {
@@ -1107,6 +1108,22 @@
         },
         "label": "VRR capture",
         "path": "compositor.vrr_capture",
+        "required": false,
+        "section": "display"
+      },
+      {
+        "advanced": true,
+        "caution": null,
+        "help": "Frame rate the game is paced to while no client receives the stream, to save power and GPU time. 0 keeps the stream's frame rate. Games that do not wait for the compositor are unaffected.",
+        "kind": {
+          "max": 1000.0,
+          "min": 0.0,
+          "optional": false,
+          "type": "integer",
+          "unit": "FPS"
+        },
+        "label": "Frame rate without a client",
+        "path": "compositor.detached_frame_rate",
         "required": false,
         "section": "display"
       },

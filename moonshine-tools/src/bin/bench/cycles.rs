@@ -450,6 +450,7 @@ fn session_manager(
 				CaptureMode::Auto
 			},
 			bench_pointer: super::bench_pointer(args),
+			detached_frame_rate: args.detached_frame_rate,
 			..Default::default()
 		},
 		Default::default(),

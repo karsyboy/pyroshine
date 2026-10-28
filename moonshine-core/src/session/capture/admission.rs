@@ -4,7 +4,7 @@ use super::frame::ExportedFrame;
 use smithay::reexports::calloop::ping::{Ping, PingSource, make_ping};
 use std::sync::{
 	Arc,
-	atomic::{AtomicU8, AtomicU64, Ordering},
+	atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 	mpsc,
 };
 use std::time::{Duration, Instant};
@@ -74,6 +74,8 @@ impl OverlayCaps {
 pub(crate) struct CaptureSender {
 	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
 	overlay_caps: Arc<AtomicU8>,
+	/// See [`CaptureReceiver::set_delivering`].
+	delivering: Arc<AtomicBool>,
 	tx: mpsc::SyncSender<ExportedFrame>,
 	demand_source: Option<PingSource>,
 	state: Arc<AtomicU64>,
@@ -82,6 +84,7 @@ pub(crate) struct CaptureReceiver {
 	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
 	/// Whether the active consumer composites `ExportedFrame::overlay`.
 	overlay_caps: Arc<AtomicU8>,
+	delivering: Arc<AtomicBool>,
 	rx: mpsc::Receiver<ExportedFrame>,
 	demand: Option<Ping>,
 	state: Arc<AtomicU64>,
@@ -97,6 +100,8 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	let state = Arc::new(AtomicU64::new(IDLE));
 	let context = Arc::new(std::sync::OnceLock::new());
 	let overlay_caps = Arc::new(AtomicU8::new(0));
+	// Until a consumer says otherwise, frames are wanted.
+	let delivering = Arc::new(AtomicBool::new(true));
 	let (demand, demand_source) = match make_ping() {
 		Ok((ping, source)) => (Some(ping), Some(source)),
 		Err(error) => {
@@ -108,6 +113,7 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 		CaptureSender {
 			context: context.clone(),
 			overlay_caps: overlay_caps.clone(),
+			delivering: delivering.clone(),
 			tx,
 			demand_source,
 			state: state.clone(),
@@ -115,6 +121,7 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 		CaptureReceiver {
 			context,
 			overlay_caps,
+			delivering,
 			rx,
 			state,
 			demand,
@@ -128,6 +135,7 @@ impl CaptureSender {
 		Self {
 			context: self.context.clone(),
 			overlay_caps: self.overlay_caps.clone(),
+			delivering: self.delivering.clone(),
 			tx: self.tx.clone(),
 			demand_source: None,
 			state: self.state.clone(),
@@ -177,6 +185,11 @@ impl CaptureSender {
 	pub(crate) fn requested(&self) -> bool {
 		self.state.load(Ordering::Acquire) & STATE_MASK == REQUESTED
 	}
+	/// Whether a client currently receives the stream (see
+	/// [`CaptureReceiver::set_delivering`]).
+	pub(crate) fn delivering(&self) -> bool {
+		self.delivering.load(Ordering::Acquire)
+	}
 	pub(crate) fn occupied(&self) -> bool {
 		self.state.load(Ordering::Acquire) & STATE_MASK == OCCUPIED
 	}
@@ -207,6 +220,13 @@ impl CaptureReceiver {
 			.get()
 			.cloned()
 			.ok_or_else(|| "Capture GPU context not initialized; compositor must be ready before streaming".into())
+	}
+	/// Whether a client currently receives what this consumer encodes. Unlike
+	/// capture demand, which also pauses while the consumer is busy, it is
+	/// false only while no client is attached; the backend may then slow the
+	/// application down (`[compositor] detached_frame_rate`).
+	pub(crate) fn set_delivering(&self, delivering: bool) {
+		self.delivering.store(delivering, Ordering::Release);
 	}
 	/// Declare which frame overlay layers this consumer composites.
 	pub(crate) fn set_overlay_caps(&self, caps: OverlayCaps) {

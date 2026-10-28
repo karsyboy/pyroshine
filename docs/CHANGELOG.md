@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- **Slow down a game nobody is watching** (opt-in). [`[compositor] detached_frame_rate`](CONFIGURATION.md#compositor) sets the frame rate most games are paced to while no client is connected, saving power and GPU time; a returning client gets the full rate immediately. Off by default.
+
 ### Changed
 
 - **Lower latency with demanding games** for H.264, HEVC and AV1. While a GPU-bound game ran, every frame waited for the game's next frame before it was encoded; at 4K60 the server-side delay drops from 14 ms to under 6 ms, and the game runs slightly faster. When the GPU has headroom, each frame now costs about 0.3 ms more. PyroWave is unchanged.

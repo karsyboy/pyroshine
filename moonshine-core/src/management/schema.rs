@@ -1090,6 +1090,14 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		)
 		.advanced(),
 		Field::new(
+			"compositor.detached_frame_rate",
+			"display",
+			"Frame rate without a client",
+			"Frame rate the game is paced to while no client receives the stream, to save power and GPU time. 0 keeps the stream's frame rate. Games that do not wait for the compositor are unaffected.",
+			integer(0.0, 1000.0, Some("FPS")),
+		)
+		.advanced(),
+		Field::new(
 			"compositor.keyboard.layout",
 			"keyboard",
 			"Layout",

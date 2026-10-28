@@ -76,6 +76,14 @@ struct SceneLayers<'a> {
 	upper: [Option<&'a smithay::desktop::Window>; 5],
 }
 
+/// Whether throttled frame callbacks are due `elapsed` after the last ones, at
+/// `rate` per second on a refresh grid of `refresh`. Ticks land on the grid,
+/// so half an interval of early arrival is allowed; otherwise a rate dividing
+/// the stream rate would skip an extra tick.
+fn detached_callbacks_due(elapsed: std::time::Duration, rate: u32, refresh: std::time::Duration) -> bool {
+	elapsed >= std::time::Duration::from_secs_f64(1.0 / f64::from(rate.max(1))).saturating_sub(refresh / 2)
+}
+
 /// Frame callbacks and presentation feedback of a composited capture whose
 /// render is still running (see `MoonshineCompositor::defer_presentation`).
 struct DeferredPresentation {
@@ -381,6 +389,12 @@ pub(crate) struct MoonshineCompositor {
 	render_fence_handoffs: u64,
 	/// Presentation of a handed-over capture, waiting for its render fence.
 	deferred_presentation: Option<DeferredPresentation>,
+	/// `[compositor] detached_frame_rate`; `0` disables the throttle.
+	pub(super) detached_frame_rate: u32,
+	/// When frame callbacks last went out while throttled.
+	last_detached_callbacks: std::time::Instant,
+	/// Frame callbacks are currently throttled (logged on change).
+	callbacks_throttled: bool,
 	/// A client `wl_buffer` or a capture slot was dropped since the last tick.
 	/// The GLES renderer keeps every imported or bound DMA-BUF (and so its GPU
 	/// memory) until its caches are cleaned, which it otherwise only does after
@@ -1002,6 +1016,9 @@ impl MoonshineCompositor {
 				render_wait_max: std::time::Duration::ZERO,
 				render_fence_handoffs: 0,
 				deferred_presentation: None,
+				detached_frame_rate: 0,
+				last_detached_callbacks: std::time::Instant::now(),
+				callbacks_throttled: false,
 				gles_cache_stale: false,
 				capture_slot_failed: false,
 				direct_rejections: [0; DirectReject::COUNT],
@@ -1904,6 +1921,40 @@ impl MoonshineCompositor {
 		);
 	}
 
+	/// Whether this capture opportunity sends frame callbacks. With
+	/// `detached_frame_rate` set and no client receiving the stream, they go
+	/// out at that rate instead, so a game paced by them (most, through FIFO
+	/// presentation) renders less while nobody watches; buffer releases, input
+	/// and the capture grid are unaffected, so a returning client gets the
+	/// stream rate on the next tick.
+	fn callbacks_due(&mut self, requested: bool) -> bool {
+		let throttled = self.detached_frame_rate != 0 && !self.frame_tx.delivering();
+		if throttled != self.callbacks_throttled {
+			self.callbacks_throttled = throttled;
+			if throttled {
+				tracing::info!(
+					frame_rate = self.detached_frame_rate,
+					"No client receives the stream; slowing frame callbacks"
+				);
+			} else {
+				tracing::info!("A client receives the stream again; frame callbacks at the stream rate");
+			}
+		}
+		if !requested || !throttled {
+			return requested;
+		}
+		let now = std::time::Instant::now();
+		if !detached_callbacks_due(
+			now.duration_since(self.last_detached_callbacks),
+			self.detached_frame_rate,
+			self.refresh_interval(),
+		) {
+			return false;
+		}
+		self.last_detached_callbacks = now;
+		true
+	}
+
 	/// The lowest free capture slot, allocating one if every allocated slot is
 	/// still read by the encoder. Reusing the lowest slot keeps damage-tracked
 	/// redraws small and lets the others fall idle and be released.
@@ -1962,6 +2013,7 @@ impl MoonshineCompositor {
 	fn render_and_export(&mut self, send_callbacks: bool) {
 		// The previous composited frame's callbacks precede this capture's.
 		self.finish_deferred_presentation();
+		let send_callbacks = self.callbacks_due(send_callbacks);
 		if self.log_stats && self.gpu_timer.has_pending() {
 			self.gpu_timer.poll(&mut self.renderer);
 		}
@@ -3293,6 +3345,22 @@ fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Opt
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn detached_callbacks_follow_the_configured_rate_on_the_refresh_grid() {
+		use std::time::Duration;
+		let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+		let tick = ms(1000.0 / 60.0);
+		// 30 FPS on a 60 Hz grid: every second tick, even if it lands early.
+		assert!(!super::detached_callbacks_due(tick, 30, tick));
+		assert!(super::detached_callbacks_due(ms(33.2), 30, tick));
+		// 10 FPS on a 120 Hz grid: every twelfth tick.
+		let tick = ms(1000.0 / 120.0);
+		assert!(!super::detached_callbacks_due(tick * 11, 10, tick));
+		assert!(super::detached_callbacks_due(tick * 12, 10, tick));
+		// A rate at or above the stream rate never withholds a tick.
+		assert!(super::detached_callbacks_due(tick, 240, tick));
+	}
+
 	use super::{directly_exportable, require_importable, select_surface_source_size};
 
 	/// Found on an RTX 3080 (2026-10-13): clients picked NVIDIA's compressed

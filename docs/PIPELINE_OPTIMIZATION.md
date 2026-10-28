@@ -347,6 +347,14 @@ epoch activates; that resume showed its first frame after 0.8 s (HEVC) and
 returns, a replay of the last frame (static-scene IDR, PyroWave resend) waits
 two frame intervals so a fresh capture can arrive first.
 
+With [`[compositor] detached_frame_rate`](CONFIGURATION.md#compositor) set, the
+compositor also sends frame callbacks only at that rate while the encoder
+reports that no client receives the stream (`CaptureReceiver::set_delivering`,
+which unlike capture demand ignores a merely busy encoder). Games paced by frame
+callbacks then render less: at 10 FPS on a 120 Hz stream vkcube's GPU time
+fell from about 13 to 1.5 ms per second. Buffer releases, input and the refresh
+grid continue, so the first tick after a client returns sends callbacks again.
+
 Conventional packetization of frames of 128 KiB or more runs inside
 `tokio::task::block_in_place`, so its FEC and encryption work (about 1 ms for
 a 1 MB encrypted 4K frame) does not delay other tasks queued on that runtime
