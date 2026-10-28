@@ -429,6 +429,9 @@ pub(crate) struct VideoStreamHandle {
 	packet_tx: mpsc::Sender<VideoPacketMessage>,
 	pause_tx: watch::Sender<u64>,
 	reconfigure_tx: std::sync::mpsc::Sender<VideoReconfigureCommand>,
+	/// Wakes the encoder, which sleeps while no client receives frames, after
+	/// a command is queued for it.
+	demand: MediaDemand,
 }
 
 pub(super) struct VideoReconfigureCommand {
@@ -461,6 +464,7 @@ impl VideoStreamHandle {
 		if !self.start.open() {
 			tracing::debug!("Ignoring duplicate video start signal");
 		}
+		self.demand.wake();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
@@ -490,6 +494,7 @@ impl VideoStreamHandle {
 		self.reset_tx
 			.send(pipeline::EpochActivation { generation, applied })
 			.map_err(|_| ())?;
+		self.demand.wake();
 		waiting.await.map_err(|_| ())?
 	}
 
@@ -516,6 +521,7 @@ impl VideoStreamHandle {
 				applied,
 			})
 			.map_err(|_| ())?;
+		self.demand.wake();
 		waiting.await.map_err(|_| ())?
 	}
 
@@ -568,6 +574,7 @@ impl VideoStreamHandle {
 			fec_feedback_tx: watch::channel(FrameFecStatus::default()).0,
 			packet_tx,
 			reconfigure_tx: std::sync::mpsc::channel().0,
+			demand: MediaDemand::new(),
 		};
 		(handle, VideoHandleProbe { idr_rx, packet_rx })
 	}
@@ -694,7 +701,7 @@ impl VideoStream {
 			stats_tx,
 			fec_feedback_rx,
 			reconfigure_rx,
-			demand,
+			demand.clone(),
 			stop_cause,
 			rate_rx,
 		)
@@ -710,6 +717,7 @@ impl VideoStream {
 			packet_tx,
 			pause_tx,
 			reconfigure_tx,
+			demand,
 		})
 	}
 }

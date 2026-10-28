@@ -911,6 +911,16 @@ impl VideoPipeline {
 		// Registered before the thread exists: a stop before `StartB`, or a
 		// failed spawn, is still accounted for by the session's completion.
 		let worker = WorkerGuard::register(&stop_session_manager, SessionShutdownReason::VideoEncoderStopped)?;
+		// The encoder sleeps while no client receives frames; a stop must end
+		// that sleep at once.
+		runtime.spawn({
+			let demand = inner.demand.demand.clone();
+			let stop = stop_session_manager.clone();
+			async move {
+				stop.wait_shutdown_triggered().await;
+				demand.wake();
+			}
+		});
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
@@ -950,6 +960,10 @@ struct VideoPipelineInner {
 	stop_cause: crate::session::failure::StopCauseSlot,
 }
 
+/// Longest sleep of a paused or not yet started encoding loop. Every command
+/// it must act on wakes it; this only bounds a missed wake.
+const PAUSED_WAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// [`crate::session::stream::MediaDemand`] as the encoding loops see it: whether to produce,
 /// and whether a replay of the last frame may stand in for a fresh capture.
 struct DemandTracker {
@@ -976,6 +990,28 @@ impl DemandTracker {
 			_ => {},
 		}
 		wanted
+	}
+
+	/// See [`crate::session::stream::MediaDemand::wakes`].
+	fn wakes(&self) -> u64 {
+		self.demand.wakes()
+	}
+
+	/// The receive of an encoding loop while no client receives frames: hand
+	/// back a frame captured before the pause (so its buffers return at once),
+	/// otherwise sleep until a command, demand change or stop wakes the loop
+	/// (previously it woke every frame interval to look).
+	fn wait_paused(
+		&self,
+		frame_rx: &crate::session::capture::admission::CaptureReceiver,
+		wakes: u64,
+	) -> Result<crate::session::capture::frame::ExportedFrame, std::sync::mpsc::RecvTimeoutError> {
+		let drained = frame_rx.recv_timeout_if(std::time::Duration::ZERO, false);
+		if !matches!(drained, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+			return drained;
+		}
+		self.demand.wait_for_wake(wakes, PAUSED_WAKE_BOUND);
+		Err(std::sync::mpsc::RecvTimeoutError::Timeout)
 	}
 
 	/// A replay of the last produced frame (static-scene IDR, PyroWave resend)
@@ -1036,6 +1072,7 @@ impl VideoPipelineInner {
 		// produced yet, so a reset or reconfiguration only records the context
 		// and activates the transport epoch for its generation.
 		loop {
+			let wakes = self.demand.wakes();
 			if stop_session_manager.is_shutdown_triggered() {
 				tracing::debug!("Video pipeline stopped before start signal.");
 				return;
@@ -1058,7 +1095,8 @@ impl VideoPipelineInner {
 					return;
 				}
 			}
-			std::thread::sleep(std::time::Duration::from_millis(5));
+			// StartB, reconfiguration, reset and stop all wake this.
+			self.demand.demand.wait_for_wake(wakes, PAUSED_WAKE_BOUND);
 		}
 
 		let mut pending_applied: Option<EpochActivation> = None;
@@ -1487,6 +1525,7 @@ impl VideoPipelineInner {
 		let mut pending_rate: Option<super::rate::PendingRate> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			let wakes = self.demand.wakes();
 			if let Some(mut rate) = self.rate_rx.take() {
 				match encoder.set_bitrate(rate.requested() as usize, ctx.fps) {
 					Ok(accepted) => {
@@ -1547,7 +1586,12 @@ impl VideoPipelineInner {
 			} else {
 				imports_released = false;
 			}
-			let mut received = match frame_rx.recv_timeout_if(frame_interval, self.demand.wanted()) {
+			let received = if self.demand.wanted() {
+				frame_rx.recv_timeout_if(frame_interval, true)
+			} else {
+				self.demand.wait_paused(frame_rx, wakes)
+			};
+			let mut received = match received {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1919,6 +1963,7 @@ impl VideoPipelineInner {
 		let mut encoder_color_desc: Option<ColorDescription> = Some(color_description_for(ctx.format)?);
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			let wakes = self.demand.wakes();
 			let reconfigure = reconfigure_rx.try_recv().ok();
 			if let Some(command) = &reconfigure {
 				self.rate_rx.activate(command.generation);
@@ -2036,10 +2081,12 @@ impl VideoPipelineInner {
 					recv_timeout = frame_interval.saturating_sub(waited.elapsed());
 				}
 			}
-			let received_frame = match frame_rx.recv_timeout_if(
-				recv_timeout,
-				conventional_can_admit(&in_flight, credit_limit) && self.demand.wanted(),
-			) {
+			let received = if self.demand.wanted() {
+				frame_rx.recv_timeout_if(recv_timeout, conventional_can_admit(&in_flight, credit_limit))
+			} else {
+				self.demand.wait_paused(frame_rx, wakes)
+			};
+			let received_frame = match received {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.

@@ -319,7 +319,10 @@ and packetization stop once in-flight work drains, the encoders release their
 imports of the client's buffers (which otherwise expire only on later imports,
 pinning a swapchain the game replaced while nobody watched), and the audio encoder
 returns PCM to the Pulse server without encoding it. The compositor keeps
-presenting to the application and Pulse keeps serving it. After demand
+presenting to the application and Pulse keeps serving it. The encoding thread
+sleeps meanwhile (and before `StartB`): `MediaDemand` wakes it when demand
+changes and when a reconfiguration, reset, start or stop is queued for it, so a
+resumed epoch activates at once instead of at the thread's next poll. After demand
 returns, a replay of the last frame (static-scene IDR, PyroWave resend) waits
 two frame intervals so a fresh capture can arrive first.
 

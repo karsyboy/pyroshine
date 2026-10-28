@@ -65,19 +65,60 @@ impl RtpHeader {}
 /// audio encoder recycles PCM without encoding it, so capture, conversion,
 /// encoding and packetization stop after in-flight work drains. The compositor
 /// keeps presenting to the application and the Pulse server keeps serving it.
+///
+/// It also wakes an encoder that sleeps while demand is clear: changing demand,
+/// and [`MediaDemand::wake`] for any other command the encoder must see (epoch
+/// activation, start, stop), end [`MediaDemand::wait_for_wake`].
 #[derive(Clone, Debug)]
-pub(crate) struct MediaDemand(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub(crate) struct MediaDemand(std::sync::Arc<DemandState>);
+
+#[derive(Debug)]
+struct DemandState {
+	wanted: std::sync::atomic::AtomicBool,
+	/// Wakes so far; a waiter compares it with the count it last saw, so a wake
+	/// between its check and its wait is never lost.
+	wakes: std::sync::Mutex<u64>,
+	woken: std::sync::Condvar,
+}
 
 impl MediaDemand {
 	pub(crate) fn new() -> Self {
-		Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+		Self(std::sync::Arc::new(DemandState {
+			wanted: std::sync::atomic::AtomicBool::new(true),
+			wakes: std::sync::Mutex::new(0),
+			woken: std::sync::Condvar::new(),
+		}))
 	}
 
 	pub(crate) fn wanted(&self) -> bool {
-		self.0.load(std::sync::atomic::Ordering::Acquire)
+		self.0.wanted.load(std::sync::atomic::Ordering::Acquire)
 	}
 
 	pub(crate) fn set(&self, wanted: bool) {
-		self.0.store(wanted, std::sync::atomic::Ordering::Release);
+		if self.0.wanted.swap(wanted, std::sync::atomic::Ordering::AcqRel) != wanted {
+			self.wake();
+		}
+	}
+
+	/// Wake a sleeping encoder so it re-reads its commands.
+	pub(crate) fn wake(&self) {
+		*self.0.wakes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+		self.0.woken.notify_all();
+	}
+
+	/// The wake count to pass to [`Self::wait_for_wake`], read before the
+	/// caller checks the state it would otherwise sleep on.
+	pub(crate) fn wakes(&self) -> u64 {
+		*self.0.wakes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// Sleep until a wake after `seen` or `timeout`.
+	pub(crate) fn wait_for_wake(&self, seen: u64, timeout: std::time::Duration) {
+		let guard = self.0.wakes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		let _ = self
+			.0
+			.woken
+			.wait_timeout_while(guard, timeout, |wakes| *wakes == seen)
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
 	}
 }
