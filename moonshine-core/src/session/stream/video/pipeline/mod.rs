@@ -181,6 +181,21 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 		.ok_or_else(|| format!("unsupported DRM fourcc 0x{fourcc:08x} for the conventional encoders"))
 }
 
+/// A converter error as the encoder loop handles it. A conversion that ran out
+/// its bound left the GPU work pending and the converter unusable (see
+/// `InputConverter::submit_and_wait`): like device loss, it stops the stream,
+/// without waiting for a queue that would never go idle.
+fn conversion_error(error: vk::Result) -> EncodeError {
+	if error == vk::Result::TIMEOUT {
+		EncodeError::Native {
+			message: "GPU color conversion did not finish within 5 s; the GPU stopped making progress".into(),
+			device_lost: true,
+		}
+	} else {
+		EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(error))
+	}
+}
+
 /// Classify an encoder error from a step after the source was converted.
 /// Device loss is terminal (every later GPU operation fails the same way, so
 /// the loop must stop instead of freezing the stream); any other failure
@@ -2105,7 +2120,7 @@ impl VideoPipelineInner {
 							match input_converter.copy_last_output(target) {
 								Ok(true) => Ok(()),
 								Ok(false) => Err(EncodeError::native("no converted frame to recover from")),
-								Err(e) => Err(EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(e))),
+								Err(e) => Err(conversion_error(e)),
 							}
 						};
 						let encoded_order = encoder.next_display_order();
@@ -2442,7 +2457,7 @@ impl VideoPipelineInner {
 					.map(|outcome| {
 						convert_window.record(outcome.gpu_ns, frame.has_overlays());
 					})
-					.map_err(|e| EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(e)));
+					.map_err(conversion_error);
 
 				if converted.is_err() {
 					last_output = false;
@@ -2928,6 +2943,13 @@ mod tests {
 		// A setup failure keeps its own advice.
 		let setup = encoder_stop_cause(VideoCodec::Av1, &EncoderError::Setup("too small".into()));
 		assert!(setup.detail.starts_with("The AV1 encoder could not be created"));
+	}
+
+	#[test]
+	fn a_stalled_conversion_stops_the_stream_like_device_loss() {
+		assert!(super::conversion_error(vk::Result::TIMEOUT).device_lost());
+		assert!(!super::conversion_error(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).device_lost());
+		assert!(super::conversion_error(vk::Result::ERROR_DEVICE_LOST).device_lost());
 	}
 
 	#[test]

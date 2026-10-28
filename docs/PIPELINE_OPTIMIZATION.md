@@ -211,7 +211,13 @@ The conversion submits to the dedicated compute family by default
 queue alongside a GPU-bound game; `graphics` remains available for A/B
 comparison. Pixelforge shares the input image concurrently with that family.
 The conversion ends with a CPU fence wait before `Encoder::encode`, whose API
-takes no wait semaphore, and releases the source only after that wait.
+takes no wait semaphore, and releases the source only after that wait. The wait
+is bounded at 5 s: a GPU that stops without reporting device loss stops the
+stream like device loss instead of hanging the encode thread, and the converter
+refuses further work because its submission is still pending. Chaining the
+conversion to the encode with a semaphore would need a Pixelforge API change
+and separate tracking of the source's release, for at most the fence round trip:
+about 50 µs at 4K (`converter_timing`: 98 µs GPU, 151 µs wall).
 
 Conventional encoding uses Pixelforge's asynchronous pipeline with two owned
 completion credits spanning submission, readback, packetization, queue residence

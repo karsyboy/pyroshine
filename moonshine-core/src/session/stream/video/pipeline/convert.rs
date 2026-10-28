@@ -56,6 +56,12 @@ const GROUP_SIZE: u32 = 8;
 /// Views kept for recently seen source images (swapchains rotate 2-4 images).
 const MAX_CACHED_VIEWS: usize = 8;
 
+/// Longest wait for one conversion or copy. A conversion takes well under a
+/// millisecond; this only bounds a GPU that stopped without reporting device
+/// loss, so the encode thread reports the stall instead of hanging (the same
+/// bound as the VA-API and NVENC slot waits).
+const GPU_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Queue preference for the conversion submission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1070,6 +1076,9 @@ pub(crate) struct InputConverter {
 	command_pool: vk::CommandPool,
 	command_buffer: vk::CommandBuffer,
 	fence: vk::Fence,
+	/// A wait ran out [`GPU_WAIT_TIMEOUT`]: the fence and command buffer are
+	/// still pending, so every later submission fails without touching them.
+	stalled: std::cell::Cell<bool>,
 	query_pool: vk::QueryPool,
 	timestamp_period_ns: f64,
 }
@@ -1208,6 +1217,7 @@ impl InputConverter {
 			command_pool: vk::CommandPool::null(),
 			command_buffer: vk::CommandBuffer::null(),
 			fence: vk::Fence::null(),
+			stalled: std::cell::Cell::new(false),
 			query_pool: vk::QueryPool::null(),
 			timestamp_period_ns: f64::from(limits.timestamp_period),
 			context,
@@ -1696,6 +1706,9 @@ impl InputConverter {
 		layers: &Layers<'_>,
 		target: Option<Target>,
 	) -> Result<ConvertOutcome, vk::Result> {
+		if self.stalled.get() {
+			return Err(vk::Result::TIMEOUT);
+		}
 		let layout = self.layout;
 		let mut push = PushConstants {
 			width: self.width,
@@ -2224,25 +2237,39 @@ impl InputConverter {
 		}
 	}
 
-	/// Submit `cmd` to this converter's queue and wait for it.
+	/// Submit `cmd` to this converter's queue and wait for it, at most
+	/// [`GPU_WAIT_TIMEOUT`]. `Err(vk::Result::TIMEOUT)` means the GPU stopped
+	/// making progress without reporting device loss: the submission is still
+	/// pending, so its fence and command buffer must not be reused and the
+	/// stream must stop (see `conversion_error` in the pipeline).
 	///
 	/// # Safety
 	///
 	/// `cmd` was recorded from this converter's pool and is executable.
 	unsafe fn submit_and_wait(&self, cmd: vk::CommandBuffer) -> Result<(), vk::Result> {
+		if self.stalled.get() {
+			return Err(vk::Result::TIMEOUT);
+		}
 		let device = self.context.device();
 		let command_buffers = [cmd];
 		// SAFETY: guaranteed by the caller; the fence is unsignaled (it is reset
-		// after every wait).
+		// after every completed wait).
 		unsafe {
 			device.queue_submit(
 				self.queue,
 				&[vk::SubmitInfo::default().command_buffers(&command_buffers)],
 				self.fence,
 			)?;
-			let waited = device.wait_for_fences(&[self.fence], true, u64::MAX);
-			device.reset_fences(&[self.fence])?;
-			waited
+			match device.wait_for_fences(&[self.fence], true, GPU_WAIT_TIMEOUT.as_nanos() as u64) {
+				Err(vk::Result::TIMEOUT) => {
+					self.stalled.set(true);
+					Err(vk::Result::TIMEOUT)
+				},
+				waited => {
+					device.reset_fences(&[self.fence])?;
+					waited
+				},
+			}
 		}
 	}
 
@@ -2253,6 +2280,9 @@ impl InputConverter {
 	/// so the current slot never holds the latest frame (review 2026-10-05
 	/// BUG-002).
 	pub(crate) fn copy_last_output(&self, target: Target) -> Result<bool, vk::Result> {
+		if self.stalled.get() {
+			return Err(vk::Result::TIMEOUT);
+		}
 		if !self.output_valid {
 			return Ok(false);
 		}
@@ -2270,8 +2300,11 @@ impl InputConverter {
 			device.end_command_buffer(cmd)?;
 			if let Err(e) = self.submit_and_wait(cmd) {
 				// A failed wait leaves the submission state unknown; idle the
-				// queue before the command buffer is reused.
-				let _ = device.queue_wait_idle(self.queue);
+				// queue before the command buffer is reused. A stalled GPU would
+				// never go idle, and stops the stream instead.
+				if e != vk::Result::TIMEOUT {
+					let _ = device.queue_wait_idle(self.queue);
+				}
 				return Err(e);
 			}
 		}
