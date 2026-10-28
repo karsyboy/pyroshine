@@ -53,10 +53,10 @@
 //! risk reuse under a pending read. The capture credit is a third, independent
 //! signal that bounds capture demand through transport.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smithay::backend::allocator::Buffer;
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -375,6 +375,12 @@ pub(crate) struct ExportedFrame {
 	/// frame is sampled 1:1 and one that raced an extent change is
 	/// edge-extended. Encoders with their own scaler (PyroWave) always scale.
 	pub scale_to_stream: bool,
+	/// Completion fence (`sync_file`) of the backend's GPU work that writes
+	/// the buffer, when the frame is handed over before that work finished: a
+	/// composited capture hands it to the encoder instead of blocking the
+	/// compositor thread (input, frame callbacks) until the render completes.
+	/// Consumers read the buffer only after [`Self::wait_ready`].
+	pub ready: Option<OwnedFd>,
 }
 
 /// Layout of a single DMA-BUF plane; its descriptor is owned by the frame.
@@ -434,7 +440,52 @@ impl ExportedFrame {
 			overlays: Default::default(),
 			origin: CaptureOrigin::default(),
 			scale_to_stream: false,
+			ready: None,
 		}
+	}
+
+	/// Wait, at most `timeout`, until the backend's GPU work on the buffer is
+	/// complete ([`Self::ready`]); returns how long that took. An error leaves
+	/// the buffer's content and GPU ownership unknown.
+	pub(crate) fn wait_ready(&mut self, timeout: Duration) -> Result<Duration, String> {
+		let Some(fence) = &self.ready else {
+			return Ok(Duration::ZERO);
+		};
+		let started = Instant::now();
+		loop {
+			let remaining = timeout.saturating_sub(started.elapsed());
+			if remaining.is_zero() {
+				return Err(format!(
+					"the compositor's render did not finish within {} s",
+					timeout.as_secs()
+				));
+			}
+			let mut poll = libc::pollfd {
+				fd: fence.as_raw_fd(),
+				events: libc::POLLIN,
+				revents: 0,
+			};
+			// Round up so a sub-millisecond remainder still waits.
+			let millis = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+			// SAFETY: one initialized pollfd for a descriptor this frame owns.
+			match unsafe { libc::poll(&mut poll, 1, millis) } {
+				0 => continue,
+				result if result < 0 => {
+					let error = std::io::Error::last_os_error();
+					if error.kind() == std::io::ErrorKind::Interrupted {
+						continue;
+					}
+					return Err(format!("cannot wait for the compositor's render: {error}"));
+				},
+				_ if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 => {
+					return Err("the compositor's render fence reported an error".into());
+				},
+				_ if poll.revents & libc::POLLIN != 0 => break,
+				_ => continue,
+			}
+		}
+		self.ready = None;
+		Ok(started.elapsed())
 	}
 
 	/// Layers to composite, bottom to top.
@@ -495,6 +546,7 @@ impl ExportedFrame {
 			overlays: Default::default(),
 			origin: CaptureOrigin::default(),
 			scale_to_stream: false,
+			ready: None,
 		}
 	}
 }

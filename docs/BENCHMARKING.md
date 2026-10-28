@@ -317,8 +317,9 @@ Ethernet header/FCS, preamble and inter-frame gap. VLAN/tunnel overhead and othe
 traffic are additional. Do not treat the UDP payload as physical wire bitrate.
 
 The benchmark's latency starts at direct export or composition completion;
-it does not include game rendering, client decode/display, or the compositor
-CPU fence wait. Measure those separately when evaluating end-to-end latency.
+it does not include game rendering or client decode/display. A composited
+frame's render completion is waited for inside the encoder (the conventional
+`import` stage). Measure the rest separately when evaluating end-to-end latency.
 Changes deliberately deferred pending evidence are listed in the
 [capture pipeline guide](PIPELINE_OPTIMIZATION.md#measurement-and-changes-needing-more-proof).
 

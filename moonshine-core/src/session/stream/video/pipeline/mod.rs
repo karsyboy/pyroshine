@@ -980,6 +980,11 @@ struct VideoPipelineInner {
 	stop_cause: crate::session::failure::StopCauseSlot,
 }
 
+/// Longest wait for the compositor's render of a composited capture
+/// (`ExportedFrame::wait_ready`): it bounds a GPU that stopped, like the
+/// converter's own waits.
+const RENDER_READY_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How an encoding loop ended.
 enum LoopExit {
 	/// The session is stopping.
@@ -1703,7 +1708,7 @@ impl VideoPipelineInner {
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
 			let (encoded, created_at, source_time, pacing_origin, buffer_index, channel_wait, new_content) =
-				if let Some(frame) = received {
+				if let Some(mut frame) = received {
 					if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
 						// Overlays are composited only into unscaled input. A capture
 						// that raced an extent change is dropped rather than encoded
@@ -1724,6 +1729,13 @@ impl VideoPipelineInner {
 						.take()
 						.map(|encoded: EncodedFrame| encoded.data)
 						.unwrap_or_default();
+					// A composited capture is handed over before its render finished.
+					if let Err(error) = frame.wait_ready(RENDER_READY_BOUND) {
+						let failure =
+							EncodeFailure::new(EncodeStage::Import, Recovery::Terminal, SourceAccess::Unknown, error);
+						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+						continue;
+					}
 					let encoded = match encoder.encode(&frame, reusable) {
 						Ok(encoded) => encoded,
 						Err(failure) => {
@@ -2286,7 +2298,7 @@ impl VideoPipelineInner {
 				},
 			};
 
-			if let Some(frame) = received_frame {
+			if let Some(mut frame) = received_frame {
 				// Drop-to-catch-up: if the consumer (packetize/network-send) is too
 				// far behind, skip this capture *before* encoding it so the stream
 				// stays realtime instead of accumulating latency. Dropping pre-encode
@@ -2308,6 +2320,13 @@ impl VideoPipelineInner {
 				}
 
 				let t1_received = std::time::Instant::now();
+				// A composited capture is handed over before its render finished.
+				if let Err(error) = frame.wait_ready(RENDER_READY_BOUND) {
+					let failure =
+						EncodeFailure::new(EncodeStage::Import, Recovery::Terminal, SourceAccess::Unknown, error);
+					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+					continue;
+				}
 
 				tracing::trace!(
 					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",

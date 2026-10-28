@@ -124,12 +124,21 @@ Direct export also needs a single-plane RGB buffer the encoders sample (8-bit,
 ([capture buffers](COMPOSITOR.md#ownership-and-frame-handoff)); anything else,
 such as a video player's NV12 surface, is composited (`direct_reject_format`).
 
-Composition submits GLES, waits for its SyncPoint, then exports the image to the
-Vulkan consumer. PyroWave packet pacing starts before compositor preparation and
-rendering; the GLES fence wait and encoding consume the same frame budget rather
-than extending it. Completion-based pipeline latency is measured separately.
-Failed rendering/completion stops capture rather than publishing or recycling a
-buffer with uncertain GPU ownership.
+Composition submits GLES and hands the frame to the encoder at once with the
+render's completion fence as a `sync_file` (`ExportedFrame::ready`); the
+encoder waits for it, at most 5 s, before it reads the buffer, and the slot
+stays owned until then. The compositor thread, which also dispatches input and
+frame callbacks, no longer waits: behind a GPU-bound 4K game that wait averaged
+10.7 ms (up to 14.6 ms) per composited capture on an RX 9070 XT. The frame
+callbacks and presentation feedback of that capture are sent when the fence
+signals (a calloop source), or at the next capture if that comes first, so a
+client's next frame cannot reach the GPU ahead of the composition; sent at
+handoff they raised composited HEVC 4K60 p99 frame age from about 5 to 10.6 ms.
+A fence that cannot be exported is waited for on the compositor thread as
+before. PyroWave packet pacing starts before compositor preparation and
+rendering; the render and encoding consume the same frame budget rather
+than extending it. Failed rendering, or a fence that never signals, stops
+capture rather than publishing or recycling a buffer with uncertain GPU ownership.
 
 A visible cursor or Steam notification does not by itself force composition;
 see [late composition](COMPOSITOR.md#late-composition-cursor-and-steam-notifications).
@@ -430,15 +439,13 @@ measure earlier handoff separately and do not report transmission throughput.
 
 ## Measurement and changes needing more proof
 
-Composited capture waits for its render fence on the compositor thread. On an
-RX 9070 XT at 4K60 the wait averaged 0.15–0.5 ms per capture alone and about
-10.7 ms (maximum about 14.5 ms) while a GPU-bound 4K game ran, so input and
-presentation dispatch can be delayed by most of a frame under contention.
-Direct export avoids it. A completion handoff (publishing the frame when an
-exported render fence signals, from the event loop) would remove that stall
-but must keep the pool slot owned until the fence signals and handle device
-loss and teardown; it is not implemented. Measure with
-`render_fence_wait_*` in the capture summary.
+Composited captures hand their render fence to the encoder (see
+[direct export and composition](#direct-export-and-composition));
+`render_fence_handoffs` in the capture summary counts them and
+`render_fence_wait_*` measures only the fallback wait on the compositor thread.
+Under a GPU-bound game composited frames still age about 15 ms (HEVC) and
+24 ms (PyroWave 4:4:4) at 4K60: the render itself waits behind the game on the
+graphics queue.
 
 [Benchmarking](BENCHMARKING.md) defines latency/GPU/throughput denominators;
 [runtime diagnostics](LONG_SESSION_PERFORMANCE.md) explains stall signatures.

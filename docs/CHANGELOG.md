@@ -23,6 +23,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - While no client is connected, the encoders let go of the game's frame buffers, so a game that changes resolution meanwhile frees its old buffers.
 - While no client is connected the video encoder sleeps instead of checking for work every frame, and a reconnecting client gets its first frame sooner (PyroWave 4K60: 23 ms after PLAY instead of 42 ms).
 - After a client has been gone for a minute, the video encoder is released and its GPU memory returned to the game (about 60 MiB for HEVC, 200 MiB for PyroWave at 4K). A client that reconnects after that waits about half a second to a second for its first frame while the encoder is rebuilt.
+- Composited frames (for example with the Steam overlay open) no longer block the compositor while the GPU finishes them. Behind a GPU-bound game that wait took about 11 ms per frame and delayed input and the game's frame pacing; frame latency is unchanged.
 - The service returns memory to the system after each session. Its memory use no longer grows by about 12 MiB per session (to about 240 MiB after 20 sessions); it now stays near 80 MiB.
 
 ### Fixed

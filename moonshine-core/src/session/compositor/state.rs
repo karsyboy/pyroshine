@@ -76,6 +76,15 @@ struct SceneLayers<'a> {
 	upper: [Option<&'a smithay::desktop::Window>; 5],
 }
 
+/// Frame callbacks and presentation feedback of a composited capture whose
+/// render is still running (see `MoonshineCompositor::defer_presentation`).
+struct DeferredPresentation {
+	feedback: OutputPresentationFeedback,
+	send_callbacks: bool,
+	/// The fence source; `None` once it removed itself.
+	token: Option<RegistrationToken>,
+}
+
 /// A GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
 	/// The exported DMA-BUF. Frames exported from this slot hold their own
@@ -367,6 +376,11 @@ pub(crate) struct MoonshineCompositor {
 	/// (review 2026-10-05 PERF-003): total and longest in the window.
 	render_wait: std::time::Duration,
 	render_wait_max: std::time::Duration,
+	/// Composited captures handed over with their render fence instead of
+	/// waiting for it on this thread, in the window.
+	render_fence_handoffs: u64,
+	/// Presentation of a handed-over capture, waiting for its render fence.
+	deferred_presentation: Option<DeferredPresentation>,
 	/// A client `wl_buffer` or a capture slot was dropped since the last tick.
 	/// The GLES renderer keeps every imported or bound DMA-BUF (and so its GPU
 	/// memory) until its caches are cleaned, which it otherwise only does after
@@ -986,6 +1000,8 @@ impl MoonshineCompositor {
 				composited_frames: 0,
 				render_wait: std::time::Duration::ZERO,
 				render_wait_max: std::time::Duration::ZERO,
+				render_fence_handoffs: 0,
+				deferred_presentation: None,
 				gles_cache_stale: false,
 				capture_slot_failed: false,
 				direct_rejections: [0; DirectReject::COUNT],
@@ -1944,6 +1960,8 @@ impl MoonshineCompositor {
 
 	/// Capture for a refresh tick (`send_callbacks`) or a deferred slot.
 	fn render_and_export(&mut self, send_callbacks: bool) {
+		// The previous composited frame's callbacks precede this capture's.
+		self.finish_deferred_presentation();
 		if self.log_stats && self.gpu_timer.has_pending() {
 			self.gpu_timer.poll(&mut self.renderer);
 		}
@@ -2035,6 +2053,7 @@ impl MoonshineCompositor {
 				composited_frames = self.composited_frames, capture_requested = self.frame_tx.requested(), capture_occupied = self.frame_tx.occupied(),
 				render_fence_wait_us_per_composited_capture = (self.composited_frames != 0).then(|| self.render_wait.as_micros() as u64 / self.composited_frames),
 				render_fence_wait_max_us = self.render_wait_max.as_micros() as u64,
+				render_fence_handoffs = self.render_fence_handoffs,
 				screen_dirty = self.screen_dirty,
 				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
 				held_scanout_buffers = self.held_scanout_buffers.len(),
@@ -2108,6 +2127,7 @@ impl MoonshineCompositor {
 			self.gpu_timer.reset_window();
 			self.render_wait = std::time::Duration::ZERO;
 			self.render_wait_max = std::time::Duration::ZERO;
+			self.render_fence_handoffs = 0;
 			self.captured_frames = 0;
 			self.pre_render_rejected = 0;
 			self.stale_after_render = 0;
@@ -2466,28 +2486,38 @@ impl MoonshineCompositor {
 		drop(framebuffer);
 		self.gpu_timer.end(&mut self.renderer);
 
-		// Block until the render has actually completed. `finish()` only flushes
-		// the GL blit, so without waiting the encoder can read a stale buffer
-		// from the round-robin pool (frames arrive out of order).
-		let wait_started = std::time::Instant::now();
-		let waited = sync.wait();
-		if self.log_stats {
-			let wait = wait_started.elapsed();
-			self.render_wait += wait;
-			self.render_wait_max = self.render_wait_max.max(wait);
-		}
-		if let Err(e) = waited {
-			tracing::error!("Failed to wait for render fence: {e}; stopping capture");
-			// Never publish or recycle a buffer whose GPU completion is unknown.
-			self.capture_failed = true;
-			return;
+		// The encoder must not read the buffer before the render completed
+		// (`finish()` only flushes the GL commands). Hand it the render's
+		// completion fence instead of waiting here: behind a GPU-bound game the
+		// wait took most of a frame, and this thread also dispatches input and
+		// sends frame callbacks. The slot stays owned (`consumed` false) until
+		// the encoder has waited and read it. Only a fence that cannot be
+		// exported is still waited for here.
+		let ready = if sync.is_reached() { None } else { sync.export() };
+		if ready.is_none() {
+			let wait_started = std::time::Instant::now();
+			let waited = sync.wait();
+			if self.log_stats {
+				let wait = wait_started.elapsed();
+				self.render_wait += wait;
+				self.render_wait_max = self.render_wait_max.max(wait);
+			}
+			if let Err(e) = waited {
+				tracing::error!("Failed to wait for render fence: {e}; stopping capture");
+				// Never publish or recycle a buffer whose GPU completion is unknown.
+				self.capture_failed = true;
+				return;
+			}
+		} else if self.log_stats {
+			self.render_fence_handoffs += 1;
 		}
 
-		// Update created_at to reflect the actual render completion time.
-		// The ExportedFrame was built before renderer.bind() (borrow workaround),
-		// so the original timestamp is too early.
+		// The ExportedFrame was built before renderer.bind() (borrow
+		// workaround), so its timestamp predates the render submission.
 		let mut exported_frame = exported_frame;
 		exported_frame.created_at = std::time::Instant::now();
+		let presentation_fence = ready.as_ref().and_then(|fence| fence.try_clone().ok());
+		exported_frame.ready = ready;
 
 		let mut published_at = None;
 		// Send the pre-built frame to the encoder.
@@ -2511,7 +2541,9 @@ impl MoonshineCompositor {
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
 			Err(super::admission::CaptureSendError::Full) => {
-				// Channel full (only possible during epoch reset) — release the buffer.
+				// Channel full (only possible during epoch reset) — release the
+				// buffer. A render still pending is ordered before any later
+				// render into the slot on this GL context.
 				if self.log_stats {
 					self.stale_after_render += 1;
 				}
@@ -2528,19 +2560,6 @@ impl MoonshineCompositor {
 				published_at = Some(std::time::Instant::now());
 			},
 		}
-
-		// Send frame callbacks to clients so they know to submit the
-		// next buffer.
-		self.space.elements().for_each(|window| {
-			if send_callbacks {
-				window.send_frame(
-					&self.output,
-					self.clock.now(),
-					Some(std::time::Duration::ZERO),
-					|_, _| Some(self.output.clone()),
-				);
-			}
-		});
 
 		// Native Wayland clients can wait for presentation feedback before
 		// submitting again, even when their buffers are composited rather than scanned out.
@@ -2561,7 +2580,32 @@ impl MoonshineCompositor {
 				);
 			}
 		}
+		// Frame callbacks and feedback go out once the render finished, as when
+		// this thread waited for it: sent earlier, they let the client's next
+		// frame reach the GPU ahead of this render and delay the capture.
+		drop(render_result);
+		match presentation_fence {
+			Some(fence) => self.defer_presentation(fence, feedback, send_callbacks),
+			None => self.present(feedback, send_callbacks),
+		}
+		if let Some(at) = published_at {
+			self.capture_published(at, source_time);
+		}
+	}
 
+	/// Send frame callbacks (on a refresh tick) and presentation feedback for
+	/// the frame just composited, and flush them to clients.
+	fn present(&mut self, mut feedback: OutputPresentationFeedback, send_callbacks: bool) {
+		if send_callbacks {
+			self.space.elements().for_each(|window| {
+				window.send_frame(
+					&self.output,
+					self.clock.now(),
+					Some(std::time::Duration::ZERO),
+					|_, _| Some(self.output.clone()),
+				);
+			});
+		}
 		let frame_period = self
 			.output
 			.preferred_mode()
@@ -2574,7 +2618,6 @@ impl MoonshineCompositor {
 			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
 			),
 		);
-
 		// Flush the frame callbacks (and any other pending events) to
 		// clients immediately. Without this, the wl_callback.done events
 		// sit in the outgoing buffer until the next Wayland socket
@@ -2583,10 +2626,55 @@ impl MoonshineCompositor {
 		if let Err(e) = self.display_handle.flush_clients() {
 			tracing::error!("Failed to flush clients after render: {e}");
 		}
-		drop(render_result);
-		if let Some(at) = published_at {
-			self.capture_published(at, source_time);
+	}
+
+	/// [`Self::present`] once `fence` (the render's `sync_file`) signals,
+	/// without blocking this thread; the next capture attempt presents it
+	/// first if the render is still running then.
+	fn defer_presentation(
+		&mut self,
+		fence: std::os::fd::OwnedFd,
+		feedback: OutputPresentationFeedback,
+		send_callbacks: bool,
+	) {
+		self.finish_deferred_presentation();
+		let source = smithay::reexports::calloop::generic::Generic::new(
+			fence,
+			smithay::reexports::calloop::Interest::READ,
+			smithay::reexports::calloop::Mode::OneShot,
+		);
+		match self.handle.insert_source(source, |_, _, state: &mut Self| {
+			// The source removes itself.
+			if let Some(pending) = state.deferred_presentation.as_mut() {
+				pending.token = None;
+			}
+			state.finish_deferred_presentation();
+			Ok(smithay::reexports::calloop::PostAction::Remove)
+		}) {
+			Ok(token) => {
+				self.deferred_presentation = Some(DeferredPresentation {
+					feedback,
+					send_callbacks,
+					token: Some(token),
+				});
+			},
+			Err(error) => {
+				tracing::warn!(%error, "Cannot watch the render fence; presenting now");
+				self.present(feedback, send_callbacks);
+			},
 		}
+	}
+
+	/// Present a deferred frame now (its fence signaled, or a newer capture
+	/// is due).
+	fn finish_deferred_presentation(&mut self) {
+		let Some(pending) = self.deferred_presentation.take() else {
+			return;
+		};
+		if let Some(token) = pending.token {
+			self.handle.remove(token);
+		}
+		self.present(pending.feedback, pending.send_callbacks);
 	}
 
 	/// Attempt direct DMA-BUF scanout, bypassing compositor rendering.
