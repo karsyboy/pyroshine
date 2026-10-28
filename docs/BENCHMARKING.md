@@ -35,6 +35,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--composited` | off | Force the GLES fallback, independent of fullscreen direct-export eligibility |
 | `--cursor <mode>` | off | Emulate client pointer use so the compositor cursor is visible: `static` (one motion) or `moving` (motion every refresh tick). Also applies to `--cycles` and `--reconnect-cycles` |
 | `--conversion-queue <mode>` | `auto` | H.264/HEVC/AV1 conversion queue: `auto`/`compute` (dedicated compute family when present) or `graphics` |
+| `--fec-threads <N>` | `0` | FEC parity threads per stream, as [`stream.video.fec_threads`](CONFIGURATION.md#streamvideo): `0` scales with the host's CPU threads |
 | `--pyrowave-record` | off | Use PyroWave's record-framed dialect as Nightjar does: SDR frames of an HDR stream are encoded as 10-bit sRGB SDR (BT.709 primaries and matrix) |
 | `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto` (graphics), `graphics`, or explicit `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |

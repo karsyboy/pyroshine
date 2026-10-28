@@ -18,7 +18,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - **Lower latency with demanding games** for H.264, HEVC and AV1. While a GPU-bound game ran, every frame waited for the game's next frame before it was encoded; at 4K60 the server-side delay drops from 14 ms to under 6 ms, and the game runs slightly faster. When the GPU has headroom, each frame now costs about 0.3 ms more. PyroWave is unchanged.
 - Streaming sessions use less GPU memory: composition buffers are allocated only when a frame needs composition and freed after 30 seconds without one. A fullscreen game at 4K no longer reserves 96 MiB (SDR) or 192 MiB (HDR) for them.
-- Video error correction uses four dedicated threads instead of one per CPU. At PyroWave 4K120 this halves Pyroshine's CPU use and stops it waking every core thousands of times a second, with no added latency.
+- Video error correction uses a few dedicated threads per stream instead of one per CPU: a quarter of the host's CPU threads, from 1 to 4, or the number set with the new [`fec_threads`](CONFIGURATION.md#streamvideo) setting. At PyroWave 4K120 on a 16-thread CPU this halves Pyroshine's CPU use and stops it waking every core thousands of times a second, with no added latency. The threads now also end with the stream.
 - VA-API and NVENC streams allocate one fewer input frame (12 MiB at 4K 4:2:0, up to 50 MiB at 4K 4:4:4 10-bit).
 - While no client is connected, the encoders let go of the game's frame buffers, so a game that changes resolution meanwhile frees its old buffers.
 - While no client is connected the video encoder sleeps instead of checking for work every frame, and a reconnecting client gets its first frame sooner (PyroWave 4K60: 23 ms after PLAY instead of 42 ms).

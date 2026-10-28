@@ -37,6 +37,9 @@ struct Args {
 	/// H.264/HEVC/AV1 conversion queue; auto prefers a dedicated compute family.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	conversion_queue: String,
+	/// FEC threads per stream (`stream.video.fec_threads`); 0 scales with the host.
+	#[arg(long, default_value_t = 0)]
+	fec_threads: usize,
 	/// H.264/HEVC/AV1 encoder backends (`stream.video.encoder`): auto prefers
 	/// Vulkan Video and falls back to VA-API, then NVENC, per profile.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "vulkan", "vaapi", "nvenc"])]
@@ -934,6 +937,7 @@ fn workload(
 		"minimum_fec_packets": args.minimum_fec_packets,
 		"packet_size": args.packet_size,
 		"conversion_queue": args.conversion_queue,
+		"fec_threads": args.fec_threads,
 		"pyrowave_queue": args.pyrowave_queue,
 		"pyrowave_record": args.pyrowave_record,
 		"duration_s": duration,
@@ -1158,6 +1162,7 @@ async fn run_benchmark(
 			encoder_table: capabilities
 				.map(|capabilities| capabilities.gpu.encoder_table())
 				.unwrap_or_default(),
+			fec_threads: args.fec_threads,
 			..VideoStreamConfig::default()
 		},
 		AudioStreamConfig {

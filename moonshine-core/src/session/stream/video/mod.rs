@@ -101,6 +101,12 @@ pub struct VideoStreamConfig {
 	/// and 8-byte UDP headers and the 16-byte stream overhead).
 	#[serde(default)]
 	pub max_packet_size: usize,
+
+	/// Threads computing FEC parity for large frames. `0` (default) uses a
+	/// quarter of the host's hardware threads, at least one and at most four;
+	/// a larger value is capped at the host's threads.
+	#[serde(default)]
+	pub fec_threads: usize,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -155,6 +161,7 @@ impl Default for VideoStreamConfig {
 			encoder: pipeline::EncoderPreference::Auto,
 			encoder_table: pipeline::EncoderTable::default(),
 			max_packet_size: 0,
+			fec_threads: 0,
 		}
 	}
 }

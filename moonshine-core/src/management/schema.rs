@@ -859,6 +859,14 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			integer(0.0, 65_000.0, Some("bytes")),
 		),
 		Field::new(
+			"stream.video.fec_threads",
+			"video",
+			"Error correction threads",
+			"Threads that compute error correction for large frames. 0 uses a quarter of this computer's CPU threads (at least 1, at most 4); a larger value is capped at its thread count. Takes effect on the next stream.",
+			integer(0.0, 256.0, Some("threads")),
+		)
+		.advanced(),
+		Field::new(
 			"stream.video.pyrowave_queue",
 			"video",
 			"PyroWave GPU queue",

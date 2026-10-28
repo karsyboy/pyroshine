@@ -20,29 +20,45 @@ const MAX_DATA_SHARDS_WITHOUT_FEC: usize = 1023;
 /// The GameStream multi-FEC header allocates two bits to the last block index.
 const MAX_FEC_BLOCKS: usize = 4;
 
-/// Threads that compute parity for large FEC blocks (see [`fec_pool`]). At
-/// PyroWave 4:4:4 4K120 (1.5 Gb/s, 16-thread CPU) four kept packetization at
-/// 120 µs per frame, as fast as sixteen, and halved the process's CPU time;
-/// two took 160 µs and one 254 µs.
-const FEC_THREADS: usize = 4;
+/// Most FEC threads the automatic setting uses. At PyroWave 4:4:4 4K120
+/// (1.5 Gb/s) on a 16-thread CPU four kept packetization at 120 µs per frame,
+/// as fast as eight or sixteen, at half the process CPU time; two took 160 µs
+/// and one 254 µs.
+const MAX_AUTO_FEC_THREADS: usize = 4;
 
-/// fec-rs splits a block's parity rows over rayon when the block is large
-/// (every protected 4K PyroWave block). Rayon's global pool has one thread per
-/// CPU, and all of them woke for every block: ~19,000 wakeups/s at 4K120 on a
-/// 16-thread CPU, competing with the game's own threads. A small named pool
-/// keeps the parallel speedup without that fan-out. `None` (the pool could
-/// not start) computes on the global pool as before.
-fn fec_pool() -> Option<&'static rayon::ThreadPool> {
-	static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
-	POOL.get_or_init(|| {
-		rayon::ThreadPoolBuilder::new()
-			.num_threads(FEC_THREADS)
-			.thread_name(|index| format!("video-fec-{index}"))
-			.build()
-			.inspect_err(|error| tracing::warn!(%error, "Could not start the FEC thread pool"))
-			.ok()
-	})
-	.as_ref()
+/// Threads computing FEC parity for `configured` (`[stream.video] fec_threads`)
+/// on a host with `host_threads` hardware threads: `0` selects a quarter of
+/// them (at least one, at most [`MAX_AUTO_FEC_THREADS`]); an explicit count is
+/// kept within the host's threads.
+pub(crate) fn fec_threads_for(configured: usize, host_threads: usize) -> usize {
+	let host_threads = host_threads.max(1);
+	match configured {
+		0 => (host_threads / 4).clamp(1, MAX_AUTO_FEC_THREADS),
+		threads => threads.min(host_threads),
+	}
+}
+
+/// The FEC thread pool of one video stream.
+///
+/// fec-rs splits a large block's parity rows over rayon (every protected 4K
+/// PyroWave block). Rayon's global pool has one thread per CPU, and all of them
+/// woke for every block: ~19,000 wakeups/s at 4K120 on a 16-thread CPU,
+/// competing with the game's own threads, and they lived for the whole process.
+/// A small named pool keeps the parallel speedup without that fan-out, and its
+/// threads end with the stream. `None` (the pool could not start) computes on
+/// the global pool.
+pub(crate) fn fec_thread_pool(configured: usize) -> Option<Arc<rayon::ThreadPool>> {
+	// Honors CPU affinity and cgroup quotas, unlike a raw core count.
+	let host_threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+	let threads = fec_threads_for(configured, host_threads);
+	tracing::debug!(threads, host_threads, configured, "Starting the video FEC thread pool");
+	rayon::ThreadPoolBuilder::new()
+		.num_threads(threads)
+		.thread_name(|index| format!("video-fec-{index}"))
+		.build()
+		.inspect_err(|error| tracing::warn!(%error, "Could not start the FEC thread pool"))
+		.ok()
+		.map(Arc::new)
 }
 
 const NV_VIDEO_PACKET_SIZE: usize = 16;
@@ -186,6 +202,8 @@ pub(crate) struct Packetizer {
 	encryption: VideoEncryption,
 	/// Rate limit recurring layout warnings for consistently large frames.
 	last_fec_warning: Option<Instant>,
+	/// The stream's FEC thread pool (see [`fec_thread_pool`]).
+	fec_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl Packetizer {
@@ -196,11 +214,18 @@ impl Packetizer {
 			keys_rx,
 			encryption: VideoEncryption::Disabled,
 			last_fec_warning: None,
+			fec_pool: None,
 		};
 		if encrypt {
 			packetizer.encryption = packetizer.current_encryption();
 		}
 		packetizer
+	}
+
+	/// Compute large FEC blocks on `pool` (see [`fec_thread_pool`]).
+	pub(crate) fn with_fec_pool(mut self, pool: Option<Arc<rayon::ThreadPool>>) -> Self {
+		self.fec_pool = pool;
+		self
 	}
 
 	pub fn set_pyrowave_dialect(&mut self, dialect: Option<PyroWaveDialect>) {
@@ -278,6 +303,8 @@ impl Packetizer {
 		rtp_timestamp: u32,
 		frame_processing_latency: u16,
 	) -> Result<ShardBatch, ()> {
+		// Held across the FEC encoder's mutable borrow of `self`.
+		let fec_pool = self.fec_pool.clone();
 		// Eagerly read current encryption key and update cipher if rotated.
 		self.maybe_update_cipher();
 		if let VideoEncryption::Unavailable { .. } = self.encryption {
@@ -498,7 +525,7 @@ impl Packetizer {
 
 				let t_fec_compute = Instant::now();
 
-				match fec_pool() {
+				match &fec_pool {
 					Some(pool) => pool.install(|| encoder.encode(&mut fec_slices)),
 					None => encoder.encode(&mut fec_slices),
 				}
@@ -708,6 +735,22 @@ fn packet_layout(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn fec_threads_scale_with_the_host_and_respect_an_explicit_count() {
+		use super::fec_threads_for;
+		// Automatic: a quarter of the hardware threads, between one and four.
+		assert_eq!(fec_threads_for(0, 1), 1);
+		assert_eq!(fec_threads_for(0, 4), 1);
+		assert_eq!(fec_threads_for(0, 8), 2);
+		assert_eq!(fec_threads_for(0, 12), 3);
+		assert_eq!(fec_threads_for(0, 16), 4);
+		assert_eq!(fec_threads_for(0, 64), 4);
+		// Explicit: as configured, but never more than the host has.
+		assert_eq!(fec_threads_for(6, 16), 6);
+		assert_eq!(fec_threads_for(32, 16), 16);
+		assert_eq!(fec_threads_for(2, 0), 1);
+	}
+
 	use super::*;
 	use crate::session::keys::ActiveKeys;
 

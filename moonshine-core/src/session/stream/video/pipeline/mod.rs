@@ -907,6 +907,7 @@ impl VideoPipeline {
 		let capture_context = frame_rx.context().map_err(|error| {
 			tracing::error!(%error, "Cannot start video pipeline");
 		})?;
+		let fec_pool = super::packetizer::fec_thread_pool(config.fec_threads);
 		let inner = VideoPipelineInner {
 			rate_rx,
 			capture_context,
@@ -915,6 +916,7 @@ impl VideoPipeline {
 			keys_rx,
 			fec_feedback_rx,
 			demand: DemandTracker::new(demand),
+			fec_pool,
 			stop_cause,
 		};
 
@@ -971,6 +973,9 @@ struct VideoPipelineInner {
 	keys_rx: SessionKeysReceiver,
 	fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 	demand: DemandTracker,
+	/// FEC thread pool shared by this stream's encoder epochs; its threads end
+	/// with the stream.
+	fec_pool: Option<Arc<rayon::ThreadPool>>,
 	/// Receives the failure that ends the stream.
 	stop_cause: crate::session::failure::StopCauseSlot,
 }
@@ -1583,7 +1588,8 @@ impl VideoPipelineInner {
 		// PyroWave composites layers inside its 1:1 scaler input fetch.
 		let _overlay_support = OverlaySupport::declare(frame_rx, OverlayCaps::PIXELS.union(OverlayCaps::DMABUF));
 
-		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		let mut packetizer =
+			Packetizer::new(ctx.encrypt_video, self.keys_rx.clone()).with_fec_pool(self.fec_pool.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
 		packetizer.warm_up(
@@ -1945,7 +1951,8 @@ impl VideoPipelineInner {
 		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 
-		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		let mut packetizer =
+			Packetizer::new(ctx.encrypt_video, self.keys_rx.clone()).with_fec_pool(self.fec_pool.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		packetizer.warm_up(
 			self.config.fec_percentage,

@@ -210,6 +210,7 @@ is moved aside (`history.sqlite3.corrupt-<time>`) and a new one started.
 | `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
 | `log_frame_spikes` | boolean, `false` | Warn when a frame's encoding and packetization exceeds the frame budget. Useful for latency diagnostics. |
 | `max_packet_size` | nonnegative integer, `0` | Cap the client-requested stream packet size in bytes. `0` disables the cap; caps below `200` are ignored with a warning. Smaller client requests are honored. With video encryption the cap also covers the 32-byte encryption prefix, keeping the same on-wire size. |
+| `fec_threads` | nonnegative integer, `0` | Threads that compute error-correction parity for large video frames, per stream. `0` uses a quarter of the host's CPU threads (as limited by affinity and cgroups), at least 1 and at most 4. A larger value is capped at the host's thread count. Takes effect on the next stream. More threads shorten packetization of high-bitrate 4K frames but wake more cores; on a 16-thread CPU four were as fast as sixteen at half the CPU time. |
 
 To silence periodic streaming statistics, add this to the existing video table
 and restart Pyroshine (set it to `true` to enable them again):

@@ -344,11 +344,15 @@ a 1 MB encrypted 4K frame) does not delay other tasks queued on that runtime
 worker. Frames are still packetized one at a time in order.
 
 Reed–Solomon parity of a large block (every protected 4K PyroWave block) is
-split over four `video-fec-*` threads of a dedicated rayon pool. Rayon's global
-pool would use one thread per CPU and wake all of them for each block: on a
-16-thread CPU at PyroWave 4:4:4 4K120 that was ~19,000 wakeups/s and twice the
-process's CPU time for the same 120 µs packetization. Fewer than four threads
-lengthen packetization (two: 160 µs, one: 254 µs).
+split over the stream's own rayon pool of `video-fec-*` threads
+([`fec_threads`](CONFIGURATION.md#streamvideo)): by default a quarter of the
+host's hardware threads as `available_parallelism` reports them (CPU affinity
+and cgroup quotas included), at least one and at most four. The threads end
+with the stream. Rayon's global pool would use one thread per CPU, wake all of
+them for each block and live for the whole process: on a 16-thread CPU at
+PyroWave 4:4:4 4K120 that was ~19,000 wakeups/s and twice the process's CPU
+time for the same 120 µs packetization. Eight threads matched four (121 µs at
+more CPU time); two took 157–160 µs and one 254 µs.
 
 ## Live conventional bitrate and reference recovery
 
