@@ -14,10 +14,6 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-### Fixed
-
-- Games streamed without composition no longer leave their old swapchain buffers in GPU memory for the rest of the session. At 4K a game that recreated its swapchain at startup kept about 500 MiB of VRAM allocated until something forced a composited frame.
-
 ### Changed
 
 - **Lower latency with demanding games** for H.264, HEVC and AV1. While a GPU-bound game ran, every frame waited for the game's next frame before it was encoded; at 4K60 the server-side delay drops from 14 ms to under 6 ms, and the game runs slightly faster. When the GPU has headroom, each frame now costs about 0.3 ms more. PyroWave is unchanged.
@@ -27,6 +23,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - While no client is connected, the encoders let go of the game's frame buffers, so a game that changes resolution meanwhile frees its old buffers.
 - While no client is connected the video encoder sleeps instead of checking for work every frame, and a reconnecting client gets its first frame sooner (PyroWave 4K60: 23 ms after PLAY instead of 42 ms).
 - The service returns memory to the system after each session. Its memory use no longer grows by about 12 MiB per session (to about 240 MiB after 20 sessions); it now stays near 80 MiB.
+
+### Fixed
+
+- Games streamed without composition no longer leave their old swapchain buffers in GPU memory for the rest of the session. At 4K a game that recreated its swapchain at startup kept about 500 MiB of VRAM allocated until something forced a composited frame.
 
 ## [v0.18.0-prerelease.1] - 2026-10-27
 
