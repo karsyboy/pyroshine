@@ -48,7 +48,7 @@ pub use backend::{EncoderBackend, EncoderPreference, EncoderTable};
 pub use convert::ConversionQueueMode;
 use convert::{ChromaSiting, ColorSpace, ConvertFormat, InputConverter, Target};
 pub(crate) use dmabuf::KcmpProbe;
-use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
+use dmabuf::{DmaBufImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
 use pixelforge::{
@@ -135,9 +135,9 @@ impl Drop for OverlaySupport<'_> {
 
 /// Import a single-plane client DMA-BUF layer through the frame importer.
 fn import_overlay(
-	importer: &mut DmaBufImporter,
+	importer: &DmaBufImporter,
 	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
-) -> Result<(Arc<CachedImport>, bool), String> {
+) -> Result<DmaBufImport, String> {
 	use smithay::backend::allocator::Buffer;
 	use std::os::fd::AsFd;
 	let modifier: u64 = dmabuf.format().modifier.into();
@@ -155,10 +155,8 @@ fn import_overlay(
 		.ok_or("layer DMA-BUF has no planes")?;
 	let format = drm_fourcc_to_vk(dmabuf.format().code as u32)?;
 	// The frame owns a strong reference to `dmabuf`, so the descriptor stays
-	// open for this call; the importer duplicates what it keeps.
-	importer
-		.import_or_reuse(plane.fd, dmabuf.width(), dmabuf.height(), format, &[plane])
-		.map_err(|e| e.to_string())
+	// open for this call; Vulkan receives a duplicate.
+	importer.import(dmabuf.width(), dmabuf.height(), format, &[plane])
 }
 
 fn conventional_can_admit(in_flight: &AtomicUsize, limit: usize) -> bool {
@@ -2032,8 +2030,8 @@ impl VideoPipelineInner {
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
 
-		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
-		let mut dmabuf_importer: Option<DmaBufImporter> = None;
+		// Zero-copy import of each captured frame into the encoders' device.
+		let importer = DmaBufImporter::new(context.clone());
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
@@ -2341,28 +2339,6 @@ impl VideoPipelineInner {
 					frame.planes().len()
 				);
 
-				let importer = match &mut dmabuf_importer {
-					Some(imp) => imp,
-					None => match DmaBufImporter::new(context.clone(), self.config.log_stats) {
-						Ok(imp) => {
-							dmabuf_importer = Some(imp);
-							dmabuf_importer.as_mut().unwrap()
-						},
-						Err(e) => {
-							// No importer can be created on this device: nothing will
-							// ever be encoded, so stop instead of failing every frame.
-							let failure = EncodeFailure::new(
-								EncodeStage::Setup,
-								Recovery::Terminal,
-								SourceAccess::NotSubmitted,
-								format!("failed to create DMA-BUF importer: {e}"),
-							);
-							apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-							continue;
-						},
-					},
-				};
-
 				// Build DmaBufPlane array from ExportedFrame planes. The raw fds are
 				// borrowed from the frame's source lease, which `frame` holds for
 				// the rest of this iteration; the importer duplicates what it keeps.
@@ -2404,25 +2380,22 @@ impl VideoPipelineInner {
 					},
 				};
 
-				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-				// The `Arc` pins the image while the converter caches a view of it.
-				let (source_import, needs_transition) =
-					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
-						Ok(result) => result,
-						Err(e) => {
-							let failure = EncodeFailure::new(
-								EncodeStage::Import,
-								Recovery::DropFrame,
-								SourceAccess::NotSubmitted,
-								format!("failed to import DMA-BUF: {e}"),
-							);
-							apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-							continue;
-						},
-					};
-				// First-time imports are in UNDEFINED layout and owned externally;
-				// the converter acquires them. Cached imports were left in
-				// GENERAL by the previous conversion.
+				// Imported for this conversion only (see `DmaBufImporter`).
+				let source_import = match importer.import(frame.width, frame.height, import_vk_format, planes) {
+					Ok(import) => import,
+					Err(e) => {
+						let failure = EncodeFailure::new(
+							EncodeStage::Import,
+							Recovery::DropFrame,
+							SourceAccess::NotSubmitted,
+							format!("failed to import DMA-BUF: {e}"),
+						);
+						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+						continue;
+					},
+				};
+				// A fresh import is in UNDEFINED layout and owned by the foreign
+				// producer; the conversion acquires it.
 
 				let t2_imported = std::time::Instant::now();
 
@@ -2488,9 +2461,8 @@ impl VideoPipelineInner {
 				};
 				input_converter.set_color(frame_space, full_range, frame_white_nits);
 
-				// DMA-BUF layers go through the same identity-checked import
-				// cache as the game source; the `Arc`s pin them for the call.
-				let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
+				// DMA-BUF layers are imported for this conversion like the source.
+				let mut layer_imports: [Option<DmaBufImport>; MAX_OVERLAYS] = Default::default();
 				let mut import_failed = None;
 				for (slot, layer) in frame.overlays.iter().enumerate() {
 					if let Some(FrameOverlay {
@@ -2498,7 +2470,7 @@ impl VideoPipelineInner {
 						..
 					}) = layer
 					{
-						match import_overlay(importer, dmabuf) {
+						match import_overlay(&importer, dmabuf) {
 							Ok(import) => layer_imports[slot] = Some(import),
 							Err(e) => import_failed = Some(e),
 						}
@@ -2519,7 +2491,7 @@ impl VideoPipelineInner {
 					let input = match &layer.content {
 						OverlayContent::Pixels(image) => convert::LayerInput::Pixels(image),
 						OverlayContent::Dmabuf { dmabuf, opaque } => {
-							let (import, first_use) = layer_imports[slot].as_ref()?;
+							let import = layer_imports[slot].as_ref()?;
 							convert::LayerInput::Imported {
 								import,
 								// Known: the import above accepted it.
@@ -2527,7 +2499,7 @@ impl VideoPipelineInner {
 									smithay::backend::allocator::Buffer::format(dmabuf).code as u32,
 								)
 								.ok()?,
-								first_use: *first_use,
+								first_use: true,
 								opaque: *opaque,
 							}
 						},
@@ -2569,7 +2541,7 @@ impl VideoPipelineInner {
 					.convert(
 						&source_import,
 						import_vk_format,
-						needs_transition,
+						true,
 						frame.scale_to_stream,
 						&layers,
 						target,
@@ -2631,12 +2603,9 @@ impl VideoPipelineInner {
 				// (frame age 14.3 ms; 5.8 ms imported per frame). Mapping each
 				// new import costs ~0.3 ms of submission time when the GPU is
 				// otherwise idle; see PIPELINE_OPTIMIZATION.md.
+				// The converter destroyed its views of them after its fence.
 				drop(layer_imports);
 				drop(source_import);
-				input_converter.release_source_views();
-				if let Some(importer) = dmabuf_importer.as_mut() {
-					importer.release_all();
-				}
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current

@@ -36,12 +36,10 @@
 //! miscompiles the shader fails the stream setup with a precise error instead
 //! of streaming corrupted colors.
 
-use std::sync::Arc;
-
 use ash::vk;
 use pixelforge::{Codec, VideoContext};
 
-use super::dmabuf::CachedImport;
+use super::dmabuf::DmaBufImport;
 use crate::session::capture::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
 
 /// Precompiled from `shaders/convert.comp` by `scripts/build-shaders.sh`.
@@ -54,8 +52,6 @@ const BLOCK_HEIGHT: u32 = 2;
 const GROUP_SIZE: u32 = 8;
 
 /// Views kept for recently seen source images (swapchains rotate 2-4 images).
-const MAX_CACHED_VIEWS: usize = 8;
-
 /// Longest wait for one conversion or copy. A conversion takes well under a
 /// millisecond; this only bounds a GPU that stopped without reporting device
 /// loss, so the encode thread reports the stall instead of hanging (the same
@@ -110,7 +106,7 @@ pub(crate) enum LayerInput<'a> {
 	Pixels(&'a OverlayImage),
 	/// An imported client DMA-BUF, read in place like the game source.
 	Imported {
-		import: &'a Arc<CachedImport>,
+		import: &'a DmaBufImport,
 		format: vk::Format,
 		first_use: bool,
 		/// Ignore the alpha channel (X formats).
@@ -1069,10 +1065,10 @@ pub(crate) struct InputConverter {
 	output_valid: bool,
 	/// Upload textures for CPU-texel layers, one per layer slot.
 	layer_textures: [OverlayTexture; MAX_OVERLAYS],
-	/// Views of recently used source images. The `Arc` pins each image for as
-	/// long as its view exists; entries the importer no longer holds are
-	/// dropped first.
-	views: Vec<(Arc<CachedImport>, vk::ImageView)>,
+	/// Views of this conversion's source and imported layers. Every import
+	/// lives for one conversion (see `DmaBufImporter`), so its views are
+	/// destroyed once the conversion's fence has signaled.
+	transient_views: Vec<vk::ImageView>,
 	command_pool: vk::CommandPool,
 	command_buffer: vk::CommandBuffer,
 	fence: vk::Fence,
@@ -1213,7 +1209,7 @@ impl InputConverter {
 			readback: std::ptr::null(),
 			output_valid: false,
 			layer_textures: [OverlayTexture::EMPTY; MAX_OVERLAYS],
-			views: Vec::new(),
+			transient_views: Vec::new(),
 			command_pool: vk::CommandPool::null(),
 			command_buffer: vk::CommandBuffer::null(),
 			fence: vk::Fence::null(),
@@ -1590,31 +1586,12 @@ impl InputConverter {
 		}
 	}
 
-	/// View of `source`, created on first use and cached while the importer
-	/// keeps the image alive.
-	fn source_view(&mut self, source: &Arc<CachedImport>, format: vk::Format) -> Result<vk::ImageView, String> {
-		if let Some((_, view)) = self.views.iter().find(|(import, _)| Arc::ptr_eq(import, source)) {
-			return Ok(*view);
-		}
-		let device = self.context.device().clone();
-		// Every previous submission has completed (each conversion waits), so
-		// views of images the importer evicted can be destroyed now.
-		self.views.retain(|(import, view)| {
-			let keep = Arc::strong_count(import) > 1;
-			if !keep {
-				// SAFETY: no pending GPU work references the view.
-				unsafe { device.destroy_image_view(*view, None) };
-			}
-			keep
-		});
-		if self.views.len() >= MAX_CACHED_VIEWS {
-			let (_, view) = self.views.remove(0);
-			// SAFETY: as above.
-			unsafe { device.destroy_image_view(view, None) };
-		}
-		// SAFETY: the image is pinned by `source` for the lifetime of the view.
+	/// A view of `source` for the conversion being recorded; see
+	/// [`Self::transient_views`].
+	fn source_view(&mut self, source: &DmaBufImport, format: vk::Format) -> Result<vk::ImageView, String> {
+		// SAFETY: `source` outlives the conversion, which destroys the view.
 		let view = unsafe {
-			device.create_image_view(
+			self.context.device().create_image_view(
 				&vk::ImageViewCreateInfo::default()
 					.image(source.image())
 					.view_type(vk::ImageViewType::TYPE_2D)
@@ -1624,17 +1601,20 @@ impl InputConverter {
 			)
 		}
 		.map_err(|e| format!("source image view: {e}"))?;
-		self.views.push((Arc::clone(source), view));
+		self.transient_views.push(view);
 		Ok(view)
 	}
 
-	/// Destroy every cached source view and release its import, while no
-	/// client receives frames (see `DmaBufImporter::release_all`).
-	pub(crate) fn release_source_views(&mut self) {
+	/// Destroy the views of the finished conversion. A stalled conversion may
+	/// still read them, so they are left alone; the stream stops then.
+	fn release_transient_views(&mut self) {
+		if self.stalled.get() {
+			return;
+		}
 		let device = self.context.device();
-		for (_, view) in self.views.drain(..) {
-			// SAFETY: every conversion waits for its fence, so no pending GPU
-			// work references the view.
+		for view in self.transient_views.drain(..) {
+			// SAFETY: the conversion that used the view completed or was never
+			// submitted, so no pending GPU work references it.
 			unsafe { device.destroy_image_view(view, None) };
 		}
 	}
@@ -1674,7 +1654,7 @@ impl InputConverter {
 	/// in its layout.
 	pub(crate) fn convert(
 		&mut self,
-		source: &Arc<CachedImport>,
+		source: &DmaBufImport,
 		source_format: vk::Format,
 		first_use: bool,
 		scaled: bool,
@@ -1682,9 +1662,10 @@ impl InputConverter {
 		target: Target,
 	) -> Result<ConvertOutcome, vk::Result> {
 		self.output_valid = false;
-		let view = self
-			.source_view(source, source_format)
-			.map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+		let view = match self.source_view(source, source_format) {
+			Ok(view) => view,
+			Err(_) => return Err(vk::Result::ERROR_INITIALIZATION_FAILED),
+		};
 		let binding = SourceBinding {
 			image: source.image(),
 			view,
@@ -1701,6 +1682,17 @@ impl InputConverter {
 	/// Record, submit and wait for one conversion; copy the result into
 	/// `target` when given, else make it host-visible (self-check).
 	fn dispatch(
+		&mut self,
+		source: &SourceBinding,
+		layers: &Layers<'_>,
+		target: Option<Target>,
+	) -> Result<ConvertOutcome, vk::Result> {
+		let outcome = self.record_and_wait(source, layers, target);
+		self.release_transient_views();
+		outcome
+	}
+
+	fn record_and_wait(
 		&mut self,
 		source: &SourceBinding,
 		layers: &Layers<'_>,
@@ -2695,13 +2687,20 @@ impl Drop for SelfCheckSource {
 
 impl Drop for InputConverter {
 	fn drop(&mut self) {
+		// A stalled submission may still use every object below, and idling
+		// its queue would never return: leave them to the (ending) device
+		// rather than hang teardown.
+		if self.stalled.get() {
+			tracing::warn!("Leaving a stalled color converter's GPU objects to the device");
+			return;
+		}
 		let device = self.context.device().clone();
 		// SAFETY: every conversion waits for its fence, so no submission that
 		// references these objects can still be pending. A failed wait leaves
 		// the queue in an unknown state; idle the queue before destroying.
 		unsafe {
 			let _ = device.queue_wait_idle(self.queue);
-			for (_, view) in self.views.drain(..) {
+			for view in self.transient_views.drain(..) {
 				device.destroy_image_view(view, None);
 			}
 			for slot in 0..MAX_OVERLAYS {

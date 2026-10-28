@@ -16,8 +16,6 @@ use std::time::{Duration, Instant};
 /// Pipeline stage that failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EncodeStage {
-	/// Creating per-session import/conversion objects.
-	Setup,
 	/// Importing the source DMA-BUF.
 	Import,
 	/// Converting/scaling the source into the encoder's input.

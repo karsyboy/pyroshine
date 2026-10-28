@@ -1,20 +1,18 @@
 //! Zero-copy DMA-BUF import into Vulkan images for video encoding.
 //!
-//! `DmaBufImporter` caches `VkImage`/`VkDeviceMemory` per DMA-BUF file descriptor,
-//! avoiding per-frame `vkCreateImage` + `vkAllocateMemory` (~0.5–1.5ms on NVIDIA).
+//! [`DmaBufImporter`] imports a captured frame (and its DMA-BUF overlay
+//! layers) for one conversion; the [`DmaBufImport`] is dropped once the
+//! conversion's fence has signaled. Imports are deliberately not cached: an
+//! import that stays alive keeps the client's buffer in this device's
+//! submissions, whose implicit synchronization then makes later work (the
+//! video encode among it) wait for whatever the client is rendering into that
+//! buffer. Behind a GPU-bound game that held every frame for the game's next
+//! one (see `PIPELINE_OPTIMIZATION.md`). Importing costs about 15 µs of CPU per
+//! frame plus mapping the buffer at submission.
 //!
-//! The cache is keyed by raw fd rather than `wl_buffer` ObjectId because the
-//! NVIDIA Wayland WSI creates a new `wl_buffer` wrapper each frame while the
-//! underlying DMA-BUF fd is stable.
-//!
-//! Kernel fd recycling is caught by a two-layer check on every cache hit:
-//! 1. Import parameters (format, dimensions, modifier) — catches genuine
-//!    reconfigurations (e.g. PQ → scRGB HDR switch).
-//! 2. Buffer identity — catches a recycled fd number pointing at a new buffer
-//!    whose parameters happen to be identical.
-//!
-//! The buffer identity check uses one of two methods. [`KcmpProbe`] picks the
-//! method once per process:
+//! The module also identifies DMA-BUFs for callers that do cache imports (the
+//! PyroWave encoder): [`same_buffer`] checks whether two fds refer to one
+//! buffer. [`KcmpProbe`] picks the method once per process:
 //! - `kcmp(2)` (preferred). It checks whether two fds share one open file
 //!   description, the kernel's `struct file`. All DMA-BUF fds in a session are
 //!   dups of the exporter's single `struct file`, so this means "same buffer".
@@ -24,56 +22,27 @@
 //!   same buffer. Pyroshine uses this method when a seccomp filter blocks
 //!   `kcmp(2)` (Podman's default profile, Flatpak) or the kernel lacks it.
 //!
-//! Each cache entry holds a `dup` of its fd. The `dup` keeps the buffer alive,
-//! so its inode stays in use and `kcmp(2)` has an fd to compare against.
-//!
 //! The inode method has one limitation. The kernel numbers these inodes with a
 //! 32-bit counter (`get_next_ino`), shared with pipes, sockets and other
 //! pseudo-files. After about 4 billion new inodes the counter wraps, and a new
-//! buffer could get the inode number of a live entry. By accident, the risk is
-//! negligible: an entry expires after `CACHE_TTL` (2 seconds), and a hit also
-//! needs matching import parameters.
-//!
-//! A local process can force a collision on purpose. It can advance the
-//! counter by creating pipes, then send a new buffer at the same fd number. The
-//! result is only a stale frame from a buffer the session already provided.
-//! The old buffer stays alive and the import parameters match, so memory
-//! safety and confidentiality are not affected. `kcmp(2)` cannot be fooled
-//! this way, which is why it is preferred.
-//!
-//! Entries are refcounted: consumers (e.g. `ColorConverter`) hold an `Arc` so
-//! an image is never destroyed while they cache a view of it.
+//! buffer could get the inode number of a cached one; the caller's own expiry
+//! and layout checks keep the risk negligible by accident. A local process can
+//! force a collision on purpose, which yields only a stale frame from a buffer
+//! the session already provided; `kcmp(2)` cannot be fooled this way, which is
+//! why it is preferred.
 //!
 //! The startup healthcheck reports which method is in use. It warns, but does
 //! not refuse startup, when `kcmp(2)` is unavailable.
 
 use ash::vk;
 use pixelforge::VideoContext;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::io::{BorrowedFd, IntoRawFd};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-use tracing::{debug, trace};
-
-/// Window counters shared by both importers, reported only every five seconds.
-#[derive(Default, Debug, Clone, Copy)]
-pub(crate) struct ImportCacheStats {
-	pub hit: u64,
-	pub miss: u64,
-	pub recreate: u64,
-	pub evict: u64,
-}
-
-/// TTL before a cached import is evicted. 2s covers in-flight GPU work
-/// (~16ms depth-2 at 120fps) while keeping VRAM under control.
-const CACHE_TTL: Duration = Duration::from_secs(2);
-
-/// Sweep for stale entries every N `import_or_reuse` calls.
-const SWEEP_INTERVAL_CALLS: u32 = 60;
+use std::sync::OnceLock;
+use tracing::debug;
 
 /// Own partially-created resources until the import has completely succeeded.
 /// Every setup/driver error must release the image and any allocated memory.
@@ -117,53 +86,19 @@ pub(crate) struct DmaBufPlane {
 	pub modifier: u64,
 }
 
-/// Identifying parameters of a DMA-BUF import. A cached image may only be
-/// reused when all of these match the new request; a mismatch on the same fd
-/// means the fd number was recycled for a different buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ImportParams {
-	width: u32,
-	height: u32,
-	format: vk::Format,
-	modifier: u64,
-	plane_count: usize,
-	/// (offset, stride) per plane.
-	plane_layouts: [(u32, u32); 4],
-}
-
-impl ImportParams {
-	fn new(width: u32, height: u32, format: vk::Format, planes: &[DmaBufPlane]) -> Self {
-		let mut plane_layouts = [(0, 0); 4];
-		for (i, p) in planes.iter().take(4).enumerate() {
-			plane_layouts[i] = (p.offset, p.stride);
-		}
-		Self {
-			width,
-			height,
-			format,
-			modifier: planes.first().map_or(0, |p| p.modifier),
-			plane_count: planes.len().min(4),
-			plane_layouts,
-		}
-	}
-}
-
-/// Cached Vulkan resources for a single compositor buffer slot.
-pub(crate) struct CachedImport {
+/// A DMA-BUF imported into the encoders' device for one conversion. Dropping
+/// it frees the image and the imported memory, so it must outlive every GPU
+/// read of it.
+pub(crate) struct DmaBufImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
-	params: ImportParams,
-	/// Duplicate of the DMA-BUF fd. It keeps the buffer alive for identity checks.
-	fd: OwnedFd,
-	/// How a later hit checks that its fd still refers to this buffer.
-	identity: Identity,
-	/// TTL timestamp; `Mutex` lets a cache hit refresh it through a shared `Arc`.
-	last_used: Mutex<Instant>,
+	width: u32,
+	height: u32,
 	/// Own context clone so `Drop` can free resources after the importer is gone.
 	context: VideoContext,
 }
 
-/// How the cache checks that two fds refer to the same DMA-BUF.
+/// How [`same_buffer`] checks that two fds refer to the same DMA-BUF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompareMethod {
 	/// Compare open file descriptions with `kcmp(2)`.
@@ -174,8 +109,8 @@ pub(crate) enum CompareMethod {
 
 /// Result of the one-time `kcmp(2)` probe.
 ///
-/// The cache and the startup healthcheck read the same result, so the
-/// healthcheck reports the method the cache really uses.
+/// [`same_buffer`] and the startup healthcheck read the same result, so the
+/// healthcheck reports the method its callers really use.
 #[derive(Debug)]
 pub(crate) enum KcmpProbe {
 	/// `kcmp(2)` works.
@@ -200,7 +135,7 @@ impl KcmpProbe {
 	}
 
 	/// The comparison method this result selects. Any probe failure selects
-	/// the inode method, so the cache always has a working method.
+	/// the inode method, so there is always a working method.
 	pub(crate) fn method(&self) -> CompareMethod {
 		match self {
 			Self::Available => CompareMethod::Kcmp,
@@ -230,8 +165,8 @@ fn kcmp_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
 /// Check whether two open fds refer to the same DMA-BUF, with the method
 /// [`KcmpProbe`] selected. An error counts as different buffers.
 ///
-/// For callers that keep their own `dup` of a buffer instead of a
-/// [`CachedImport`], such as the PyroWave import cache.
+/// For callers that keep their own `dup` of a buffer, such as the PyroWave
+/// import cache.
 pub(crate) fn same_buffer(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> bool {
 	match KcmpProbe::get().method() {
 		CompareMethod::Kcmp => kcmp_file(a, b).unwrap_or(false),
@@ -263,39 +198,9 @@ impl BufferId {
 	}
 }
 
-/// What a cache entry keeps to recognise its buffer on a later hit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Identity {
-	/// Compare the entry's fd with the new fd using `kcmp(2)`.
-	OpenFile,
-	/// Compare with the buffer's identity, read when the entry was created.
-	Inode(BufferId),
-}
-
-impl Identity {
-	/// Record the identity of the buffer behind `fd` for `method`.
-	fn read(method: CompareMethod, fd: BorrowedFd<'_>) -> io::Result<Self> {
-		match method {
-			CompareMethod::Kcmp => Ok(Self::OpenFile),
-			CompareMethod::Inode => BufferId::of(fd).map(Self::Inode),
-		}
-	}
-
-	/// Check whether `fd` refers to the buffer behind `own`, the entry's fd.
-	///
-	/// An error counts as a different buffer. The cache then imports the
-	/// buffer again instead of reusing an image that may be wrong.
-	fn matches(self, own: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> bool {
-		match self {
-			Self::OpenFile => kcmp_file(own, fd).unwrap_or(false),
-			Self::Inode(id) => BufferId::of(fd).is_ok_and(|other| other == id),
-		}
-	}
-}
-
-impl CachedImport {
+impl DmaBufImport {
 	/// Wrap a test-owned image (not a DMA-BUF) so GPU fixture tests can drive
-	/// consumers of imports. The entry owns and frees `image` and `memory`.
+	/// consumers of imports. The import owns and frees `image` and `memory`.
 	#[cfg(test)]
 	pub(crate) fn for_test(
 		context: VideoContext,
@@ -303,16 +208,12 @@ impl CachedImport {
 		memory: vk::DeviceMemory,
 		width: u32,
 		height: u32,
-		format: vk::Format,
 	) -> Self {
 		Self {
 			image,
 			memory,
-			params: ImportParams::new(width, height, format, &[]),
-			fd: std::fs::File::open("/dev/null").expect("open /dev/null").into(),
-			// Never looked up: test entries are handed to consumers directly.
-			identity: Identity::OpenFile,
-			last_used: Mutex::new(Instant::now()),
+			width,
+			height,
 			context,
 		}
 	}
@@ -324,28 +225,13 @@ impl CachedImport {
 
 	/// Width and height of the imported image.
 	pub(crate) fn extent(&self) -> (u32, u32) {
-		(self.params.width, self.params.height)
-	}
-
-	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
-	fn is_same_buffer(&self, fd: BorrowedFd<'_>) -> bool {
-		self.identity.matches(self.fd.as_fd(), fd)
-	}
-
-	/// Refresh the TTL timestamp.
-	fn touch(&self, now: Instant) {
-		*self.last_used.lock().expect("CachedImport last_used mutex poisoned") = now;
-	}
-
-	/// Current TTL timestamp.
-	fn last_used(&self) -> Instant {
-		*self.last_used.lock().expect("CachedImport last_used mutex poisoned")
+		(self.width, self.height)
 	}
 }
 
-impl Drop for CachedImport {
+impl Drop for DmaBufImport {
 	fn drop(&mut self) {
-		// SAFETY: runs when the last `Arc` drops, so nothing references the image.
+		// SAFETY: the owner drops the import only after every GPU read of it.
 		unsafe {
 			let device = self.context.device();
 			device.destroy_image(self.image, None);
@@ -354,179 +240,44 @@ impl Drop for CachedImport {
 	}
 }
 
-/// Imports DMA-BUF fds into Vulkan images with a per-fd cache and TTL eviction.
+/// Imports DMA-BUF fds into Vulkan images, one import per conversion (see the
+/// module documentation for why nothing is cached).
 ///
-/// Layout transitions are deferred to the consumer (e.g. `ColorConverter`) to
-/// avoid a separate GPU submission per first-time import.
+/// Every import starts in `UNDEFINED` layout; the consumer (`InputConverter`)
+/// acquires it from the foreign queue family in the same submission that
+/// reads it, so an import costs no extra GPU submission.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Buffer identity method, chosen once by [`KcmpProbe`].
-	method: CompareMethod,
-	/// Per-fd cache; `is_same_buffer` catches recycled fds. `Arc`s are shared
-	/// with consumers that keep the image alive while caching a view of it.
-	cache: HashMap<RawFd, Arc<CachedImport>>,
-	/// Stale imports awaiting TTL expiry before the importer drops its `Arc`.
-	retired: Vec<Arc<CachedImport>>,
-	/// Calls since the last stale-entry sweep.
-	calls_since_sweep: u32,
-	last_resource_summary: Instant,
-	log_stats: bool,
-	stats: ImportCacheStats,
 }
 
 impl DmaBufImporter {
 	/// Create a new DMA-BUF importer.
-	pub fn new(context: VideoContext, log_stats: bool) -> Result<Self, String> {
+	pub fn new(context: VideoContext) -> Self {
 		let external_memory_fd = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
-		let method = KcmpProbe::get().method();
-		debug!("DMA-BUF import cache identity method: {method:?}");
-
-		Ok(Self {
+		Self {
 			context,
 			external_memory_fd,
-			method,
-			cache: HashMap::new(),
-			retired: Vec::new(),
-			calls_since_sweep: 0,
-			last_resource_summary: Instant::now(),
-			log_stats,
-			stats: ImportCacheStats::default(),
-		})
+		}
 	}
 
-	/// Import a DMA-BUF, reusing a cached import on hit. Returns
-	/// `(import, needs_transition)`; the `Arc` pins the image to the caller.
-	pub fn import_or_reuse(
-		&mut self,
-		fd: RawFd,
+	/// Import the DMA-BUF of `planes` (borrowed: Vulkan receives a duplicate
+	/// of the first plane's fd).
+	pub fn import(
+		&self,
 		width: u32,
 		height: u32,
 		format: vk::Format,
 		planes: &[DmaBufPlane],
-	) -> Result<(Arc<CachedImport>, bool), String> {
-		self.calls_since_sweep += 1;
-		if self.calls_since_sweep >= SWEEP_INTERVAL_CALLS {
-			self.calls_since_sweep = 0;
-			self.evict_stale();
-		}
-
-		let params = ImportParams::new(width, height, format, planes);
-
-		// SAFETY: the caller keeps `fd` open for the duration of this call.
-		let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-
-		let now = Instant::now();
-		if let Some(cached) = self.cache.get(&fd)
-			&& cached.params == params
-			&& cached.is_same_buffer(borrowed_fd)
-		{
-			cached.touch(now);
-			if self.log_stats {
-				self.stats.hit += 1;
-			}
-			return Ok((Arc::clone(cached), false));
-		}
-
-		if self.log_stats {
-			self.stats.miss += 1;
-		}
-		// Miss: retire the stale entry for TTL-deferred release.
-		if let Some(stale) = self.cache.remove(&fd) {
-			if self.log_stats {
-				self.stats.recreate += 1;
-			}
-			debug!(
-				"fd {fd} now refers to a different buffer (params {:?} -> {:?}); retiring stale import",
-				stale.params, params
-			);
-			stale.touch(now);
-			self.retired.push(stale);
-		}
-
-		debug!(
-			"First import for fd {fd}: {}x{}, format={:?}, stride={}, modifier={:#x}",
-			width, height, format, planes[0].stride, planes[0].modifier
-		);
-
-		// Keep a dup so the buffer stays alive for identity checks.
-		let owned_fd = borrowed_fd
-			.try_clone_to_owned()
-			.map_err(|e| format!("Failed to duplicate DMA-BUF FD for the import cache: {e}"))?;
-		let identity = Identity::read(self.method, owned_fd.as_fd())
-			.map_err(|e| format!("Failed to read DMA-BUF identity for the import cache: {e}"))?;
-
+	) -> Result<DmaBufImport, String> {
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
-
-		let cached = Arc::new(CachedImport {
+		Ok(DmaBufImport {
 			image,
 			memory,
-			params,
-			fd: owned_fd,
-			identity,
-			last_used: Mutex::new(now),
+			width,
+			height,
 			context: self.context.clone(),
-		});
-		self.cache.insert(fd, Arc::clone(&cached));
-		Ok((cached, true))
-	}
-
-	/// Drop the importer's references to every import. The conventional
-	/// pipeline calls this after each conversion: an import that stays alive
-	/// keeps the client's buffer in this device's submissions, whose implicit
-	/// synchronization then waits for the client's rendering into it.
-	/// Consumers that still pin an import keep it until they release it.
-	pub(crate) fn release_all(&mut self) {
-		self.cache.clear();
-		self.retired.clear();
-	}
-
-	/// Move TTL-expired entries to `retired` for one more `CACHE_TTL` before
-	/// releasing the importer's `Arc` (consumers may still pin the image).
-	fn evict_stale(&mut self) {
-		let now = Instant::now();
-		let cutoff = now - CACHE_TTL;
-
-		let mut moved = 0usize;
-		let mut expired = Vec::new();
-		self.cache.retain(|_, v| {
-			if v.last_used() < cutoff {
-				v.touch(now);
-				expired.push(Arc::clone(v));
-				moved += 1;
-				false
-			} else {
-				true
-			}
-		});
-		self.retired.extend(expired);
-
-		let before = self.retired.len();
-		self.retired.retain(|v| v.last_used() >= cutoff);
-		let dropped = before - self.retired.len();
-		if self.log_stats {
-			self.stats.evict += moved as u64;
-		}
-		if self.log_stats && now.duration_since(self.last_resource_summary) >= Duration::from_secs(5) {
-			tracing::info!(
-				import_cache = self.cache.len(),
-				import_cache_hit = self.stats.hit,
-				import_cache_miss = self.stats.miss,
-				import_cache_recreate = self.stats.recreate,
-				import_cache_evict = self.stats.evict,
-				retired_imports = self.retired.len(),
-				"Video DMA-BUF resources"
-			);
-			self.last_resource_summary = now;
-			self.stats = ImportCacheStats::default();
-		}
-
-		if moved > 0 || dropped > 0 {
-			trace!(
-				"DmaBufImporter: retired {moved} stale cache entries, dropped {dropped} from retired, {} live",
-				self.cache.len()
-			);
-		}
+		})
 	}
 
 	/// Raw Vulkan DMA-BUF import. Returns `(VkImage, VkDeviceMemory)` in `UNDEFINED` layout.
@@ -652,29 +403,12 @@ impl DmaBufImporter {
 	}
 }
 
-impl Drop for DmaBufImporter {
-	fn drop(&mut self) {
-		// Releases only the importer's refs; `CachedImport::drop` frees the rest.
-		self.cache.clear();
-		self.retired.clear();
-	}
-}
-
 #[cfg(test)]
 mod tests {
-	use super::{CompareMethod, DmaBufPlane, Identity, ImportParams, ImportResources, KcmpProbe, same_buffer};
+	use super::{BufferId, CompareMethod, DmaBufPlane, ImportResources, KcmpProbe, kcmp_file, same_buffer};
 	use ash::vk;
 	use std::io;
-	use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-
-	fn plane(offset: u32, stride: u32) -> DmaBufPlane {
-		DmaBufPlane {
-			fd: 42,
-			offset,
-			stride,
-			modifier: 0xdead,
-		}
-	}
+	use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 	#[test]
 	fn incomplete_imports_release_resources_but_success_transfers_ownership() {
@@ -724,28 +458,6 @@ mod tests {
 		RELEASED.with_borrow(|released| assert_eq!(released, &["image", "image", "image", "image", "image", "memory"]));
 	}
 
-	#[test]
-	fn import_params_match_for_identical_buffer() {
-		let a = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
-		let b = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
-		assert_eq!(a, b);
-	}
-
-	#[test]
-	fn import_params_detect_recycled_fd_after_format_switch() {
-		// PQ → scRGB: format and stride differ, so the fd is a cache miss despite same fd number.
-		let pq = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
-		let scrgb = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 15360)]);
-		assert_ne!(pq, scrgb);
-	}
-
-	#[test]
-	fn import_params_detect_stride_only_change() {
-		let a = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 15360)]);
-		let b = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 16384)]);
-		assert_ne!(a, b);
-	}
-
 	/// Create an anonymous in-memory file. Like a DMA-BUF, each memfd has its
 	/// own inode on a kernel pseudo-filesystem and its own open file description.
 	fn memfd() -> OwnedFd {
@@ -778,13 +490,13 @@ mod tests {
 			.filter(|&method| method == CompareMethod::Inode || kcmp_available);
 
 		for method in methods {
-			let identity = Identity::read(method, buffer.as_fd()).unwrap();
+			let same = |a: BorrowedFd<'_>, b: BorrowedFd<'_>| match method {
+				CompareMethod::Kcmp => kcmp_file(a, b).unwrap(),
+				CompareMethod::Inode => BufferId::of(a).unwrap() == BufferId::of(b).unwrap(),
+			};
+			assert!(same(buffer.as_fd(), dup.as_fd()), "{method:?}: dup must match");
 			assert!(
-				identity.matches(buffer.as_fd(), dup.as_fd()),
-				"{method:?}: dup must match"
-			);
-			assert!(
-				!identity.matches(buffer.as_fd(), other.as_fd()),
+				!same(buffer.as_fd(), other.as_fd()),
 				"{method:?}: other buffer must not match"
 			);
 		}
@@ -797,9 +509,8 @@ mod tests {
 	/// STAB-004 on real hardware (opt-in with `MOONSHINE_TEST_GPU=1` and
 	/// `--ignored`; ordinary CI has no GPU). A frame exported from a GBM pool whose buffer and
 	/// allocator were dropped — the compositor exiting before the encoder
-	/// imports — still imports into Vulkan, and a new buffer that receives the
-	/// same descriptor number after the frame is gone never aliases the cached
-	/// import.
+	/// imports — still imports into Vulkan, and so does a new buffer that
+	/// receives the same descriptor number after the frame is gone.
 	#[test]
 	#[ignore = "needs a GPU render node: MOONSHINE_TEST_GPU=1"]
 	fn gpu_import_after_source_owner_teardown_and_fd_reuse() {
@@ -857,21 +568,19 @@ mod tests {
 		assert_eq!(context.physical_device(), verified.physical_device());
 		assert_eq!(context.device().handle(), verified.device().handle());
 		drop((sender, file, verified));
-		let mut importer = DmaBufImporter::new(context.clone(), false).unwrap();
+		let importer = DmaBufImporter::new(context.clone());
 
 		let mut first_allocator = allocator();
 		let first = export(&mut first_allocator);
 		// The whole compositor (GBM device included) exits before import.
 		drop(first_allocator);
 		let first_planes = planes(&first);
-		let (import, created) = importer
-			.import_or_reuse(first_planes[0].fd, SIZE, SIZE, format, &first_planes)
+		let import = importer
+			.import(SIZE, SIZE, format, &first_planes)
 			.expect("a frame must import after its compositor owner is gone");
-		assert!(created);
-		let (again, created) = importer
-			.import_or_reuse(first_planes[0].fd, SIZE, SIZE, format, &first_planes)
-			.unwrap();
-		assert!(!created && Arc::ptr_eq(&import, &again));
+		// Every import is its own image: nothing is cached between frames.
+		let again = importer.import(SIZE, SIZE, format, &first_planes).unwrap();
+		assert_ne!(import.image(), again.image());
 		let reused_number = first_planes[0].fd;
 
 		// A replacement compositor exists before the old frame is released, so
@@ -897,11 +606,10 @@ mod tests {
 			}
 		});
 		second_planes[0].fd = reused_number;
-		let (second_import, created) = importer
-			.import_or_reuse(second_planes[0].fd, SIZE, SIZE, format, &second_planes)
-			.unwrap();
-		assert!(created, "a different buffer must never reuse a cached import");
-		assert!(!Arc::ptr_eq(&import, &second_import));
+		let second_import = importer
+			.import(SIZE, SIZE, format, &second_planes)
+			.expect("a new buffer on a freed descriptor number must import");
+		assert_ne!(import.image(), second_import.image());
 		// SAFETY: plain idle wait on the test's own device.
 		unsafe { context.device().device_wait_idle() }.unwrap();
 		drop((import, again, second_import, importer));

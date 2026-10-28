@@ -784,7 +784,7 @@ mod gpu {
 	}
 
 	/// A sampled source image in GENERAL layout holding `bytes`.
-	fn source_image(context: &VideoContext, (w, h): (u32, u32), format: vk::Format, bytes: &[u8]) -> Arc<CachedImport> {
+	fn source_image(context: &VideoContext, (w, h): (u32, u32), format: vk::Format, bytes: &[u8]) -> DmaBufImport {
 		let device = context.device();
 		// SAFETY: test-owned objects on a live device.
 		let (image, memory) = unsafe {
@@ -866,7 +866,7 @@ mod gpu {
 			);
 		});
 		free_buffer(context, staging);
-		Arc::new(CachedImport::for_test(context.clone(), image, memory, w, h, format))
+		DmaBufImport::for_test(context.clone(), image, memory, w, h)
 	}
 
 	fn half_to_f32(bits: u16) -> f32 {
@@ -1051,7 +1051,7 @@ mod gpu {
 	fn check(
 		context: &VideoContext,
 		case: &Case,
-		source: &Arc<CachedImport>,
+		source: &DmaBufImport,
 		bytes: &[u8],
 		layers: (&Layers<'_>, &[TestLayer]),
 	) -> Result<reference::Agreement, String> {

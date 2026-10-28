@@ -1497,7 +1497,8 @@ fn check_inhibit(report: &mut HealthReport) {
 
 fn check_kcmp(report: &mut HealthReport) {
 	/// Explains the fallback when `kcmp(2)` is unavailable.
-	const FALLBACK: &str = "  The DMA-BUF import cache compares inode numbers instead (needs Linux 5.3 or later).";
+	const FALLBACK: &str =
+		"  The PyroWave DMA-BUF import cache compares inode numbers instead (needs Linux 5.3 or later).";
 
 	let start = Instant::now();
 	let probe = KcmpProbe::get();
@@ -1536,7 +1537,9 @@ fn check_kcmp(report: &mut HealthReport) {
 		),
 		_ => report.add_failed(
 			"kcmp(2)",
-			format!("  kcmp(2) not available: {error}\n  kcmp(2) is required for DMA-BUF import cache validation."),
+			format!(
+				"  kcmp(2) not available: {error}\n  kcmp(2) is required for PyroWave DMA-BUF import cache validation."
+			),
 			duration_ms,
 		),
 	}

@@ -36,7 +36,6 @@ Protect pairing credentials and other private data before sharing logs.
 | `PyroWave DMA-BUF import summary` | Import-cache hit/miss/recreate/evict counters |
 | `PyroWave GPU timestamps …` | Exclusive GPU-stage costs, separately from wall-clock encode waits |
 | `Video transport summary` | GSO/fallback sends, `would_block_events`, rebases, send duration, pacing lateness, queue occupancy and throughput |
-| `Video DMA-BUF resources` | Conventional cache and retired imports, sampled during import sweeps |
 
 Accumulators reset per window; `/proc` sampling is independent and occurs once
 per five seconds, not per frame/packet. TRACE transport logs are detailed and
@@ -59,7 +58,7 @@ for GPU timestamp, composition and encoded/UDP/Ethernet measurement boundaries.
 | FPS falls, captures age, encoding timings stay stable | Game frame cadence, demand, scene changes and buffer release/flush progress |
 | Client FPS steady but motion stutters | `Video capture cadence`: interval spread, deferred/superseded slots and captures covering 0 or 2+ commits |
 | Clean scene, completed buffers still held, client stops committing | Release-before-static-gate ordering; a swapchain-starved client cannot dirty the scene |
-| Import/conversion latency or fd/cache counts grow | Full DMA-BUF identity/layout, eviction and partial allocation cleanup |
+| Import/conversion latency or fd/cache counts grow | PyroWave cache identity/layout and eviction; partial allocation cleanup of either importer |
 | Submit/encode wait grows with in-flight/consumer occupancy | GPU contention, encoder progress, device loss or overflow |
 | Packetization grows | Shard counts and FEC layout/policy |
 | `WouldBlock`, rebases, packet occupancy or send lateness grow | Socket readiness, link/receiver capacity and pacing |
@@ -82,7 +81,7 @@ and counts together before weakening ownership or synchronization.
 | Packet channel | Bounded, awaited sends; PyroWave waits for actual send completion |
 | Held scanout buffers | Release completed holds and flush events before static skipping; retain buffers still read by GPU |
 | Retired compositor pools | Drop only after all slots are consumed; output changes can retire pools |
-| Conventional imports | Released after every conversion (implicit sync would otherwise tie encodes to the game's rendering); consumer references protect active views |
+| Conventional imports | One per conversion, with its views; dropped after the conversion's fence (implicit sync would otherwise tie encodes to the game's rendering) |
 | PyroWave imports | Unused entries expire after synchronous GPU completion; all are released on pause; preserve fd identity/layout checks |
 | Partial Vulkan imports | Owned fd/image/memory guards clean up failures; transfer fd ownership only on successful import |
 | FEC and diagnostics | Bounded policy/cache keys and windowed samples, not histories indexed by frame number |

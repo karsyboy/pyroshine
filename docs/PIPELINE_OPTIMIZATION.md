@@ -301,14 +301,14 @@ or a chunk overrun moves the remaining pacing schedule forward; no overdue later
 chunks are released together. The maximum within-chunk burst is the
 payload-capped GSO cadence (also used without GSO).
 
-Both importers retain DMA-BUF open-file identity and full layout validation.
-A recycled numeric fd or reused compositor index is insufficient identity.
-Unused PyroWave imports expire; conventional consumers can separately pin imports
-while GPU work remains active. See [resource bounds](LONG_SESSION_PERFORMANCE.md#resource-lifetimes).
+The PyroWave import cache checks DMA-BUF open-file identity and the full
+layout on every hit; a recycled numeric fd or reused compositor index is
+insufficient identity. Unused PyroWave imports expire. See
+[resource bounds](LONG_SESSION_PERFORMANCE.md#resource-lifetimes).
 
-The conventional pipeline keeps no client buffer imported between frames: after
-each conversion's fence it releases the source, its overlay layers and their
-converter views, and imports the next frame again (about 15 µs). A buffer that
+The conventional pipeline caches nothing: it imports each frame's source and
+overlay layers for one conversion (about 15 µs), creates their views for that
+conversion, and destroys views and imports once its fence has signaled. A buffer that
 stays imported makes the device's later submissions, the video encode among
 them, wait under implicit synchronization for whatever the game is rendering
 into it. With a GPU-bound 4K game on an RX 9070 XT, keeping the game's

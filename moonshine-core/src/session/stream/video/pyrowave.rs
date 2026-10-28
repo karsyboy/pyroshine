@@ -21,7 +21,16 @@ use pixelforge::VideoContext;
 use super::format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 };
-use super::pipeline::dmabuf::{ImportCacheStats, same_buffer};
+use super::pipeline::dmabuf::same_buffer;
+
+/// Import-cache counters, reported only every five seconds.
+#[derive(Default, Debug, Clone, Copy)]
+struct ImportCacheStats {
+	hit: u64,
+	miss: u64,
+	recreate: u64,
+	evict: u64,
+}
 use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
 use crate::session::capture::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
 use serde::{Deserialize, Serialize};
@@ -1533,8 +1542,7 @@ mod tests {
 		let context = crate::gpu::capture_context(&file).unwrap();
 		let mut allocator = GbmAllocator::new(GbmDevice::new(file).unwrap(), GbmBufferFlags::RENDERING);
 		let fd_props = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
-		let mut conventional =
-			crate::session::stream::video::pipeline::dmabuf::DmaBufImporter::new(context.clone(), false).unwrap();
+		let conventional = crate::session::stream::video::pipeline::dmabuf::DmaBufImporter::new(context.clone());
 		let mut encoder = PyroWaveEncoder::new(
 			&context,
 			NegotiatedVideoFormat::sdr(
@@ -1674,9 +1682,7 @@ mod tests {
 						modifier: frame.modifier,
 					})
 					.collect();
-				let conventional_result = conventional
-					.import_or_reuse(planes[0].fd, SIZE, SIZE, vk_format, &planes)
-					.map(|_| ());
+				let conventional_result = conventional.import(SIZE, SIZE, vk_format, &planes).map(|_| ());
 				let line = format!(
 					"{fourcc:?} {} -> modifier {:#018x}: fd memory types {:#x}: conventional {}, PyroWave {}",
 					if is_compositor {
