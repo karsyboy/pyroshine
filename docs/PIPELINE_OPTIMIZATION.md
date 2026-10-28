@@ -301,7 +301,9 @@ Measure real-game contention before drawing conclusions from cube benchmarks.
 Capture follows client demand. A pause (client detached or reconnecting)
 clears the stream's media demand until the next epoch is activated: the encoder
 then requests no captures and replays nothing, so capture, conversion, encoding
-and packetization stop once in-flight work drains, and the audio encoder
+and packetization stop once in-flight work drains, the encoders release their
+imports of the client's buffers (which otherwise expire only on later imports,
+pinning a swapchain the game replaced while nobody watched), and the audio encoder
 returns PCM to the Pulse server without encoding it. The compositor keeps
 presenting to the application and Pulse keeps serving it. After demand
 returns, a replay of the last frame (static-scene IDR, PyroWave resend) waits

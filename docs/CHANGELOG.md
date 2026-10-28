@@ -23,6 +23,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Streaming sessions use less GPU memory: composition buffers are allocated only when a frame needs composition and freed after 30 seconds without one. A fullscreen game at 4K no longer reserves 96 MiB (SDR) or 192 MiB (HDR) for them.
 - Video error correction uses four dedicated threads instead of one per CPU. At PyroWave 4K120 this halves Pyroshine's CPU use and stops it waking every core thousands of times a second, with no added latency.
 - VA-API and NVENC streams allocate one fewer input frame (12 MiB at 4K 4:2:0, up to 50 MiB at 4K 4:4:4 10-bit).
+- While no client is connected, the encoders let go of the game's frame buffers, so a game that changes resolution meanwhile frees its old buffers.
 
 ## [v0.18.0-prerelease.1] - 2026-10-27
 

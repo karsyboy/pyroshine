@@ -1618,6 +1618,17 @@ impl InputConverter {
 		Ok(view)
 	}
 
+	/// Destroy every cached source view and release its import, while no
+	/// client receives frames (see `DmaBufImporter::release_all`).
+	pub(crate) fn release_source_views(&mut self) {
+		let device = self.context.device();
+		for (_, view) in self.views.drain(..) {
+			// SAFETY: every conversion waits for its fence, so no pending GPU
+			// work references the view.
+			unsafe { device.destroy_image_view(view, None) };
+		}
+	}
+
 	/// Stage `image` in `slot` when its content changed. Returns the view to
 	/// sample and whether the staging buffer holds new content to upload.
 	fn prepare_pixels(&mut self, slot: usize, image: &OverlayImage) -> Result<(vk::ImageView, bool), String> {

@@ -1480,6 +1480,8 @@ impl VideoPipelineInner {
 		let mut failures = FailurePolicy::default();
 		// A requested replay of the last frame, kept until a frame is sent.
 		let mut resend_last = false;
+		// Imports were released for the current pause.
+		let mut imports_released = false;
 		// A live bitrate installed in the encoder, applied once the first frame
 		// encoded with it has been sent.
 		let mut pending_rate: Option<super::rate::PendingRate> = None;
@@ -1535,7 +1537,16 @@ impl VideoPipelineInner {
 			// encoder-state invalidation. Drain the channel so it cannot lag.
 			while invalidate_request_rx.try_recv().is_ok() {}
 
-			// No captures while no client can receive them (PERF-001).
+			// No captures while no client can receive them (PERF-001), and no
+			// client buffers held for them either.
+			if !self.demand.wanted() {
+				if !imports_released {
+					encoder.release_imports();
+					imports_released = true;
+				}
+			} else {
+				imports_released = false;
+			}
 			let mut received = match frame_rx.recv_timeout_if(frame_interval, self.demand.wanted()) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -1863,6 +1874,8 @@ impl VideoPipelineInner {
 
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
+		// Imports were released for the current pause (see below).
+		let mut imports_released = false;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
@@ -2010,6 +2023,19 @@ impl VideoPipelineInner {
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
+			}
+
+			// While no client can receive frames, release the client's buffers
+			// once the last frame in flight is done with them; they expire only
+			// on later imports otherwise.
+			if self.demand.wanted() {
+				imports_released = false;
+			} else if !imports_released && in_flight.load(Ordering::Acquire) == 0 {
+				input_converter.release_source_views();
+				if let Some(importer) = dmabuf_importer.as_mut() {
+					importer.release_all();
+				}
+				imports_released = true;
 			}
 
 			// Try to receive a frame from compositor (with timeout).

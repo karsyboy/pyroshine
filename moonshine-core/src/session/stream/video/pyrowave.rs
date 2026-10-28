@@ -1269,6 +1269,18 @@ impl PyroWaveEncoder {
 		Ok(bytes.saturating_mul(8).saturating_mul(fps as usize))
 	}
 
+	/// Drop every cached import, while no client receives frames. Imports
+	/// otherwise expire only on later encodes, so a paused stream would keep the
+	/// client's buffers (including a swapchain it replaced meanwhile) alive.
+	/// Every encode has finished with its source when `encode` returns.
+	pub(crate) fn release_imports(&mut self) {
+		let released = self.images.entries.len();
+		self.images.entries.clear();
+		if released != 0 {
+			tracing::debug!(released, "Released PyroWave DMA-BUF imports while paused");
+		}
+	}
+
 	pub(crate) fn import_cache_len(&self) -> usize {
 		self.images.entries.len()
 	}
