@@ -335,6 +335,11 @@ pub(crate) struct MoonshineCompositor {
 	/// (review 2026-10-05 PERF-003): total and longest in the window.
 	render_wait: std::time::Duration,
 	render_wait_max: std::time::Duration,
+	/// A client destroyed a `wl_buffer` since the last tick. The GLES renderer
+	/// keeps every imported DMA-BUF (and so the client's GPU memory) until its
+	/// texture cache is cleaned, which it otherwise only does after rendering;
+	/// direct export never renders, so the tick cleans it instead.
+	pub(super) client_buffer_destroyed: bool,
 	direct_rejections: [u64; DirectReject::COUNT],
 	gpu_timer: super::gpu_timing::GpuTimer,
 	pub pen_tablet_descriptor: TabletDescriptor,
@@ -955,6 +960,7 @@ impl MoonshineCompositor {
 				composited_frames: 0,
 				render_wait: std::time::Duration::ZERO,
 				render_wait_max: std::time::Duration::ZERO,
+				client_buffer_destroyed: false,
 				direct_rejections: [0; DirectReject::COUNT],
 				gpu_timer: super::gpu_timing::GpuTimer::default(),
 				pen_tablet_descriptor,
@@ -1860,6 +1866,13 @@ impl MoonshineCompositor {
 	fn render_and_export(&mut self, send_callbacks: bool) {
 		if self.log_stats && self.gpu_timer.has_pending() {
 			self.gpu_timer.poll(&mut self.renderer);
+		}
+		// Runs on the tick after the destroy request, once Smithay has dropped
+		// the buffer's `Dmabuf`; only entries whose `Dmabuf` is gone are freed.
+		if std::mem::take(&mut self.client_buffer_destroyed)
+			&& let Err(error) = self.renderer.cleanup_texture_cache()
+		{
+			tracing::warn!(%error, "Failed to release destroyed client buffers from the GLES import cache");
 		}
 		self.retired_buffer_pools
 			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));

@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Games streamed without composition no longer leave their old swapchain buffers in GPU memory for the rest of the session. At 4K a game that recreated its swapchain at startup kept about 500 MiB of VRAM allocated until something forced a composited frame.
+
 ## [v0.18.0-prerelease.1] - 2026-10-27
 
 ### Added

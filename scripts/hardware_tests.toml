@@ -102,6 +102,11 @@ requires = ["render-node", "xwayland"]
 timeout = 120
 
 [[test]]
+name = "session::compositor::xwayland_tests::destroyed_client_dmabufs_release_their_memory"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
 name = "session::compositor::xwayland_tests::live_output_reconfiguration_resizes_windows_held_at_output_size"
 requires = ["render-node", "xwayland"]
 timeout = 120

@@ -1471,6 +1471,153 @@ mod xwayland_tests {
 		shut_down(stop);
 	}
 
+	/// GPU memory of this process's DRM clients (every `drm-total-*` region,
+	/// once per client), or `None` when the driver reports no memory keys.
+	fn drm_memory_bytes() -> Option<u64> {
+		let mut clients = std::collections::HashMap::new();
+		for entry in std::fs::read_dir("/proc/self/fdinfo").ok()?.flatten() {
+			let Ok(text) = std::fs::read_to_string(entry.path()) else {
+				continue;
+			};
+			let Some(id) = text.lines().find_map(|line| line.strip_prefix("drm-client-id:")) else {
+				continue;
+			};
+			let total = text
+				.lines()
+				.filter_map(|line| line.strip_prefix("drm-total-"))
+				.filter_map(|rest| {
+					let mut fields = rest.split_once(':')?.1.split_whitespace();
+					let value: u64 = fields.next()?.parse().ok()?;
+					Some(
+						value
+							* match fields.next() {
+								Some("KiB") => 1 << 10,
+								Some("MiB") => 1 << 20,
+								Some("GiB") => 1 << 30,
+								_ => 1,
+							},
+					)
+				})
+				.reduce(|a, b| a + b);
+			if let Some(total) = total {
+				clients.insert(id.trim().to_owned(), total);
+			}
+		}
+		(!clients.is_empty()).then(|| clients.values().sum())
+	}
+
+	/// A client's destroyed DMA-BUF `wl_buffer` must not stay alive in the
+	/// GLES import cache while every frame is exported directly (nothing is
+	/// rendered, so the renderer never cleans its cache by itself). Games
+	/// recreate swapchains at startup and on mode changes; at 4K that retained
+	/// hundreds of MiB of the game's VRAM for the whole session.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn destroyed_client_dmabufs_release_their_memory() {
+		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+		use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier, dmabuf::AsDmabuf};
+		use wayland_client::protocol::{wl_buffer, wl_registry};
+		use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+			zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+			zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+		};
+
+		#[derive(Default)]
+		struct Client {
+			dmabuf: Option<ZwpLinuxDmabufV1>,
+		}
+		impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for Client {
+			fn event(
+				state: &mut Self,
+				registry: &wl_registry::WlRegistry,
+				event: wl_registry::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				qh: &wayland_client::QueueHandle<Self>,
+			) {
+				if let wl_registry::Event::Global {
+					name,
+					interface,
+					version,
+				} = event && interface == "zwp_linux_dmabuf_v1"
+				{
+					state.dmabuf = Some(registry.bind(name, version.min(3), qh, ()));
+				}
+			}
+		}
+		wayland_client::delegate_noop!(Client: ignore ZwpLinuxDmabufV1);
+		wayland_client::delegate_noop!(Client: ignore ZwpLinuxBufferParamsV1);
+		wayland_client::delegate_noop!(Client: ignore wl_buffer::WlBuffer);
+
+		let (stop, _handles, launched) = launch();
+		let socket = std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap())
+			.join(&launched.ready().display.wayland_display);
+		let wayland =
+			wayland_client::Connection::from_socket(std::os::unix::net::UnixStream::connect(socket).unwrap()).unwrap();
+		let mut queue = wayland.new_event_queue();
+		let qh = queue.handle();
+		wayland.display().get_registry(&qh, ());
+		let mut client = Client::default();
+		queue.roundtrip(&mut client).unwrap();
+		let linux_dmabuf = client.dmabuf.clone().expect("zwp_linux_dmabuf_v1 is advertised");
+
+		let Some(baseline) = drm_memory_bytes() else {
+			eprintln!("skipped: this driver reports no DRM fdinfo memory");
+			shut_down(stop);
+			return;
+		};
+		// Large enough to stand out from driver noise.
+		const SIZE: u32 = 4096;
+		const BYTES: u64 = SIZE as u64 * SIZE as u64 * 4;
+		let node = super::find_render_node(&None).unwrap();
+		let file = std::fs::OpenOptions::new().read(true).write(true).open(node).unwrap();
+		let mut allocator = GbmAllocator::new(GbmDevice::new(file).unwrap(), GbmBufferFlags::RENDERING);
+		let buffer = allocator
+			.create_buffer(SIZE, SIZE, Fourcc::Argb8888, &[Modifier::Linear])
+			.unwrap();
+		let dmabuf = buffer.export().unwrap();
+		let params = linux_dmabuf.create_params(&qh, ());
+		let modifier: u64 = dmabuf.format().modifier.into();
+		for (index, ((handle, offset), stride)) in
+			dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides()).enumerate()
+		{
+			params.add(
+				handle,
+				index as u32,
+				offset,
+				stride,
+				(modifier >> 32) as u32,
+				modifier as u32,
+			);
+		}
+		let wl_buffer = params.create_immed(
+			SIZE as i32,
+			SIZE as i32,
+			Fourcc::Argb8888 as u32,
+			zwp_linux_buffer_params_v1::Flags::empty(),
+			&qh,
+			(),
+		);
+		queue.roundtrip(&mut client).unwrap();
+		assert!(
+			drm_memory_bytes().unwrap() >= baseline + BYTES,
+			"the client buffer is allocated and imported"
+		);
+
+		wl_buffer.destroy();
+		params.destroy();
+		queue.roundtrip(&mut client).unwrap();
+		drop(dmabuf);
+		drop(buffer);
+		drop(allocator);
+		assert!(
+			wait_until(|| drm_memory_bytes().unwrap() < baseline + BYTES / 4),
+			"the compositor still holds the destroyed client buffer: {} MiB above baseline",
+			drm_memory_bytes().unwrap().saturating_sub(baseline) >> 20
+		);
+		shut_down(stop);
+	}
+
 	#[allow(dead_code, unused_imports, non_upper_case_globals, clippy::all)]
 	mod input_method_client {
 		use wayland_client;
