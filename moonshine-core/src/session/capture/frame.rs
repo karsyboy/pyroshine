@@ -14,9 +14,9 @@
 //! | Primaries, transfer, matrix | [`FrameColorSpace`], from the source's color declaration |
 //! | Range, chroma | Full-range RGB, so 4:4:4; the encoder converts to the negotiated YUV |
 //! | HDR metadata | `hdr_metadata`, static HDR10 metadata of the source |
-//! | Timestamps | `source_time` (content time, drives RTP), `created_at` (export completion) |
+//! | Timestamps | `source_time` (content time, drives RTP), `created_at` (handoff to the channel) |
 //! | Damage | None: every frame is encoded whole |
-//! | Producer sync | Complete before the frame is sent (see below) |
+//! | Producer sync | Complete before the frame is sent, or a `ready` fence the consumer waits for (see below) |
 //! | Consumer sync | `consumed` (content reuse) and the capture credit (demand), separately |
 //!
 //! A source that cannot meet a row (YUV or cropped buffers, an unsampleable
@@ -25,13 +25,16 @@
 //!
 //! # Producer synchronization
 //!
-//! A frame is sent only once every producer write to its buffer has
-//! completed: the backend waited on the producer's fence, or latched a client
-//! commit only after its DMA-BUF finished rendering. Consumers therefore read
-//! without waiting for the producer. A backend whose source signals
-//! completion differently (for example a DRM syncobj timeline point) waits
-//! for it before sending; carrying an unsignaled fence to the consumer would
-//! need an extension of this type, not a different reading of it.
+//! Every producer write to a frame's buffer has completed before the
+//! consumer reads it. Either the backend established it before sending (it
+//! waited on the producer's fence, or latched a client commit only after its
+//! DMA-BUF finished rendering), or the frame carries the producer's
+//! completion fence as a `sync_file` in [`ExportedFrame::ready`] and every
+//! consumer calls [`ExportedFrame::wait_ready`] before reading. The isolated
+//! compositor uses `ready` for its own GLES composition, so its thread does
+//! not wait for the GPU. A backend whose source signals completion
+//! differently (for example a DRM syncobj timeline point) waits for it, or
+//! converts it to a `sync_file`, before sending.
 //!
 //! # Source-buffer ownership
 //!
@@ -342,8 +345,8 @@ pub(crate) struct ExportedFrame {
 	pub width: u32,
 	/// Frame height in pixels.
 	pub height: u32,
-	/// When the backend finished producing the frame (render completion for
-	/// composed frames, export for direct ones).
+	/// When the backend handed the frame to the channel (after submitting the
+	/// render for composed frames, at export for direct ones).
 	pub created_at: Instant,
 	/// When the frame's content became current: the sampled refresh deadline
 	/// under fixed pacing, or the latch time of the newest content under VRR

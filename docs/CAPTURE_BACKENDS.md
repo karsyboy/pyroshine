@@ -98,8 +98,10 @@ short:
   (8-bit, 10-bit or FP16), uncropped, without damage information.
 - Color encoding comes from the source's declaration (`FrameColorSpace` and
   HDR10 metadata), never from the buffer format.
-- Producer writes have completed before a frame is sent. Consumers do not wait
-  for the producer.
+- Producer writes have completed before a frame is read: either before it is
+  sent, or the frame carries the producer's completion fence (`ready`, a
+  `sync_file`) and the encoder waits for it before reading. The isolated
+  compositor hands composited frames over this way.
 - Three signals stay independent: the `SourceLease` keeps descriptors and
   memory valid, `consumed` permits content reuse once no GPU work can read the
   buffer, and the capture credit bounds capture demand through transport.
