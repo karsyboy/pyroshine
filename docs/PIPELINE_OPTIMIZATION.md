@@ -328,7 +328,13 @@ returns PCM to the Pulse server without encoding it. The compositor keeps
 presenting to the application and Pulse keeps serving it. The encoding thread
 sleeps meanwhile (and before `StartB`): `MediaDemand` wakes it when demand
 changes and when a reconfiguration, reset, start or stop is queued for it, so a
-resumed epoch activates at once instead of at the thread's next poll. After demand
+resumed epoch activates at once instead of at the thread's next poll. After
+60 seconds without a client the thread drops its encoder (conventional: once
+nothing is in flight, through the reconfiguration drain), returning its GPU
+memory to the game: 62 MiB for HEVC and 204 MiB for PyroWave 4:4:4 at 4K on an
+RX 9070 XT. The next reset or reconfiguration builds a new encoder before its
+epoch activates; that resume showed its first frame after 0.8 s (HEVC) and
+0.5 s (PyroWave), against about 40 ms with the encoder kept. After demand
 returns, a replay of the last frame (static-scene IDR, PyroWave resend) waits
 two frame intervals so a fresh capture can arrive first.
 

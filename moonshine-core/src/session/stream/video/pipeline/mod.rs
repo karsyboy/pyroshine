@@ -975,6 +975,23 @@ struct VideoPipelineInner {
 	stop_cause: crate::session::failure::StopCauseSlot,
 }
 
+/// How an encoding loop ended.
+enum LoopExit {
+	/// The session is stopping.
+	Stop,
+	/// Rebuild the encoder for a reconfigured epoch.
+	Reconfigure(VideoReconfigureCommand),
+	/// No client received frames for [`DETACHED_ENCODER_RELEASE`]: drop the
+	/// encoder until the next epoch.
+	Release,
+}
+
+/// How long the encoder of a detached client is kept. Keeping it makes an
+/// unchanged resume instant; releasing it returns its GPU memory to the game
+/// (77-137 MiB for a conventional 4K encoder, 160-240 MiB for PyroWave) at the
+/// cost of rebuilding it when a client returns.
+const DETACHED_ENCODER_RELEASE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Longest sleep of a paused or not yet started encoding loop. Every command
 /// it must act on wakes it; this only bounds a missed wake.
 const PAUSED_WAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
@@ -986,12 +1003,15 @@ struct DemandTracker {
 	/// When demand last became wanted; `None` while it is clear. Only the
 	/// encoding thread touches it.
 	wanted_since: std::cell::Cell<Option<std::time::Instant>>,
+	/// When demand last became clear; `None` while it is wanted.
+	unwanted_since: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl DemandTracker {
 	fn new(demand: crate::session::stream::MediaDemand) -> Self {
 		Self {
 			wanted_since: std::cell::Cell::new(demand.wanted().then(std::time::Instant::now)),
+			unwanted_since: std::cell::Cell::new((!demand.wanted()).then(std::time::Instant::now)),
 			demand,
 		}
 	}
@@ -1000,11 +1020,26 @@ impl DemandTracker {
 	fn wanted(&self) -> bool {
 		let wanted = self.demand.wanted();
 		match (wanted, self.wanted_since.get()) {
-			(true, None) => self.wanted_since.set(Some(std::time::Instant::now())),
-			(false, Some(_)) => self.wanted_since.set(None),
+			(true, None) => {
+				self.wanted_since.set(Some(std::time::Instant::now()));
+				self.unwanted_since.set(None);
+			},
+			(false, Some(_)) => {
+				self.wanted_since.set(None);
+				self.unwanted_since.set(Some(std::time::Instant::now()));
+			},
 			_ => {},
 		}
 		wanted
+	}
+
+	/// Whether no client has received frames for [`DETACHED_ENCODER_RELEASE`].
+	fn release_due(&self) -> bool {
+		!self.wanted()
+			&& self
+				.unwanted_since
+				.get()
+				.is_some_and(|since| since.elapsed() >= DETACHED_ENCODER_RELEASE)
 	}
 
 	/// See [`crate::session::stream::MediaDemand::wakes`].
@@ -1038,6 +1073,34 @@ impl DemandTracker {
 }
 
 impl VideoPipelineInner {
+	/// After a [`LoopExit::Release`], sleep until a client's epoch arrives (a
+	/// reset keeps the context, a reconfiguration replaces it) and return its
+	/// activation for the rebuilt encoder; `None` when the session stops.
+	fn wait_for_next_epoch(
+		&mut self,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<EpochActivation>,
+		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
+		stop_session_manager: &ShutdownManager<SessionShutdownReason>,
+	) -> Option<EpochActivation> {
+		loop {
+			let wakes = self.demand.wakes();
+			if stop_session_manager.is_shutdown_triggered() {
+				return None;
+			}
+			if let Ok(command) = reconfigure_rx.try_recv() {
+				self.context = command.context;
+				return Some(EpochActivation {
+					generation: command.generation,
+					applied: command.applied,
+				});
+			}
+			if let Ok(activation) = reset_request_rx.try_recv() {
+				return Some(activation);
+			}
+			self.demand.demand.wait_for_wake(wakes, PAUSED_WAKE_BOUND);
+		}
+	}
+
 	fn activate_reconfigured_epoch(
 		&self,
 		runtime: &tokio::runtime::Handle,
@@ -1167,14 +1230,27 @@ impl VideoPipelineInner {
 			};
 
 			match result {
-				Ok(Some(command)) => {
+				Ok(LoopExit::Reconfigure(command)) => {
 					self.context = command.context;
 					pending_applied = Some(EpochActivation {
 						generation: command.generation,
 						applied: command.applied,
 					});
 				},
-				Ok(None) => break,
+				Ok(LoopExit::Release) => {
+					tracing::info!(
+						detached_secs = DETACHED_ENCODER_RELEASE.as_secs(),
+						"Released the video encoder while no client is attached"
+					);
+					// The next epoch (reset or reconfiguration) builds a new one.
+					let Some(activation) =
+						self.wait_for_next_epoch(&mut reset_request_rx, &reconfigure_rx, &stop_session_manager)
+					else {
+						break;
+					};
+					pending_applied = Some(activation);
+				},
+				Ok(LoopExit::Stop) => break,
 				Err(error) => {
 					if let Some(activation) = pending_applied.take() {
 						let _ = activation.applied.send(Err(()));
@@ -1436,7 +1512,7 @@ impl VideoPipelineInner {
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		applied: Option<EpochActivation>,
 		runtime: &tokio::runtime::Handle,
-	) -> Result<Option<VideoReconfigureCommand>, String> {
+	) -> Result<LoopExit, String> {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
 		let video_context = self.capture_context.clone();
@@ -1563,7 +1639,7 @@ impl VideoPipelineInner {
 			}
 			if let Ok(command) = reconfigure_rx.try_recv() {
 				frame_rx.reset();
-				return Ok(Some(command));
+				return Ok(LoopExit::Reconfigure(command));
 			}
 			if fec_feedback_rx.has_changed().unwrap_or(false) {
 				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
@@ -1597,6 +1673,10 @@ impl VideoPipelineInner {
 				if !imports_released {
 					encoder.release_imports();
 					imports_released = true;
+				}
+				// Every encode and send has completed: nothing is in flight.
+				if self.demand.release_due() {
+					return Ok(LoopExit::Release);
 				}
 			} else {
 				imports_released = false;
@@ -1743,7 +1823,7 @@ impl VideoPipelineInner {
 			shards.set_send_completion(completion_tx);
 			if packet_tx.blocking_send(VideoPacketMessage::Batch(shards)).is_err() {
 				if stop_session_manager.is_shutdown_triggered() {
-					return Ok(None);
+					return Ok(LoopExit::Stop);
 				}
 				return Err("video packet channel closed".to_string());
 			}
@@ -1753,10 +1833,10 @@ impl VideoPipelineInner {
 					Ok(completion) => break completion,
 					Err(std::sync::mpsc::RecvTimeoutError::Timeout)
 						if !stop_session_manager.is_shutdown_triggered() => {},
-					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(LoopExit::Stop),
 					Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
 						if stop_session_manager.is_shutdown_triggered() {
-							return Ok(None);
+							return Ok(LoopExit::Stop);
 						}
 						return Err("video packet sender stopped before sending PyroWave frame".to_string());
 					},
@@ -1839,7 +1919,7 @@ impl VideoPipelineInner {
 			}
 			last_encoded = Some(encoded);
 		}
-		Ok(None)
+		Ok(LoopExit::Stop)
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -1860,7 +1940,7 @@ impl VideoPipelineInner {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		applied: Option<EpochActivation>,
-	) -> Result<Option<VideoReconfigureCommand>, String> {
+	) -> Result<LoopExit, String> {
 		let ctx = &self.context;
 		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
@@ -1979,8 +2059,7 @@ impl VideoPipelineInner {
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let wakes = self.demand.wakes();
-			let reconfigure = reconfigure_rx.try_recv().ok();
-			if let Some(command) = &reconfigure {
+			if let Ok(command) = reconfigure_rx.try_recv() {
 				self.rate_rx.activate(command.generation);
 				frame_rx.reset();
 				// Exit through the flush/drain barrier below. It guarantees every
@@ -1990,7 +2069,7 @@ impl VideoPipelineInner {
 				}
 				drop(frame_ctx_tx);
 				consumer.join()?;
-				return Ok(reconfigure);
+				return Ok(LoopExit::Reconfigure(command));
 			}
 
 			// Drain any pending stream-reset requests (client reconnect/resume).
@@ -2081,6 +2160,17 @@ impl VideoPipelineInner {
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
+			}
+
+			// Release the encoder of a long-detached client once nothing is in
+			// flight, through the same drain as a reconfiguration.
+			if self.demand.release_due() && in_flight.load(Ordering::Acquire) == 0 {
+				if let Err(e) = encoder.flush() {
+					tracing::warn!("Failed to flush encoder before releasing it: {e}");
+				}
+				drop(frame_ctx_tx);
+				consumer.join()?;
+				return Ok(LoopExit::Release);
 			}
 
 			// Try to receive a frame from compositor (with timeout).
@@ -2659,7 +2749,7 @@ impl VideoPipelineInner {
 		// A consumer that stopped on a terminal failure ends the stream.
 		consumer.join()?;
 
-		Ok(None)
+		Ok(LoopExit::Stop)
 	}
 }
 
