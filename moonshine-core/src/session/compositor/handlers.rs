@@ -328,7 +328,7 @@ fn scan_cmdline_for_app_id(cmdline: &[u8]) -> u32 {
 
 impl BufferHandler for MoonshineCompositor {
 	fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {
-		self.client_buffer_destroyed = true;
+		self.gles_cache_stale = true;
 	}
 }
 

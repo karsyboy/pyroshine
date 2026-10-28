@@ -26,6 +26,18 @@ kinds and the implicit modifier); PyroWave rejects those on every frame. Direct
 export and DMA-BUF overlay layers apply the same check to client buffers and
 composite anything else (`direct_reject_format`).
 
+Composition renders into at most three output-sized capture buffers. One is
+allocated when the compositor starts or the output mode changes, proving the
+mode is importable; composition allocates the others only when every allocated
+buffer is still being read, always renders into the lowest free one, and frees
+any buffer unused for 30 seconds. A directly exported game therefore holds no
+capture buffers after its first half minute (three are 96 MiB at 4K SDR and
+192 MiB at FP16 HDR). Frames already exported keep their own DMA-BUF reference.
+The GLES renderer caches every DMA-BUF it imported or rendered into and cleans
+that cache only after rendering, so the refresh tick cleans it whenever a client
+destroys a `wl_buffer` or a capture buffer is freed; without that, a game's old
+swapchain stayed in VRAM for a whole directly exported session.
+
 Clients choose their buffer formats from the `wp_linux_dmabuf_v1` feedback.
 It lists every format EGL can sample, with the pairs in `ImportableModifiers`
 first, in a preference tranche flagged `scanout`. Without that preference,

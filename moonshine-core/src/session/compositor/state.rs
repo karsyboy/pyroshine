@@ -58,10 +58,17 @@ use super::capture::DirectReject;
 use crate::session::capture::frame::{ExportedFrame, FrameColorSpace};
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
 
-/// Number of pre-allocated GBM buffers. Conventional encoders may retain
+/// Most GBM buffers composited capture uses. Conventional encoders may retain
 /// multiple submitted buffers; PyroWave admits only one capture at a time.
 /// This pool is buffer lifetime storage, not a frame delivery queue.
+///
+/// Slots are allocated when composition needs them and released after
+/// [`CAPTURE_SLOT_IDLE`] unused: a directly exported game never renders into
+/// them, and at 4K three slots are 96 MiB (SDR) or 192 MiB (FP16 HDR).
 const BUFFER_POOL_SIZE: usize = 3;
+
+/// How long an unused capture slot keeps its GBM buffer.
+const CAPTURE_SLOT_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Visual layers in back-to-front order; independent of input targets.
 struct SceneLayers<'a> {
@@ -69,7 +76,7 @@ struct SceneLayers<'a> {
 	upper: [Option<&'a smithay::desktop::Window>; 5],
 }
 
-/// A pre-allocated GBM buffer slot in the compositor's buffer pool.
+/// A GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
 	/// The exported DMA-BUF. Frames exported from this slot hold their own
 	/// references, so retiring or dropping the pool never closes their fds.
@@ -77,6 +84,31 @@ pub(crate) struct GbmBufferSlot {
 	/// Shared with the encoder — `true` means the encoder is done reading
 	/// and the compositor may render into this buffer again.
 	consumed: Arc<AtomicBool>,
+	/// Last composition into this slot, for idle release.
+	last_used: std::time::Instant,
+}
+
+/// Allocate one capture slot. Every slot is checked: the encoders must import
+/// what GLES renders into.
+fn allocate_capture_slot(
+	allocator: &mut GbmAllocator<std::fs::File>,
+	importable: &crate::gpu::ImportableModifiers,
+	(width, height): (u32, u32),
+	fourcc: Fourcc,
+	modifiers: &[Modifier],
+) -> Result<GbmBufferSlot, String> {
+	let buffer = allocator
+		.create_buffer(width, height, fourcc, modifiers)
+		.map_err(|error| format!("failed to allocate a {width}x{height} GBM capture buffer: {error}"))?;
+	let dmabuf = buffer
+		.export()
+		.map_err(|error| format!("failed to export a GBM capture buffer: {error}"))?;
+	require_importable(importable, &dmabuf)?;
+	Ok(GbmBufferSlot {
+		dmabuf,
+		consumed: Arc::new(AtomicBool::new(true)),
+		last_used: std::time::Instant::now(),
+	})
 }
 
 /// A client buffer kept until the encoder's GPU reads finished.
@@ -335,11 +367,13 @@ pub(crate) struct MoonshineCompositor {
 	/// (review 2026-10-05 PERF-003): total and longest in the window.
 	render_wait: std::time::Duration,
 	render_wait_max: std::time::Duration,
-	/// A client destroyed a `wl_buffer` since the last tick. The GLES renderer
-	/// keeps every imported DMA-BUF (and so the client's GPU memory) until its
-	/// texture cache is cleaned, which it otherwise only does after rendering;
-	/// direct export never renders, so the tick cleans it instead.
-	pub(super) client_buffer_destroyed: bool,
+	/// A client `wl_buffer` or a capture slot was dropped since the last tick.
+	/// The GLES renderer keeps every imported or bound DMA-BUF (and so its GPU
+	/// memory) until its caches are cleaned, which it otherwise only does after
+	/// rendering; direct export never renders, so the tick cleans them instead.
+	pub(super) gles_cache_stale: bool,
+	/// The last capture slot allocation failed; logged once per failure run.
+	capture_slot_failed: bool,
 	direct_rejections: [u64; DirectReject::COUNT],
 	gpu_timer: super::gpu_timing::GpuTimer,
 	pub pen_tablet_descriptor: TabletDescriptor,
@@ -367,11 +401,12 @@ pub(crate) struct MoonshineCompositor {
 	importable: crate::gpu::ImportableModifiers,
 
 	// -- Buffer pool --
-	pub(crate) buffer_pool: Vec<GbmBufferSlot>,
+	/// Capture slots at fixed indices (damage tracking keys on the index);
+	/// `None` until composition needs the slot.
+	pub(crate) buffer_pool: [Option<GbmBufferSlot>; BUFFER_POOL_SIZE],
 	/// Pools retired by a live resolution change. They remain alive until the
 	/// encoder releases every exported DMA-BUF from the old stream epoch.
 	retired_buffer_pools: Vec<Vec<GbmBufferSlot>>,
-	pub next_buffer_index: usize,
 	/// Per-buffer render count for damage tracking.  `None` means the buffer
 	/// has never been rendered to yet (age = 0 → full redraw).
 	pub buffer_last_rendered_at: [Option<usize>; BUFFER_POOL_SIZE],
@@ -691,28 +726,24 @@ impl MoonshineCompositor {
 			self.sdr_render_format.clone()
 		};
 		if self.width != width || self.height != height || self.render_fourcc != desired_fourcc {
-			let mut replacement = Vec::with_capacity(BUFFER_POOL_SIZE);
-			for index in 0..BUFFER_POOL_SIZE {
-				let buffer = self
-					.allocator
-					.create_buffer(width, height, desired_fourcc, &desired_modifiers)
-					.map_err(|error| format!("failed to allocate reconfigured GBM buffer {index}: {error}"))?;
-				let dmabuf = buffer
-					.export()
-					.map_err(|error| format!("failed to export reconfigured GBM buffer {index}: {error}"))?;
-				require_importable(&self.importable, &dmabuf)?;
-				replacement.push(GbmBufferSlot {
-					dmabuf,
-					consumed: Arc::new(AtomicBool::new(true)),
-				});
+			// One slot proves the new mode is importable before it is applied;
+			// composition allocates the others when it needs them.
+			let first = allocate_capture_slot(
+				&mut self.allocator,
+				&self.importable,
+				(width, height),
+				desired_fourcc,
+				&desired_modifiers,
+			)?;
+			let retired = std::mem::replace(&mut self.buffer_pool, [Some(first), None, None]);
+			let retired: Vec<_> = retired.into_iter().flatten().collect();
+			if !retired.is_empty() {
+				self.retired_buffer_pools.push(retired);
 			}
-			let retired = std::mem::replace(&mut self.buffer_pool, replacement);
-			self.retired_buffer_pools.push(retired);
 			self.width = width;
 			self.height = height;
 			self.render_fourcc = desired_fourcc;
 			self.render_modifiers = desired_modifiers;
-			self.next_buffer_index = 0;
 			self.buffer_last_rendered_at = [None; BUFFER_POOL_SIZE];
 			self.scanout_buffer_map.clear();
 			self.last_scanout_buffer_desc = None;
@@ -881,22 +912,17 @@ impl MoonshineCompositor {
 
 		let initial_refresh_interval = refresh_interval_for(output.current_mode());
 
-		// Pre-allocate GBM buffer pool for zero-alloc frame export.
-		let mut buffer_pool = Vec::with_capacity(BUFFER_POOL_SIZE);
-		for i in 0..BUFFER_POOL_SIZE {
-			let buffer = allocator
-				.create_buffer(width, height, render_fourcc, &render_modifiers)
-				.unwrap_or_else(|e| panic!("Failed to pre-allocate GBM buffer {i}: {e}"));
-			let dmabuf = buffer
-				.export()
-				.unwrap_or_else(|e| panic!("Failed to export GBM buffer {i}: {e}"));
-			require_importable(&importable, &dmabuf)?;
-			buffer_pool.push(GbmBufferSlot {
-				dmabuf,
-				consumed: Arc::new(AtomicBool::new(true)),
-			});
-		}
-		tracing::debug!("Pre-allocated {BUFFER_POOL_SIZE} GBM buffers for frame pool.");
+		// One capture slot proves at startup that the encoders import what GLES
+		// renders; composition allocates the rest on demand.
+		let first_slot = allocate_capture_slot(
+			&mut allocator,
+			&importable,
+			(width, height),
+			render_fourcc,
+			&render_modifiers,
+		)?;
+		let buffer_pool = [Some(first_slot), None, None];
+		tracing::debug!("Allocated the first GBM capture buffer.");
 
 		// Native color descriptions remain available for SDR sessions too.
 		let color_management = Some(super::color_management::ColorManagementState::new(&display_handle, hdr));
@@ -960,7 +986,8 @@ impl MoonshineCompositor {
 				composited_frames: 0,
 				render_wait: std::time::Duration::ZERO,
 				render_wait_max: std::time::Duration::ZERO,
-				client_buffer_destroyed: false,
+				gles_cache_stale: false,
+				capture_slot_failed: false,
 				direct_rejections: [0; DirectReject::COUNT],
 				gpu_timer: super::gpu_timing::GpuTimer::default(),
 				pen_tablet_descriptor,
@@ -979,7 +1006,6 @@ impl MoonshineCompositor {
 				importable,
 				buffer_pool,
 				retired_buffer_pools: Vec::new(),
-				next_buffer_index: 0,
 				buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
 				render_count: 0,
 				screen_dirty: true,
@@ -1862,6 +1888,60 @@ impl MoonshineCompositor {
 		);
 	}
 
+	/// The lowest free capture slot, allocating one if every allocated slot is
+	/// still read by the encoder. Reusing the lowest slot keeps damage-tracked
+	/// redraws small and lets the others fall idle and be released.
+	fn acquire_capture_slot(&mut self) -> Option<usize> {
+		if let Some(idx) = self
+			.buffer_pool
+			.iter()
+			.position(|slot| slot.as_ref().is_some_and(|slot| slot.consumed.load(Ordering::Acquire)))
+		{
+			return Some(idx);
+		}
+		let Some(idx) = self.buffer_pool.iter().position(Option::is_none) else {
+			tracing::trace!("Every capture buffer is still in use by the encoder, skipping frame");
+			return None;
+		};
+		match allocate_capture_slot(
+			&mut self.allocator,
+			&self.importable,
+			(self.width, self.height),
+			self.render_fourcc,
+			&self.render_modifiers,
+		) {
+			Ok(slot) => {
+				tracing::debug!(slot = idx, "Allocated a GBM capture buffer");
+				self.buffer_pool[idx] = Some(slot);
+				self.buffer_last_rendered_at[idx] = None;
+				self.capture_slot_failed = false;
+				Some(idx)
+			},
+			Err(error) => {
+				if !std::mem::replace(&mut self.capture_slot_failed, true) {
+					tracing::warn!(%error, "Skipping composited captures until a capture buffer can be allocated");
+				}
+				None
+			},
+		}
+	}
+
+	/// Free capture slots unused for [`CAPTURE_SLOT_IDLE`]. Frames already
+	/// exported from a slot hold their own reference to its DMA-BUF.
+	fn release_idle_capture_slots(&mut self) {
+		let now = std::time::Instant::now();
+		for (idx, entry) in self.buffer_pool.iter_mut().enumerate() {
+			if entry.as_ref().is_some_and(|slot| {
+				slot.consumed.load(Ordering::Acquire) && now.duration_since(slot.last_used) >= CAPTURE_SLOT_IDLE
+			}) {
+				*entry = None;
+				self.buffer_last_rendered_at[idx] = None;
+				self.gles_cache_stale = true;
+				tracing::debug!(slot = idx, "Released an idle GBM capture buffer");
+			}
+		}
+	}
+
 	/// Capture for a refresh tick (`send_callbacks`) or a deferred slot.
 	fn render_and_export(&mut self, send_callbacks: bool) {
 		if self.log_stats && self.gpu_timer.has_pending() {
@@ -1869,13 +1949,14 @@ impl MoonshineCompositor {
 		}
 		// Runs on the tick after the destroy request, once Smithay has dropped
 		// the buffer's `Dmabuf`; only entries whose `Dmabuf` is gone are freed.
-		if std::mem::take(&mut self.client_buffer_destroyed)
+		if std::mem::take(&mut self.gles_cache_stale)
 			&& let Err(error) = self.renderer.cleanup_texture_cache()
 		{
 			tracing::warn!(%error, "Failed to release destroyed client buffers from the GLES import cache");
 		}
 		self.retired_buffer_pools
 			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));
+		self.release_idle_capture_slots();
 		if self
 			.color_management
 			.as_mut()
@@ -1931,15 +2012,17 @@ impl MoonshineCompositor {
 			let busy_pool_buffers = self
 				.buffer_pool
 				.iter()
+				.flatten()
 				.filter(|slot| !slot.consumed.load(Ordering::Acquire))
 				.count();
+			let allocated_pool_buffers = self.buffer_pool.iter().flatten().count();
 			let busy_scanout_buffers = self
 				.held_scanout_buffers
 				.iter()
 				.filter(|(consumed, _, _)| !consumed.load(Ordering::Acquire))
 				.count();
 			tracing::info!(
-				capture_path = ?self.capture_path, busy_pool_buffers, busy_scanout_buffers,
+				capture_path = ?self.capture_path, busy_pool_buffers, allocated_pool_buffers, busy_scanout_buffers,
 				compositor_gpu_timer_supported = self.gpu_timer.supported(),
 				compositor_gpu_samples = self.gpu_timer.samples, compositor_gpu_disjoint_events = self.gpu_timer.disjoint,
 				compositor_gpu_ms_per_composited_capture = (self.gpu_timer.samples != 0).then(|| self.gpu_timer.nanoseconds as f64 / self.gpu_timer.samples as f64 / 1e6),
@@ -2132,13 +2215,9 @@ impl MoonshineCompositor {
 			self.direct_rejections[composition_reason as usize] += 1;
 		}
 
-		// Pick the next buffer from the pre-allocated pool.
-		let idx = self.next_buffer_index;
-		let slot = &self.buffer_pool[idx];
-		if !slot.consumed.load(Ordering::Acquire) {
-			// The encoder is still reading this buffer — skip the frame
-			// to avoid overwriting its content.
-			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
+		let Some(idx) = self.acquire_capture_slot() else {
+			// Every slot is still read by the encoder (or none could be
+			// allocated): skip the frame rather than overwrite its content.
 			if self.capture_pacing == crate::session::capture::CapturePacing::Vrr {
 				self.vrr_capture_pending = true;
 			}
@@ -2146,17 +2225,18 @@ impl MoonshineCompositor {
 				self.service_uncaptured_frame();
 			}
 			return;
-		}
+		};
 
 		self.record_capture_path("composited");
 
+		let slot = self.buffer_pool[idx].as_mut().expect("acquired capture slot");
 		// Mark the buffer as in-use before rendering.
-		self.buffer_pool[idx].consumed.store(false, Ordering::Release);
-		self.next_buffer_index = (idx + 1) % BUFFER_POOL_SIZE;
+		slot.consumed.store(false, Ordering::Release);
+		slot.last_used = std::time::Instant::now();
 
 		// Clone the consumed flag before the mutable borrow on the dmabuf
 		// so we can signal the encoder later without conflicting borrows.
-		let consumed = self.buffer_pool[idx].consumed.clone();
+		let consumed = slot.consumed.clone();
 
 		// Pre-build the ExportedFrame planes (fd duplication) BEFORE the
 		// mutable borrow from renderer.bind(). This avoids a borrow
@@ -2168,7 +2248,7 @@ impl MoonshineCompositor {
 			.filter(|window| self.space.elements().any(|w| w == *window))
 			.and_then(|window| window.wl_surface().map(|s| s.into_owned()));
 		let mut exported_frame = ExportedFrame::from_dmabuf(
-			&self.buffer_pool[idx].dmabuf,
+			&self.buffer_pool[idx].as_ref().expect("acquired capture slot").dmabuf,
 			idx,
 			consumed.clone(),
 			FrameColorSpace::Srgb,
@@ -2207,7 +2287,10 @@ impl MoonshineCompositor {
 			self.gpu_timer.begin(&mut self.renderer);
 		}
 		// Bind the pre-allocated Dmabuf as a render target.
-		let mut framebuffer = match self.renderer.bind(&mut self.buffer_pool[idx].dmabuf) {
+		let mut framebuffer = match self
+			.renderer
+			.bind(&mut self.buffer_pool[idx].as_mut().expect("acquired capture slot").dmabuf)
+		{
 			Ok(fb) => fb,
 			Err(e) => {
 				self.gpu_timer.end(&mut self.renderer);
