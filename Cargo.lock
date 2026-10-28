@@ -2567,6 +2567,7 @@ dependencies = [
  "pkcs8 0.11.0",
  "pulseaudio",
  "quinn-udp",
+ "rayon",
  "rcgen",
  "regex",
  "reis",

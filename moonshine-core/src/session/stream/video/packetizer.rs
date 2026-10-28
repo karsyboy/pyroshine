@@ -20,6 +20,31 @@ const MAX_DATA_SHARDS_WITHOUT_FEC: usize = 1023;
 /// The GameStream multi-FEC header allocates two bits to the last block index.
 const MAX_FEC_BLOCKS: usize = 4;
 
+/// Threads that compute parity for large FEC blocks (see [`fec_pool`]). At
+/// PyroWave 4:4:4 4K120 (1.5 Gb/s, 16-thread CPU) four kept packetization at
+/// 120 µs per frame, as fast as sixteen, and halved the process's CPU time;
+/// two took 160 µs and one 254 µs.
+const FEC_THREADS: usize = 4;
+
+/// fec-rs splits a block's parity rows over rayon when the block is large
+/// (every protected 4K PyroWave block). Rayon's global pool has one thread per
+/// CPU, and all of them woke for every block: ~19,000 wakeups/s at 4K120 on a
+/// 16-thread CPU, competing with the game's own threads. A small named pool
+/// keeps the parallel speedup without that fan-out. `None` (the pool could
+/// not start) computes on the global pool as before.
+fn fec_pool() -> Option<&'static rayon::ThreadPool> {
+	static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+	POOL.get_or_init(|| {
+		rayon::ThreadPoolBuilder::new()
+			.num_threads(FEC_THREADS)
+			.thread_name(|index| format!("video-fec-{index}"))
+			.build()
+			.inspect_err(|error| tracing::warn!(%error, "Could not start the FEC thread pool"))
+			.ok()
+	})
+	.as_ref()
+}
+
 const NV_VIDEO_PACKET_SIZE: usize = 16;
 const RTP_HEADER_SIZE: usize = 12;
 const PADDING_SIZE: usize = 4;
@@ -473,9 +498,11 @@ impl Packetizer {
 
 				let t_fec_compute = Instant::now();
 
-				encoder
-					.encode(&mut fec_slices)
-					.map_err(|e| tracing::warn!("Failed to encode packet as FEC shards: {e}"))?;
+				match fec_pool() {
+					Some(pool) => pool.install(|| encoder.encode(&mut fec_slices)),
+					None => encoder.encode(&mut fec_slices),
+				}
+				.map_err(|e| tracing::warn!("Failed to encode packet as FEC shards: {e}"))?;
 
 				total_fec_compute_us += t_fec_compute.elapsed().as_micros();
 

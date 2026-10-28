@@ -21,6 +21,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 ### Changed
 
 - Streaming sessions use less GPU memory: composition buffers are allocated only when a frame needs composition and freed after 30 seconds without one. A fullscreen game at 4K no longer reserves 96 MiB (SDR) or 192 MiB (HDR) for them.
+- Video error correction uses four dedicated threads instead of one per CPU. At PyroWave 4K120 this halves Pyroshine's CPU use and stops it waking every core thousands of times a second, with no added latency.
 
 ## [v0.18.0-prerelease.1] - 2026-10-27
 

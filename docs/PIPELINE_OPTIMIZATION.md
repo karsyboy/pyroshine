@@ -307,6 +307,13 @@ Conventional packetization of frames of 128 KiB or more runs inside
 a 1 MB encrypted 4K frame) does not delay other tasks queued on that runtime
 worker. Frames are still packetized one at a time in order.
 
+Reed–Solomon parity of a large block (every protected 4K PyroWave block) is
+split over four `video-fec-*` threads of a dedicated rayon pool. Rayon's global
+pool would use one thread per CPU and wake all of them for each block: on a
+16-thread CPU at PyroWave 4:4:4 4K120 that was ~19,000 wakeups/s and twice the
+process's CPU time for the same 120 µs packetization. Fewer than four threads
+lengthen packetization (two: 160 µs, one: 254 µs).
+
 ## Live conventional bitrate and reference recovery
 
 Fixed negotiated bitrate remains the default. Conventional encoders accept an

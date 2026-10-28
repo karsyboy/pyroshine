@@ -18,6 +18,7 @@ crossbeam-channel = "0.5.17"
 dasp = "0.11.0"
 dirs = "7.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
+rayon = "1"
 flate2 = "1.1.9"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
