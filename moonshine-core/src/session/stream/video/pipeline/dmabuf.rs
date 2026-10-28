@@ -471,17 +471,14 @@ impl DmaBufImporter {
 		Ok((cached, true))
 	}
 
-	/// Drop the importer's references to every import, while no client
-	/// receives frames. Entries otherwise expire only on later imports, so a
-	/// paused stream would keep the client's buffers alive; consumers that
-	/// still pin an import keep it until they release it.
+	/// Drop the importer's references to every import. The conventional
+	/// pipeline calls this after each conversion: an import that stays alive
+	/// keeps the client's buffer in this device's submissions, whose implicit
+	/// synchronization then waits for the client's rendering into it.
+	/// Consumers that still pin an import keep it until they release it.
 	pub(crate) fn release_all(&mut self) {
-		let released = self.cache.len() + self.retired.len();
 		self.cache.clear();
 		self.retired.clear();
-		if released != 0 {
-			debug!(released, "Released DMA-BUF imports while paused");
-		}
 	}
 
 	/// Move TTL-expired entries to `retired` for one more `CACHE_TTL` before

@@ -1874,8 +1874,6 @@ impl VideoPipelineInner {
 
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
-		// Imports were released for the current pause (see below).
-		let mut imports_released = false;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
@@ -2023,19 +2021,6 @@ impl VideoPipelineInner {
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
-			}
-
-			// While no client can receive frames, release the client's buffers
-			// once the last frame in flight is done with them; they expire only
-			// on later imports otherwise.
-			if self.demand.wanted() {
-				imports_released = false;
-			} else if !imports_released && in_flight.load(Ordering::Acquire) == 0 {
-				input_converter.release_source_views();
-				if let Some(importer) = dmabuf_importer.as_mut() {
-					importer.release_all();
-				}
-				imports_released = true;
 			}
 
 			// Try to receive a frame from compositor (with timeout).
@@ -2456,6 +2441,20 @@ impl VideoPipelineInner {
 				// image — signal the compositor that this GBM buffer is free.
 				frame.consumed.store(true, Ordering::Release);
 				last_output = true;
+				// Keep no client buffer imported between frames. Implicit
+				// synchronization makes this device's later submissions, the
+				// video encode among them, wait for whatever the game is
+				// rendering into any buffer that stays imported: under a
+				// GPU-bound game at 4K60 that added ~8.5 ms to every frame
+				// (frame age 14.3 ms; 5.8 ms imported per frame). Mapping each
+				// new import costs ~0.3 ms of submission time when the GPU is
+				// otherwise idle; see PIPELINE_OPTIMIZATION.md.
+				drop(layer_imports);
+				drop(source_import);
+				input_converter.release_source_views();
+				if let Some(importer) = dmabuf_importer.as_mut() {
+					importer.release_all();
+				}
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current

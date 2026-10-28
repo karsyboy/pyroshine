@@ -82,7 +82,7 @@ and counts together before weakening ownership or synchronization.
 | Packet channel | Bounded, awaited sends; PyroWave waits for actual send completion |
 | Held scanout buffers | Release completed holds and flush events before static skipping; retain buffers still read by GPU |
 | Retired compositor pools | Drop only after all slots are consumed; output changes can retire pools |
-| Conventional imports | Unused cache entries expire; retired entries and consumer references protect active views; all are released once a pause has no frame in flight |
+| Conventional imports | Released after every conversion (implicit sync would otherwise tie encodes to the game's rendering); consumer references protect active views |
 | PyroWave imports | Unused entries expire after synchronous GPU completion; all are released on pause; preserve fd identity/layout checks |
 | Partial Vulkan imports | Owned fd/image/memory guards clean up failures; transfer fd ownership only on successful import |
 | FEC and diagnostics | Bounded policy/cache keys and windowed samples, not histories indexed by frame number |

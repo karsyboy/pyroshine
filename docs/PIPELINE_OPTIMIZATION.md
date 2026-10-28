@@ -288,8 +288,22 @@ payload-capped GSO cadence (also used without GSO).
 
 Both importers retain DMA-BUF open-file identity and full layout validation.
 A recycled numeric fd or reused compositor index is insufficient identity.
-Unused imports expire; conventional consumers can separately pin imports while
-GPU work remains active. See [resource bounds](LONG_SESSION_PERFORMANCE.md#resource-lifetimes).
+Unused PyroWave imports expire; conventional consumers can separately pin imports
+while GPU work remains active. See [resource bounds](LONG_SESSION_PERFORMANCE.md#resource-lifetimes).
+
+The conventional pipeline keeps no client buffer imported between frames: after
+each conversion's fence it releases the source, its overlay layers and their
+converter views, and imports the next frame again (about 15 µs). A buffer that
+stays imported makes the device's later submissions, the video encode among
+them, wait under implicit synchronization for whatever the game is rendering
+into it. With a GPU-bound 4K game on an RX 9070 XT, keeping the game's
+swapchain imported held every HEVC 4K60 frame for the game's next frame:
+frame age 14 ms, against 5.8 ms importing per frame. The price is mapping each
+import into the GPU's address space at submission: about 0.3 ms per frame when
+the GPU has headroom (HEVC 4K60 4.5 → 4.8 ms, H.264 1080p60 2.0 → 2.5 ms); the
+conversion's own GPU time is unchanged.
+PyroWave runs on the graphics queue, where its frames queue behind the game's
+work whether or not imports stay alive, so it keeps its cache.
 
 `[stream.video] pyrowave_queue = "auto"` prefers graphics, even when a
 compute-only family is available. Explicit `graphics`/`compute` modes support A/B
@@ -419,7 +433,7 @@ Deferred work needs specific evidence before implementation:
 | Explicit EGL-to-Vulkan fence transport | Driver support, fd ownership on import failure, semaphore/buffer lifetime, reconfiguration and both encoder paths |
 | Direct scaling | Matching crop, origin, borders, sampling and color output |
 | RGB conversion/DWT fusion | Equivalent rounding/dithering/HDR output and lower GPU cost across representative devices; a previously measured candidate failed quality/performance checks |
-| Import-cache aliasing | Measured duplicate-fd churn plus preserved identity/layout checks |
+| PyroWave import-cache aliasing | Measured duplicate-fd churn plus preserved identity/layout checks |
 | Capture/send overlap | Tightly bounded work without stale scenes, extra admission credits or epoch leakage |
 
 Converter changes need the GPU fixtures on every available vendor (select a
