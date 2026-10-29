@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.0-prerelease.2] - 2026-10-29
+
 ### Added
 
 - **Slow down a game nobody is watching** (opt-in). [`[compositor] detached_frame_rate`](CONFIGURATION.md#compositor) sets the frame rate most games are paced to while no client is connected, saving power and GPU time; a returning client gets the full rate immediately. Off by default.
