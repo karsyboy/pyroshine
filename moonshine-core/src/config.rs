@@ -144,12 +144,15 @@ impl Config {
 				self.management.port
 			));
 		}
-		let udp = [
+		let mut udp = vec![
 			("stream.video.port", self.stream.video.port),
 			("stream.audio.port", self.stream.audio.port),
 			("stream.control.port", self.stream.control.port),
 		];
-		for (protocol, ports) in [("TCP", tcp), ("UDP", udp)] {
+		if self.stream.audio.microphone {
+			udp.push(("stream.audio.microphone_port", self.stream.audio.microphone_port));
+		}
+		for (protocol, ports) in [("TCP", tcp.to_vec()), ("UDP", udp)] {
 			for (index, (name, port)) in ports.iter().enumerate() {
 				// Clients are told these ports (RTSP SETUP, serverinfo); an
 				// ephemeral port would be advertised as 0 and be unreachable.
@@ -372,6 +375,7 @@ mod tests {
 			("[stream.video]\nport = 0", "stream.video.port"),
 			("[stream.audio]\nport = 0", "stream.audio.port"),
 			("[stream.control]\nport = 0", "stream.control.port"),
+			("[stream.audio]\nmicrophone_port = 0", "stream.audio.microphone_port"),
 			(
 				"[webserver]\nport = 0\nport_https = 47984\ncertificate = \"c\"\nprivate_key = \"k\"",
 				"webserver.port",
@@ -412,6 +416,13 @@ mod tests {
 		let mut config = Config::default();
 		config.stream.audio.port = config.stream.control.port;
 		assert!(config.validate().unwrap_err().contains("UDP port"));
+
+		// The microphone port counts only while the microphone is on.
+		let mut config = Config::default();
+		config.stream.audio.microphone_port = config.stream.video.port;
+		assert!(config.validate().unwrap_err().contains("stream.audio.microphone_port"));
+		config.stream.audio.microphone = false;
+		assert_eq!(config.validate(), Ok(()));
 
 		// TCP and UDP listeners may share a number.
 		let mut config = Config::default();

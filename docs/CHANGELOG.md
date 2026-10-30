@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- **Client microphone.** Pyrolight and Nightjar can send their microphone to the host (Apollo's microphone stream, UDP port 48001). Game Mode applications get it as their default input device; in Desktop Mode it appears as **Pyroshine client microphone**. Lost packets are recovered from Opus error correction or concealed, and the delay stays within about 120 ms. On by default; turn it off with [`[stream.audio] microphone`](CONFIGURATION.md#streamaudio). Open UDP port 48001 in a firewall that limits the streaming ports.
+
 ## [v0.18.0-prerelease.2] - 2026-10-29
 
 ### Added

@@ -197,7 +197,7 @@ portable installer do not configure the firewall.
 | Protocol | Default ports | Purpose |
 | --- | --- | --- |
 | TCP | 47989, 47984, 48010 | HTTP, HTTPS, RTSP |
-| UDP | 47998, 47999, 48000 | Video, control/input, audio |
+| UDP | 47998, 47999, 48000, 48001 | Video, control/input, audio, client microphone |
 | UDP | 5353 | Local mDNS discovery |
 
 With UFW, replace the subnet with your trusted LAN:
@@ -206,7 +206,7 @@ With UFW, replace the subnet with your trusted LAN:
 sudo ufw allow from 192.168.1.0/24 to any port 47984 proto tcp
 sudo ufw allow from 192.168.1.0/24 to any port 47989 proto tcp
 sudo ufw allow from 192.168.1.0/24 to any port 48010 proto tcp
-sudo ufw allow from 192.168.1.0/24 to any port 47998:48000 proto udp
+sudo ufw allow from 192.168.1.0/24 to any port 47998:48001 proto udp
 ```
 
 Manual IP addition avoids mDNS when multicast is blocked or subnets differ.

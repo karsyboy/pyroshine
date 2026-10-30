@@ -579,7 +579,11 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"Video",
 			"Forward error correction, packet size and GPU queues.",
 		),
-		section("audio", "Audio", "Audio quality for clients that do not choose one."),
+		section(
+			"audio",
+			"Audio",
+			"Audio quality for clients that do not choose one, and the client microphone.",
+		),
 		section(
 			"input",
 			"Input & controllers",
@@ -663,6 +667,12 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		port("stream.video.port", "network", "Video port", "Video stream (UDP)."),
 		port("stream.audio.port", "network", "Audio port", "Audio stream (UDP)."),
 		port("stream.control.port", "network", "Control port", "Input and control stream (UDP)."),
+		port(
+			"stream.audio.microphone_port",
+			"network",
+			"Microphone port",
+			"Client microphone stream (UDP), used while the microphone is on.",
+		),
 		Field::new(
 			"stream.timeout",
 			"network",
@@ -813,6 +823,13 @@ pub(crate) fn config_schema() -> ConfigSchema {
 		)
 		.advanced()
 		.caution("Changing the server identity requires pairing every client again."),
+		Field::new(
+			"stream.audio.microphone",
+			"audio",
+			"Client microphone",
+			"Let clients that offer it (Pyrolight, Nightjar) send their microphone. Applications hear it as the session's microphone; in Desktop Mode, select \"Pyroshine client microphone\" as the input.",
+			FieldKind::Bool,
+		),
 		Field::new(
 			"stream.audio.quality",
 			"audio",

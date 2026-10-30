@@ -18,6 +18,7 @@ use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
 mod buffer;
 mod desktop;
 mod encoder;
+mod microphone;
 mod pulse_server;
 
 /// Configuration for the audio stream.
@@ -29,6 +30,13 @@ pub struct AudioStreamConfig {
 
 	/// Audio quality for clients that do not request one.
 	pub quality: AudioQuality,
+
+	/// Offer clients a microphone stream (Apollo's microphone passthrough)
+	/// and play it to applications as the session's microphone.
+	pub microphone: bool,
+
+	/// Port to receive the client's microphone on (UDP).
+	pub microphone_port: u16,
 }
 
 impl Default for AudioStreamConfig {
@@ -36,6 +44,8 @@ impl Default for AudioStreamConfig {
 		Self {
 			port: 48000,
 			quality: AudioQuality::default(),
+			microphone: true,
+			microphone_port: 48001,
 		}
 	}
 }
@@ -417,6 +427,8 @@ pub(crate) struct AudioStream {
 	pub pulse_socket_path: PathBuf,
 	pub(crate) desktop_sink: Option<String>,
 	udp_socket: tokio::net::UdpSocket,
+	/// The client's microphone; `None` when `[stream.audio] microphone` is off.
+	microphone: Option<microphone::MicrophoneSocket>,
 	source: AudioSource,
 	stop: ShutdownManager<SessionShutdownReason>,
 }
@@ -429,14 +441,16 @@ impl AudioStream {
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		if let AudioSource::Desktop { .. } = source {
-			let udp_socket = UdpSocket::bind((address, config.port))
+			let udp_socket = UdpSocket::bind((address.as_str(), config.port))
 				.await
 				.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
+			let microphone = bind_microphone(&config, &address).await;
 			return Ok(AudioStream {
 				pulse_socket: None,
 				pulse_socket_path: PathBuf::new(),
 				desktop_sink: None,
 				udp_socket,
+				microphone,
 				source,
 				stop,
 			});
@@ -457,9 +471,10 @@ impl AudioStream {
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
 
-		let udp_socket = UdpSocket::bind((address, config.port))
+		let udp_socket = UdpSocket::bind((address.as_str(), config.port))
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
+		let microphone = bind_microphone(&config, &address).await;
 
 		// Create the socket directory for the PulseAudio server.
 		std::fs::create_dir_all(pulse_socket_dir)
@@ -481,6 +496,7 @@ impl AudioStream {
 			pulse_socket_path,
 			desktop_sink: None,
 			udp_socket,
+			microphone,
 			source: AudioSource::Pulse,
 			stop,
 		})
@@ -508,13 +524,20 @@ impl AudioStream {
 		spawn_handle_audio_packets(
 			packet_rx,
 			self.udp_socket,
-			authorization_rx,
+			authorization_rx.clone(),
 			generation,
 			demand.clone(),
 			start.waiter(),
 			self.stop.clone(),
 			worker,
 		);
+
+		// The microphone plays through the audio source below; receiving it
+		// needs no start signal (the client sends only while it streams).
+		let microphone_feed = self.microphone.as_ref().map(microphone::MicrophoneSocket::feed);
+		if let Some(microphone) = self.microphone {
+			let _ = microphone.spawn(keys_rx.clone(), authorization_rx.clone(), self.stop.clone());
+		}
 
 		// Create frame channels for PulseServer and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
@@ -533,6 +556,7 @@ impl AudioStream {
 				self.stop.clone(),
 				pulse_reconfigure_rx,
 				generation,
+				microphone_feed,
 			)
 			.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?,
 			(AudioSource::Desktop { capture }, _) => desktop::DesktopAudio::spawn(
@@ -545,6 +569,7 @@ impl AudioStream {
 				self.stop.clone(),
 				pulse_reconfigure_rx,
 				generation,
+				microphone_feed,
 			)
 			.map_err(|e| tracing::error!("Failed to start desktop audio: {e}"))?,
 			(AudioSource::Pulse, None) => {
@@ -576,6 +601,24 @@ impl AudioStream {
 			pulse_reconfigure_tx,
 		})
 	}
+}
+
+/// The microphone socket, when the microphone is on. A port that cannot be
+/// bound costs only the microphone: clients that set it up get no audio from it.
+async fn bind_microphone(config: &AudioStreamConfig, address: &str) -> Option<microphone::MicrophoneSocket> {
+	if !config.microphone {
+		return None;
+	}
+	microphone::MicrophoneSocket::bind(address, config.microphone_port)
+		.await
+		.inspect_err(|error| {
+			tracing::warn!(
+				port = config.microphone_port,
+				%error,
+				"Cannot open the microphone port; the microphone is off for this session"
+			)
+		})
+		.ok()
 }
 
 /// `worker` was registered by the caller before spawning, so a stop before
@@ -927,6 +970,7 @@ mod tests {
 				AudioStream::new_in(
 					AudioStreamConfig {
 						port,
+						microphone: false,
 						..Default::default()
 					},
 					"127.0.0.1".into(),

@@ -1173,6 +1173,7 @@ async fn run_benchmark(
 		},
 		AudioStreamConfig {
 			port: 0,
+			microphone: false,
 			..Default::default()
 		},
 		ControlStreamConfig {

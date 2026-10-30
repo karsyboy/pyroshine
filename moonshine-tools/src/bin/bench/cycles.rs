@@ -461,6 +461,7 @@ fn session_manager(
 		},
 		AudioStreamConfig {
 			port: 0,
+			microphone: false,
 			..Default::default()
 		},
 		ControlStreamConfig {

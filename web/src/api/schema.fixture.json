@@ -73,6 +73,8 @@
     "name": "Pyroshine",
     "stream": {
       "audio": {
+        "microphone": true,
+        "microphone_port": 48001,
         "port": 48000,
         "quality": "standard"
       },
@@ -230,6 +232,18 @@
         },
         "label": "Control port",
         "path": "stream.control.port",
+        "required": false,
+        "section": "network"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Client microphone stream (UDP), used while the microphone is on.",
+        "kind": {
+          "type": "port"
+        },
+        "label": "Microphone port",
+        "path": "stream.audio.microphone_port",
         "required": false,
         "section": "network"
       },
@@ -484,6 +498,18 @@
         "path": "webserver.private_key",
         "required": false,
         "section": "security"
+      },
+      {
+        "advanced": false,
+        "caution": null,
+        "help": "Let clients that offer it (Pyrolight, Nightjar) send their microphone. Applications hear it as the session's microphone; in Desktop Mode, select \"Pyroshine client microphone\" as the input.",
+        "kind": {
+          "type": "bool"
+        },
+        "label": "Client microphone",
+        "path": "stream.audio.microphone",
+        "required": false,
+        "section": "audio"
       },
       {
         "advanced": false,
@@ -2515,7 +2541,7 @@
         "title": "Video"
       },
       {
-        "description": "Audio quality for clients that do not choose one.",
+        "description": "Audio quality for clients that do not choose one, and the client microphone.",
         "id": "audio",
         "title": "Audio"
       },

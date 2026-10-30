@@ -1373,6 +1373,7 @@ mod tests {
 		);
 		let audio = crate::session::stream::audio::AudioStreamConfig {
 			port,
+			microphone: false,
 			..Default::default()
 		};
 		assert!(

@@ -6,6 +6,13 @@
 //! Periods enter a buffer bounded to [`MAX_BUFFERED_PACKETS`]. Each packet tick
 //! drains it, padding with silence when the desktop is quiet; excess packets
 //! are dropped oldest first to prevent accumulated latency.
+//!
+//! With the microphone on, the same PipeWire connection also offers a
+//! "Pyroshine client microphone" source node that plays the client's
+//! microphone for as long as the session runs. It is not made the default
+//! source: the desktop's own choice stays untouched (and nothing needs
+//! restoring); applications select it like any other microphone. PipeWire
+//! removes the node with the connection, also when the server dies.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -18,6 +25,7 @@ use pw::spa::sys as spa_sys;
 use pw::spa::utils::Id;
 
 use super::PulseReconfigure;
+use super::microphone::{MICROPHONE_SAMPLE_RATE, MicrophoneFeed};
 use super::pulse_server::{AudioFrame, CAPTURE_SAMPLE_RATE};
 use crate::session::manager::SessionShutdownReason;
 
@@ -46,6 +54,7 @@ fn positions(channels: u8) -> &'static [u32] {
 			spa_sys::SPA_AUDIO_CHANNEL_SL,
 			spa_sys::SPA_AUDIO_CHANNEL_SR,
 		],
+		1 => &[spa_sys::SPA_AUDIO_CHANNEL_MONO],
 		_ => &[spa_sys::SPA_AUDIO_CHANNEL_FL, spa_sys::SPA_AUDIO_CHANNEL_FR],
 	}
 }
@@ -213,6 +222,81 @@ fn connect(
 	})
 }
 
+/// The client's microphone as a PipeWire source node.
+struct MicrophoneSource {
+	_listener: pw::stream::StreamListener<()>,
+	stream: pw::stream::StreamRc,
+}
+
+/// Frames written when PipeWire does not say how many it wants (10 ms).
+const MICROPHONE_FALLBACK_FRAMES: usize = (MICROPHONE_SAMPLE_RATE / 100) as usize;
+
+fn connect_microphone(core: &pw::core::CoreRc, feed: MicrophoneFeed) -> Result<MicrophoneSource, String> {
+	let latency = format!("{MICROPHONE_FALLBACK_FRAMES}/{MICROPHONE_SAMPLE_RATE}");
+	let stream = pw::stream::StreamRc::new(
+		core.clone(),
+		"pyroshine-microphone",
+		pw::properties::properties! {
+			*pw::keys::MEDIA_TYPE => "Audio",
+			*pw::keys::MEDIA_CLASS => "Audio/Source",
+			*pw::keys::MEDIA_ROLE => "Communication",
+			*pw::keys::NODE_NAME => "pyroshine.microphone",
+			*pw::keys::NODE_DESCRIPTION => "Pyroshine client microphone",
+			*pw::keys::NODE_LATENCY => latency.as_str(),
+			*pw::keys::APP_NAME => "Pyroshine",
+		},
+	)
+	.map_err(|e| format!("cannot create the PipeWire microphone: {e}"))?;
+	let mut samples: Vec<f32> = Vec::new();
+	let listener = stream
+		.add_local_listener::<()>()
+		.state_changed(|_, _, old, new| tracing::debug!(?old, ?new, "Microphone source state"))
+		.process(move |stream, _| {
+			let Some(mut buffer) = stream.dequeue_buffer() else {
+				return;
+			};
+			let requested = usize::try_from(buffer.requested()).unwrap_or(0);
+			let datas = buffer.datas_mut();
+			let Some(data) = datas.first_mut() else {
+				return;
+			};
+			let Some(bytes) = data.data() else {
+				return;
+			};
+			let capacity = bytes.len() / 4;
+			let frames = match requested {
+				0 => MICROPHONE_FALLBACK_FRAMES,
+				requested => requested,
+			}
+			.min(capacity);
+			samples.resize(frames, 0.0);
+			feed.pull(&mut samples);
+			for (out, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&samples) {
+				*out = sample.to_le_bytes();
+			}
+			let chunk = data.chunk_mut();
+			*chunk.offset_mut() = 0;
+			*chunk.stride_mut() = 4;
+			*chunk.size_mut() = (frames * 4) as u32;
+		})
+		.register()
+		.map_err(|e| format!("cannot listen to the PipeWire microphone: {e}"))?;
+	let pod = format_pod(1);
+	let mut params = [Pod::from_bytes(&pod).expect("serialized pod")];
+	stream
+		.connect(
+			pw::spa::utils::Direction::Output,
+			None,
+			pw::stream::StreamFlags::MAP_BUFFERS,
+			&mut params,
+		)
+		.map_err(|e| format!("cannot connect the PipeWire microphone: {e}"))?;
+	Ok(MicrophoneSource {
+		_listener: listener,
+		stream,
+	})
+}
+
 /// The desktop audio capture of a Desktop Mode session.
 pub(crate) struct DesktopAudio;
 
@@ -230,6 +314,7 @@ impl DesktopAudio {
 		stop: ShutdownManager<SessionShutdownReason>,
 		reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
 		generation: u64,
+		microphone: Option<MicrophoneFeed>,
 	) -> std::io::Result<()> {
 		crate::session::negotiation::validate_audio_packet_duration(packet_duration_ms)
 			.map_err(std::io::Error::other)?;
@@ -250,6 +335,7 @@ impl DesktopAudio {
 					stop,
 					reconfigure_rx,
 					generation,
+					microphone,
 				);
 			})?;
 		Ok(())
@@ -271,6 +357,7 @@ fn run(
 	stop: ShutdownManager<SessionShutdownReason>,
 	reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
 	mut generation: u64,
+	microphone: Option<MicrophoneFeed>,
 ) {
 	let mut clock = match mio_timerfd::TimerFd::new(mio_timerfd::ClockId::Monotonic) {
 		Ok(clock) => clock,
@@ -286,7 +373,7 @@ fn run(
 	}
 
 	// PipeWire is optional: without it (or with capture off) the stream is silent.
-	let pipewire = capture.then(|| -> Result<_, String> {
+	let pipewire = (capture || microphone.is_some()).then(|| -> Result<_, String> {
 		pw::init();
 		let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
 		let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
@@ -306,8 +393,14 @@ fn run(
 	if capture && pipewire.is_none() {
 		return;
 	}
+	let microphone_source = pipewire.as_ref().zip(microphone).and_then(|((_, _, core), feed)| {
+		connect_microphone(core, feed)
+			.inspect(|_| tracing::info!("Offering the client's microphone as a PipeWire source"))
+			.inspect_err(|error| tracing::warn!(%error, "The microphone is unavailable in Desktop Mode"))
+			.ok()
+	});
 	let must_capture = capture;
-	let mut capture = pipewire.as_ref().and_then(|(_, _, core)| {
+	let mut capture = capture.then_some(()).and(pipewire.as_ref()).and_then(|(_, _, core)| {
 		connect(core, channels, packet_frames(packet_duration_ms), sink.as_deref())
 			.inspect_err(|error| tracing::warn!(%error, "Desktop audio is unavailable; streaming silence"))
 			.ok()
@@ -343,13 +436,16 @@ fn run(
 				let _ = clock.set_timeout_interval(&interval(packet_duration_ms));
 				// A new format needs a new stream; PipeWire converts the sink's layout.
 				drop(capture.take());
-				capture = pipewire.as_ref().and_then(|(_, _, core)| {
-					connect(core, channels, packet_frames(packet_duration_ms), sink.as_deref())
-						.inspect_err(
-							|error| tracing::warn!(%error, "Desktop audio reconfiguration failed; streaming silence"),
-						)
-						.ok()
-				});
+				capture = must_capture
+					.then_some(())
+					.and(pipewire.as_ref())
+					.and_then(|(_, _, core)| {
+						connect(core, channels, packet_frames(packet_duration_ms), sink.as_deref())
+							.inspect_err(
+								|error| tracing::warn!(%error, "Desktop audio reconfiguration failed; streaming silence"),
+							)
+							.ok()
+					});
 				silence = PacketBuffer::new(channels, packet_frames(packet_duration_ms));
 				tracing::info!(channels, packet_duration_ms, "Reconfigured desktop audio capture");
 			} else if let Some(capture) = &capture {
@@ -428,6 +524,9 @@ fn run(
 	if let Some(capture) = capture {
 		let _ = capture.stream.disconnect();
 	}
+	if let Some(microphone) = microphone_source {
+		let _ = microphone.stream.disconnect();
+	}
 }
 
 #[cfg(test)]
@@ -458,6 +557,7 @@ mod tests {
 
 	#[test]
 	fn layouts_match_the_opus_channel_order() {
+		assert_eq!(positions(1), &[spa_sys::SPA_AUDIO_CHANNEL_MONO]);
 		assert_eq!(positions(2).len(), 2);
 		assert_eq!(positions(6)[3], spa_sys::SPA_AUDIO_CHANNEL_LFE);
 		assert_eq!(positions(8)[7], spa_sys::SPA_AUDIO_CHANNEL_SR);

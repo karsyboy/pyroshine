@@ -4,6 +4,7 @@ use std::time;
 use pulseaudio::protocol::{self as pulse, ClientInfoList};
 
 use crate::session::stream::audio::pulse_server::dyn_buffer::DynPlaybackBuffer;
+use crate::session::stream::audio::pulse_server::record::{self, RecordStream};
 use crate::session::stream::audio::pulse_server::{
 	Client, ClientWriter, Error, PlaybackStream, SINK_NAME, ServerState, StreamState, pop_missing,
 };
@@ -84,22 +85,176 @@ pub(super) fn handle_command(
 			write_reply(client, seq, &server.sinks, client.protocol_version)?;
 			Ok(())
 		},
-		pulse::Command::GetSourceInfo(_) => {
-			pulse::write_error(
-				&mut ClientWriter(&mut client.outgoing),
-				seq,
-				&pulse::PulseError::NoEntity,
-			)?;
+		pulse::Command::GetSourceInfo(params) => {
+			match server.sources.first().filter(|_| {
+				// A lookup by name or index; both unset is the default source.
+				record::selects_source(params.index, params.name.as_ref())
+			}) {
+				Some(source) => {
+					let mut source = source.clone();
+					source.muted = server.source_muted;
+					source.cvolume = linear_to_cvolume(&[server.source_volume]);
+					write_reply(client, seq, &source, client.protocol_version)?;
+				},
+				None => pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::NoEntity,
+				)?,
+			}
 			Ok(())
 		},
 		pulse::Command::GetSourceOutputInfoList => {
-			let reply: pulse::SourceOutputInfoList = Vec::new();
+			let reply: pulse::SourceOutputInfoList = client
+				.record_streams
+				.values()
+				.map(|stream| stream.source_output_info(client.id))
+				.collect();
 			write_reply(client, seq, &reply, client.protocol_version)?;
 			Ok(())
 		},
+		pulse::Command::GetSourceOutputInfo(index) => {
+			match client
+				.record_streams
+				.values()
+				.find(|stream| stream.stream_index == index)
+			{
+				Some(stream) => {
+					let info = stream.source_output_info(client.id);
+					write_reply(client, seq, &info, client.protocol_version)?;
+				},
+				None => pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::NoEntity,
+				)?,
+			}
+			Ok(())
+		},
 		pulse::Command::GetSourceInfoList => {
-			let reply: pulse::SourceInfoList = Vec::new();
+			let mut reply: pulse::SourceInfoList = server.sources.clone();
+			for source in &mut reply {
+				source.muted = server.source_muted;
+				source.cvolume = linear_to_cvolume(&[server.source_volume]);
+			}
 			write_reply(client, seq, &reply, client.protocol_version)?;
+			Ok(())
+		},
+		pulse::Command::LookupSource(name) => {
+			if !server.sources.is_empty() && record::selects_source(None, Some(&name)) {
+				write_reply(
+					client,
+					seq,
+					&pulse::LookupReply(record::SOURCE_INDEX),
+					client.protocol_version,
+				)?;
+			} else {
+				pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::NoEntity,
+				)?;
+			}
+			Ok(())
+		},
+		pulse::Command::CreateRecordStream(params) => create_record_stream(client, server, seq, params),
+		pulse::Command::DeleteRecordStream(channel) => {
+			client.record_streams.remove(&channel);
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::CorkRecordStream(params) => {
+			if let Some(stream) = client.record_streams.get_mut(&params.channel) {
+				stream.corked = params.cork;
+			}
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::FlushRecordStream(channel) => {
+			if let Some(stream) = client.record_streams.get_mut(&channel) {
+				stream.flush();
+			}
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::GetRecordLatency(pulse::LatencyParams { channel, now, .. }) => {
+			if let Some(stream) = client.record_streams.get(&channel) {
+				let reply = pulse::RecordLatency {
+					sink_usec: 0,
+					source_usec: 0,
+					playing: !stream.corked,
+					local_time: now,
+					remote_time: time::SystemTime::now(),
+					write_offset: (stream.sent + stream.pending_bytes() as u64) as i64,
+					read_offset: stream.sent as i64,
+				};
+				write_reply(client, seq, &reply, client.protocol_version)?;
+			} else {
+				pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::NoEntity,
+				)?;
+			}
+			Ok(())
+		},
+		pulse::Command::SetRecordStreamBufferAttr(params) => {
+			if let Some(stream) = client.record_streams.get_mut(&params.index) {
+				stream.buffer_attr = params.buffer_attr;
+				record::configure_record_buffer(&mut stream.buffer_attr, &stream.spec);
+				let buffer_attr = stream.buffer_attr;
+				write_reply(
+					client,
+					seq,
+					&pulse::SetRecordStreamBufferAttrReply {
+						buffer_attr,
+						configured_source_latency: 0,
+					},
+					client.protocol_version,
+				)?;
+			} else {
+				pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::NoEntity,
+				)?;
+			}
+			Ok(())
+		},
+		pulse::Command::SetRecordStreamName(_)
+		| pulse::Command::UpdateRecordStreamProplist(_)
+		| pulse::Command::RemoveRecordStreamProplist(_)
+		| pulse::Command::SetDefaultSource(_)
+		| pulse::Command::SuspendSource(_) => {
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::SetSourceVolume(params) => {
+			server.source_volume = cvolume_to_linear(&params.volume, 1)[0];
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::SetSourceMute(params) => {
+			server.source_muted = params.mute;
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::SetSourceOutputVolume(params) => {
+			for stream in client.record_streams.values_mut() {
+				if stream.stream_index == params.index {
+					stream.volume = cvolume_to_linear(&params.volume, 1)[0];
+				}
+			}
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
+			Ok(())
+		},
+		pulse::Command::SetSourceOutputMute(params) => {
+			for stream in client.record_streams.values_mut() {
+				if stream.stream_index == params.index {
+					stream.muted = params.mute;
+				}
+			}
+			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
 			Ok(())
 		},
 		pulse::Command::Subscribe(_) => {
@@ -513,6 +668,142 @@ pub(super) fn handle_command(
 			)?;
 			Ok(())
 		},
+	}
+}
+
+/// A record stream from the microphone source, in the format the client asks
+/// for; refused when the microphone is off or another source is named.
+fn create_record_stream(
+	client: &mut Client,
+	server: &mut ServerState,
+	seq: u32,
+	params: pulse::RecordStreamParams,
+) -> Result<(), Error> {
+	if server.sources.is_empty() || !record::selects_source(params.source_index, params.source_name.as_ref()) {
+		tracing::debug!(
+			source = ?params.source_name,
+			"Refusing a record stream: the only source is the microphone, when it is on"
+		);
+		pulse::write_error(
+			&mut ClientWriter(&mut client.outgoing),
+			seq,
+			&pulse::PulseError::NoEntity,
+		)?;
+		return Ok(());
+	}
+
+	let mut sample_spec = params.sample_spec;
+	let mut spec_from_formats = false;
+	if sample_spec.format == pulse::SampleFormat::Invalid
+		&& let Some(format) = params.formats.iter().find_map(|f| sample_spec_from_format(f).ok())
+	{
+		sample_spec = format;
+		spec_from_formats = true;
+	}
+	let source = &server.sources[0];
+	let mut channel_map = params.channel_map;
+	// Flags that leave a property to the source take the source's.
+	if params.flags.fix_format {
+		sample_spec.format = source.sample_spec.format;
+	}
+	if params.flags.fix_rate {
+		sample_spec.sample_rate = source.sample_spec.sample_rate;
+	}
+	if params.flags.fix_channels {
+		sample_spec.channels = source.sample_spec.channels;
+		channel_map = source.channel_map;
+	}
+	let explicit_map = (!params.flags.fix_channels && !spec_from_formats).then_some(&channel_map);
+	if let Err(reason) = validate_sample_spec(&sample_spec, explicit_map) {
+		tracing::warn!("rejecting record stream: {reason}");
+		pulse::write_error(
+			&mut ClientWriter(&mut client.outgoing),
+			seq,
+			&pulse::PulseError::Invalid,
+		)?;
+		return Ok(());
+	}
+	if channel_map.num_channels() != sample_spec.channels {
+		channel_map = match sample_spec.channels {
+			1 => pulse::ChannelMap::mono(),
+			2 => pulse::ChannelMap::stereo(),
+			channels => {
+				tracing::warn!(channels, "rejecting record stream: no channel map");
+				pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::Invalid,
+				)?;
+				return Ok(());
+			},
+		};
+	}
+
+	let mut buffer_attr = params.buffer_attr;
+	record::configure_record_buffer(&mut buffer_attr, &sample_spec);
+	let stream_index = server.next_stream_index;
+	let mut stream = match RecordStream::new(
+		stream_index,
+		sample_spec,
+		channel_map,
+		buffer_attr,
+		params.flags.start_corked,
+		server.tick_frames,
+	) {
+		Ok(stream) => stream,
+		Err(reason) => {
+			tracing::warn!("rejecting record stream: {reason}");
+			pulse::write_error(
+				&mut ClientWriter(&mut client.outgoing),
+				seq,
+				&pulse::PulseError::NotSupported,
+			)?;
+			return Ok(());
+		},
+	};
+	stream.muted = params.flags.start_muted == Some(true);
+	if let Some(volume) = &params.cvolume {
+		stream.volume = cvolume_to_linear(volume, 1)[0];
+	}
+	server.next_stream_index += 1;
+	let channel = server.next_record_channel_index;
+	server.next_record_channel_index += 1;
+	client.record_streams.insert(channel, stream);
+	tracing::debug!(
+		?sample_spec,
+		fragment = buffer_attr.fragment_size,
+		"Microphone record stream created"
+	);
+
+	let reply = pulse::CreateRecordStreamReply {
+		channel,
+		stream_index,
+		buffer_attr,
+		sample_spec,
+		channel_map,
+		stream_latency: 0,
+		sink_index: record::SOURCE_INDEX,
+		sink_name: Some(CString::new(record::SOURCE_NAME).unwrap()),
+		suspended: false,
+		format: format_info(&sample_spec),
+	};
+	write_reply(client, seq, &reply, client.protocol_version)
+}
+
+/// The PCM `FormatInfo` of a stream's sample spec.
+fn format_info(spec: &pulse::SampleSpec) -> pulse::FormatInfo {
+	let mut props = pulse::Props::new();
+	props.set(
+		pulse::Prop::FormatChannels,
+		CString::new(spec.channels.to_string()).unwrap(),
+	);
+	props.set(
+		pulse::Prop::FormatRate,
+		CString::new(spec.sample_rate.to_string()).unwrap(),
+	);
+	pulse::FormatInfo {
+		encoding: pulse::FormatEncoding::Pcm,
+		props,
 	}
 }
 

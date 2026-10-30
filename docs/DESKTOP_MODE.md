@@ -81,6 +81,12 @@ silent. On exit the saved default output and surviving streams' destinations
 are restored, using an available output if a saved audio device is missing.
 With `audio = false`, playback routing stays local.
 
+A client that sends its microphone ([`[stream.audio] microphone`](CONFIGURATION.md#streamaudio))
+appears as the **Pyroshine client microphone** input for the session's
+lifetime, whatever `audio` is set to. It does not become the default input;
+select it in the application or the desktop's sound settings. It is removed
+with the session, so there is nothing to restore.
+
 A lost controlling connection starts `disconnect_grace_secs` (0–86400 seconds).
 An authenticated reconnect before expiry cancels that deadline. Changed client
 modes prepare and validate a replacement output before switching. **End Session**

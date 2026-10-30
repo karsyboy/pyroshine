@@ -128,7 +128,7 @@ fn create_encoder(
 /// GameStream audio AES-CBC IV: big-endian `rikeyid + RTP sequence number`,
 /// zero-padded. The client computes this sum in wrapping 32-bit arithmetic, so
 /// any accepted key ID (including those near `u32::MAX`) must wrap here too.
-fn audio_iv(key_id: RemoteInputKeyId, sequence_number: u16) -> [u8; 16] {
+pub(super) fn audio_iv(key_id: RemoteInputKeyId, sequence_number: u16) -> [u8; 16] {
 	let mut iv = [0u8; 16];
 	iv[..4].copy_from_slice(&key_id.get().wrapping_add(u32::from(sequence_number)).to_be_bytes());
 	iv

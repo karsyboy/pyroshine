@@ -123,8 +123,8 @@ listeners accessible only over a trusted LAN or VPN. Startup refuses a
 configuration in which a listener port is 0 (clients are told these ports, so
 they must be fixed), two TCP listeners (`webserver.port`,
 `webserver.port_https`, `stream.port`) or two UDP listeners
-(`stream.video.port`, `stream.audio.port`, `stream.control.port`) share a
-port, `[stream].timeout` is outside 1–86400, or whose `address` is not an IP
+(`stream.video.port`, `stream.audio.port`, `stream.control.port` and, while the
+microphone is on, `stream.audio.microphone_port`) share a port, `[stream].timeout` is outside 1–86400, or whose `address` is not an IP
 address. The web interface's settings editor applies the same checks.
 
 Pair through the [web interface](MANAGEMENT.md#pair-a-client) or
@@ -243,6 +243,8 @@ Requests whose datagram would exceed one UDP payload (65507 bytes) are rejected.
 | --- | --- | --- |
 | `port` | integer, `48000` | Audio listener port (UDP). |
 | `quality` | string, `"standard"` | Opus bitrate for clients that do not request one: `standard`, `high` or `maximum` (table below). Pyrolight sends its own **Audio quality** setting, which takes precedence. |
+| `microphone` | boolean, `true` | Let clients send their microphone (Pyrolight's **Send microphone to the host**, Nightjar's **Send microphone to the PC**). The client turns it on; nothing is received otherwise. Game Mode applications get it as the default input device; in Desktop Mode, choose **Pyroshine client microphone** as the input. |
+| `microphone_port` | integer, `48001` | Microphone listener port (UDP), used while `microphone` is on. |
 
 | Layout | `standard` | `high` | `maximum` |
 | --- | --- | --- | --- |

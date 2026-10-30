@@ -1552,7 +1552,7 @@ fn check_kcmp(report: &mut HealthReport) {
 fn check_ports(report: &mut HealthReport, config: &Config) {
 	let start = Instant::now();
 
-	let ports: &[(u16, &str, bool)] = &[
+	let mut ports: Vec<(u16, &str, bool)> = vec![
 		(config.webserver.port, "HTTP", true),
 		(config.webserver.port_https, "HTTPS", true),
 		(config.stream.port, "RTSP", true),
@@ -1560,11 +1560,14 @@ fn check_ports(report: &mut HealthReport, config: &Config) {
 		(config.stream.audio.port, "Audio UDP", false),
 		(config.stream.control.port, "Control UDP", false),
 	];
+	if config.stream.audio.microphone {
+		ports.push((config.stream.audio.microphone_port, "Microphone UDP", false));
+	}
 
 	let mut failed = Vec::new();
 	let mut ok_list = Vec::new();
 
-	for &(port, name, is_tcp) in ports {
+	for (port, name, is_tcp) in ports {
 		let result = if is_tcp {
 			std::net::TcpListener::bind((config.address.as_str(), port)).map(|_| ())
 		} else {
@@ -1603,11 +1606,14 @@ fn check_ports_in_server(report: &mut HealthReport, config: &Config, session_act
 		"HTTP({}), HTTPS({}), RTSP({}) served by Pyroshine",
 		config.webserver.port, config.webserver.port_https, config.stream.port
 	)];
-	let udp = [
+	let mut udp = vec![
 		(config.stream.video.port, "Video UDP"),
 		(config.stream.audio.port, "Audio UDP"),
 		(config.stream.control.port, "Control UDP"),
 	];
+	if config.stream.audio.microphone {
+		udp.push((config.stream.audio.microphone_port, "Microphone UDP"));
+	}
 	if session_active {
 		ok_list.push("UDP stream ports in use by the session".into());
 	} else {

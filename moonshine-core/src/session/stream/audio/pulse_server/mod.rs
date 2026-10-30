@@ -1,5 +1,6 @@
 mod commands;
 mod dyn_buffer;
+mod record;
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
@@ -16,6 +17,7 @@ use dyn_buffer::DynPlaybackBuffer;
 
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::PulseReconfigure;
+use crate::session::stream::audio::microphone::MicrophoneFeed;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -145,6 +147,7 @@ struct Client {
 	outgoing: BytesMut,
 	writable_registered: bool,
 	playback_streams: BTreeMap<u32, PlaybackStream>,
+	record_streams: BTreeMap<u32, record::RecordStream>,
 }
 
 /// Outcome of attempting to flush a client's outgoing buffer.
@@ -203,6 +206,13 @@ struct ServerState {
 	sink_muted: bool,
 	capture_channels: u8,
 	capture_spec: pulse::SampleSpec,
+	/// The microphone source; empty when the microphone is off.
+	sources: Vec<pulse::SourceInfo>,
+	next_record_channel_index: u32,
+	source_volume: f32,
+	source_muted: bool,
+	/// Source frames per clock tick.
+	tick_frames: usize,
 }
 
 pub(crate) struct PulseServer {
@@ -219,6 +229,10 @@ pub(crate) struct PulseServer {
 	clients: BTreeMap<mio::Token, Client>,
 	server_state: ServerState,
 	reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
+
+	/// The client's microphone, played by the microphone source.
+	microphone: Option<MicrophoneFeed>,
+	microphone_tick: Vec<f32>,
 
 	epoch: time::Instant,
 }
@@ -277,6 +291,7 @@ impl PulseServer {
 		stop: ShutdownManager<SessionShutdownReason>,
 		reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
 		generation: u64,
+		microphone: Option<MicrophoneFeed>,
 	) -> Result<(), Error> {
 		listener.set_nonblocking(true)?;
 		let listener = UnixListener::from_std(listener);
@@ -315,7 +330,9 @@ impl PulseServer {
 			server_version: Some(std::ffi::CString::new(env!("CARGO_PKG_VERSION")).unwrap()),
 			host_name: Some(std::ffi::CString::new("moonshine").unwrap()),
 			default_sink_name: Some(sink_name.clone()),
-			default_source_name: Some(std::ffi::CString::new("").unwrap()),
+			default_source_name: Some(
+				std::ffi::CString::new(if microphone.is_some() { record::SOURCE_NAME } else { "" }).unwrap(),
+			),
 			sample_spec: capture_spec,
 			channel_map,
 			..Default::default()
@@ -372,8 +389,19 @@ impl PulseServer {
 				sink_muted: false,
 				capture_channels: channels,
 				capture_spec,
+				sources: if microphone.is_some() {
+					vec![record::source_info()]
+				} else {
+					Vec::new()
+				},
+				next_record_channel_index: 0,
+				source_volume: 1.0,
+				source_muted: false,
+				tick_frames: (CAPTURE_SAMPLE_RATE / clock_rate_hz) as usize,
 			},
 			reconfigure_rx,
+			microphone,
+			microphone_tick: Vec::new(),
 			epoch: time::Instant::now(),
 		};
 
@@ -489,6 +517,7 @@ impl PulseServer {
 								outgoing: BytesMut::new(),
 								writable_registered: false,
 								playback_streams: BTreeMap::new(),
+								record_streams: BTreeMap::new(),
 							},
 						);
 					},
@@ -553,6 +582,19 @@ impl PulseServer {
 		self.clock
 			.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / u64::from(clock_rate_hz)))?;
 		self.clock_rate_hz = clock_rate_hz;
+		let tick_frames = (CAPTURE_SAMPLE_RATE / clock_rate_hz) as usize;
+		if tick_frames != self.server_state.tick_frames {
+			self.server_state.tick_frames = tick_frames;
+			for client in self.clients.values_mut() {
+				for stream in client.record_streams.values_mut() {
+					stream.flush();
+					if let Err(error) = stream.set_tick_frames(tick_frames) {
+						tracing::error!(%error, "Cannot follow the new packet duration; muting a record stream");
+						stream.muted = true;
+					}
+				}
+			}
+		}
 		if channels == self.server_state.capture_channels {
 			return Ok(());
 		}
@@ -897,6 +939,8 @@ impl PulseServer {
 			}
 		}
 
+		self.record_tick(num_frames as usize)?;
+
 		// Flush pending output for all clients. WouldBlock is handled gracefully
 		// (buffered + WRITABLE interest); a stuck client is dropped, never the
 		// whole server.
@@ -930,6 +974,35 @@ impl PulseServer {
 	}
 }
 
+impl PulseServer {
+	/// Play one tick of the microphone to every running record stream. The
+	/// feed is drained every tick, recorded or not, so it never holds old audio.
+	fn record_tick(&mut self, frames: usize) -> Result<(), Error> {
+		let Some(feed) = &self.microphone else {
+			return Ok(());
+		};
+		self.microphone_tick.resize(frames, 0.0);
+		feed.pull(&mut self.microphone_tick);
+		if self.server_state.source_muted {
+			self.microphone_tick.fill(0.0);
+		} else if self.server_state.source_volume != 1.0 {
+			let volume = self.server_state.source_volume;
+			self.microphone_tick.iter_mut().for_each(|sample| *sample *= volume);
+		}
+		for client in self.clients.values_mut() {
+			for (&channel, stream) in client.record_streams.iter_mut() {
+				if stream.corked {
+					continue;
+				}
+				if let Some(chunk) = stream.push(&self.microphone_tick) {
+					pulse::write_memblock(&mut ClientWriter(&mut client.outgoing), channel, &chunk, 0)?;
+				}
+			}
+		}
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 mod epoch_tests {
 	use super::*;
@@ -953,6 +1026,7 @@ mod epoch_tests {
 			stop.clone(),
 			command_rx,
 			1,
+			None,
 		)
 		.unwrap();
 		let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
@@ -1044,6 +1118,7 @@ mod receive_tests {
 				stop.clone(),
 				command_rx,
 				1,
+				None,
 			)
 			.unwrap();
 			Self {
@@ -1659,6 +1734,7 @@ mod receive_tests {
 				stop.clone(),
 				command_rx,
 				1,
+				None,
 			)
 			.unwrap();
 			let pacat = |frames: usize| {
@@ -1754,5 +1830,129 @@ mod receive_tests {
 				.await
 				.expect("stop after real clients");
 		}
+	}
+
+	/// Real libpulse clients see the microphone as the default source and
+	/// record it in the format they ask for (`parecord`, resampled to 16 kHz
+	/// stereo s16 and at 48 kHz mono float); without a client microphone the
+	/// source is silent.
+	/// `MOONSHINE_TEST_PULSE_CLIENT=1 cargo test -p moonshine-core real_pulse_clients_record -- --ignored`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs parecord and pactl (libpulse): MOONSHINE_TEST_PULSE_CLIENT=1"]
+	async fn real_pulse_clients_record_the_microphone() {
+		use std::process::{Command, Stdio};
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_PULSE_CLIENT").is_some(),
+			"set MOONSHINE_TEST_PULSE_CLIENT=1"
+		);
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("native");
+		let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+		let (frame_tx, frames) = crossbeam_channel::bounded(3);
+		let (_recycle, recycle_rx) = crossbeam_channel::bounded(3);
+		let (_commands, command_rx) = crossbeam_channel::unbounded();
+		let stop = ShutdownManager::new();
+		let feed = MicrophoneFeed::default();
+		PulseServer::spawn(
+			listener,
+			path.clone(),
+			2,
+			10,
+			frame_tx,
+			recycle_rx,
+			stop.clone(),
+			command_rx,
+			1,
+			Some(feed.clone()),
+		)
+		.unwrap();
+		// The encoder side keeps the clock's frames flowing.
+		let drain = std::thread::spawn(move || while frames.recv_timeout(time::Duration::from_secs(1)).is_ok() {});
+		let server = format!("--server=unix:{}", path.display());
+
+		let pactl = |args: &[&str]| {
+			let output = Command::new("pactl").arg(&server).args(args).output().expect("pactl");
+			assert!(
+				output.status.success(),
+				"pactl {args:?}: {}",
+				String::from_utf8_lossy(&output.stderr)
+			);
+			String::from_utf8_lossy(&output.stdout).into_owned()
+		};
+		assert!(pactl(&["get-default-source"]).contains(record::SOURCE_NAME));
+		assert!(pactl(&["list", "short", "sources"]).contains(record::SOURCE_NAME));
+
+		// Records for `seconds` while `speak` decides whether the client sends.
+		let record = |format: &str, rate: u32, channels: u8, speak: bool| {
+			let mut child = Command::new("parecord")
+				.args([
+					server.as_str(),
+					"--raw",
+					&format!("--format={format}"),
+					&format!("--rate={rate}"),
+					&format!("--channels={channels}"),
+					"--latency-msec=20",
+				])
+				.stdout(Stdio::piped())
+				.stderr(Stdio::null())
+				.spawn()
+				.expect("parecord");
+			let mut stdout = child.stdout.take().unwrap();
+			let reader = std::thread::spawn(move || {
+				let mut bytes = Vec::new();
+				let _ = std::io::Read::read_to_end(&mut stdout, &mut bytes);
+				bytes
+			});
+			let start = time::Instant::now();
+			while start.elapsed() < time::Duration::from_secs(1) {
+				if speak {
+					feed.push(&[0.5; 480]);
+				}
+				std::thread::sleep(time::Duration::from_millis(10));
+			}
+			child.kill().unwrap();
+			child.wait().unwrap();
+			reader.join().unwrap()
+		};
+
+		let voice = record("s16le", 16000, 2, true);
+		let samples: Vec<i16> = voice
+			.as_chunks::<2>()
+			.0
+			.iter()
+			.map(|b| i16::from_le_bytes(*b))
+			.collect();
+		assert!(
+			samples.len() > 16000,
+			"about a second of stereo 16 kHz: {} samples",
+			samples.len()
+		);
+		let loud = samples.iter().filter(|s| (i32::from(**s) - 16384).abs() < 2000).count();
+		assert!(
+			loud > samples.len() / 2,
+			"the microphone is heard: {loud} of {}",
+			samples.len()
+		);
+
+		let float = record("float32le", 48000, 1, true);
+		let samples: Vec<f32> = float
+			.as_chunks::<4>()
+			.0
+			.iter()
+			.map(|b| f32::from_le_bytes(*b))
+			.collect();
+		assert!(samples.iter().filter(|s| (**s - 0.5).abs() < 1e-3).count() > samples.len() / 2);
+
+		let quiet = record("s16le", 48000, 1, false);
+		assert!(
+			!quiet.is_empty() && quiet.iter().all(|&b| b == 0),
+			"silent without a client microphone"
+		);
+
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(time::Duration::from_secs(2), stop.wait_shutdown_complete())
+			.await
+			.expect("stop after recording");
+		drain.join().unwrap();
 	}
 }

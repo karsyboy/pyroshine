@@ -127,6 +127,11 @@ requires = ["pacat"]
 env = { MOONSHINE_TEST_PULSE_CLIENT = "1" }
 
 [[test]]
+name = "session::stream::audio::pulse_server::receive_tests::real_pulse_clients_record_the_microphone"
+requires = ["pacat"]
+env = { MOONSHINE_TEST_PULSE_CLIENT = "1" }
+
+[[test]]
 name = "session::stream::control::input::gamepad::compatibility_tests::native_devices_join_their_threads_on_destruction"
 requires = ["input-devices"]
 env = { MOONSHINE_TEST_DEVICES = "1" }

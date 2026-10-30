@@ -84,7 +84,7 @@ flowchart LR
 | `session/capture/` | Capture backend selection, start and readiness contract, capabilities, output mode; the shared frame contract (`frame.rs`) and capture admission (`admission.rs`) | Scene, focus, encoding |
 | `session/compositor/` | The isolated capture backend: Wayland/XWayland server, scene, focus, cursor, Steam classification, output, capture and frame export | Codec negotiation, transport |
 | `session/stream/video/` | Import, convert and encode captured frames; packetize, protect, encrypt, pace and send | Scene composition |
-| `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP | — |
+| `session/stream/audio/` | PulseAudio-compatible capture server, Opus encoding, FEC, encryption and UDP; the client microphone (`microphone.rs`: receive, decrypt, Opus decode, bounded playout feed) played as a Pulse source or a Desktop Mode PipeWire source | — |
 | `session/stream/control/` | ENet control channel, peer authorization, input decoding and routing, virtual controllers, client feedback | Wayland focus |
 | `management/` | Session-bus management interface: status, pairing, clients, configuration store, telemetry aggregation | Session, pairing or trust decisions (it calls the owners) |
 | `gpu_sensors/` | Capture GPU sensors and per-process GPU time for telemetry and support bundles | Anything on a media path (it runs on blocking threads, once per second) |
@@ -111,7 +111,8 @@ runs on dedicated threads that communicate through bounded channels:
 | `compositor` thread | calloop event loop: Wayland dispatch, XWayland, input injection, refresh timer, scene capture |
 | `video-pipeline` thread | DMA-BUF import, conversion and encoding (Pixelforge or PyroWave) |
 | Video packet task | Packetization, FEC, encryption, pacing and UDP send |
-| `pulse-server` thread | PulseAudio protocol server for the application |
+| `pulse-server` thread | PulseAudio protocol server for the application, including the microphone source's record streams |
+| Microphone receive task | Receives, decrypts and decodes the client's microphone datagrams into the playout feed; failures cost only the microphone |
 | `audio-encode` thread and audio packet task | Opus encoding, audio FEC/encryption and UDP send |
 | Control task | ENet service loop, message decoding, input routing, feedback |
 | `gamepad-input` thread | Inputtino virtual controller state and native feedback callbacks |

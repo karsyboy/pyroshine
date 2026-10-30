@@ -1,4 +1,5 @@
 use aes::cipher::Array;
+use aes::cipher::BlockModeDecrypt;
 use aes::cipher::BlockModeEncrypt;
 use aes::cipher::KeyIvInit;
 use aes_gcm::{
@@ -57,4 +58,40 @@ pub(crate) fn encrypt_cbc(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>,
 		.encrypt_padded::<Pkcs7>(&mut buffer, data.len())
 		.map_err(|_| "Buffer too small for CBC encryption")?;
 	Ok(ct.to_vec())
+}
+
+/// AES-128-CBC decryption with PKCS#7 padding removed.
+pub(crate) fn decrypt_cbc(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+	let key: &Array<u8, _> = key.try_into().map_err(|_| "Invalid CBC key length")?;
+	let iv: &Array<u8, _> = iv.try_into().map_err(|_| "Invalid CBC IV length")?;
+	if data.is_empty() || !data.len().is_multiple_of(16) {
+		return Err("CBC ciphertext is not a whole number of blocks".into());
+	}
+
+	let cipher = cbc::Decryptor::<aes::Aes128>::new(key, iv);
+	let mut buffer = data.to_vec();
+	let plaintext = cipher
+		.decrypt_padded::<Pkcs7>(&mut buffer)
+		.map_err(|_| "Invalid CBC padding")?;
+	let len = plaintext.len();
+	buffer.truncate(len);
+	Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn cbc_round_trips_every_padding_length() {
+		let key = [7u8; 16];
+		let iv = [9u8; 16];
+		for len in 0..40 {
+			let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+			let sealed = encrypt_cbc(&data, &key, &iv).unwrap();
+			assert_eq!(decrypt_cbc(&sealed, &key, &iv).unwrap(), data, "len {len}");
+		}
+		assert!(decrypt_cbc(&[0; 15], &key, &iv).is_err());
+		assert!(decrypt_cbc(&[], &key, &iv).is_err());
+	}
 }

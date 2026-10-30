@@ -47,6 +47,8 @@ enum EncryptionFlags {
 	ControlV2 = 0x01,
 	Video = 0x02,
 	Audio = 0x04,
+	/// Apollo's microphone stream; it is always encrypted.
+	Microphone = 0x08,
 }
 
 /// Concurrent RTSP connections. Moonlight sends one request per connection,
@@ -183,6 +185,9 @@ impl RtspServer {
 		if self.video_config.encrypt {
 			flags |= EncryptionFlags::Video as u8;
 		}
+		if self.audio_config.microphone {
+			flags |= EncryptionFlags::Microphone as u8;
+		}
 		flags
 	}
 
@@ -240,6 +245,15 @@ impl RtspServer {
 			"a=x-moonshine-audio.quality:{}\r\n",
 			AudioQuality::MAX.level()
 		));
+		// Apollo's microphone offer: the mono Opus rtpmap is what clients look
+		// for, after the `m=audio` line naming the port. Clients without
+		// microphone support ignore these lines and the encryption bit.
+		if self.audio_config.microphone {
+			result.push_str(&format!(
+				"m=audio {} RTP/AVP 96\r\na=rtpmap:96 opus/48000/1\r\na=fmtp:96 minptime=10;useinbandfec=1\r\n",
+				self.audio_config.microphone_port
+			));
+		}
 
 		result
 	}
@@ -303,6 +317,7 @@ impl RtspServer {
 						Some("video") => ("video", self.video_config.port),
 						Some("audio") => ("audio", self.audio_config.port),
 						Some("control") => ("control", self.control_config.port),
+						Some("mic") if self.audio_config.microphone => ("mic", self.audio_config.microphone_port),
 						Some(stream) => {
 							tracing::warn!("Unknown stream '{stream}'");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
@@ -325,6 +340,8 @@ impl RtspServer {
 					response = match stream_id {
 						"audio" => response.header(PING_PAYLOAD_HEADER.clone(), grant.ping_payload(MediaStream::Audio)),
 						"video" => response.header(PING_PAYLOAD_HEADER.clone(), grant.ping_payload(MediaStream::Video)),
+						// The microphone flows only from the client: nothing to discover.
+						"mic" => response,
 						_ => response.header(CONNECT_DATA_HEADER.clone(), grant.control_connect_data().to_string()),
 					};
 					return response.build(Vec::new());
@@ -409,6 +426,9 @@ impl RtspServer {
 		let client_encryption_flags: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
 		let encrypt_video = self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0);
+		if self.audio_config.microphone && client_encryption_flags & EncryptionFlags::Microphone as u8 != 0 {
+			tracing::info!("The client will send its microphone (encrypted)");
+		}
 		let packet_size = self
 			.video_config
 			.clamp_packet_size(requested_packet_size, encrypt_video);
@@ -1457,6 +1477,53 @@ mod tests {
 					"review 2026-10-05 CFG-001: SETUP advertised port 0 for {stream} from a validated configuration"
 				);
 			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+
+		/// The microphone is offered as Apollo does (mono Opus rtpmap after an
+		/// `m=audio` line with the port, encryption bit 8) and set up on its
+		/// port; with the microphone off there is neither.
+		#[tokio::test]
+		async fn the_microphone_is_offered_and_set_up_only_when_on() {
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			let setup = |server: &RtspServer| {
+				let raw = normalize_request_target(
+					b"SETUP streamid=mic/0/0 RTSP/1.0\r\nCSeq: 5\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\n\r\n"
+						.to_vec(),
+				);
+				let (rtsp_types::Message::Request(request), _) = rtsp_types::Message::<Vec<u8>>::parse(&raw).unwrap()
+				else {
+					panic!("SETUP fixture is a request");
+				};
+				server.handle_setup_request(&request, 5, &grant)
+			};
+
+			server.audio_config.microphone_port = 48123;
+			let description = server.description();
+			let offer = description
+				.find("m=audio 48123 RTP/AVP 96\r\n")
+				.expect("the port is offered");
+			assert!(description[offer..].contains("a=rtpmap:96 opus/48000/1\r\n"));
+			let supported = server.encryption_flags_supported();
+			assert_ne!(supported & EncryptionFlags::Microphone as u8, 0);
+			let response = setup(&server);
+			assert_eq!(response.status(), rtsp_types::StatusCode::Ok);
+			assert_eq!(
+				response.header(&headers::TRANSPORT).unwrap().as_str(),
+				"server_port=48123"
+			);
+
+			server.audio_config.microphone = false;
+			let description = server.description();
+			assert!(!description.contains("m=audio") && !description.contains("opus/48000/1"));
+			assert_eq!(
+				server.encryption_flags_supported() & EncryptionFlags::Microphone as u8,
+				0
+			);
+			assert_eq!(setup(&server).status(), rtsp_types::StatusCode::BadRequest);
 			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 		}
 	}
