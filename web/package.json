@@ -1,7 +1,7 @@
 {
   "name": "pyroshine-web",
   "private": true,
-  "version": "0.18.0-prerelease.2",
+  "version": "0.18.0-prerelease.3",
   "description": "Pyroshine web management interface: pairing, clients, dashboard, settings, history and diagnostics",
   "license": "BSD-2-Clause",
   "type": "module",
