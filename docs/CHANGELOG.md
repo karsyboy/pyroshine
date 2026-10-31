@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.0-prerelease.4] - 2026-10-31
+
 ### Added
 
 - **Full error correction for PyroWave above 1 Gb/s** with Pyrolight. A video frame could use only four error-correction blocks, so at 4K120 the configured 20% parity shrank to 16% at 1.15 Gb/s and 3% at 1.3 Gb/s, and above about 1.4 Gb/s frames were sent without any. Pyrolight now negotiates up to sixteen blocks per frame and keeps the configured protection up to about 4.6 MB per frame. Moonlight, Nightjar and older Pyrolight releases keep the previous format. The parity now actually sent counts toward the network load (1.3 Gb/s PyroWave at 20% is about 1.6 Gb/s of UDP payload): leave headroom on the link, as the bandwidth test recommends. The pipeline log and `moonshine-bench` report the effective parity. Tested on the host and against Pyrolight's protocol code; not yet tested with a Pyrolight client over a real 2.5 GbE link.
