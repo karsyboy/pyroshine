@@ -1175,9 +1175,11 @@ mod tests {
 	}
 
 	/// The PyroWave admission policy (`FrameCredits`, two credits) against the
-	/// real paced sender: the producer hands each next frame over while the
-	/// previous one is still being paced out, frames are sent and completed in
-	/// order, and no more than two are ever outstanding.
+	/// real paced sender: the next frame is handed over while the previous one
+	/// is still being sent, a third is admitted only once the first has
+	/// completed, and frames are sent and completed in order. Each send stalls
+	/// for 150 ms after its first datagram, so the overlap does not depend on how
+	/// fast a loaded machine schedules the producer.
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn pyrowave_credits_overlap_paced_sends_within_their_bound() {
 		use std::sync::{Arc, Mutex};
@@ -1188,9 +1190,12 @@ mod tests {
 			bitrate_bps: 100_000_000,
 			frame_interval: Duration::from_millis(12),
 		};
-		let window = Duration::from_millis(10);
+		let window = Duration::from_millis(5);
 		let stop = ShutdownManager::new();
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let mut socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		socket.force_no_gso_for_test();
+		socket.faults.stall_after = Some(1);
+		socket.faults.stall_duration = Some(Duration::from_millis(150));
 		let (tx, _handle, client) = paced_sender(socket, &stop, pacing).await;
 
 		let receiver = tokio::spawn(async move {
@@ -1250,10 +1255,17 @@ mod tests {
 			assert_eq!(*frame, index as u32, "completion order");
 			assert_eq!(*disposition, shard_batch::CompletionDisposition::Submitted);
 		}
-		// Every following frame was handed over before its predecessor's paced
-		// send finished: encoding (here, producing) overlapped transmission.
+		// Every following frame was handed over while its predecessor was still
+		// being sent: producing (encoding) overlapped transmission.
 		for frame in 1..FRAMES as usize {
 			assert!(handoffs[frame] < completions[frame - 1].1, "frame {frame} overlapped");
+		}
+		// No frame was admitted before the frame two ahead of it had completed.
+		for frame in 2..FRAMES as usize {
+			assert!(
+				handoffs[frame] > completions[frame - 2].1,
+				"frame {frame} within the bound"
+			);
 		}
 		// Datagrams arrive frame by frame, shard by shard.
 		assert_eq!(order.len(), FRAMES as usize * SHARDS);
