@@ -1,4 +1,6 @@
-use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect, record_client_follows_hdr_mode};
+use crate::session::stream::video::pyrowave_protocol::{
+	BITSTREAM_ID, FEC_BLOCKS_ATTRIBUTE, FecBlockLayout, PyroWaveDialect, record_client_follows_hdr_mode,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
@@ -215,6 +217,10 @@ impl RtspServer {
 		if self.supported_codecs & CODEC_PYROWAVE_MASK != 0 {
 			result.push_str("a=x-ss-pyrowave.version:1\r\na=rtpmap:99 PYROWAVE/90000\r\n");
 			result.push_str(&format!("a=x-ss-pyrowave.bitstream:{BITSTREAM_ID}\r\na=x-ss-pyrowave.dialects:native-wire-v1 record-framed\r\na=x-ss-pyrowave.profiles:{}\r\n", pyrowave_profiles(self.supported_codecs)));
+			result.push_str(&format!(
+				"a={FEC_BLOCKS_ATTRIBUTE}:{}\r\n",
+				FecBlockLayout::EXTENDED_VALUE
+			));
 		}
 
 		// Emit surround-params for each Opus configuration.
@@ -496,6 +502,21 @@ impl RtspServer {
 			},
 		};
 		let pyrowave_sdr_as_sdr = negotiated_pyrowave_sdr_as_sdr(pyrowave_dialect, &sdp_session);
+		let fec_layout = match negotiated_fec_layout(pyrowave_dialect.is_some(), &sdp_session) {
+			Ok(layout) => layout,
+			Err(reason) => {
+				tracing::warn!(reason, "PyroWave ANNOUNCE rejected");
+				self.report_rejection(
+					"pyrowave_negotiation_failed",
+					format!("The client's PyroWave stream request was rejected: {reason}."),
+					"Update Pyrolight and Pyroshine to releases that speak the same PyroWave version.",
+				);
+				return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::BadRequest)
+					.header(headers::CSEQ, cseq.to_string())
+					.header(headers::CONTENT_TYPE, "text/plain")
+					.build(format!("PyroWave ANNOUNCE rejected: {reason}").into_bytes());
+			},
+		};
 
 		let requested_hdr_mode = self.session_manager.requested_hdr_mode().await;
 		let (dynamic_range, chroma_sampling_type, bit_depth) =
@@ -606,6 +627,7 @@ impl RtspServer {
 			fps,
 			pyrowave_dialect = ?pyrowave_dialect,
 			pyrowave_sdr_as_sdr,
+			fec_max_blocks = fec_layout.max_blocks(),
 			pyrowave_bitstream = BITSTREAM_ID,
 			packet_size,
 			"Selected video mode"
@@ -614,6 +636,7 @@ impl RtspServer {
 		let video_stream_context = VideoStreamContext {
 			pyrowave_dialect,
 			pyrowave_sdr_as_sdr,
+			fec_layout,
 			width,
 			height,
 			fps,
@@ -1057,6 +1080,14 @@ fn negotiated_pyrowave_dialect(
 		unique_sdp_attribute(session, "x-ss-video[0].pyrowaveAdaptiveFec")?,
 	)
 	.map(Some)
+}
+
+/// The FEC block layout a PyroWave client echoed (see [`FecBlockLayout`]).
+fn negotiated_fec_layout(pyrowave: bool, session: &sdp_types::Session) -> Result<FecBlockLayout, &'static str> {
+	if !pyrowave {
+		return Ok(FecBlockLayout::GameStream);
+	}
+	FecBlockLayout::negotiate(true, unique_sdp_attribute(session, FEC_BLOCKS_ATTRIBUTE)?)
 }
 
 /// Whether a record-framed PyroWave client presents by the control stream's
@@ -2028,6 +2059,46 @@ mod tests {
 			axes(VideoCodec::PyroWave, Some(false)),
 			(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420, BitDepth::Ten)
 		);
+	}
+
+	/// DESCRIBE advertises the extended FEC block layout with PyroWave; only a
+	/// PyroWave client that echoes it receives more than four blocks per frame.
+	#[tokio::test]
+	async fn extended_fec_blocks_are_advertised_and_require_an_echo() {
+		use super::*;
+		use crate::healthcheck::{CODEC_HEVC, CODEC_PYROWAVE};
+		let shutdown = ShutdownManager::new();
+		let mut server = RtspServer::for_test(SessionManager::for_test(shutdown.clone()), RtspLimits::default());
+		server.supported_codecs = CODEC_HEVC;
+		assert!(!server.description().contains(FEC_BLOCKS_ATTRIBUTE));
+		server.supported_codecs = CODEC_PYROWAVE;
+		assert!(server.description().contains("a=x-ss-pyrowave.fecBlocks:16\r\n"));
+
+		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n";
+		let layout = |pyrowave: bool, extra: &str| {
+			negotiated_fec_layout(
+				pyrowave,
+				&sdp_types::Session::parse(format!("{base}{extra}").as_bytes()).unwrap(),
+			)
+		};
+		let native = include_str!("../tests/protocol/native-announce.sdp");
+		let native = sdp_types::Session::parse(native.as_bytes()).unwrap();
+		assert_eq!(negotiated_fec_layout(true, &native), Ok(FecBlockLayout::GameStream));
+		assert_eq!(layout(true, ""), Ok(FecBlockLayout::GameStream));
+		assert_eq!(
+			layout(true, "a=x-ss-pyrowave.fecBlocks:16\r\n"),
+			Ok(FecBlockLayout::Extended)
+		);
+		for malformed in [
+			"a=x-ss-pyrowave.fecBlocks:8\r\n",
+			"a=x-ss-pyrowave.fecBlocks\r\n",
+			"a=x-ss-pyrowave.fecBlocks:16\r\na=x-ss-pyrowave.fecBlocks:16\r\n",
+		] {
+			assert!(layout(true, malformed).is_err(), "{malformed}");
+			// Conventional codecs ignore the PyroWave attribute entirely.
+			assert_eq!(layout(false, malformed), Ok(FecBlockLayout::GameStream));
+		}
+		shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
 	}
 
 	/// DESCRIBE advertises the highest audio quality level, ANNOUNCE requests a

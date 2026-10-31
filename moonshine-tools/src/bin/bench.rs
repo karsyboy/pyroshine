@@ -61,6 +61,10 @@ struct Args {
 	/// HDR stream are encoded as 10-bit sRGB SDR (BT.709 primaries and matrix).
 	#[arg(long)]
 	pyrowave_record: bool,
+	/// Negotiate the extended PyroWave FEC block layout (up to 16 FEC blocks
+	/// per frame) as Pyrolight does, instead of GameStream's four.
+	#[arg(long)]
+	pyrowave_fec_blocks_extended: bool,
 	/// Transport measurement controls; encoding bitrate/quality remains unchanged.
 	#[arg(long)]
 	encrypt_video: bool,
@@ -384,6 +388,10 @@ struct StatsSummary {
 	encoded_size: SizeDistribution,
 	avg_packets_per_frame: f64,
 	stale_frames_dropped: u64,
+	/// Parity as a percentage of data shards, and frames whose layout
+	/// carried less parity than requested.
+	effective_fec_percentage: f64,
+	fec_reduced_frames: u64,
 	total: LatencyDistribution,
 	/// Content time (capture deadline or latch) to transport completion.
 	age: LatencyDistribution,
@@ -513,6 +521,9 @@ struct StatsAccumulator {
 	packet_count: u64,
 	encoded_size_samples: Vec<u64>,
 	stale_frames_dropped: u64,
+	data_shards: u64,
+	parity_shards: u64,
+	fec_reduced_frames: u64,
 	source_interval_us: u128,
 	source_interval_samples_us: Vec<u64>,
 	capture_paths: [u64; 3],
@@ -554,6 +565,9 @@ impl StatsAccumulator {
 			packet_count: 0,
 			encoded_size_samples: Vec::new(),
 			stale_frames_dropped: 0,
+			data_shards: 0,
+			parity_shards: 0,
+			fec_reduced_frames: 0,
 			source_interval_us: 0,
 			source_interval_samples_us: Vec::new(),
 			capture_paths: [0; 3],
@@ -605,6 +619,9 @@ impl StatsAccumulator {
 		self.packet_count += stats.packet_count as u64;
 		self.encoded_size_samples.push(stats.encoded_bytes as u64);
 		self.stale_frames_dropped += u64::from(stats.stale_frames_dropped);
+		self.data_shards += stats.data_shards as u64;
+		self.parity_shards += stats.parity_shards as u64;
+		self.fec_reduced_frames += u64::from(stats.fec_percentage < stats.requested_fec_percentage);
 		if !stats.source_interval.is_zero() {
 			let interval = stats.source_interval.as_micros() as u64;
 			self.source_interval_us += interval as u128;
@@ -654,6 +671,12 @@ impl StatsAccumulator {
 			encoded_size: SizeDistribution::new(self.encoded_bytes, &self.encoded_size_samples),
 			avg_packets_per_frame: self.packet_count as f64 / self.count as f64,
 			stale_frames_dropped: self.stale_frames_dropped,
+			effective_fec_percentage: if self.data_shards == 0 {
+				0.0
+			} else {
+				self.parity_shards as f64 * 100.0 / self.data_shards as f64
+			},
+			fec_reduced_frames: self.fec_reduced_frames,
 			total: LatencyDistribution::new(self.total_us, &self.total_samples_us),
 			age: LatencyDistribution::new(self.age_us, &self.age_samples_us),
 			slot_wait: LatencyDistribution::new(self.slot_wait_us, &self.slot_wait_samples_us),
@@ -769,6 +792,11 @@ impl StatsAccumulator {
 		);
 		tracing::info!("  key_frames: {}", summary.key_frames);
 		tracing::info!("  stale compositor frames dropped: {}", summary.stale_frames_dropped);
+		tracing::info!(
+			"  fec: effective={:.1}% reduced frames={}",
+			summary.effective_fec_percentage,
+			summary.fec_reduced_frames
+		);
 		tracing::info!(
 			"  capture: direct={} direct_late={} composited={} vrr={}  source interval: p50={}us p99={}us max={}us  packets failed/discarded: {}/{}",
 			summary.capture_paths[0],
@@ -945,6 +973,7 @@ fn workload(
 		"detached_frame_rate": args.detached_frame_rate,
 		"pyrowave_queue": args.pyrowave_queue,
 		"pyrowave_record": args.pyrowave_record,
+		"pyrowave_fec_blocks_extended": args.pyrowave_fec_blocks_extended,
 		"duration_s": duration,
 		"warmup_s": args.warmup,
 		"command": args.command,
@@ -1241,6 +1270,11 @@ async fn run_benchmark(
 		}),
 		// `--pyrowave-record` emulates Nightjar, which presents by HDR mode.
 		pyrowave_sdr_as_sdr: args.pyrowave_record,
+		fec_layout: if args.pyrowave_fec_blocks_extended && negotiated_format.codec == VideoCodec::PyroWave {
+			moonshine_core::session::stream::video::pyrowave_protocol::FecBlockLayout::Extended
+		} else {
+			moonshine_core::session::stream::video::pyrowave_protocol::FecBlockLayout::GameStream
+		},
 		width,
 		height,
 		fps: target_fps,

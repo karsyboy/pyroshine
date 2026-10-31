@@ -179,6 +179,10 @@ pub(super) fn summary(summary: &StatsSummary) -> Value {
 		"submitted_udp_payload_mbps": round(summary.wire_mbps),
 		"key_frames": summary.key_frames,
 		"stale_frames_dropped": summary.stale_frames_dropped,
+		"fec": {
+			"effective_percentage": round(summary.effective_fec_percentage),
+			"reduced_frames": summary.fec_reduced_frames,
+		},
 		"vrr_frames": summary.vrr_frames,
 		"latency_us": {
 			"total": distribution(&summary.total),

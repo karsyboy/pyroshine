@@ -38,6 +38,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--detached-frame-rate <N>` | `0` | Frame callbacks per second while no client receives the stream, as [`compositor.detached_frame_rate`](CONFIGURATION.md#compositor); measure with `--detach-seconds` |
 | `--fec-threads <N>` | `0` | FEC parity threads per stream, as [`stream.video.fec_threads`](CONFIGURATION.md#streamvideo): `0` scales with the host's CPU threads |
 | `--pyrowave-record` | off | Use PyroWave's record-framed dialect as Nightjar does: SDR frames of an HDR stream are encoded as 10-bit sRGB SDR (BT.709 primaries and matrix) |
+| `--pyrowave-fec-blocks-extended` | off | Use the extended FEC block layout Pyrolight negotiates (up to 16 blocks per frame) instead of GameStream's four, so large frames keep the requested parity |
 | `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto` (graphics), `graphics`, or explicit `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
@@ -216,6 +217,7 @@ Every 5 seconds, a summary is printed with:
 - **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, enqueue/residence and actual socket send; consumer queue is reported as a diagnostic included inside encode wait
 - **Key frames** — number of keyframes emitted
 - **Frame age** — p50/p95/p99/max from the content's capture deadline (or VRR latch) to transport completion, which includes capture deferral that `total` omits; the conventional encoder-slot wait (time a converted frame waited for Pixelforge's input slot, part of `convert`); and how many frames were outstanding when each frame was submitted (`1/2/3/4+`), which shows encode/send overlap
+- **FEC** — parity shards as a percentage of data shards and the number of frames whose layout carried less parity than requested (the GameStream four-block limit)
 
 At the end of the run, a final summary covers the entire session (excluding the warmup period). It adds:
 
@@ -236,7 +238,7 @@ comparable. It contains:
 | `capabilities` | probed GPU name, codec profiles, HDR and DMA-BUF support (with `--capabilities` or `--skip-unsupported`) |
 | `runs[].workload` | codec, resolution, FPS, bitrate, negotiated chroma/bit depth/range, HDR, encoder implementation (`pixelforge-vulkan-video` or `pyrowave`), capture mode, VRR, cursor, encryption, FEC, packet size, queue preferences, duration, warmup, application |
 | `runs[].status` | `ok`, `no_frames`, `interrupted`, `failed` (with `error`) or `unsupported` (with `reason`) |
-| `runs[].summary` | frames, FPS, encoded and submitted UDP Mbps, latency distributions (avg/min/p50/p95/p99/max µs) for `total`, `frame_age`, `submit`, `encode_wait`, `slot_wait`, `source_interval`; the average stage breakdown; frame sizes; packets; capture paths and composition reasons |
+| `runs[].summary` | frames, FPS, encoded and submitted UDP Mbps, effective FEC (`fec.effective_percentage`, `fec.reduced_frames`), latency distributions (avg/min/p50/p95/p99/max µs) for `total`, `frame_age`, `submit`, `encode_wait`, `slot_wait`, `source_interval`; the average stage breakdown; frame sizes; packets; capture paths and composition reasons |
 | `runs[].pacing` | target interval, expected/delivered frames, delivery ratio, arrival-interval distribution, standard deviation, late intervals and missed frame slots |
 | `runs[].resources` | benchmark-process CPU (percent of one core) and per-engine GPU busy ms/s from DRM fdinfo over the measured window; RSS, peak RSS, threads, descriptors and DMA-BUF descriptors; device-wide busy percentage where the driver exposes it (amdgpu `gpu_busy_percent`) |
 | `runs[].stats_lagged` | per-frame statistics the benchmark missed; nonzero means the summary undercounts |
@@ -390,6 +392,34 @@ sampler records per-process DRM engine time and amdgpu power, clocks and memory
 activity. See its README for calibration and interpretation limits; repeat
 runs interleaved because a GPU's sustained clocks drift by about half a percent
 over a long session.
+
+## High-bitrate PyroWave matrix
+
+`scripts/pyrowave_high_bitrate/run.py` runs `moonshine-bench` once per bitrate
+(500, 800, 1000, 1150, 1300 and 1500 Mb/s by default) at 4K120 with an
+incompressible source, an mpv noise shader (`noise.glsl`) that fills every
+frame budget, optionally beside the GPU-bound `gpuload` probe (`--gpu-load
+1800:96`) and busy CPU threads (`--cpu-load N`). It prints one row per run:
+delivered FPS, missed capture slots, frame age, send and packetization time,
+encoded and submitted UDP Mb/s, effective FEC, frames outstanding at
+submission, process CPU and peak RSS, and keeps each run's JSON. Arguments
+after `--` go to `moonshine-bench`, for example `--pyrowave-fec-blocks-extended`;
+`MOONSHINE_PYROWAVE_FRAMES_IN_FLIGHT=1` reproduces the serialized pipeline.
+
+```sh
+scripts/pyrowave_high_bitrate/run.py --label after --bench target/release/moonshine-bench \
+  --pyrowave-lib /usr/lib/libpyrowave-shared.so.1 --out runs/after --cpu-load 12 \
+  -- --pyrowave-fec-blocks-extended
+```
+
+Noise is a worst case for the encoder and the transport, not a game; the
+loopback receiver measures the server's capture, encode, packetization,
+pacing and kernel submission, not a physical link, a client decoder or
+presentation. CPU-only packetization cost per layout and bitrate:
+
+```sh
+cargo test --release -p moonshine-core pyrowave_high_bitrate_packetizer_measurements -- --ignored --nocapture
+```
 
 ## Transport measurement scripts
 

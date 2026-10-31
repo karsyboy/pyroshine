@@ -95,23 +95,44 @@ fn conventional_input_slots() -> usize {
 	conventional_credit_limit()
 }
 
+/// Useful-work credits of the PyroWave pipeline: frames captured (or replayed)
+/// and not yet transport-complete.
+///
+/// PyroWave encodes and reads a frame back synchronously, so the encode thread
+/// holds no GPU work beyond the frame it is encoding; what the second credit
+/// buys is overlap with the paced send. A full-budget frame is paced over its
+/// whole bitrate window, about one capture interval, so with a single credit
+/// its completion raced the next refresh tick: a completion just after the
+/// tick lost the slot (see `PIPELINE_OPTIMIZATION.md`), and the stream fell
+/// toward half rate. With two credits the next frame is captured on its tick
+/// and encoded while the previous one is still being paced out, and is sent
+/// right after it. A third would only queue a frame behind a link that is
+/// already behind.
+const DEFAULT_PYROWAVE_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Diagnostic override of [`DEFAULT_PYROWAVE_FRAMES_IN_FLIGHT`] (1..=3); `1`
+/// restores fully serialized capture, encode and send for A/B measurement.
+const PYROWAVE_FRAMES_IN_FLIGHT_ENV: &str = "MOONSHINE_PYROWAVE_FRAMES_IN_FLIGHT";
+
 fn conventional_credit_limit() -> usize {
-	match std::env::var(FRAMES_IN_FLIGHT_ENV) {
-		Err(_) => DEFAULT_FRAMES_IN_FLIGHT,
+	credit_limit(FRAMES_IN_FLIGHT_ENV, DEFAULT_FRAMES_IN_FLIGHT)
+}
+
+fn pyrowave_credit_limit() -> usize {
+	credit_limit(PYROWAVE_FRAMES_IN_FLIGHT_ENV, DEFAULT_PYROWAVE_FRAMES_IN_FLIGHT)
+}
+
+fn credit_limit(variable: &str, default: usize) -> usize {
+	match std::env::var(variable) {
+		Err(_) => default,
 		Ok(value) => match value.trim().parse::<usize>() {
 			Ok(limit @ 1..=MAX_FRAMES_IN_FLIGHT) => {
-				tracing::info!(
-					limit,
-					"Conventional frame credit bound overridden by {FRAMES_IN_FLIGHT_ENV}"
-				);
+				tracing::info!(limit, "Frame credit bound overridden by {variable}");
 				limit
 			},
 			_ => {
-				tracing::warn!(
-					value,
-					"Ignoring {FRAMES_IN_FLIGHT_ENV}: expected 1..={MAX_FRAMES_IN_FLIGHT}"
-				);
-				DEFAULT_FRAMES_IN_FLIGHT
+				tracing::warn!(value, "Ignoring {variable}: expected 1..={MAX_FRAMES_IN_FLIGHT}");
+				default
 			},
 		},
 	}
@@ -518,6 +539,15 @@ enum ConsumerMessage {
 	ResetCounters(EpochActivation),
 }
 
+/// A PyroWave batch's transport completion, reported back to the encode
+/// thread (live-rate application, slow-send warnings). Statistics travel
+/// separately as [`FrameStats`].
+struct PyroWaveCompletion {
+	epoch: u64,
+	frame_number: u32,
+	send: std::time::Duration,
+}
+
 /// A request to activate the next client epoch: the authorization generation
 /// it is for and the acknowledgment the session manager awaits. The packet
 /// handler delivers that epoch only while its generation is current.
@@ -726,6 +756,12 @@ async fn run_packet_consumer(
 		failures.record_success();
 		let wire_bytes = shards.as_bytes().len();
 		let packet_count = shards.shard_count();
+		let fec_layout = (
+			shards.data_shards(),
+			shards.parity_shards(),
+			shards.fec_percentage(),
+			shards.requested_fec_percentage(),
+		);
 
 		let t_packetized = std::time::Instant::now();
 
@@ -756,6 +792,10 @@ async fn run_packet_consumer(
 			attempted_packet_count: 0,
 			failed_packet_count: 0,
 			discarded_packet_count: 0,
+			data_shards: fec_layout.0,
+			parity_shards: fec_layout.1,
+			fec_percentage: fec_layout.2,
+			requested_fec_percentage: fec_layout.3,
 			stale_frames_dropped: 0,
 			is_key_frame,
 			source_interval,
@@ -851,6 +891,10 @@ async fn run_packet_consumer(
 			attempted_packet_count: 0,
 			failed_packet_count: 0,
 			discarded_packet_count: 0,
+			data_shards: fec_layout.0,
+			parity_shards: fec_layout.1,
+			fec_percentage: fec_layout.2,
+			requested_fec_percentage: fec_layout.3,
 			stale_frames_dropped: 0,
 			is_key_frame,
 			source_interval,
@@ -1594,6 +1638,7 @@ impl VideoPipelineInner {
 		let mut packetizer =
 			Packetizer::new(ctx.encrypt_video, self.keys_rx.clone()).with_fec_pool(self.fec_pool.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
+		packetizer.set_fec_layout(ctx.fec_layout);
 		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
 		packetizer.warm_up(
 			fec_controller.percentage(),
@@ -1611,6 +1656,18 @@ impl VideoPipelineInner {
 		let mut last_frame_time = std::time::Instant::now();
 		let mut consecutive_slow_sends = 0u32;
 		let mut last_slow_send_warning: Option<std::time::Instant> = None;
+		// Frames admitted and not yet transport-complete (see
+		// `DEFAULT_PYROWAVE_FRAMES_IN_FLIGHT`). Capture admission itself ends
+		// once a frame is encoded; these credits travel with each batch to the
+		// sender and wake this thread when released.
+		let credits = super::shard_batch::FrameCredits::new(pyrowave_credit_limit());
+		let network_queue = Arc::new(super::shard_batch::QueueDepth::default());
+		// Each batch reports its completion here once. The credits bound the
+		// number outstanding, so a send never finds the channel full.
+		let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel::<PyroWaveCompletion>(MAX_FRAMES_IN_FLIGHT);
+		// Counts epochs, so a completion of an older epoch cannot apply a rate
+		// staged in a newer one whose frame numbers restarted.
+		let mut epoch = 0u64;
 		let mut diagnostics = PipelineWindow::new(self.config.log_stats);
 		let mut gpu_report_started = std::time::Instant::now();
 		let mut gpu_window_frames = 0u64;
@@ -1621,13 +1678,44 @@ impl VideoPipelineInner {
 		// Imports were released for the current pause.
 		let mut imports_released = false;
 		// A live bitrate installed in the encoder, applied once the first frame
-		// encoded with it has been sent.
+		// encoded with it has been sent; with the frame number of that frame
+		// once it is handed to the sender.
 		let mut pending_rate: Option<super::rate::PendingRate> = None;
+		let mut pending_rate_frame: Option<u32> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let wakes = self.demand.wakes();
 			// Tells the compositor whether anyone watches (detached_frame_rate).
 			frame_rx.set_delivering(self.demand.wanted());
+			while let Ok(done) = completion_rx.try_recv() {
+				if done.epoch == epoch
+					&& pending_rate_frame == Some(done.frame_number)
+					&& let Some(rate) = pending_rate.take()
+				{
+					pending_rate_frame = None;
+					rate.finish(
+						super::rate::RateState::Applied,
+						Some(u64::from(done.frame_number)),
+						None,
+					);
+				}
+				if done.send > frame_interval {
+					consecutive_slow_sends = consecutive_slow_sends.saturating_add(1);
+					if consecutive_slow_sends >= 30
+						&& last_slow_send_warning
+							.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30))
+					{
+						tracing::warn!(
+							send_us = duration_micros_u64(done.send),
+							frame_budget_us = duration_micros_u64(frame_interval),
+							"PyroWave send backpressure is consistently exceeding the frame budget"
+						);
+						last_slow_send_warning = Some(std::time::Instant::now());
+					}
+				} else {
+					consecutive_slow_sends = 0;
+				}
+			}
 			if let Some(mut rate) = self.rate_rx.take() {
 				match encoder.set_bitrate(rate.requested() as usize, ctx.fps) {
 					Ok(accepted) => {
@@ -1644,6 +1732,7 @@ impl VideoPipelineInner {
 						}
 						rate.stage(u32::try_from(accepted).unwrap_or(u32::MAX));
 						pending_rate = Some(rate);
+						pending_rate_frame = None;
 					},
 					Err(error) => rate.finish(super::rate::RateState::Failed, None, Some(error)),
 				}
@@ -1659,11 +1748,15 @@ impl VideoPipelineInner {
 				frame_rx.reset();
 				frame_number = 0;
 				sequence_number = 0;
+				epoch += 1;
 				rtp_clock.reset(std::time::Instant::now());
+				// BeginEpoch is queued behind every batch of the old epoch; the
+				// sender delivers or discards those before activating this one.
 				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
 				// The resumed generation negotiated its own rate; BeginEpoch
 				// restored the sender's pacing to it.
 				pending_rate = None;
+				pending_rate_frame = None;
 				encoder.set_bitrate(ctx.bitrate, ctx.fps)?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
@@ -1685,30 +1778,47 @@ impl VideoPipelineInner {
 					encoder.release_imports();
 					imports_released = true;
 				}
-				// Every encode and send has completed: nothing is in flight.
-				if self.demand.release_due() {
+				// Release only once every encode and send has completed.
+				if self.demand.release_due() && credits.outstanding() == 0 {
 					return Ok(LoopExit::Release);
 				}
 			} else {
 				imports_released = false;
 			}
+			// While every credit is held, sleep until the sender releases one
+			// rather than for a whole interval, so demand is raised as soon as
+			// the oldest frame is sent and the capture lands on the next tick.
+			let mut recv_timeout = frame_interval;
+			if self.demand.wanted() && !credits.available() {
+				let waited = std::time::Instant::now();
+				if !credits.wait_available(frame_interval) {
+					recv_timeout = frame_interval.saturating_sub(waited.elapsed());
+				}
+				diagnostics.record_credit_wait(waited.elapsed());
+			}
 			let received = if self.demand.wanted() {
-				frame_rx.recv_timeout_if(frame_interval, true)
+				frame_rx.recv_timeout_if(recv_timeout, credits.available())
 			} else {
 				self.demand.wait_paused(frame_rx, wakes)
 			};
-			let mut received = match received {
+			let received = match received {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
 			};
-
-			// Keep admission occupied through packetization and actual socket send,
-			// independently of the source buffer's earlier GPU-consumed lifecycle.
-			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
+			// A frame credit, taken before encoding so every early exit returns it.
+			let admitted;
 			let (encoded, created_at, source_time, pacing_origin, buffer_index, channel_wait, new_content) =
 				if let Some(mut frame) = received {
+					// Demand is raised only below the bound, but a capture claimed
+					// before a replay took the last credit can still arrive. It is
+					// released unencoded rather than exceed the bound.
+					if !credits.available() {
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					}
+					admitted = credits.take();
 					if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
 						// Overlays are composited only into unscaled input. A capture
 						// that raced an extent change is dropped rather than encoded
@@ -1776,6 +1886,9 @@ impl VideoPipelineInner {
 						});
 					}
 					last_frame_time = std::time::Instant::now();
+					// `frame` drops at the end of this branch, which ends its capture
+					// admission: the next tick may be captured while this frame is
+					// still being paced out, within the network credits.
 					(
 						encoded,
 						created_at,
@@ -1785,13 +1898,14 @@ impl VideoPipelineInner {
 						received_at.saturating_duration_since(created_at),
 						true,
 					)
-				} else if resend_last && self.demand.may_replay(2 * frame_interval) {
+				} else if resend_last && credits.available() && self.demand.may_replay(2 * frame_interval) {
 					let Some(encoded) = last_encoded.take() else {
 						continue;
 					};
 					resend_last = false;
 					let now = std::time::Instant::now();
 					// A resend shows the last content again now.
+					admitted = credits.take();
 					(encoded, now, now, now, usize::MAX, std::time::Duration::ZERO, false)
 				} else {
 					if !self.demand.wanted() {
@@ -1834,60 +1948,37 @@ impl VideoPipelineInner {
 			// on top of it, preserving the negotiated frame cadence.
 			shards.set_pacing_origin(pacing_origin);
 
+			let (credit, outstanding) = admitted;
 			let packet_count = shards.shard_count();
 			let packetized = std::time::Instant::now();
-			let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
-			let mut shards = shards;
-			shards.set_send_completion(completion_tx);
-			if packet_tx.blocking_send(VideoPacketMessage::Batch(shards)).is_err() {
-				if stop_session_manager.is_shutdown_triggered() {
-					return Ok(LoopExit::Stop);
-				}
-				return Err("video packet channel closed".to_string());
-			}
-			let queued = std::time::Instant::now();
-			let sent = loop {
-				match completion_rx.recv_timeout(frame_interval) {
-					Ok(completion) => break completion,
-					Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-						if !stop_session_manager.is_shutdown_triggered() => {},
-					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(LoopExit::Stop),
-					Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-						if stop_session_manager.is_shutdown_triggered() {
-							return Ok(LoopExit::Stop);
-						}
-						return Err("video packet sender stopped before sending PyroWave frame".to_string());
-					},
-				}
-			};
-			if new_content && let Some(rate) = pending_rate.take() {
-				rate.finish(super::rate::RateState::Applied, Some(u64::from(frame_number)), None);
-			}
+			// The batch owns this frame's credit until its transport completes,
+			// fails or is discarded with its epoch. Meanwhile this thread goes on
+			// to the next capture.
+			shards.hold_until_release(credit);
+			shards.track_queue(network_queue.clone());
 			let stats = FrameStats {
 				channel_wait,
 				import: encoded.import,
 				convert: std::time::Duration::ZERO,
 				slot_wait: std::time::Duration::ZERO,
-				outstanding: 1,
+				outstanding: outstanding.min(u8::MAX as usize) as u8,
 				submit: encoded.submit,
 				consumer_queue: std::time::Duration::ZERO,
 				encode_wait: encoded.encode_wait,
 				packetize: packetized.duration_since(before_packetize),
-				enqueue: sent
-					.send_started_at
-					.unwrap_or(sent.finished_at)
-					.saturating_duration_since(packetized),
-				send: sent
-					.finished_at
-					.saturating_duration_since(sent.send_started_at.unwrap_or(queued)),
-				total: sent.finished_at.duration_since(created_at),
+				enqueue: std::time::Duration::ZERO,
+				send: std::time::Duration::ZERO,
+				total: std::time::Duration::ZERO,
 				encoded_bytes: encoded.data_size,
-				wire_bytes: sent.outcome.submitted_payload_bytes,
-				packet_count: sent.outcome.submitted_datagrams,
-				attempted_packet_count: sent.outcome.attempted_datagrams,
-				failed_packet_count: sent.outcome.failed_datagrams,
-				discarded_packet_count: packet_count
-					.saturating_sub(sent.outcome.submitted_datagrams + sent.outcome.failed_datagrams),
+				wire_bytes: 0,
+				packet_count: 0,
+				attempted_packet_count: 0,
+				failed_packet_count: 0,
+				discarded_packet_count: 0,
+				data_shards: shards.data_shards(),
+				parity_shards: shards.parity_shards(),
+				fec_percentage: shards.fec_percentage(),
+				requested_fec_percentage: shards.requested_fec_percentage(),
 				stale_frames_dropped,
 				is_key_frame: true,
 				source_interval,
@@ -1895,38 +1986,60 @@ impl VideoPipelineInner {
 				vrr_capture: last_vrr_capture,
 				capture_origin: last_capture_origin,
 			};
-			if stats.send > frame_interval {
-				consecutive_slow_sends = consecutive_slow_sends.saturating_add(1);
-				if consecutive_slow_sends >= 30
-					&& last_slow_send_warning.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30))
-				{
-					tracing::warn!(
-						send_us = duration_micros_u64(stats.send),
-						frame_budget_us = duration_micros_u64(frame_interval),
-						"PyroWave send backpressure is consistently exceeding the frame budget"
-					);
-					last_slow_send_warning = Some(std::time::Instant::now());
-				}
-			} else {
-				consecutive_slow_sends = 0;
+			let completion_stats = stats.clone();
+			let completion_stats_tx = stats_tx.clone();
+			let completion_tx = completion_tx.clone();
+			let completion_epoch = epoch;
+			shards.observe_completion(move |completion| {
+				let mut stats = completion_stats;
+				let started = completion.send_started_at.unwrap_or(completion.finished_at);
+				stats.enqueue = started.saturating_duration_since(packetized);
+				stats.send = completion.finished_at.saturating_duration_since(started);
+				stats.total = completion.finished_at.saturating_duration_since(created_at);
+				stats.wire_bytes = completion.outcome.submitted_payload_bytes;
+				stats.packet_count = completion.outcome.submitted_datagrams;
+				stats.attempted_packet_count = completion.outcome.attempted_datagrams;
+				stats.failed_packet_count = completion.outcome.failed_datagrams;
+				stats.discarded_packet_count =
+					packet_count.saturating_sub(stats.packet_count + stats.failed_packet_count);
+				let _ = completion_tx.try_send(PyroWaveCompletion {
+					epoch: completion_epoch,
+					frame_number,
+					send: stats.send,
+				});
+				let _ = completion_stats_tx.send(stats);
+			});
+			if new_content && pending_rate.is_some() && pending_rate_frame.is_none() {
+				pending_rate_frame = Some(frame_number);
 			}
+			if packet_tx.blocking_send(VideoPacketMessage::Batch(shards)).is_err() {
+				if stop_session_manager.is_shutdown_triggered() {
+					return Ok(LoopExit::Stop);
+				}
+				return Err("video packet channel closed".to_string());
+			}
+			let queued = std::time::Instant::now();
 			tracing::trace!(
 				frame_number,
 				buffer_index,
-				encoded_bytes = stats.encoded_bytes,
-				encode_wait_us = duration_micros_u64(stats.encode_wait),
+				encoded_bytes = encoded.data_size,
+				outstanding,
+				encode_wait_us = duration_micros_u64(encoded.encode_wait),
 				packet_channel_wait_us = duration_micros_u64(queued.duration_since(packetized)),
-				socket_send_us = duration_micros_u64(sent.finished_at.saturating_duration_since(queued)),
-				total_us = duration_micros_u64(stats.total),
-				"PyroWave frame transport completed"
+				"PyroWave frame handed to the sender"
 			);
+			// Transport time is reported at completion (FrameStats, the sender's
+			// transport summary); this window ends at the handoff.
 			diagnostics.record(
-				&stats,
-				0,
+				&FrameStats {
+					send: queued.duration_since(packetized),
+					total: queued.saturating_duration_since(created_at),
+					..stats
+				},
+				credits.outstanding(),
 				packet_tx.max_capacity() - packet_tx.capacity(),
 				Some(encoder.import_cache_len()),
 			);
-			let _ = stats_tx.send(stats);
 			gpu_window_frames += 1;
 			if self.config.log_stats && gpu_report_started.elapsed() >= std::time::Duration::from_secs(5) {
 				let seconds = gpu_report_started.elapsed().as_secs_f64();

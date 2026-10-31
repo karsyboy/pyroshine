@@ -31,11 +31,11 @@ Protect pairing credentials and other private data before sharing logs.
 | --- | --- |
 | `Video runtime health` | CPU (100% = one core), open fds, resident KiB, packet occupancy and independent timer lateness; unavailable values are `None` |
 | `Video capture resources` | Capture path/age, dirty state, busy/held buffers, releases, retired pools, admission/rejection and GLES timing counters; `render_fence_handoffs` counts composited captures handed to the encoder with their render fence; `render_fence_wait_us_per_composited_capture` and `render_fence_wait_max_us` are how long the compositor thread (input and presentation included) waited for renders whose fence could not be exported |
-| `Video pipeline summary` | Completed FPS, stage timings, stale drops, in-flight/packet occupancy and PyroWave import-cache size |
+| `Video pipeline summary` | Completed FPS, stage timings, stale drops, in-flight/packet occupancy, requested and effective FEC percentage with frames whose layout carried less, PyroWave frame-credit waits (`credit_waits`, `credit_wait_us`: capture withheld while the sender held every credit) and import-cache size |
 | `Video direct-export rejections` | First blocking reason for direct eligibility, counted per attempt |
 | `PyroWave DMA-BUF import summary` | Import-cache hit/miss/recreate/evict counters |
 | `PyroWave GPU timestamps …` | Exclusive GPU-stage costs, separately from wall-clock encode waits |
-| `Video transport summary` | GSO/fallback sends, `would_block_events`, rebases, send duration, pacing lateness, queue occupancy and throughput |
+| `Video transport summary` | GSO/fallback sends, `would_block_events`, rebases, `late_frames` (sent after their whole pacing window elapsed), send duration, pacing lateness, queue occupancy and throughput |
 
 Accumulators reset per window; `/proc` sampling is independent and occurs once
 per five seconds, not per frame/packet. TRACE transport logs are detailed and

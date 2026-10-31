@@ -66,6 +66,50 @@ impl CreditWake {
 	}
 }
 
+/// A bound on useful work: frames admitted (captured or replayed) and not yet
+/// transport-complete. Each admitted frame takes a [`NetworkCredit`] that its
+/// batch holds until the sender completes, fails or discards it; releasing it
+/// wakes a producer waiting in [`Self::wait_available`].
+pub(crate) struct FrameCredits {
+	count: Arc<AtomicUsize>,
+	wake: Arc<CreditWake>,
+	limit: usize,
+}
+impl FrameCredits {
+	pub fn new(limit: usize) -> Self {
+		Self {
+			count: Arc::new(AtomicUsize::new(0)),
+			wake: Arc::new(CreditWake::default()),
+			limit: limit.max(1),
+		}
+	}
+
+	pub fn outstanding(&self) -> usize {
+		self.count.load(Ordering::Acquire)
+	}
+
+	pub fn available(&self) -> bool {
+		self.outstanding() < self.limit
+	}
+
+	/// Wait until a credit is free or `timeout` elapses; returns whether one is.
+	pub fn wait_available(&self, timeout: std::time::Duration) -> bool {
+		self.wake.wait_below(&self.count, self.limit, timeout)
+	}
+
+	/// Take a credit and return it with the number outstanding, itself
+	/// included. Callers admit work only while [`Self::available`], and only
+	/// one thread takes credits, so the bound holds.
+	pub fn take(&self) -> (NetworkCredit, usize) {
+		let outstanding = self.count.fetch_add(1, Ordering::AcqRel) + 1;
+		debug_assert!(outstanding <= self.limit);
+		(
+			NetworkCredit::with_wake(self.count.clone(), self.wake.clone()),
+			outstanding,
+		)
+	}
+}
+
 use std::time::Instant;
 
 /// Output queue storage, including the batch currently borrowed by the sender.
@@ -134,9 +178,13 @@ pub(crate) struct ShardBatch {
 	data_shards: usize,
 	parity_shards: usize,
 	fec_blocks: usize,
+	/// Configured parity percentage, and the one the frame's layout carries
+	/// (lower when the negotiated block limit could not fit it).
+	requested_fec_percentage: u8,
+	fec_percentage: u8,
 	/// Capture timestamp used as the origin of frame-aware transport pacing.
 	pacing_origin: Option<std::time::Instant>,
-	/// Optional low-latency completion signal used by synchronous producers.
+	/// Completion signal for tests that wait on one batch.
 	send_started_at: Option<Instant>,
 	outcome: TransportOutcome,
 	disposition: CompletionDisposition,
@@ -158,6 +206,8 @@ impl ShardBatch {
 			data_shards: 0,
 			parity_shards: 0,
 			fec_blocks: 0,
+			requested_fec_percentage: 0,
+			fec_percentage: 0,
 			pacing_origin: None,
 			send_completion: None,
 			send_started_at: None,
@@ -210,6 +260,19 @@ impl ShardBatch {
 		self.fec_blocks
 	}
 
+	pub fn requested_fec_percentage(&self) -> u8 {
+		self.requested_fec_percentage
+	}
+
+	pub fn fec_percentage(&self) -> u8 {
+		self.fec_percentage
+	}
+
+	pub fn set_fec_percentages(&mut self, requested: u8, effective: u8) {
+		self.requested_fec_percentage = requested;
+		self.fec_percentage = effective;
+	}
+
 	pub fn pacing_origin(&self) -> Option<std::time::Instant> {
 		self.pacing_origin
 	}
@@ -233,6 +296,7 @@ impl ShardBatch {
 		self.fec_blocks = fec_blocks;
 	}
 
+	#[cfg(test)]
 	pub fn set_send_completion(&mut self, completion: std::sync::mpsc::SyncSender<TransportCompletion>) {
 		debug_assert!(self.send_completion.is_none());
 		self.send_completion = Some(completion);
@@ -423,6 +487,8 @@ impl ShardBuf {
 			data_shards: 0,
 			parity_shards: 0,
 			fec_blocks: 0,
+			requested_fec_percentage: 0,
+			fec_percentage: 0,
 			pacing_origin: None,
 			send_completion: None,
 			send_started_at: None,

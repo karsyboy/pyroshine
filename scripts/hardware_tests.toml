@@ -141,6 +141,10 @@ name = "session::stream::video::packetizer::tests::transport_packetizer_measurem
 kind = "informational"
 
 [[test]]
+name = "session::stream::video::packetizer::tests::pyrowave_high_bitrate_packetizer_measurements"
+kind = "informational"
+
+[[test]]
 name = "session::stream::video::pipeline::convert::tests::converter_matches_reference_on_gpu"
 requires = ["render-node", "vulkan-video-encode"]
 env = { MOONSHINE_TEST_GPU = "1" }

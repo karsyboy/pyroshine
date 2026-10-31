@@ -12,12 +12,14 @@ or GLES rendering. Without demand it retains dirty state and skips capture work.
 
 | Consumer | When demand is useful | When admission ends |
 | --- | --- | --- |
-| PyroWave | Prior frame's encode, packetization and socket send have completed | Actual socket-send completion, or an error/drop |
+| PyroWave | Fewer than two useful frames outstanding, including paced network work | The frame's encode (readback) completing |
 | Conventional codec | Fewer than two useful frames outstanding, including network work | Final socket submission, transport failure, epoch discard or cancellation |
 
-The source buffer's `consumed` flag is independent. It releases the DMA-BUF only
-after GPU reads finish; PyroWave can release the client's buffer before paced
-network sending completes. RAII releases admission on early returns/errors.
+For both, a useful-work credit is held from admission through final socket
+submission, transport failure, epoch discard or cancellation; demand is raised
+only below the bound. The source buffer's `consumed` flag is independent. It
+releases the DMA-BUF only after GPU reads finish, before paced network sending
+completes. RAII releases admission and credits on early returns/errors.
 Timeouts revoke unclaimed demand, not a capture already rendering.
 
 Epoch changes drain queued frames and reject racing old sends/receives. An old
@@ -269,8 +271,10 @@ actually submitted, including while network credits are exhausted.
 
 Network output storage is bounded by the credits: two frames, or at most three
 with the diagnostic override. For a negotiated wire shard
-size `S`, the protocol's maximum four unprotected blocks of 1023 data shards
-bound it by `N * 4092 * S` bytes for `N` credits; protected blocks have at most 255 total shards.
+size `S`, GameStream's maximum four unprotected blocks of 1023 data shards
+bound it by `N * 4092 * S` bytes for `N` credits (sixteen blocks, `N * 16368 * S`,
+with the PyroWave extended FEC layout); protected blocks have at most 255 total
+shards. PyroWave frames are also bounded by their 3 MiB budget.
 This is a representability bound, not a desired queue size. TRACE completion
 records expose current/high-water output frames and bytes. An indefinitely
 blocked socket can make those frames indefinitely old; stop and pause interrupt
@@ -284,12 +288,34 @@ credits. Do not use kernel submission as source-read completion or proof of
 receiver delivery.
 Rejecting capture before encoding preserves predictive reference
 chains; discarding encoded reference frames can break decoding until an IDR.
-PyroWave completes one encode and send before requesting the next capture.
-This bounds latency but can limit FPS when capture + encode + paced send consumes
-a refresh interval; enlarging queues is not a free throughput improvement. A
-frame whose encode outlasted its bitrate-derived send window is therefore paced
-to finish before the next capture slot (at up to four times the bitrate) rather
-than over a fresh full window.
+
+PyroWave encodes and reads back each frame synchronously on its encode thread,
+then hands the packetized frame to the sender with a credit and goes on to the
+next capture; the same two-credit bound (`FrameCredits`) limits frames admitted
+and not yet sent. A full-budget frame is paced over its whole bitrate window,
+about one capture interval, so when PyroWave held capture admission until send
+completion that completion raced the next refresh tick: the slack was one GSO
+chunk interval (about 0.3 ms at 1.3 Gb/s and 4K120, shrinking as bitrate grows),
+and any later completion lost the slot. With two credits the next frame is
+captured on its tick and encoded while the previous one is still being paced
+out, then sent right after it, in order. A sustained slow link holds the
+second credit and capture demand is withheld, so captures, not encoded frames,
+are skipped and no backlog of rendered scenes builds; at most one encoded frame
+waits behind the one being sent. Epoch changes discard queued frames whole
+(see transport ownership below); a frame is never dropped part-way.
+
+A frame whose send window elapsed during encode, or while it waited behind the
+previous frame, is paced to finish before its next capture slot (at up to four
+times the bitrate) rather than over a fresh full window; a frame that lost only
+part of its window is never sent faster than that either.
+`MOONSHINE_PYROWAVE_FRAMES_IN_FLIGHT` (1–3) overrides the bound for A/B
+measurement; `1` restores the serialized pipeline. It is a diagnostic, not a
+setting.
+
+Under a GPU-bound game the PyroWave encode itself, not the transport, limits
+the rate: its work (about 0.6 ms at 4K) queues behind the game on the graphics
+queue for 7–15 ms, and the synchronous encode cannot take the next capture
+before it finishes. Overlapping the transport does not change that.
 PyroWave uses a lazily allocated, reusable CLOCK_MONOTONIC timerfd through Tokio
 AsyncFd for precise packet deadlines. A mutable send borrow enforces one wait
 per timer; cancellation and rearming cannot leak a prior frame's expiry. There
@@ -468,7 +494,7 @@ Deferred work needs specific evidence before implementation:
 | Direct scaling | Matching crop, origin, borders, sampling and color output |
 | RGB conversion/DWT fusion | Equivalent rounding/dithering/HDR output and lower GPU cost across representative devices; a previously measured candidate failed quality/performance checks |
 | PyroWave import-cache aliasing | Measured duplicate-fd churn plus preserved identity/layout checks |
-| Capture/send overlap | Tightly bounded work without stale scenes, extra admission credits or epoch leakage |
+| Overlapping PyroWave encodes | Double-buffered PyroWave encoder resources (a codec patch) and a measured gain under GPU contention, where the synchronous encode limits the rate |
 
 Converter changes need the GPU fixtures on every available vendor (select a
 device with `VK_DRIVER_FILES`), plus a decoded stream from a real client:

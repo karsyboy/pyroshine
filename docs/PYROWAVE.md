@@ -94,6 +94,7 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 | `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 (also after `hdrMode=0`: PyroWave has no 10-bit SDR) |
 | `x-nv-video[0].encoderCscMode` bit 0 | `0` limited, `1` full range |
 | `x-ss-pyrowave.version` | `1` |
+| `x-ss-pyrowave.fecBlocks` | `16`: the extended FEC block layout, only when DESCRIBE offered it (see [FEC policy](#fec-policy)) |
 
 Wire v1 uses an 8-bit intermediate for SDR and a 10-bit intermediate for HDR10.
 An HDR10 stream to Nightjar encodes SDR content as 10-bit SDR (sRGB transfer,
@@ -145,16 +146,21 @@ but spaces GSO super-packets across the frame's bitrate-derived transmit window
 instead of submitting every chunk back-to-back. The schedule is anchored to the
 capture timestamp, so GPU encode time consumes part of the window rather than
 being added to it. The sender distributes chunks across the remaining time
-without reordering or interleaving frames. If the whole window elapsed during
-encode, the frame is spread across the time left before the next capture slot
-(nine tenths of the frame interval after capture), never slower than the bitrate
-window and never faster than four times the bitrate. Restarting a full window
-there would add it to the encode time and lose the next capture whenever encode
-time exceeds the window, for example while the GPU stays at idle clocks or a game
-contends for its queue. If socket backpressure consumes scheduled slots, the
-sender rebases the remaining schedule instead of emitting an unbounded catch-up
-burst. The pipeline holds capture admission until actual send completion, so
-paced sending cannot accumulate a backlog of rendered scenes. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
+without reordering or interleaving frames, and never faster than four times
+the bitrate. If the whole window elapsed during encode or while the frame waited
+behind the previous one, the frame is spread across the time left before the
+next capture slot (nine tenths of the frame interval after capture), never
+slower than the bitrate window. Restarting a full window there would add it to
+the delay and make every following frame wait behind it, for example while the
+GPU stays at idle clocks or a game contends for its queue. If socket
+backpressure consumes scheduled slots, the sender rebases the remaining
+schedule instead of emitting an unbounded catch-up burst.
+
+The encode thread does not wait for a frame's paced send: it captures and
+encodes the next frame meanwhile, within two frames admitted and not yet sent,
+so a full-budget frame whose send ends just after the next refresh tick no
+longer costs that capture. A slow link withholds capture demand at that bound
+rather than queueing encoded frames. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
 
 Packet size and GSO limits are derived from negotiated shard layout, not a fixed
 number of submissions per frame. `stream.video.max_packet_size` can cap client
@@ -190,9 +196,27 @@ to the configured range and take effect only at a subsequent frame boundary.
 The PyroWave policy decays clean-link protection sooner because every frame is
 independently decodable.
 
-Large frames must fit representable Reed-Solomon blocks. If requested protection
-does not fit, choose the largest lower integer percentage Moonlight can recover
-exactly; use zero only when no protected layout is representable.
+Large frames must fit representable Reed-Solomon blocks: at most 255 shards
+each, at most four blocks per frame in GameStream's header. At 1392-byte packets
+that keeps 20% parity only up to 848 data shards, about 1.1 Gb/s at 120 FPS; a
+full 1.3 Gb/s frame (985 data shards) fits only 3%, and above about 1.4 Gb/s no
+protected four-block layout exists. Pyroshine offers PyroWave clients an
+extended layout in DESCRIBE (`x-ss-pyrowave.fecBlocks:16`): up to sixteen blocks
+per frame, with the high two bits of the current and last block index in the
+low nibble of `multiFecBlocks`, which GameStream senders leave zero. A client
+that implements it echoes the attribute in ANNOUNCE; only then are frames sent
+in more than four blocks, so the configured percentage holds up to 3392 data
+shards (4.6 MB). Any other echoed value is rejected; Moonlight, Nightjar and
+older Pyrolight builds keep the GameStream layout, and conventional codecs never
+use the extension. Frames of up to four blocks are byte-identical in both
+layouts.
+
+If requested protection does not fit the negotiated layout, choose the largest
+lower integer percentage Moonlight can recover exactly; use zero only when no
+protected layout is representable. Such frames are logged (rate-limited) with
+the requested and effective percentage, and the pipeline summary reports the
+effective parity percentage and the number of frames that carried less than
+requested.
 
 Sender parity uses the same rule as Moonlight's receiver:
 `ceil(data_shards * fec_percentage / 100)`. The emitted integer percentage is
@@ -268,7 +292,8 @@ sends those bytes through the ordinary GameStream packetizer. Moonlight performs
 its normal RTP/NvVideoPacket reassembly and gives the complete decode unit to
 `pyrowave_decoder_push_packet()`. There is no per-shard PyroWave length prefix
 or padding inside the encoded frame. Existing sequencing, encryption,
-multi-block FEC, and frame boundaries remain unchanged. Every PyroWave frame is
+multi-block FEC, and frame boundaries remain unchanged; the extended FEC block
+layout, when negotiated, only widens the block index. Every PyroWave frame is
 independently decodable, so IDR requests resend the last complete PyroWave frame
 and reference-frame invalidation has no codec state to modify.
 

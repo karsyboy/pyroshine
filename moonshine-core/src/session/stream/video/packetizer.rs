@@ -1,4 +1,4 @@
-use super::pyrowave_protocol::{PyroWaveDialect, record_boundaries};
+use super::pyrowave_protocol::{FecBlockLayout, PyroWaveDialect, record_boundaries};
 use aes_gcm::{
 	Aes128Gcm, Key,
 	aead::{AeadInOut, KeyInit, Nonce},
@@ -17,8 +17,6 @@ use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
 pub(crate) const MAX_SHARDS: usize = 255;
 /// The GameStream FEC header allocates 10 bits to the data-shard count.
 const MAX_DATA_SHARDS_WITHOUT_FEC: usize = 1023;
-/// The GameStream multi-FEC header allocates two bits to the last block index.
-const MAX_FEC_BLOCKS: usize = 4;
 
 /// Most FEC threads the automatic setting uses. At PyroWave 4:4:4 4K120
 /// (1.5 Gb/s) on a 16-thread CPU four kept packetization at 120 µs per frame,
@@ -196,6 +194,8 @@ enum VideoEncryption {
 
 pub(crate) struct Packetizer {
 	pyrowave_dialect: Option<PyroWaveDialect>,
+	/// How many FEC blocks a frame may span (see [`FecBlockLayout`]).
+	fec_layout: FecBlockLayout,
 	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
 	/// Watch channel for encryption keys — read eagerly per `packetize()` call.
 	keys_rx: SessionKeysReceiver,
@@ -210,6 +210,7 @@ impl Packetizer {
 	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
 		let mut packetizer = Self {
 			pyrowave_dialect: None,
+			fec_layout: FecBlockLayout::GameStream,
 			fec_encoders: HashMap::new(),
 			keys_rx,
 			encryption: VideoEncryption::Disabled,
@@ -230,6 +231,12 @@ impl Packetizer {
 
 	pub fn set_pyrowave_dialect(&mut self, dialect: Option<PyroWaveDialect>) {
 		self.pyrowave_dialect = dialect;
+	}
+
+	/// Use the block layout the client negotiated. Only PyroWave clients that
+	/// echoed the extended layout may receive more than four blocks.
+	pub fn set_fec_layout(&mut self, layout: FecBlockLayout) {
+		self.fec_layout = layout;
 	}
 
 	fn current_encryption(&self) -> VideoEncryption {
@@ -305,6 +312,7 @@ impl Packetizer {
 	) -> Result<ShardBatch, ()> {
 		// Held across the FEC encoder's mutable borrow of `self`.
 		let fec_pool = self.fec_pool.clone();
+		let fec_layout = self.fec_layout;
 		// Eagerly read current encryption key and update cipher if rotated.
 		self.maybe_update_cipher();
 		if let VideoEncryption::Unavailable { .. } = self.encryption {
@@ -367,7 +375,12 @@ impl Packetizer {
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
-		let layout = packet_layout(nr_data_shards, fec_percentage, minimum_fec_packets as usize)?;
+		let layout = packet_layout(
+			nr_data_shards,
+			fec_percentage,
+			minimum_fec_packets as usize,
+			fec_layout.max_blocks(),
+		)?;
 		if (layout.fec_percentage < fec_percentage || (layout.disable_fec && minimum_fec_packets > 0))
 			&& self
 				.last_fec_warning
@@ -386,16 +399,18 @@ impl Packetizer {
 					requested_fec_percentage = fec_percentage,
 					effective_fec_percentage = layout.fec_percentage,
 					blocks = layout.blocks,
-					"Reduced video FEC to fit the GameStream four-block limit"
+					max_blocks = fec_layout.max_blocks(),
+					"Reduced video FEC to fit the negotiated FEC block limit"
 				);
 			}
 			self.last_fec_warning = Some(Instant::now());
 		}
 		let nr_blocks = layout.blocks;
 		let nr_data_shards_per_block = layout.data_shards_per_block;
+		let requested_fec_percentage = fec_percentage;
 		let fec_percentage = layout.fec_percentage;
 		let disable_fec = layout.disable_fec;
-		let last_block_index = (nr_blocks as u8 - 1) << 6;
+		let last_block_index = nr_blocks - 1;
 
 		tracing::trace!(
 			nr_data_shards_per_block,
@@ -489,7 +504,7 @@ impl Packetizer {
 					*sequence_number << 8,
 					frame_number,
 					flags,
-					((block_index as u8) << 4) | last_block_index,
+					fec_layout.encode(block_index, last_block_index),
 					(block_shard_index << 12 | nr_data_shards << 22 | usize::from(fec_percentage) << 4) as u32,
 				);
 
@@ -548,7 +563,7 @@ impl Packetizer {
 					// NvVideoPacket fields that Moonlight needs.
 					let nv = &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE];
 					nv[4..8].copy_from_slice(&frame_number.to_le_bytes()); // frame_index
-					nv[11] = ((block_index as u8) << 4) | last_block_index; // multi_fec_blocks
+					nv[11] = fec_layout.encode(block_index, last_block_index); // multi_fec_blocks
 					let fec_info = ((nr_data_shards + block_shard_index) << 12
 						| nr_data_shards << 22
 						| usize::from(fec_percentage) << 4) as u32;
@@ -615,6 +630,7 @@ impl Packetizer {
 			total_parity_shards,
 			nr_blocks,
 		);
+		all_shards.set_fec_percentages(requested_fec_percentage, fec_percentage);
 		Ok(all_shards)
 	}
 
@@ -671,19 +687,21 @@ fn block_fec_parameters(
 	None
 }
 
-/// Select a transport layout compatible with Moonlight's four-block and
-/// Reed-Solomon's 255-shard limit. If the requested percentage does not fit,
-/// protection is reduced one representable percentage point at a time. Only
-/// when no protected four-block layout exists is FEC disabled for the frame.
+/// Select a transport layout compatible with the negotiated block limit
+/// (GameStream's four, see [`FecBlockLayout`]) and Reed-Solomon's 255-shard
+/// limit. If the requested percentage does not fit, protection is reduced one
+/// representable percentage point at a time. Only when no protected layout
+/// exists is FEC disabled for the frame.
 fn packet_layout(
 	nr_data_shards: usize,
 	requested_fec_percentage: u8,
 	minimum_parity_shards: usize,
+	max_blocks: usize,
 ) -> Result<PacketLayout, ()> {
 	debug_assert!(nr_data_shards > 0);
 	if requested_fec_percentage == 0 && minimum_parity_shards == 0 {
 		let blocks = nr_data_shards.div_ceil(MAX_DATA_SHARDS_WITHOUT_FEC);
-		if blocks > MAX_FEC_BLOCKS {
+		if blocks > max_blocks {
 			return Err(());
 		}
 		return Ok(PacketLayout {
@@ -695,7 +713,7 @@ fn packet_layout(
 	}
 
 	for fec_percentage in (0..=requested_fec_percentage).rev() {
-		for blocks in 1..=MAX_FEC_BLOCKS {
+		for blocks in 1..=max_blocks {
 			let data_shards_per_block = nr_data_shards.div_ceil(blocks);
 			if data_shards_per_block > MAX_SHARDS {
 				continue;
@@ -717,10 +735,11 @@ fn packet_layout(
 	}
 
 	let blocks = nr_data_shards.div_ceil(MAX_DATA_SHARDS_WITHOUT_FEC);
-	if blocks > MAX_FEC_BLOCKS {
+	if blocks > max_blocks {
 		tracing::error!(
 			nr_data_shards,
-			"Encoded frame exceeds the GameStream 10-bit shard-count limit"
+			max_blocks,
+			"Encoded frame exceeds the 10-bit shard count of the negotiated FEC blocks"
 		);
 		return Err(());
 	}
@@ -948,6 +967,56 @@ mod tests {
 		}
 	}
 
+	/// CPU-only cost of packetizing full-budget PyroWave 4K120 frames with
+	/// GameStream's and the extended FEC layout, on the stream's FEC pool.
+	/// Run alone with `--release --ignored --nocapture`.
+	#[test]
+	#[ignore]
+	fn pyrowave_high_bitrate_packetizer_measurements() {
+		let pool = fec_thread_pool(0);
+		println!("layout,mbps,encrypted,data_shards,parity_shards,blocks,fec_percent,p50_us,p99_us,max_us,allocations");
+		for layout in [FecBlockLayout::GameStream, FecBlockLayout::Extended] {
+			for mbps in [500usize, 800, 1000, 1150, 1300, 1500] {
+				for encrypted in [false, true] {
+					let bytes = mbps * 1_000_000 / (120 * 8);
+					let data: Vec<u8> = (0..bytes).map(|i| (i * 31 + i / 97) as u8).collect();
+					let (_tx, rx) = tokio::sync::watch::channel(ActiveKeys::for_test([0x11; 16], 7));
+					let mut packetizer = Packetizer::new(encrypted, rx).with_fec_pool(pool.clone());
+					packetizer.set_fec_layout(layout);
+					packetizer.warm_up(20, 0, || false);
+					let mut times = Vec::new();
+					let mut last = None;
+					let mut allocations = 0;
+					for sample in 0..140 {
+						measurement_allocator::reset();
+						let started = Instant::now();
+						let batch = packetizer
+							.packetize(&data, true, 1392, 0, 20, sample, &mut 0, 0, 0)
+							.unwrap();
+						let elapsed = started.elapsed().as_micros() as u64;
+						if sample >= 20 {
+							times.push(elapsed);
+							allocations = measurement_allocator::counts()[0];
+						}
+						last = Some(batch);
+					}
+					times.sort_unstable();
+					let batch = last.unwrap();
+					println!(
+						"{layout:?},{mbps},{encrypted},{},{},{},{},{},{},{},{allocations}",
+						batch.data_shards(),
+						batch.parity_shards(),
+						batch.fec_blocks(),
+						batch.fec_percentage(),
+						times[times.len() / 2],
+						times[times.len() * 99 / 100],
+						times[times.len() - 1],
+					);
+				}
+			}
+		}
+	}
+
 	/// `(iv, plaintext)` of one decrypted shard.
 	type DecryptedShard = ([u8; 12], Vec<u8>);
 
@@ -1128,7 +1197,7 @@ mod tests {
 
 	#[test]
 	fn ordinary_frames_keep_fec() {
-		let layout = packet_layout(400, 20, 0).unwrap();
+		let layout = packet_layout(400, 20, 0, 4).unwrap();
 		assert_eq!(layout.fec_percentage, 20);
 		assert!(!layout.disable_fec);
 		assert_eq!(layout.blocks, 2);
@@ -1137,7 +1206,7 @@ mod tests {
 
 	#[test]
 	fn oversized_frames_reduce_fec_instead_of_disabling_it() {
-		let layout = packet_layout(934, 20, 0).unwrap();
+		let layout = packet_layout(934, 20, 0, 4).unwrap();
 		assert_eq!(
 			layout,
 			PacketLayout {
@@ -1151,12 +1220,129 @@ mod tests {
 
 	#[test]
 	fn frames_beyond_the_header_limit_are_rejected() {
-		assert!(packet_layout(MAX_DATA_SHARDS_WITHOUT_FEC * MAX_FEC_BLOCKS + 1, 20, 0).is_err());
+		assert!(packet_layout(MAX_DATA_SHARDS_WITHOUT_FEC * 4 + 1, 20, 0, 4).is_err());
+	}
+
+	#[test]
+	fn extended_layout_keeps_the_requested_fec_beyond_four_blocks() {
+		// 1392-byte packets at 120 FPS: data shards per frame at 1.15, 1.3,
+		// 1.5 and 2 Gb/s; GameStream's four blocks protect at most 848 at 20%.
+		for data_shards in [871, 985, 1136, 1515] {
+			let gamestream = packet_layout(data_shards, 20, 0, 4).unwrap();
+			assert!(gamestream.fec_percentage < 20 || gamestream.disable_fec);
+			let extended = packet_layout(data_shards, 20, 0, FecBlockLayout::Extended.max_blocks()).unwrap();
+			assert_eq!(extended.fec_percentage, 20);
+			assert!(!extended.disable_fec);
+			assert!(extended.blocks > 4 && extended.blocks <= 16);
+			assert!(
+				extended.data_shards_per_block + receiver_parity_shards(extended.data_shards_per_block, 20)
+					<= MAX_SHARDS
+			);
+		}
+		// The largest protected frame: 16 full blocks.
+		assert_eq!(packet_layout(16 * 212, 20, 0, 16).unwrap().fec_percentage, 20);
+		assert!(packet_layout(16 * 212 + 1, 20, 0, 16).unwrap().fec_percentage < 20);
+		// Below five blocks the extended layout is byte-identical to GameStream's.
+		for encrypt in [false, true] {
+			let data: Vec<u8> = (0..800 * 1376).map(|i| (i * 7 + i / 13) as u8).collect();
+			let mut gamestream = packetizer_with(encrypt);
+			let mut extended = packetizer_with(encrypt);
+			extended.set_fec_layout(FecBlockLayout::Extended);
+			// Each test packetizer has its own key, so nonces match too.
+			let a = gamestream.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 7, 1).unwrap();
+			let b = extended.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 7, 1).unwrap();
+			assert_eq!(a.fec_blocks(), 4);
+			assert_eq!(a.as_bytes(), b.as_bytes());
+		}
+	}
+
+	/// Data shards of every block of `batch`, recovered from the wire with
+	/// up to `lose` data shards missing per block, reassembled to the frame.
+	fn recover_extended_frame(batch: &ShardBatch, lose: impl Fn(usize, usize) -> bool) -> Result<Vec<u8>, ()> {
+		let shards: Vec<&[u8]> = batch.as_bytes().chunks_exact(batch.shard_size()).collect();
+		let mut frame = Vec::new();
+		let mut index = 0;
+		let mut block = 0;
+		while index < shards.len() {
+			let nv = &shards[index][NV_PACKET_OFFSET..];
+			let fec_info = u32::from_le_bytes(nv[12..16].try_into().unwrap());
+			let data = ((fec_info >> 22) & 0x3ff) as usize;
+			let parity = receiver_parity_shards(data, ((fec_info >> 4) & 0xff) as u8);
+			let byte = nv[11] as usize;
+			assert_eq!((byte >> 4) & 3 | (byte & 3) << 2, block, "block index");
+			assert_eq!(
+				(byte >> 6) & 3 | ((byte >> 2) & 3) << 2,
+				batch.fec_blocks() - 1,
+				"last block"
+			);
+			let mut received: Vec<Option<Vec<u8>>> = shards[index..index + data + parity]
+				.iter()
+				.enumerate()
+				.map(|(i, s)| (!lose(block, i)).then(|| s[PAYLOAD_OFFSET..].to_vec()))
+				.collect();
+			if parity > 0 {
+				ReedSolomon::new(data, parity)
+					.unwrap()
+					.reconstruct(&mut received)
+					.map_err(|_| ())?;
+			}
+			for shard in &received[..data] {
+				frame.extend_from_slice(shard.as_ref().ok_or(())?);
+			}
+			index += data + parity;
+			block += 1;
+		}
+		assert_eq!(block, batch.fec_blocks());
+		Ok(frame)
+	}
+
+	#[test]
+	fn extended_blocks_recover_random_and_burst_loss_up_to_their_parity() {
+		// 1.3 Gb/s at 120 FPS: 985 data shards in five blocks of 197 + 40.
+		let data: Vec<u8> = (0..985 * 1376 - 8).map(|i| (i * 131 + i / 7) as u8).collect();
+		let mut p = packetizer();
+		p.set_fec_layout(FecBlockLayout::Extended);
+		let batch = p.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 0, 0).unwrap();
+		assert_eq!((batch.fec_blocks(), batch.fec_percentage()), (5, 20));
+		assert_eq!(batch.data_shards(), 985);
+		assert_eq!(batch.parity_shards(), 5 * 40);
+		let check = |frame: Vec<u8>| assert_eq!(&frame[8..8 + data.len()], &data[..]);
+		check(recover_extended_frame(&batch, |_, _| false).unwrap());
+		// A burst of exactly the parity count in every block.
+		check(recover_extended_frame(&batch, |_, i| (50..90).contains(&i)).unwrap());
+		// Scattered loss, data and parity alike, up to the parity count.
+		check(recover_extended_frame(&batch, |block, i| (i * 7 + block) % 6 == 0 && i < 6 * 40).unwrap());
+		// One more than the parity in a single block is unrecoverable.
+		assert!(recover_extended_frame(&batch, |block, i| block == 3 && i < 41).is_err());
+	}
+
+	/// The client's reassembly test (`tests/pyrowave_extended_fec.c` in
+	/// Pyrolight's moonlight-common-c) feeds this exact frame through its
+	/// queue, Reed-Solomon recovery and depacketizer. Rewrite the fixture with
+	/// `MOONSHINE_UPDATE_FEC_FIXTURE=1` and copy it to the client.
+	#[test]
+	fn extended_fec_frame_matches_the_client_fixture() {
+		// 24-byte packets keep the fixture small: 849 data shards, one more
+		// than four 20%-protected blocks hold, so the frame needs five.
+		let data: Vec<u8> = (0..849 * 8 - 8).map(|i| (i * 131 + i / 7) as u8).collect();
+		let mut p = packetizer();
+		p.set_fec_layout(FecBlockLayout::Extended);
+		let batch = p.packetize(&data, true, 24, 0, 20, 1, &mut 0, 9000, 3).unwrap();
+		assert_eq!((batch.fec_blocks(), batch.fec_percentage()), (5, 20));
+		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/protocol/pyrowave-extended-fec.bin");
+		if std::env::var_os("MOONSHINE_UPDATE_FEC_FIXTURE").is_some() {
+			std::fs::write(&path, batch.as_bytes()).unwrap();
+		}
+		assert_eq!(std::fs::read(&path).unwrap(), batch.as_bytes());
+		assert_eq!(
+			&recover_extended_frame(&batch, |_, i| i % 7 == 1).unwrap()[8..8 + data.len()],
+			&data[..]
+		);
 	}
 
 	#[test]
 	fn zero_percentage_and_zero_minimum_disable_fec() {
-		let layout = packet_layout(100, 0, 0).unwrap();
+		let layout = packet_layout(100, 0, 0, 4).unwrap();
 		assert!(layout.disable_fec);
 		assert_eq!(layout.fec_percentage, 0);
 	}
@@ -1275,8 +1461,8 @@ mod tests {
 
 	#[test]
 	fn four_block_boundary_degrades_smoothly() {
-		let before = packet_layout(848, 20, 0).unwrap();
-		let after = packet_layout(849, 20, 0).unwrap();
+		let before = packet_layout(848, 20, 0, 4).unwrap();
+		let after = packet_layout(849, 20, 0, 4).unwrap();
 		assert_eq!(before.blocks, 4);
 		assert_eq!(before.fec_percentage, 20);
 		assert_eq!(after.blocks, 4);

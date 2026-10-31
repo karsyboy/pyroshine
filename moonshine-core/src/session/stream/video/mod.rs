@@ -180,8 +180,8 @@ pub struct FrameStats {
 	/// Part of `convert` spent waiting for the encoder's input slot, i.e. for
 	/// the readback of the frame submitted two encodes earlier.
 	pub slot_wait: std::time::Duration,
-	/// Frames submitted but not yet transport-complete when this frame was
-	/// submitted, including itself (always 1 for PyroWave).
+	/// Frames admitted but not yet transport-complete when this frame was
+	/// submitted, including itself.
 	pub outstanding: u8,
 	/// Time spent submitting the frame to the asynchronous encoder.
 	pub submit: std::time::Duration,
@@ -208,6 +208,14 @@ pub struct FrameStats {
 	pub attempted_packet_count: usize,
 	pub failed_packet_count: usize,
 	pub discarded_packet_count: usize,
+	/// Data and parity shards of the frame's FEC layout (planned, not sent).
+	pub data_shards: usize,
+	pub parity_shards: usize,
+	/// Parity percentage the frame's layout carries, and the one configured
+	/// (or chosen by automatic FEC). Lower when the negotiated block limit
+	/// could not fit the configured protection.
+	pub fec_percentage: u8,
+	pub requested_fec_percentage: u8,
 	/// Stale compositor frames discarded before this frame was encoded.
 	pub stale_frames_dropped: u32,
 	/// Whether this frame is a key (IDR) frame.
@@ -251,6 +259,9 @@ pub struct VideoStreamContext {
 	/// (see [`pyrowave_protocol::record_client_follows_hdr_mode`]): SDR frames
 	/// of an HDR10 PyroWave stream are encoded as SDR with HDR mode off.
 	pub pyrowave_sdr_as_sdr: bool,
+	/// How many FEC blocks a frame may span; extended only for PyroWave
+	/// clients that negotiated it.
+	pub fec_layout: pyrowave_protocol::FecBlockLayout,
 	/// Width of the video stream in pixels.
 	pub width: u32,
 
@@ -371,6 +382,7 @@ impl VideoStreamContext {
 		}
 		changed!(pyrowave_dialect, "PyroWave dialect");
 		changed!(pyrowave_sdr_as_sdr, "PyroWave SDR presentation");
+		changed!(fec_layout, "FEC block layout");
 		changed!(width, "width");
 		changed!(height, "height");
 		changed!(fps, "fps");
@@ -1106,6 +1118,224 @@ mod tests {
 					.is_err()
 			);
 		}
+	}
+
+	/// A started packet handler with PyroWave pacing, its channel, and a client
+	/// socket that pinged it (so batches are deliverable).
+	async fn paced_sender(
+		socket: UdpGsoSocket,
+		stop: &ShutdownManager<SessionShutdownReason>,
+		pacing: FramePacing,
+	) -> (
+		mpsc::Sender<VideoPacketMessage>,
+		VideoStreamHandle,
+		tokio::net::UdpSocket,
+	) {
+		let server = socket.local_addr().unwrap();
+		let (mut handle, _probe) = VideoStreamHandle::for_test();
+		let (tx, rx) = mpsc::channel(128);
+		handle.packet_tx = tx.clone();
+		let (pause_tx, pause_rx) = watch::channel(0u64);
+		handle.pause_tx = pause_tx;
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		spawn_handle_video_packets(
+			rx,
+			pause_rx,
+			socket,
+			authorization_rx,
+			1,
+			MediaDemand::new(),
+			handle.start.waiter(),
+			stop.clone(),
+			worker(stop),
+			Some(pacing),
+			120,
+			false,
+		);
+		handle.trigger();
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		client.send_to(b"PING", server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+		(tx, handle, client)
+	}
+
+	/// One PyroWave-shaped frame: `shards` datagrams whose first bytes name
+	/// the frame and shard, paced over `window` at `pacing`'s bitrate.
+	fn paced_frame(frame: u32, shards: usize, pacing: FramePacing, window: std::time::Duration) -> ShardBatch {
+		let mut buffer = shard_batch::ShardBuf::new(shards, 256, 0);
+		for shard in 0..shards {
+			buffer.shard_mut(shard)[..4].copy_from_slice(&frame.to_be_bytes());
+			buffer.shard_mut(shard)[4..8].copy_from_slice(&(shard as u32).to_be_bytes());
+		}
+		let mut batch = buffer.into_batch();
+		let encoded = (u128::from(pacing.bitrate_bps) * window.as_nanos() / 8 / 1_000_000_000) as usize;
+		batch.set_frame_metadata(frame, encoded, shards, 0, 1);
+		batch.set_pacing_origin(std::time::Instant::now());
+		batch
+	}
+
+	/// The PyroWave admission policy (`FrameCredits`, two credits) against the
+	/// real paced sender: the producer hands each next frame over while the
+	/// previous one is still being paced out, frames are sent and completed in
+	/// order, and no more than two are ever outstanding.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn pyrowave_credits_overlap_paced_sends_within_their_bound() {
+		use std::sync::{Arc, Mutex};
+		use std::time::{Duration, Instant};
+		const FRAMES: u32 = 8;
+		const SHARDS: usize = 24;
+		let pacing = FramePacing {
+			bitrate_bps: 100_000_000,
+			frame_interval: Duration::from_millis(12),
+		};
+		let window = Duration::from_millis(10);
+		let stop = ShutdownManager::new();
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let (tx, _handle, client) = paced_sender(socket, &stop, pacing).await;
+
+		let receiver = tokio::spawn(async move {
+			let mut order = Vec::new();
+			let mut buffer = [0u8; 512];
+			while order.len() < FRAMES as usize * SHARDS {
+				let Ok(Ok((_, _))) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer)).await
+				else {
+					break;
+				};
+				order.push((
+					u32::from_be_bytes(buffer[..4].try_into().unwrap()),
+					u32::from_be_bytes(buffer[4..8].try_into().unwrap()),
+				));
+			}
+			order
+		});
+
+		let credits = Arc::new(shard_batch::FrameCredits::new(2));
+		let completions = Arc::new(Mutex::new(Vec::new()));
+		let producer = {
+			let credits = credits.clone();
+			let completions = completions.clone();
+			std::thread::spawn(move || {
+				let mut handoffs = Vec::new();
+				let mut most_outstanding = 0;
+				for frame in 0..FRAMES {
+					if !credits.available() {
+						assert!(credits.wait_available(Duration::from_secs(2)), "a credit is released");
+					}
+					let (credit, outstanding) = credits.take();
+					most_outstanding = most_outstanding.max(outstanding);
+					let mut batch = paced_frame(frame, SHARDS, pacing, window);
+					batch.hold_until_release(credit);
+					let completions = completions.clone();
+					batch.observe_completion(move |completion| {
+						completions
+							.lock()
+							.unwrap()
+							.push((frame, completion.finished_at, completion.disposition));
+					});
+					handoffs.push(Instant::now());
+					tx.blocking_send(VideoPacketMessage::Batch(batch)).unwrap();
+				}
+				(handoffs, most_outstanding)
+			})
+		};
+		let (handoffs, most_outstanding) = tokio::task::spawn_blocking(move || producer.join().unwrap())
+			.await
+			.unwrap();
+		let order = receiver.await.unwrap();
+		let completions = completions.lock().unwrap().clone();
+
+		assert_eq!(most_outstanding, 2);
+		assert_eq!(completions.len(), FRAMES as usize);
+		for (index, (frame, _, disposition)) in completions.iter().enumerate() {
+			assert_eq!(*frame, index as u32, "completion order");
+			assert_eq!(*disposition, shard_batch::CompletionDisposition::Submitted);
+		}
+		// Every following frame was handed over before its predecessor's paced
+		// send finished: encoding (here, producing) overlapped transmission.
+		for frame in 1..FRAMES as usize {
+			assert!(handoffs[frame] < completions[frame - 1].1, "frame {frame} overlapped");
+		}
+		// Datagrams arrive frame by frame, shard by shard.
+		assert_eq!(order.len(), FRAMES as usize * SHARDS);
+		assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "datagram order");
+		assert_eq!(credits.outstanding(), 0);
+		let _ = stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
+	/// A stalled link holds the producer at the credit bound instead of
+	/// queueing frames, and a pause returns every credit: the sent prefix of
+	/// the interrupted frame is reported, the queued frame is discarded whole.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn pyrowave_credits_bound_a_stalled_link_and_pause_returns_them() {
+		use std::sync::Arc;
+		use std::time::Duration;
+		let pacing = FramePacing {
+			bitrate_bps: 100_000_000,
+			frame_interval: Duration::from_millis(12),
+		};
+		let stop = ShutdownManager::new();
+		let mut socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		socket.force_no_gso_for_test();
+		socket.faults.stall_after = Some(4);
+		let (tx, handle, _client) = paced_sender(socket, &stop, pacing).await;
+
+		let credits = Arc::new(shard_batch::FrameCredits::new(2));
+		let (dispositions_tx, dispositions) = std::sync::mpsc::channel();
+		let producer = {
+			let credits = credits.clone();
+			std::thread::spawn(move || {
+				let mut admitted = 0;
+				for frame in 0..4 {
+					if !credits.available() && !credits.wait_available(Duration::from_millis(200)) {
+						// The link is stalled: admission waits rather than queueing.
+						break;
+					}
+					let (credit, outstanding) = credits.take();
+					assert!(outstanding <= 2);
+					let mut batch = paced_frame(frame, 8, pacing, Duration::from_millis(2));
+					batch.hold_until_release(credit);
+					let dispositions_tx = dispositions_tx.clone();
+					batch.observe_completion(move |completion| {
+						let _ = dispositions_tx.send((
+							frame,
+							completion.disposition,
+							completion.outcome.submitted_datagrams,
+						));
+					});
+					tx.blocking_send(VideoPacketMessage::Batch(batch)).unwrap();
+					admitted += 1;
+				}
+				admitted
+			})
+		};
+		let admitted = tokio::task::spawn_blocking(move || producer.join().unwrap())
+			.await
+			.unwrap();
+		assert_eq!(admitted, 2, "the stalled first frame and one queued behind it");
+		assert_eq!(credits.outstanding(), 2);
+
+		tokio::time::timeout(Duration::from_secs(1), handle.pause_for_reconfigure())
+			.await
+			.unwrap()
+			.unwrap();
+		let mut completed: Vec<_> = dispositions.try_iter().collect();
+		completed.sort_by_key(|(frame, _, _)| *frame);
+		assert_eq!(
+			completed,
+			vec![
+				(0, shard_batch::CompletionDisposition::Discarded, 4),
+				(1, shard_batch::CompletionDisposition::Discarded, 0),
+			]
+		);
+		assert_eq!(credits.outstanding(), 0);
+		assert!(credits.available());
+		let _ = stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
 	}
 
 	#[tokio::test(flavor = "current_thread")]

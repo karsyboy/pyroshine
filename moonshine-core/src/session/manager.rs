@@ -2234,6 +2234,7 @@ mod tests {
 		VideoStreamContext {
 			pyrowave_dialect: None,
 			pyrowave_sdr_as_sdr: false,
+			fec_layout: Default::default(),
 			width: 1920,
 			height: 1080,
 			fps: 60,

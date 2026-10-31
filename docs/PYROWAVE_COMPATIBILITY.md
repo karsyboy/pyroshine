@@ -22,6 +22,7 @@ a=rtpmap:99 PYROWAVE/90000
 a=x-ss-pyrowave.bitstream:186f0393
 a=x-ss-pyrowave.dialects:native-wire-v1 record-framed
 a=x-ss-pyrowave.profiles:420-sdr8 420-hdr10 444-sdr8 444-hdr10
+a=x-ss-pyrowave.fecBlocks:16
 ```
 
 The profile list contains only modes enabled by startup capability checks. The
@@ -38,9 +39,16 @@ recognized by its record capability markers, as is Nightjar, which sends
 feature bit 1 to hosts that report PyroWave fields in `/serverinfo` and ignores
 its additional pacing hints. User-agent strings are irrelevant.
 
-Unknown revisions, native versions other than 1, duplicate/empty attributes,
-and contradictory dialect markers are rejected with RTSP 400 and a text reason.
-Conventional codec requests bypass PyroWave dialect negotiation.
+Either dialect may echo `x-ss-pyrowave.fecBlocks:16` to receive frames in up to
+sixteen FEC blocks instead of four (see [FEC policy](PYROWAVE.md#fec-policy));
+Pyrolight does when the host offers it. A client that does not echo it receives
+GameStream's layout. The layout is chosen only from this echo, never inferred
+from packets.
+
+Unknown revisions, native versions other than 1, FEC block layouts other than
+16, duplicate/empty attributes, and contradictory dialect markers are rejected
+with RTSP 400 and a text reason. Conventional codec requests bypass PyroWave
+dialect and FEC layout negotiation.
 
 ## Record compatibility boundary
 

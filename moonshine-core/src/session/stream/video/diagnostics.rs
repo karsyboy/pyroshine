@@ -18,6 +18,8 @@ pub(super) struct TransportWindow {
 	would_block: u64,
 	fallback: u64,
 	rebases: u64,
+	/// Frames that started after their whole pacing window had elapsed.
+	late_frames: u64,
 	gso: u64,
 	per_shard: u64,
 	max_send: Duration,
@@ -41,6 +43,7 @@ impl TransportWindow {
 			would_block: 0,
 			fallback: 0,
 			rebases: 0,
+			late_frames: 0,
 			gso: 0,
 			per_shard: 0,
 			max_send: Duration::ZERO,
@@ -70,6 +73,7 @@ impl TransportWindow {
 		self.would_block += u64::from(stats.would_block_events);
 		self.fallback += u64::from(stats.fallback_chunks);
 		self.rebases += u64::from(stats.backpressure_rebases);
+		self.late_frames += u64::from(stats.pacing_rebased);
 		self.gso += u64::from(stats.gso_sends);
 		self.per_shard += u64::from(stats.per_shard_sends);
 		self.max_send = self.max_send.max(stats.elapsed);
@@ -91,6 +95,7 @@ impl TransportWindow {
 				would_block_events = self.would_block,
 				fallback_chunks = self.fallback,
 				backpressure_rebases = self.rebases,
+				late_frames = self.late_frames,
 				gso_sends = self.gso,
 				per_shard_sends = self.per_shard,
 				max_send_us = duration_micros_u64(self.max_send),
@@ -111,6 +116,14 @@ pub(super) struct PipelineWindow {
 	frames: u64,
 	stale: u64,
 	encoded_bytes: u64,
+	data_shards: u64,
+	parity_shards: u64,
+	/// Frames whose layout carried less parity than requested.
+	fec_reduced: u64,
+	requested_fec: u8,
+	/// Capture admission withheld because every frame credit was in transport.
+	credit_waits: u64,
+	credit_wait: Duration,
 
 	sums: [u64; 9],
 	maxima: [u64; 9],
@@ -124,9 +137,23 @@ impl PipelineWindow {
 			frames: 0,
 			stale: 0,
 			encoded_bytes: 0,
+			data_shards: 0,
+			parity_shards: 0,
+			fec_reduced: 0,
+			requested_fec: 0,
+			credit_waits: 0,
+			credit_wait: Duration::ZERO,
 
 			sums: [0; 9],
 			maxima: [0; 9],
+		}
+	}
+
+	/// Time the encode thread waited for the sender to release a frame credit.
+	pub fn record_credit_wait(&mut self, waited: Duration) {
+		if self.enabled {
+			self.credit_waits += 1;
+			self.credit_wait = self.credit_wait.saturating_add(waited);
 		}
 	}
 
@@ -137,6 +164,10 @@ impl PipelineWindow {
 		self.frames += 1;
 		self.stale += u64::from(stats.stale_frames_dropped);
 		self.encoded_bytes += stats.encoded_bytes as u64;
+		self.data_shards += stats.data_shards as u64;
+		self.parity_shards += stats.parity_shards as u64;
+		self.fec_reduced += u64::from(stats.fec_percentage < stats.requested_fec_percentage);
+		self.requested_fec = stats.requested_fec_percentage;
 
 		for (i, duration) in [
 			stats.channel_wait,
@@ -163,6 +194,11 @@ impl PipelineWindow {
 				encoded_frames = self.frames, fps = self.frames as f64 / elapsed.as_secs_f64(),
 				encoded_mbps = self.encoded_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
 				stale_frames_dropped = self.stale, encoder_in_flight = in_flight,
+				requested_fec_percentage = self.requested_fec,
+				effective_fec_percentage = effective_fec_percentage(self.data_shards, self.parity_shards),
+				fec_reduced_frames = self.fec_reduced,
+				credit_waits = self.credit_waits,
+				credit_wait_us = duration_micros_u64(self.credit_wait),
 				packet_queue, import_cache = ?imports,
 				channel_wait_us = avg[0], max_channel_wait_us = self.maxima[0],
 				import_us = avg[1], max_import_us = self.maxima[1],
@@ -178,6 +214,14 @@ impl PipelineWindow {
 			*self = Self::new(self.enabled);
 		}
 	}
+}
+
+/// Parity shards as a percentage of data shards over a window.
+pub(super) fn effective_fec_percentage(data_shards: u64, parity_shards: u64) -> f64 {
+	if data_shards == 0 {
+		return 0.0;
+	}
+	(parity_shards as f64 * 1000.0 / data_shards as f64).round() / 10.0
 }
 
 /// Runs independently of frame completion, so a stuck encode/send still leaves
@@ -295,6 +339,10 @@ mod tests {
 			attempted_packet_count: 10,
 			failed_packet_count: 0,
 			discarded_packet_count: 0,
+			data_shards: 0,
+			parity_shards: 0,
+			fec_percentage: 0,
+			requested_fec_percentage: 0,
 			stale_frames_dropped: 2,
 			is_key_frame: true,
 			source_interval: Duration::ZERO,

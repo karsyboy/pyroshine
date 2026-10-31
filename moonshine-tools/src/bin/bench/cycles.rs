@@ -136,6 +136,7 @@ impl Settings {
 		VideoStreamContext {
 			pyrowave_dialect: pyrowave.then_some(PyroWaveDialect::NativeWireV1),
 			pyrowave_sdr_as_sdr: false,
+			fec_layout: Default::default(),
 			width,
 			height,
 			fps: self.fps(),

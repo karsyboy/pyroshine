@@ -41,6 +41,58 @@ impl PyroWaveDialect {
 		Err("Unsupported PyroWave protocol dialect; native requires version 1, records require feature bit 1")
 	}
 }
+/// SDP attribute of the extended FEC block layout. The host advertises the
+/// layout it supports in DESCRIBE; a client that implements it echoes the
+/// same value in ANNOUNCE, and only then does the host use it.
+pub const FEC_BLOCKS_ATTRIBUTE: &str = "x-ss-pyrowave.fecBlocks";
+
+/// How many Reed-Solomon blocks one video frame may span, and how their
+/// indices are written to `NV_VIDEO_PACKET::multiFecBlocks`.
+///
+/// GameStream has two bits each for the current (bits 4–5) and last
+/// (bits 6–7) block index, so at most four blocks of 255 shards protect a
+/// frame. At 1392-byte packets that keeps 20% parity only up to 848 data
+/// shards (about 1.1 Gb/s at 120 FPS); larger frames lose most of their
+/// parity. The extended layout carries the high two bits of each index in the
+/// byte's low nibble (bits 0–1 current, bits 2–3 last), which GameStream
+/// senders leave zero, for up to sixteen blocks. It is never inferred from
+/// packets: only a client that echoed [`FEC_BLOCKS_ATTRIBUTE`] receives it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FecBlockLayout {
+	#[default]
+	GameStream,
+	Extended,
+}
+impl FecBlockLayout {
+	/// The value both sides exchange for [`Self::Extended`].
+	pub const EXTENDED_VALUE: &'static str = "16";
+
+	/// Select the layout from the client's ANNOUNCE. Conventional codecs and
+	/// PyroWave clients that do not echo the attribute keep GameStream's.
+	pub fn negotiate(pyrowave: bool, attribute: Option<&str>) -> Result<Self, &'static str> {
+		match attribute {
+			_ if !pyrowave => Ok(Self::GameStream),
+			None => Ok(Self::GameStream),
+			Some(Self::EXTENDED_VALUE) => Ok(Self::Extended),
+			Some(_) => Err("Unsupported PyroWave FEC block layout; expected 16"),
+		}
+	}
+
+	pub const fn max_blocks(self) -> usize {
+		match self {
+			Self::GameStream => 4,
+			Self::Extended => 16,
+		}
+	}
+
+	/// The `multiFecBlocks` byte of a shard in block `block` of `last + 1`.
+	/// Identical to GameStream's encoding whenever both indices are below 4.
+	pub(crate) const fn encode(self, block: usize, last: usize) -> u8 {
+		debug_assert!(block <= last && last < self.max_blocks());
+		(((block & 3) << 4) | ((last & 3) << 6) | ((block >> 2) & 3) | (((last >> 2) & 3) << 2)) as u8
+	}
+}
+
 /// Whether a record-framed client converts PyroWave planes by the control
 /// stream's HDR mode rather than by the sequence header, so SDR frames of an
 /// HDR10 stream can be sent as SDR with HDR mode off (the Rubylight host's
@@ -109,6 +161,40 @@ mod tests {
 		assert!(!record_client_follows_hdr_mode(Some("record-framed"), None, None));
 		assert!(!record_client_follows_hdr_mode(None, Some("0"), None));
 		assert!(!record_client_follows_hdr_mode(None, None, Some("1")));
+	}
+	#[test]
+	fn fec_block_layout_is_explicit_and_pyrowave_only() {
+		assert_eq!(FecBlockLayout::negotiate(true, None), Ok(FecBlockLayout::GameStream));
+		assert_eq!(
+			FecBlockLayout::negotiate(true, Some("16")),
+			Ok(FecBlockLayout::Extended)
+		);
+		assert!(FecBlockLayout::negotiate(true, Some("4")).is_err());
+		assert!(FecBlockLayout::negotiate(true, Some("32")).is_err());
+		assert!(FecBlockLayout::negotiate(true, Some("sixteen")).is_err());
+		// Conventional codecs never change their GameStream wire format.
+		assert_eq!(
+			FecBlockLayout::negotiate(false, Some("16")),
+			Ok(FecBlockLayout::GameStream)
+		);
+	}
+	#[test]
+	fn extended_block_indices_keep_the_gamestream_bits() {
+		for layout in [FecBlockLayout::GameStream, FecBlockLayout::Extended] {
+			for last in 0..4 {
+				for block in 0..=last {
+					assert_eq!(layout.encode(block, last), ((block << 4) | (last << 6)) as u8);
+				}
+			}
+		}
+		let extended = FecBlockLayout::Extended;
+		for last in 0..16usize {
+			for block in 0..=last {
+				let byte = extended.encode(block, last) as usize;
+				assert_eq!((byte >> 4) & 3 | (byte & 3) << 2, block);
+				assert_eq!((byte >> 6) & 3 | ((byte >> 2) & 3) << 2, last);
+			}
+		}
 	}
 	#[test]
 	fn native_and_nonary_are_explicit() {

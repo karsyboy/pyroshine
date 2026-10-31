@@ -66,15 +66,18 @@ pub(crate) struct FramePacing {
 	/// Negotiated encoder bitrate. A frame is spread across the time its
 	/// encoded size represents at this rate.
 	pub bitrate_bps: u64,
-	/// Capture slot length. Capture admission stays occupied until a frame is
-	/// sent, so a send that runs past the next slot costs that capture.
+	/// Capture slot length. The next frame is captured and encoded while this
+	/// one is sent, and waits for it: a send that runs past the next slot
+	/// delays that frame.
 	pub frame_interval: Duration,
 }
 
-/// A late frame finishes within this many tenths of its capture slot, leaving
-/// the rest for send completion to release capture admission before the tick.
+/// A late frame finishes within this many tenths of its capture slot, so the
+/// frame captured at the next tick does not wait behind it.
 const LATE_FRAME_SLOT_TENTHS: u32 = 9;
-/// A late frame is never sent faster than this multiple of the bitrate.
+/// A late frame is never sent faster than this multiple of the bitrate, also
+/// when it was late only for part of its window (it waited for the previous
+/// frame's send or a slow encode): no catch-up burst approaches line rate.
 const LATE_FRAME_MAX_SPEEDUP: u32 = 4;
 
 /// Duration represented by `encoded_bytes` at the negotiated encoder bitrate.
@@ -123,19 +126,25 @@ fn pacing_schedule(
 
 	match requested.checked_add(pacing_duration) {
 		Some(deadline) if deadline > started => {
-			// Encoding used part of this frame's transmit window. Start now and
-			// distribute every chunk across the time that remains; do not dump the
-			// already-due prefix as a catch-up burst.
-			(started, deadline.duration_since(started), false, lateness)
+			// Encoding, or the previous frame's send, used part of this frame's
+			// transmit window. Start now and distribute every chunk across the
+			// time that remains; do not dump the already-due prefix as a
+			// catch-up burst, nor send faster than LATE_FRAME_MAX_SPEEDUP times
+			// the bitrate when little of the window remains.
+			let window = deadline
+				.duration_since(started)
+				.max(pacing_duration / LATE_FRAME_MAX_SPEEDUP);
+			(started, window, false, lateness)
 		},
 		_ => {
-			// The complete window elapsed while encoding. A fresh full window
-			// would add the whole window to the encode time and push the send
-			// past the next capture slot, halving the frame rate whenever encode
-			// time exceeds the window (slow GPU clocks or a contended queue).
-			// Finish before that slot instead, never slower than the bitrate and
-			// never faster than LATE_FRAME_MAX_SPEEDUP times it; when even that
-			// cannot meet the slot, the frame is late regardless.
+			// The complete window elapsed while encoding or queued behind the
+			// previous frame. A fresh full window would add the whole window to
+			// the delay and push the send past the next capture slot, so every
+			// following frame would queue behind it (slow GPU clocks, a
+			// contended queue). Finish before that slot instead, never slower
+			// than the bitrate and never faster than LATE_FRAME_MAX_SPEEDUP
+			// times it; when even that cannot meet the slot, the frame is late
+			// regardless.
 			let slot_end = requested.checked_add(frame_interval * LATE_FRAME_SLOT_TENTHS / 10);
 			let window = slot_end
 				.map_or(pacing_duration, |end| end.saturating_duration_since(started))
@@ -342,10 +351,10 @@ impl UdpGsoSocket {
 		}
 		stats.pacing_duration = pacing_duration;
 		let requested_pacing_origin = batch.pacing_origin().unwrap_or(started);
-		// A frame whose entire pacing window elapsed during encode is already
-		// late. Rebase it instead of releasing every overdue GSO chunk as one
-		// catch-up burst. PyroWave capture admission remains occupied until
-		// this complete frame is sent, so no rendered backlog can accumulate.
+		// A frame whose pacing window elapsed during encode, or while it waited
+		// behind the previous frame, is already late. Rebase it instead of
+		// releasing every overdue GSO chunk as one catch-up burst. The
+		// pipeline's frame credits bound how many frames can wait here.
 		let (mut pacing_origin, scheduled_pacing_duration, pacing_rebased, initial_lateness) = pacing_schedule(
 			requested_pacing_origin,
 			pacing_duration,
@@ -880,6 +889,14 @@ mod tests {
 		assert_eq!(duration, Duration::from_millis(5));
 		assert!(!rebased);
 		assert_eq!(lateness, Duration::from_millis(5));
+
+		// Little of the window remains (the frame waited behind the previous
+		// send): the remainder is stretched to the bounded catch-up rate.
+		let requested = started - Duration::from_micros(9_500);
+		let (origin, duration, rebased, _) = pacing_schedule(requested, window, slot, started);
+		assert_eq!(origin, started);
+		assert_eq!(duration, window / LATE_FRAME_MAX_SPEEDUP);
+		assert!(!rebased);
 
 		// The window elapsed, the next capture slot (at 18 ms of 20) has not: the
 		// frame finishes before it instead of adding a full window to its encode.
