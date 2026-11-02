@@ -1094,6 +1094,15 @@ mod tests {
 				}
 			}
 
+			/// Pump until the server's disconnect arrives, for at most `limit`, so
+			/// a slow runner cannot fail the test while a lost disconnect still does.
+			async fn pump_until_disconnected(&mut self, limit: Duration) {
+				let deadline = Instant::now() + limit;
+				while !self.disconnected && Instant::now() < deadline {
+					self.pump(Duration::from_millis(20)).await;
+				}
+			}
+
 			async fn send_raw(&mut self, bytes: &[u8]) {
 				if let Some(peer) = self.host.peer_mut(self.peer) {
 					let _ = peer.send(0, Packet::new(bytes, PacketMode::ReliableSequenced));
@@ -1423,7 +1432,7 @@ mod tests {
 			// A resume replaces the generation and key: the previous client is
 			// disconnected and cannot act, without pausing the new epoch.
 			server.resume(2, NEW_KEY);
-			legit.pump(Duration::from_millis(100)).await;
+			legit.pump_until_disconnected(Duration::from_secs(5)).await;
 			assert!(legit.disconnected, "stale generation peer is disconnected");
 			legit.send(&KEY, &request_idr).await;
 			let mut stale = Client::connect(CLIENT_IP, server.addr, connect_data).await;
@@ -1577,7 +1586,7 @@ mod tests {
 			server.hdr_tx.send_replace(HdrModeState::new(true));
 			client.send(&KEY, &ping()).await;
 			client.send(&KEY, &request_idr()).await;
-			client.pump(Duration::from_millis(100)).await;
+			client.pump_until_disconnected(Duration::from_secs(5)).await;
 			assert!(client.disconnected, "stale peer is disconnected");
 			assert_eq!(client.hdr_messages(&KEY), 1, "no feedback to the retired peer");
 			assert_eq!(server.idrs(), 0);
@@ -1618,7 +1627,8 @@ mod tests {
 
 			// The old deadline passes, then the old transport disconnects late.
 			new.keep_alive(&NEW_KEY, timeouts(1.5)).await;
-			old.pump(Duration::from_millis(100)).await;
+			// Bounded below `new`'s own liveness deadline, which is not serviced here.
+			old.pump_until_disconnected(timeouts(0.5)).await;
 			assert!(old.disconnected, "replaced peer is disconnected");
 			old.send(&KEY, &ping()).await;
 			new.keep_alive(&NEW_KEY, timeouts(1.5)).await;
