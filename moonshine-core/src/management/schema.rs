@@ -323,6 +323,17 @@ fn launch_fields(section: &str, scanner: bool) -> Vec<FieldSpec> {
 		.advanced()
 		.0,
 		Field::new(
+			"env",
+			section,
+			"Environment",
+			&format!(
+				"Extra environment variables for {of}. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch."
+			),
+			FieldKind::Environment,
+		)
+		.advanced()
+		.0,
+		Field::new(
 			"launch_timeout_secs",
 			section,
 			"Launch timeout",
@@ -1228,6 +1239,7 @@ pub(crate) mod tests {
 			"stdout": "journal",
 			"stderr": "journal",
 			"launch_timeout_secs": 5,
+			"env": {"COSMIC_BACKEND": "winit"},
 			"frame_limit_mode": "custom",
 			"frame_limit_fps": 90,
 			"frame_limit_method": "mangohud",

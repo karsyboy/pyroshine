@@ -240,6 +240,81 @@ function TextListEditor({
   );
 }
 
+const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/// Environment variables, one name and value per row. Rows being typed stay
+/// in the editor; the setting receives the rows that have a name, and is unset
+/// (`null`) when there are none.
+function EnvironmentEditor({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: Record<string, string>;
+  onChange: (value: Record<string, string> | null) => void;
+  disabled?: boolean;
+}) {
+  const toRows = (env: Record<string, string>) => Object.entries(env).map(([name, text]) => [name, String(text)] as [string, string]);
+  const external = JSON.stringify(value);
+  const [rows, setRows] = useState<[string, string][]>(() => toRows(value));
+  const toValue = (next: [string, string][]) => {
+    const named = next.filter(([name]) => name.trim() !== "");
+    return named.length === 0 ? null : Object.fromEntries(named.map(([name, text]) => [name.trim(), text]));
+  };
+  useEffect(() => {
+    setRows((current) => (JSON.stringify(toValue(current) ?? {}) === external ? current : toRows(JSON.parse(external))));
+  }, [external]);
+  const update = (next: [string, string][]) => {
+    setRows(next);
+    onChange(toValue(next));
+  };
+  const shown = rows.length === 0 ? [["", ""] as [string, string]] : rows;
+  return (
+    <Stack sx={{ gap: 1 }}>
+      {shown.map(([name, text], index) => {
+        const invalid = name.trim() !== "" && !VARIABLE_NAME.test(name.trim());
+        const duplicate = name.trim() !== "" && shown.findIndex(([other]) => other.trim() === name.trim()) !== index;
+        return (
+          <Stack key={index} direction="row" sx={{ gap: 1, alignItems: "flex-start" }}>
+            <TextField
+              value={name}
+              disabled={disabled}
+              placeholder="NAME"
+              error={invalid || duplicate}
+              helperText={invalid ? "Letters, digits and _" : duplicate ? "Already set above" : undefined}
+              onChange={(event) => update(shown.map((row, i) => (i === index ? [event.target.value, row[1]] : row)))}
+              slotProps={{ htmlInput: { "aria-label": `Variable ${index + 1} name`, spellCheck: false } }}
+              sx={{ flex: 2, "& input": { fontFamily: "monospace", fontSize: 13 } }}
+            />
+            <TextField
+              value={text}
+              disabled={disabled}
+              placeholder="value"
+              onChange={(event) => update(shown.map((row, i) => (i === index ? [row[0], event.target.value] : row)))}
+              slotProps={{ htmlInput: { "aria-label": `Variable ${index + 1} value`, spellCheck: false } }}
+              sx={{ flex: 3, "& input": { fontFamily: "monospace", fontSize: 13 } }}
+            />
+            <IconButton
+              size="small"
+              aria-label="Remove variable"
+              disabled={disabled || (rows.length <= 1 && name === "" && text === "")}
+              onClick={() => update(shown.filter((_, i) => i !== index))}
+              sx={{ mt: 1 }}
+            >
+              <Close fontSize="small" />
+            </IconButton>
+          </Stack>
+        );
+      })}
+      <Box>
+        <Button size="small" startIcon={<Add />} disabled={disabled} onClick={() => update([...shown, ["", ""]])}>
+          Add variable
+        </Button>
+      </Box>
+    </Stack>
+  );
+}
+
 /// Control for a scalar or list field. Structured lists (applications,
 /// scanners) have their own editors.
 export function FieldControl(props: ControlProps) {
@@ -362,6 +437,13 @@ export function FieldControl(props: ControlProps) {
           {error && <FormHelperText error>{error}</FormHelperText>}
         </>
       );
+    case "environment":
+      return (
+        <>
+          <EnvironmentEditor value={(value as Record<string, string> | null) ?? {}} disabled={disabled} onChange={onChange} />
+          {error && <FormHelperText error>{error}</FormHelperText>}
+        </>
+      );
     default:
       return null;
   }
@@ -370,7 +452,7 @@ export function FieldControl(props: ControlProps) {
 /// Label, help and markers for one field, with its control.
 export function FieldRow({ spec, changed, children }: { spec: FieldSpec; changed?: boolean; children: ReactNode }) {
   const inline = spec.kind.type === "bool";
-  const wide = ["command", "command_list", "path_list", "text_list"].includes(spec.kind.type);
+  const wide = ["command", "command_list", "path_list", "text_list", "environment"].includes(spec.kind.type);
   return (
     <Stack
       direction={{ xs: "column", md: inline ? "row" : wide ? "column" : "row" }}

@@ -13,6 +13,7 @@ export const renderedKinds: FieldKind["type"][] = [
   "command_list",
   "path_list",
   "text_list",
+  "environment",
   "applications",
   "scanners",
 ];

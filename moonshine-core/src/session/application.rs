@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -84,6 +84,11 @@ pub struct ApplicationConfig {
 	/// `frame_limit_method`).
 	#[serde(flatten)]
 	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
+
+	/// Extra environment variables for the application. They override the
+	/// variables Pyroshine sets, such as `DISPLAY`.
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub env: BTreeMap<String, String>,
 }
 
 impl Default for ApplicationConfig {
@@ -100,6 +105,7 @@ impl Default for ApplicationConfig {
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
 			frame_limit: Default::default(),
+			env: BTreeMap::new(),
 		}
 	}
 }
@@ -225,7 +231,7 @@ impl Application {
 			Some(limit) => frame_limit_environment(&conn, &config.title, limit).await,
 			None => Vec::new(),
 		};
-		let envs = make_envs(&context, &limit_env)?;
+		let envs = make_envs(&context, &limit_env, &config.env)?;
 
 		// Stop any leftover unit from a previous session. A unit whose processes
 		// cannot be shown gone, or that is still loaded, cannot be replaced
@@ -392,7 +398,11 @@ async fn frame_limit_environment(
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext, frame_limit: &[(String, String)]) -> Result<Vec<String>, SessionFailure> {
+fn make_envs(
+	context: &ApplicationContext,
+	frame_limit: &[(String, String)],
+	config_env: &BTreeMap<String, String>,
+) -> Result<Vec<String>, SessionFailure> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -429,7 +439,7 @@ fn make_envs(context: &ApplicationContext, frame_limit: &[(String, String)]) -> 
 		envs.push("DXVK_HDR=1".to_string());
 	}
 
-	for (key, value) in &context.extra_env {
+	for (key, value) in context.extra_env.iter().chain(config_env) {
 		if obsolete_presentation_environment(key, value) {
 			tracing::error!(
 				key,
@@ -441,16 +451,44 @@ fn make_envs(context: &ApplicationContext, frame_limit: &[(String, String)]) -> 
 			)
 			.with_hint("Remove it from the application's environment."));
 		}
-		envs.push(format!("{key}={value}"));
 	}
+	envs.extend(context.extra_env.iter().map(|(key, value)| format!("{key}={value}")));
 
 	// Unit-scoped: only this application and its children see these.
 	envs.extend(frame_limit.iter().map(|(key, value)| format!("{key}={value}")));
+
+	// The application's own variables come last: systemd keeps the last
+	// assignment, so they override everything above.
+	envs.extend(config_env.iter().map(|(key, value)| format!("{key}={value}")));
 
 	Ok(envs)
 }
 
 // Upgrade validation only: these settings have no supported native equivalent.
+/// Check an `env` table: systemd rejects a launch whose environment has an
+/// invalid name or a NUL, so report it where the setting is entered instead.
+pub fn validate_environment(env: &BTreeMap<String, String>, owner: &str) -> Result<(), String> {
+	for (key, value) in env {
+		let mut chars = key.chars();
+		let valid_name = chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+			&& chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+		if !valid_name {
+			return Err(format!(
+				"env of {owner}: '{key}' is not a valid variable name (letters, digits and _, not starting with a digit)"
+			));
+		}
+		if value.contains('\0') {
+			return Err(format!("env of {owner}: the value of {key} contains a NUL character"));
+		}
+		if obsolete_presentation_environment(key, value) {
+			return Err(format!(
+				"env of {owner}: {key} is a removed presentation-layer setting; remove it"
+			));
+		}
+	}
+	Ok(())
+}
+
 fn obsolete_presentation_environment(key: &str, value: &str) -> bool {
 	key.starts_with("MOONSHINE_WSI_")
 		|| matches!(
@@ -1989,13 +2027,18 @@ mod tests {
 			extra_env: Default::default(),
 			frame_limit: None,
 		};
-		let env = super::make_envs(&context, &[]).unwrap();
+		let env = super::make_envs(&context, &[], &Default::default()).unwrap();
 		// Disabled limiting adds nothing.
 		assert!(
 			!env.iter()
 				.any(|e| e.starts_with("DXVK_FRAME_RATE") || e.starts_with("MANGOHUD"))
 		);
-		let limited = super::make_envs(&context, &[("DXVK_FRAME_RATE".into(), "60".into())]).unwrap();
+		let limited = super::make_envs(
+			&context,
+			&[("DXVK_FRAME_RATE".into(), "60".into())],
+			&Default::default(),
+		)
+		.unwrap();
 		assert_eq!(limited.len(), env.len() + 1);
 		assert_eq!(limited.last().unwrap(), "DXVK_FRAME_RATE=60");
 		assert!(env.contains(&"DISPLAY=:5".into()));
@@ -2004,9 +2047,22 @@ mod tests {
 			e.split('=').next().unwrap(),
 			e.split_once('=').unwrap().1
 		)));
+		let configured = std::collections::BTreeMap::from([
+			("DISPLAY".to_string(), ":9".to_string()),
+			("DXVK_FRAME_RATE".to_string(), "30".to_string()),
+		]);
+		let overridden = super::make_envs(&context, &[("DXVK_FRAME_RATE".into(), "60".into())], &configured).unwrap();
+		// systemd keeps the last assignment, so the application's own values win.
+		assert_eq!(
+			&overridden[overridden.len() - 2..],
+			["DISPLAY=:9", "DXVK_FRAME_RATE=30"]
+		);
+		let obsolete_configured =
+			std::collections::BTreeMap::from([("ENABLE_MOONSHINE_WSI".to_string(), "1".to_string())]);
+		assert!(super::make_envs(&context, &[], &obsolete_configured).is_err());
 		let mut obsolete = context;
 		obsolete.extra_env.insert("ENABLE_MOONSHINE_WSI".into(), "1".into());
-		assert!(super::make_envs(&obsolete, &[]).is_err());
+		assert!(super::make_envs(&obsolete, &[], &Default::default()).is_err());
 		assert!(super::obsolete_presentation_environment(
 			"MOONSHINE_WSI_DISABLE_BYPASS",
 			"1"
@@ -2018,6 +2074,34 @@ mod tests {
 	}
 
 	use super::{ApplicationConfig, split_standard_io};
+
+	#[test]
+	fn application_env_names_are_validated() {
+		use std::collections::BTreeMap;
+		let check = |key: &str, value: &str| {
+			super::validate_environment(&BTreeMap::from([(key.to_string(), value.to_string())]), "test")
+		};
+		assert!(check("COSMIC_BACKEND", "winit").is_ok());
+		assert!(check("_x1", "").is_ok());
+		for invalid in ["", "1ABC", "A-B", "A=B", "A B"] {
+			assert!(check(invalid, "1").is_err(), "{invalid:?}");
+		}
+		assert!(check("A", "a\0b").is_err());
+		assert!(check("ENABLE_MOONSHINE_WSI", "1").is_err());
+	}
+
+	#[test]
+	fn application_env_is_read_from_toml() {
+		let config: ApplicationConfig = toml::from_str(
+			r#"
+title = "COSMIC"
+command = ["/usr/bin/start-cosmic"]
+env = { COSMIC_BACKEND = "winit" }
+"#,
+		)
+		.unwrap();
+		assert_eq!(config.env.get("COSMIC_BACKEND").map(String::as_str), Some("winit"));
+	}
 
 	#[test]
 	fn application_output_scale_is_optional_and_deserializes() {

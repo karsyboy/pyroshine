@@ -175,14 +175,14 @@ impl Config {
 		}
 		self.frame_limit.validate()?;
 		for application in &self.applications {
-			application
-				.frame_limit
-				.validate(&format!("application '{}'", application.title))?;
+			let owner = format!("application '{}'", application.title);
+			application.frame_limit.validate(&owner)?;
+			crate::session::application::validate_environment(&application.env, &owner)?;
 		}
 		for scanner in &self.application_scanners {
-			scanner
-				.frame_limit()
-				.validate(&format!("the {} scanner", scanner.kind().id()))?;
+			let owner = format!("the {} scanner", scanner.kind().id());
+			scanner.frame_limit().validate(&owner)?;
+			crate::session::application::validate_environment(scanner.env(), &owner)?;
 		}
 		if !STREAM_TIMEOUT_SECS.contains(&self.stream.timeout) {
 			return Err(format!(
@@ -261,6 +261,7 @@ impl Default for Config {
 				stderr: None,
 				launch_timeout_secs: 2,
 				frame_limit: Default::default(),
+				env: Default::default(),
 			})],
 			library: LibraryConfig::default(),
 			compositor: CompositorConfig::default(),

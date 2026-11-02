@@ -386,6 +386,7 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 | `stdout` | optional string, effective `"null"` | systemd `StandardOutput` destination, e.g. `journal`, `file:/path`, or `append:/path`. |
 | `stderr` | optional string, effective `"null"` | systemd `StandardError` destination. Set `journal` to capture errors. |
 | `launch_timeout_secs` | nonnegative integer, `2` | Time allowed for the application to reach an active state after launch; separate from the wait for pre-commands. Increase for slow launchers. |
+| `env` | table of strings, `{}` | Extra environment variables for the application, for example `env = { COSMIC_BACKEND = "winit" }`. They override the variables Pyroshine sets (such as `DISPLAY` and the frame limiter's). Names use letters, digits and `_` and do not start with a digit. Support bundles keep the names and redact the values. |
 | `frame_limit_mode` | optional `"off"`, `"stream"` or `"custom"`; unset uses [`[frame_limit]`](#frame_limit) | Frame limiting for this application. `"off"` opts out of a global limit. |
 | `frame_limit_fps` | optional integer `10`–`1000` | Frame rate for `"custom"`; unset uses `frame_limit.fps`. |
 | `frame_limit_method` | optional `"proton"` or `"mangohud"` | Limiter for this application; unset uses `frame_limit.method`. |
@@ -452,7 +453,7 @@ removed and renamed games reach clients without a restart (see
 a restart. Each entry requires `type`.
 
 All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`,
-`launch_timeout_secs` and the `frame_limit_*` overrides, with the same defaults
+`launch_timeout_secs`, `env` and the `frame_limit_*` overrides, with the same defaults
 and behavior as applications.
 Those values are copied to each discovered application. Scanners do not accept
 `output_scale`, `title`, or `boxart` overrides.

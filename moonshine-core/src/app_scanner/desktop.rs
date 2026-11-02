@@ -57,6 +57,11 @@ pub struct DesktopApplicationScannerConfig {
 	/// Overrides of `[frame_limit]` for each discovered application.
 	#[serde(flatten)]
 	pub frame_limit: crate::session::frame_limit::FrameLimitOverride,
+
+	/// Extra environment variables for each discovered application. They
+	/// override the variables Pyroshine sets, such as `DISPLAY`.
+	#[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+	pub env: std::collections::BTreeMap<String, String>,
 }
 
 const SKIPPED_EXEC_FIELD_CODES: [char; 10] = ['f', 'F', 'u', 'U', 'd', 'D', 'n', 'N', 'v', 'm'];
@@ -271,6 +276,7 @@ fn parse_desktop_application(
 			stderr: config.stderr.clone(),
 			launch_timeout_secs: config.launch_timeout_secs,
 			frame_limit: config.frame_limit.clone(),
+			env: config.env.clone(),
 		},
 	})
 }
@@ -669,6 +675,7 @@ mod tests {
 			stderr: None,
 			launch_timeout_secs: 10,
 			frame_limit: Default::default(),
+			env: Default::default(),
 		}
 	}
 

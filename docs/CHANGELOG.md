@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- **Environment variables per application.** Applications and scanners accept an [`env`](CONFIGURATION.md#application) table, for example `env = { COSMIC_BACKEND = "winit" }`; its variables override the ones Pyroshine sets. The web interface edits it under each entry's advanced settings. Invalid variable names are rejected when the configuration is loaded or saved. Ported from Moonshine.
+
 ## [v0.18.0-prerelease.4] - 2026-10-31
 
 ### Added

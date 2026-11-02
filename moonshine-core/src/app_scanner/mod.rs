@@ -127,6 +127,17 @@ impl ApplicationScannerConfig {
 		}
 	}
 
+	/// Extra environment variables applied to every discovered application.
+	pub fn env(&self) -> &std::collections::BTreeMap<String, String> {
+		match self {
+			Self::Steam(config) => &config.env,
+			Self::Desktop(config) => &config.env,
+			Self::Lutris(config) => &config.env,
+			Self::Heroic(config) => &config.env,
+			Self::Bottles(config) => &config.env,
+		}
+	}
+
 	/// The location this scanner reads, for display.
 	pub fn root(&self) -> String {
 		match self {

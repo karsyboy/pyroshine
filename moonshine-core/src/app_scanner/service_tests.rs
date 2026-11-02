@@ -302,6 +302,7 @@ async fn half_written_heroic_libraries_keep_their_games() {
 		stderr: None,
 		launch_timeout_secs: 2,
 		frame_limit: Default::default(),
+		env: Default::default(),
 	});
 	let library = start(directory.path(), vec![scanner], LibraryConfig::default());
 	assert!(library.ready(WAIT).await);

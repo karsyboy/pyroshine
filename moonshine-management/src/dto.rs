@@ -879,6 +879,8 @@ pub enum FieldKind {
 	TextList {
 		placeholder: Option<String>,
 	},
+	/// Environment variables: a table of names to values.
+	Environment,
 	/// `[[application]]` entries.
 	Applications {
 		item: Vec<FieldSpec>,

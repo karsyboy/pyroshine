@@ -372,6 +372,7 @@ export type FieldKind =
   | { type: "command_list" }
   | { type: "path_list"; expands: boolean }
   | { type: "text_list"; placeholder: string | null }
+  | { type: "environment" }
   | { type: "applications"; item: FieldSpec[] }
   | { type: "scanners"; variants: ScannerVariant[] };
 

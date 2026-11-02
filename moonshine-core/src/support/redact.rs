@@ -250,6 +250,13 @@ impl Redactor {
 
 	fn config_value(&mut self, value: &mut toml::Value, path: &str, known: &BTreeSet<String>) {
 		match value {
+			// The only table-valued settings are `env` tables: variable names
+			// are kept, values are blanked because they can hold tokens.
+			toml::Value::Table(table) if known.contains(path) => {
+				for (_, value) in table.iter_mut() {
+					*value = toml::Value::String("<redacted>".into());
+				}
+			},
 			toml::Value::Table(table) => self.config_table(table, path, known),
 			toml::Value::Array(items) => {
 				for item in items {
@@ -432,6 +439,7 @@ certificate = "/home/alice/.config/moonshine/cert.pem"
 [[application]]
 title = "Steam"
 command = ["/home/alice/bin/steam", "-bigpicture"]
+env = { API_TOKEN = "hunter2" }
 
 [[application_scanner]]
 type = "steam"
@@ -450,6 +458,7 @@ command = ["steam"]
 		);
 		assert_eq!(value["application"][0]["title"].as_str(), Some("Steam"));
 		assert_eq!(value["application"][0]["command"][0].as_str(), Some("~/bin/steam"));
+		assert_eq!(value["application"][0]["env"]["API_TOKEN"].as_str(), Some("<redacted>"));
 		assert_eq!(value["application_scanner"][0]["type"].as_str(), Some("steam"));
 		assert_eq!(
 			value["application_scanner"][0]["library"].as_str(),
@@ -472,7 +481,13 @@ command = ["steam"]
 	fn every_serialized_setting_is_known() {
 		let complete = crate::management::schema::tests::complete_config();
 		let text = toml::to_string(&complete).unwrap();
-		let redacted: toml::Table = toml::from_str(&Redactor::new().config(&text)).unwrap();
+		let mut redacted: toml::Table = toml::from_str(&Redactor::new().config(&text)).unwrap();
+		// `env` values are blanked on purpose (see `config_value`).
+		for list in ["application", "application_scanner"] {
+			for item in redacted[list].as_array_mut().unwrap() {
+				assert!(item.as_table_mut().unwrap().remove("env").is_some(), "{list} has env");
+			}
+		}
 		fn strings(value: &toml::Value, out: &mut Vec<String>) {
 			match value {
 				toml::Value::String(text) => out.push(text.clone()),

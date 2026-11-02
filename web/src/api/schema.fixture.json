@@ -1384,6 +1384,18 @@
             {
               "advanced": true,
               "caution": null,
+              "help": "Extra environment variables for the application. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch.",
+              "kind": {
+                "type": "environment"
+              },
+              "label": "Environment",
+              "path": "env",
+              "required": false,
+              "section": "applications"
+            },
+            {
+              "advanced": true,
+              "caution": null,
               "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
               "kind": {
                 "max": 3600.0,
@@ -1585,6 +1597,18 @@
                 {
                   "advanced": true,
                   "caution": null,
+                  "help": "Extra environment variables for each discovered application. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch.",
+                  "kind": {
+                    "type": "environment"
+                  },
+                  "label": "Environment",
+                  "path": "env",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
                   "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
                   "kind": {
                     "max": 3600.0,
@@ -1769,6 +1793,18 @@
                   },
                   "label": "Standard error",
                   "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Extra environment variables for each discovered application. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch.",
+                  "kind": {
+                    "type": "environment"
+                  },
+                  "label": "Environment",
+                  "path": "env",
                   "required": false,
                   "section": "scanners"
                 },
@@ -1960,6 +1996,18 @@
                   },
                   "label": "Standard error",
                   "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Extra environment variables for each discovered application. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch.",
+                  "kind": {
+                    "type": "environment"
+                  },
+                  "label": "Environment",
+                  "path": "env",
                   "required": false,
                   "section": "scanners"
                 },
@@ -2174,6 +2222,18 @@
                 {
                   "advanced": true,
                   "caution": null,
+                  "help": "Extra environment variables for each discovered application. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch.",
+                  "kind": {
+                    "type": "environment"
+                  },
+                  "label": "Environment",
+                  "path": "env",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
                   "help": "Time allowed to reach an active state after launch, separate from the wait for pre-commands. Increase for slow launchers.",
                   "kind": {
                     "max": 3600.0,
@@ -2365,6 +2425,18 @@
                   },
                   "label": "Standard error",
                   "path": "stderr",
+                  "required": false,
+                  "section": "scanners"
+                },
+                {
+                  "advanced": true,
+                  "caution": null,
+                  "help": "Extra environment variables for each discovered application. They override the variables Pyroshine sets, such as DISPLAY. Takes effect at the next launch.",
+                  "kind": {
+                    "type": "environment"
+                  },
+                  "label": "Environment",
+                  "path": "env",
                   "required": false,
                   "section": "scanners"
                 },
