@@ -14,52 +14,9 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
-## [v0.18.0-prerelease.5] - 2026-11-02
+## [v0.18.1] - 2026-11-03
 
-### Added
-
-- **Environment variables per application.** Applications and scanners accept an [`env`](CONFIGURATION.md#application) table, for example `env = { COSMIC_BACKEND = "winit" }`; its variables override the ones Pyroshine sets. The web interface edits it under each entry's advanced settings. Invalid variable names are rejected when the configuration is loaded or saved. Ported from Moonshine.
-
-## [v0.18.0-prerelease.4] - 2026-10-31
-
-### Added
-
-- **Full error correction for PyroWave above 1 Gb/s** with Pyrolight. A video frame could use only four error-correction blocks, so at 4K120 the configured 20% parity shrank to 16% at 1.15 Gb/s and 3% at 1.3 Gb/s, and above about 1.4 Gb/s frames were sent without any. Pyrolight now negotiates up to sixteen blocks per frame and keeps the configured protection up to about 4.6 MB per frame. Moonlight, Nightjar and older Pyrolight releases keep the previous format. The parity now actually sent counts toward the network load (1.3 Gb/s PyroWave at 20% is about 1.6 Gb/s of UDP payload): leave headroom on the link, as the bandwidth test recommends. The pipeline log and `moonshine-bench` report the effective parity. Tested on the host and against Pyrolight's protocol code; not yet tested with a Pyrolight client over a real 2.5 GbE link.
-
-### Changed
-
-- **PyroWave keeps its frame rate at high bitrates.** Each frame was captured only after the previous one had been completely sent, and a full frame takes about one frame interval to send, so a send finishing just after the next refresh tick cost that frame. At 4K120 and 1.3 Gb/s this dropped frames whenever the host was busy (2% with a CPU-heavy load). The next frame is now captured and encoded while the previous one is still being sent, with at most two frames in flight. A game that saturates the GPU still holds PyroWave at about half the frame rate: the encode waits behind the game's GPU work, at any bitrate.
-
-## [v0.18.0-prerelease.3] - 2026-10-30
-
-### Added
-
-- **Client microphone.** Pyrolight and Nightjar can send their microphone to the host (Apollo's microphone stream, UDP port 48001). Game Mode applications get it as their default input device; in Desktop Mode it appears as **Pyroshine client microphone**. Lost packets are recovered from Opus error correction or concealed, and the delay stays within about 120 ms. On by default; turn it off with [`[stream.audio] microphone`](CONFIGURATION.md#streamaudio). Open UDP port 48001 in a firewall that limits the streaming ports.
-
-## [v0.18.0-prerelease.2] - 2026-10-29
-
-### Added
-
-- **Slow down a game nobody is watching** (opt-in). [`[compositor] detached_frame_rate`](CONFIGURATION.md#compositor) sets the frame rate most games are paced to while no client is connected, saving power and GPU time; a returning client gets the full rate immediately. Off by default.
-
-### Changed
-
-- **Lower latency with demanding games** for H.264, HEVC and AV1. While a GPU-bound game ran, every frame waited for the game's next frame before it was encoded; at 4K60 the server-side delay drops from 14 ms to under 6 ms, and the game runs slightly faster. When the GPU has headroom, each frame now costs about 0.3 ms more. PyroWave is unchanged.
-- Streaming sessions use less GPU memory: composition buffers are allocated only when a frame needs composition and freed after 30 seconds without one. A fullscreen game at 4K no longer reserves 96 MiB (SDR) or 192 MiB (HDR) for them.
-- Video error correction uses a few dedicated threads per stream instead of one per CPU: a quarter of the host's CPU threads, from 1 to 4, or the number set with the new [`fec_threads`](CONFIGURATION.md#streamvideo) setting. At PyroWave 4K120 on a 16-thread CPU this halves Pyroshine's CPU use and stops it waking every core thousands of times a second, with no added latency. The threads now also end with the stream.
-- VA-API and NVENC streams allocate one fewer input frame (12 MiB at 4K 4:2:0, up to 50 MiB at 4K 4:4:4 10-bit).
-- While no client is connected, the encoders let go of the game's frame buffers, so a game that changes resolution meanwhile frees its old buffers.
-- While no client is connected the video encoder sleeps instead of checking for work every frame, and a reconnecting client gets its first frame sooner (PyroWave 4K60: 23 ms after PLAY instead of 42 ms).
-- After a client has been gone for a minute, the video encoder is released and its GPU memory returned to the game (about 60 MiB for HEVC, 200 MiB for PyroWave at 4K). A client that reconnects after that waits about half a second to a second for its first frame while the encoder is rebuilt.
-- Composited frames (for example with the Steam overlay open) no longer block the compositor while the GPU finishes them. Behind a GPU-bound game that wait took about 11 ms per frame and delayed input and the game's frame pacing; frame latency is unchanged.
-- The service returns memory to the system after each session. Its memory use no longer grows by about 12 MiB per session (to about 240 MiB after 20 sessions); it now stays near 80 MiB.
-
-### Fixed
-
-- A GPU that stops responding during an H.264, HEVC or AV1 stream now ends the stream with an error after 5 seconds instead of hanging the video encoder.
-- Games streamed without composition no longer leave their old swapchain buffers in GPU memory for the rest of the session. At 4K a game that recreated its swapchain at startup kept about 500 MiB of VRAM allocated until something forced a composited frame.
-
-## [v0.18.0-prerelease.1] - 2026-10-27
+First stable 0.18 release; it collects the changes from v0.18.0-prerelease.1 to v0.18.0-prerelease.5.
 
 ### Added
 
@@ -67,25 +24,33 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - **Desktop tray.** While you are signed in to a desktop, the service shows a status icon with session details, **End Session** and pairing notifications that open the matching web page. Headless hosts never start it; `[management] tray = false` turns it off.
 - **Session history.** Each session records the application, client, mode, codec, HDR, encoder, disconnects and a performance summary compared with the previous session (`[history]`, 90 days by default).
 - **Desktop Mode** (preview). Stream your existing KDE Plasma or GNOME Wayland desktop on a client-sized virtual display, with remote-only audio, input authorization, per-client UI scale, reconnect grace and automatic restoration of your physical displays. HDR requests fall back to SDR. Manage it from the Dashboard or `pyroshine desktop status|authorize|restore`. Games keep using isolated sessions. Streaming acceptance on physical KDE and GNOME hosts is still in progress. See [Desktop Mode](DESKTOP_MODE.md).
+- **Client microphone.** Pyrolight and Nightjar can send their microphone to the host (Apollo's microphone stream, UDP port 48001). Game Mode applications get it as their default input device; in Desktop Mode it appears as **Pyroshine client microphone**. Lost packets are recovered from Opus error correction or concealed, and the delay stays within about 120 ms. On by default; turn it off with [`[stream.audio] microphone`](CONFIGURATION.md#streamaudio). Open UDP port 48001 in a firewall that limits the streaming ports.
 - **H.264, HEVC and AV1 on Intel GPUs.** Profiles that Vulkan Video cannot encode now use VA-API (`intel-media-driver`) or NVENC on the same GPU. An Arc B390 now offers H.264, HEVC (including Main 10 and 4:4:4) and AV1; a UHD 730 offers H.264 and HEVC. Choose encoders with `stream.video.encoder`. These encoders pass GPU tests but have not yet been tested with a real client. See [GPU compatibility](GPU_COMPATIBILITY.md).
+- **Full error correction for PyroWave above 1 Gb/s** with Pyrolight. A frame could use only four error-correction blocks, so at 4K120 the configured 20% parity shrank to 3% at 1.3 Gb/s and disappeared above about 1.4 Gb/s. Pyrolight now negotiates up to sixteen blocks per frame and keeps the configured protection up to about 4.6 MB per frame; Moonlight, Nightjar and older Pyrolight releases keep the previous format. The parity now counts toward the network load (1.3 Gb/s PyroWave at 20% is about 1.6 Gb/s of UDP payload), so leave headroom on the link. The pipeline log and `moonshine-bench` report the effective parity.
 - **Automatic game library.** Installed, removed and renamed games reach clients without a restart; Pyroshine watches each launcher and rescans only the one that changed (`[library]`). The **Library** page searches, filters, hides and rescans games and shows each launcher's status. See [`[library]`](CONFIGURATION.md#library).
 - **More game sources.** Discover Bottles games (native or Flatpak) and non-Steam games added to the host's Steam library, with their artwork and launch options. See [application scanners](CONFIGURATION.md#application_scanner).
+- **Environment variables per application.** Applications and scanners accept an [`env`](CONFIGURATION.md#application) table, for example `env = { COSMIC_BACKEND = "winit" }`; its variables override the ones Pyroshine sets. The web interface edits it under each entry's advanced settings, and invalid variable names are rejected. Ported from Moonshine.
 - **UDP bandwidth calibration** for every codec. Paired clients such as Pyrolight measure loss and queueing through the real video sender and get a conservative bitrate suggestion; nothing changes automatically. See [Bandwidth calibration](BANDWIDTH_CALIBRATION.md).
 - **Live bitrate changes.** Clients can change their stream's bitrate without reconnecting (`GET /bitrate`), as Vibepollo and Foundation Sunshine define. Nightjar's stream menu and automatic bitrate now work. See [Client integration](CLIENT_INTEGRATION.md#live-bitrate).
 - **Nightjar support** for VRR, live bitrate and fractional refresh rates through the Vibepollo extensions; launching a different application asks the client to confirm instead of failing. See [Client integration](CLIENT_INTEGRATION.md#vibepollo-extensions).
-- **Optional frame limiting** of launched games (`[frame_limit]`, off by default) to the stream's or a fixed frame rate, through Proton's limiters or MangoHud, globally or per application. See [`[frame_limit]`](CONFIGURATION.md#frame_limit).
 - **PyroDeck support.** The app list reports each game's launcher identity (such as `steam:892970`), `/serverinfo` reports what Steam says about a streamed game (launching, updating, running or exited), and cancellation can name the expected application; `/serverinfo` advertises that check as `<PyroshineConditionalCancel>1</PyroshineConditionalCancel>` so clients never send it to a host that would ignore it. See [Client integration](CLIENT_INTEGRATION.md#conditional-application-cancellation).
+- **Optional frame limiting** of launched games (`[frame_limit]`, off by default) to the stream's or a fixed frame rate, through Proton's limiters or MangoHud, globally or per application. See [`[frame_limit]`](CONFIGURATION.md#frame_limit).
+- **Slow down a game nobody is watching** (opt-in). [`[compositor] detached_frame_rate`](CONFIGURATION.md#compositor) sets the frame rate most games are paced to while no client is connected; a returning client gets the full rate immediately.
 - **Developer tools.** `moonshine-library` reports what each launcher scan finds; `moonshine-bench --json`, `--capabilities` and `--encoder`, `scripts/bench_results.py` and `scripts/hardware_tests.py` record and compare hardware results. See [testing](TESTING.md).
 
 ### Changed
 
+- **Lower latency with demanding games** for H.264, HEVC and AV1. Frames no longer wait for the game's next frame before they are encoded: at 4K60 behind a GPU-bound game the server-side delay drops from 14 ms to under 6 ms. With GPU headroom each frame costs about 0.3 ms more.
+- **PyroWave keeps its frame rate** when encoding is slow (an RTX 3080 at idle clocks went from 41 to 60 FPS at 4K60) and at high bitrates, where the next frame is now captured and encoded while the previous one is still being sent. A game that saturates the GPU still holds PyroWave at about half the frame rate.
 - **Stable application IDs.** Discovered games keep the ID clients know across renames, reinstalls and restarts; upgrading keeps the current IDs.
-- **Each game is offered once.** Duplicates from desktop shortcuts or two launchers are merged, a manual `[[application]]` with a discovered title replaces it, and equal titles from different launchers are labeled, for example `Hades (Steam)`.
-- Games from a library that cannot be read (an unmounted drive, a half-written file) stay offered for up to seven days.
-- More box art: Steam custom, capsule and header art and Lutris banners. Box art is cached and no longer decoded on network threads.
-- Library scans at startup are much faster: a 2,000-game Steam library scans in about 40 ms.
+- **Each game is offered once.** Duplicates from desktop shortcuts or two launchers are merged, a manual `[[application]]` with a discovered title replaces it, and equal titles from different launchers are labeled, for example `Hades (Steam)`. Games from a library that cannot be read (an unmounted drive, a half-written file) stay offered for up to seven days.
+- More box art (Steam custom, capsule and header art and Lutris banners), cached and no longer decoded on network threads. A 2,000-game Steam library scans in about 40 ms at startup.
 - A Steam launch is refused with a clear error while another Steam client of the same user is running on the host, instead of the game opening on the host's desktop. See [Close a desktop Steam before streaming Steam](TIPS.md#close-a-desktop-steam-before-streaming-steam).
 - The health check explains every codec profile it does not offer and names the encoder in use. See [GPU compatibility](GPU_COMPATIBILITY.md).
+- **Less GPU memory.** Composition buffers exist only while frames need composition; VA-API and NVENC allocate one fewer input frame; encoders release the game's buffers while no client is connected, and the video encoder itself after a minute without one (a client returning after that waits up to about a second for its first frame).
+- **Less CPU and idle work.** Video error correction uses a few dedicated threads per stream (a quarter of the CPU threads, 1 to 4, or [`fec_threads`](CONFIGURATION.md#streamvideo)), halving Pyroshine's CPU use at PyroWave 4K120 on a 16-thread CPU. The encoder sleeps while no client is connected, and a reconnecting client gets its first frame sooner (PyroWave 4K60: 23 ms instead of 42 ms).
+- Composited frames (for example with the Steam overlay open) no longer block the compositor while the GPU finishes them, which behind a GPU-bound game took about 11 ms per frame.
+- The service returns memory to the system after each session and stays near 80 MiB instead of growing by about 12 MiB per session.
 - PyroWave is built from upstream [Themaister/pyrowave](https://github.com/Themaister/pyrowave) with a vendored patch series. Upstream rate-control fixes keep low-bitrate streams from losing color. The bitstream and C API are unchanged. See [PyroWave](PYROWAVE.md#pinned-dependency).
 - Pixelforge is updated to v0.10.0; H.264, HEVC and AV1 conversion uses a dedicated compute queue where available.
 - CI also runs on pushes and pull requests to `version-*` release branches.
@@ -111,7 +76,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
   - Pyroshine starts on GPUs without Vulkan Video encode and offers PyroWave there.
   - Profiles the GPU cannot encode at a constant bitrate are no longer advertised.
   - Encoder padding is no longer sent, and bitrates above a profile's limit are capped.
-  - PyroWave keeps its frame rate when encoding is slow, such as an NVIDIA GPU at idle clocks or a GPU-bound game. On an RTX 3080, 4K60 rose from 41 to 60 FPS.
+  - A GPU that stops responding during an H.264, HEVC or AV1 stream ends the stream with an error after 5 seconds instead of hanging the video encoder.
+  - Games streamed without composition no longer keep their old swapchain buffers (about 500 MiB at 4K) in GPU memory for the rest of the session.
 - **Sessions**
   - Ending a stream on NVIDIA no longer hangs the service.
   - A session stops promptly when the client leaves right after a launch.
