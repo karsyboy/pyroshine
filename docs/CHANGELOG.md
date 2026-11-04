@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.2] - 2026-11-04
+
 ### Fixed
 
 - **Steam overlay cut off over windowed applications.** In Game Mode, an application whose window is smaller than the stream (a windowed game or launcher) is scaled up to fill it, and the Steam overlay and notifications were enlarged with it, cropping their edges and offsetting clicks. They now keep their own scale, as in gamescope, and the pointer follows the overlay while it is open.
