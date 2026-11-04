@@ -202,6 +202,15 @@ passive notification. Property and geometry events update this classification.
 There is no second fixed-pixel-width detector. Classified layers paint above the
 game, its decorations, and dropdowns with their cached window opacity.
 
+Output scaling is per layer, as in gamescope's `paint_window` calls. The focus
+window, its dropdowns, decorations and other scene windows share one transform
+that fits the focus window (grown to include an open dropdown) to the output.
+The Steam overlay and notification are fitted by their own size instead: they
+span the X screen, so sharing a smaller windowed game's transform would enlarge
+them past the output and crop them. External overlays are drawn unscaled.
+Absolute and relative pointer input, and the cursor, use the transform of the
+pointer focus window, so they follow the overlay while it takes input.
+
 Passive notifications are excluded from primary focus, dropdown selection, and
 pointer hit testing. Mapping, updating, or unmapping one changes the video scene
 but does not reapply unchanged input targets. Compositor-owned root properties
@@ -395,7 +404,9 @@ focus to a Steam window and to `None` and requires the game to get it back,
 subwindow focused inside Steam's window to keep focus when a game is exited from
 the overlay, `input_focus_window_is_raised_in_the_x_stack` requires the X pointer
 to be over the overlay while it is the input focus and over the game again after
-it closes, and
+it closes, `steam_overlay_over_a_smaller_window_keeps_its_own_scale` requires
+pointer input to map 1:1 onto a full-size overlay above a fitted 640x480 game
+and through the game's transform again once it closes, and
 `x11_errors_on_destroyed_focus_windows_are_not_fatal` requires asynchronous X
 errors from vanished windows to leave the process running:
 

@@ -1379,6 +1379,89 @@ mod xwayland_tests {
 		shut_down(stop);
 	}
 
+	/// A windowed game smaller than the output is fitted to it, but the Steam
+	/// overlay spans the X screen and is drawn with its own transform (as in
+	/// gamescope). Pointer input must follow the overlay's transform while it
+	/// has input focus, or clicks miss and the overlay looks cropped.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn steam_overlay_over_a_smaller_window_keeps_its_own_scale() {
+		const GAME_APP: u32 = 219990;
+		let (stop, handles, launched) = launch();
+		let (conn, screen_num) = x11rb::connect(Some(&format!(":{}", launched.ready().display.xdisplay))).unwrap();
+		let root = conn.setup().roots[screen_num].root;
+		let input_focus =
+			|conn: &x11rb::rust_connection::RustConnection| conn.get_input_focus().unwrap().reply().unwrap().focus;
+		let pointer = || {
+			let reply = conn.query_pointer(root).unwrap().reply().unwrap();
+			(reply.root_x, reply.root_y)
+		};
+		let move_to = |x: i16, y: i16| {
+			handles
+				.input
+				.send(crate::session::capture::input::CaptureInputEvent::MouseMoveAbsolute {
+					x,
+					y,
+					screen_width: WIDTH as i16,
+					screen_height: HEIGHT as i16,
+				})
+				.unwrap();
+		};
+
+		// 640x480 on 1280x720 is fitted at 1.5x, offset 160 px horizontally.
+		let game = map_fullscreen(&conn, root, &[(b"STEAM_GAME", GAME_APP)]);
+		conn.configure_window(
+			game,
+			&x11rb::protocol::xproto::ConfigureWindowAux::new()
+				.width(640)
+				.height(480),
+		)
+		.unwrap();
+		conn.flush().unwrap();
+		assert!(
+			wait_until(|| input_focus(&conn) == game),
+			"the game never received focus"
+		);
+		move_to(1000, 540);
+		assert!(
+			wait_until(|| pointer() == (560, 360)),
+			"output (1000, 540) maps to {:?} in the game's scaled scene, not (560, 360)",
+			pointer()
+		);
+
+		let overlay = map_fullscreen(
+			&conn,
+			root,
+			&[(b"STEAM_GAME", 769), (b"STEAM_OVERLAY", 1), (b"STEAM_INPUT_FOCUS", 1)],
+		);
+		assert!(
+			wait_until(|| input_focus(&conn) == overlay),
+			"the overlay never took focus"
+		);
+		move_to(1200, 700);
+		assert!(
+			wait_until(|| pointer() == (1200, 700)),
+			"output (1200, 700) maps to {:?} under the full-size overlay, not 1:1",
+			pointer()
+		);
+
+		// Closing the overlay restores the game's transform.
+		set_cardinal(&conn, overlay, b"STEAM_INPUT_FOCUS", 0);
+		set_cardinal(&conn, overlay, b"STEAM_OVERLAY", 0);
+		conn.unmap_window(overlay).unwrap();
+		conn.flush().unwrap();
+		assert!(wait_until(|| input_focus(&conn) == game));
+		move_to(1000, 540);
+		assert!(
+			wait_until(|| pointer() == (560, 360)),
+			"the game's transform did not return: {:?}",
+			pointer()
+		);
+
+		drop(conn);
+		shut_down(stop);
+	}
+
 	/// Map a full-size child of `parent`, like a browser embedded in its window.
 	fn map_child(conn: &impl Connection, parent: u32) -> u32 {
 		let window = conn.generate_id().unwrap();

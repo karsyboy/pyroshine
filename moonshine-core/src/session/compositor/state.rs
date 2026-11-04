@@ -270,6 +270,13 @@ impl From<PointerRenderElement<GlesRenderer>> for OutputRenderElements {
 /// A composed element with an output scaling and centering transform applied.
 type ScaledOutputElement = RelocateRenderElement<RescaleRenderElement<OutputRenderElements>>;
 
+/// An output scaling transform: the scale and centering offset, and the
+/// origin (the scaled window's top-left in physical output coordinates).
+type SceneTransform = (
+	super::scaling::OutputScale,
+	smithay::utils::Point<i32, smithay::utils::Physical>,
+);
+
 /// Central compositor state for Moonshine's headless compositor.
 ///
 /// Runs on a dedicated calloop thread. All Smithay delegate_*! macros
@@ -1105,19 +1112,22 @@ impl MoonshineCompositor {
 		output: &Output,
 		layers: SceneLayers<'_>,
 		opacity: impl Fn(&smithay::desktop::Window) -> f32,
-	) -> Vec<OutputRenderElements> {
+		transform: impl Fn(&smithay::desktop::Window) -> Option<SceneTransform>,
+	) -> Vec<(OutputRenderElements, Option<SceneTransform>)> {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
 		let Some(output_geo) = space.output_geometry(output) else {
 			return Vec::new();
 		};
 
-		let mut render_window = |elements: &mut Vec<OutputRenderElements>, window: &smithay::desktop::Window| {
+		let mut render_window = |elements: &mut Vec<(OutputRenderElements, Option<SceneTransform>)>,
+		                         window: &smithay::desktop::Window| {
 			let alpha = opacity(window);
 			if alpha == 0.0 {
 				return;
 			}
 			let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
+			let transform = transform(window);
 
 			elements.extend(
 				window
@@ -1125,7 +1135,7 @@ impl MoonshineCompositor {
 						renderer, location, scale, alpha,
 					)
 					.into_iter()
-					.map(|e| OutputRenderElements::Space(e, None)),
+					.map(|e| (OutputRenderElements::Space(e, None), transform)),
 			);
 		};
 
@@ -1156,14 +1166,46 @@ impl MoonshineCompositor {
 	///
 	/// `None` when no scaling is needed: no window to anchor to, or the window
 	/// already fills the output.
-	fn compute_output_scale(
+	fn compute_output_scale(&self) -> Option<SceneTransform> {
+		// The scaling base is the focus window; its dropdown is fitted with it.
+		self.window_output_scale(self.focused_window.as_ref()?, self.override_window.as_ref())
+	}
+
+	/// The transform a scene window is drawn with.
+	///
+	/// The Steam overlay and notification are scaled by their own size, not by
+	/// the focus window's: they span the whole X screen, so fitting them with a
+	/// smaller windowed game would enlarge them past the output and crop them.
+	/// External overlays (MangoHud, OBS) are drawn unscaled. Everything else
+	/// shares the focus window's transform. Gamescope: the `scaleW` and
+	/// `NoScale` arguments of `paint_window` in `paint_all`.
+	fn layer_output_scale(&self, window: &smithay::desktop::Window) -> Option<SceneTransform> {
+		if self.overlay_window.as_ref() == Some(window) || self.notification_window.as_ref() == Some(window) {
+			self.window_output_scale(window, None)
+		} else if self.external_overlay_window.as_ref() == Some(window) {
+			None
+		} else {
+			self.compute_output_scale()
+		}
+	}
+
+	/// The transform of the window receiving pointer input, which absolute and
+	/// relative pointer motion must invert, and which the cursor is drawn with.
+	/// Gamescope: `focusedWindowScaleX/Y` follow the input focus window.
+	fn input_output_scale(&self) -> Option<SceneTransform> {
+		match self.pointer_focus_window.as_ref() {
+			Some(window) => self.layer_output_scale(window),
+			None => self.compute_output_scale(),
+		}
+	}
+
+	/// The transform that fits `window` (grown to include `fit`, if any) to
+	/// the output; `None` when it already fills the output.
+	fn window_output_scale(
 		&self,
-	) -> Option<(
-		super::scaling::OutputScale,
-		smithay::utils::Point<i32, smithay::utils::Physical>,
-	)> {
-		// The scaling base is the focus window.
-		let window = self.focused_window.as_ref()?;
+		window: &smithay::desktop::Window,
+		fit: Option<&smithay::desktop::Window>,
+	) -> Option<SceneTransform> {
 		if self.window_metadata.get(window).is_none_or(|m| m.is_useless()) {
 			return None;
 		}
@@ -1177,7 +1219,7 @@ impl MoonshineCompositor {
 
 		// Grow the source to include the override/dropdown window, so it stays
 		// on-screen without pushing the scale below 1.
-		if let Some(fit) = self.override_window.as_ref() {
+		if let Some(fit) = fit {
 			let fit_geo = fit.geometry();
 			let fit_right = fit_geo.loc.x - geo.loc.x + fit_geo.size.w;
 			let fit_bottom = fit_geo.loc.y - geo.loc.y + fit_geo.size.h;
@@ -1224,7 +1266,7 @@ impl MoonshineCompositor {
 		&self,
 		point: smithay::utils::Point<f64, smithay::utils::Logical>,
 	) -> smithay::utils::Point<f64, smithay::utils::Logical> {
-		let Some((scale, origin)) = self.compute_output_scale() else {
+		let Some((scale, origin)) = self.input_output_scale() else {
 			return point;
 		};
 		smithay::utils::Point::from((
@@ -1237,7 +1279,7 @@ impl MoonshineCompositor {
 	/// output scaling (`1.0` per axis when no scaling is active).
 	pub fn scene_input_ratio(&self) -> (f64, f64) {
 		let output_scale = self.output.current_scale().fractional_scale();
-		match self.compute_output_scale() {
+		match self.input_output_scale() {
 			Some((scale, _)) => (
 				1.0 / (output_scale * scale.scale_x),
 				1.0 / (output_scale * scale.scale_y),
@@ -2336,8 +2378,19 @@ impl MoonshineCompositor {
 		};
 
 		// Compute the output scaling before binding the framebuffer, which
-		// borrows `self` mutably.
-		let output_scale = self.compute_output_scale();
+		// borrows `self` mutably. Steam overlays and external overlays have
+		// their own transforms; every other window shares the focus window's.
+		let base_transform = self.compute_output_scale();
+		let layer_transforms = [
+			self.overlay_window.clone(),
+			self.notification_window.clone(),
+			self.external_overlay_window.clone(),
+		]
+		.map(|window| {
+			let transform = window.as_ref().and_then(|w| self.layer_output_scale(w));
+			(window, transform)
+		});
+		let cursor_transform = self.input_output_scale();
 
 		// Select the sampler filter for this frame (linear by default).
 		let filter = self.upscale_filter;
@@ -2399,8 +2452,9 @@ impl MoonshineCompositor {
 		);
 
 		// Combine elements in front-to-back order: cursor first (on top), then space.
-		let mut elements: Vec<OutputRenderElements> = Vec::new();
-		elements.extend(cursor_elements);
+		// The cursor follows the transform of the window it points into.
+		let mut elements: Vec<(OutputRenderElements, Option<SceneTransform>)> = Vec::new();
+		elements.extend(cursor_elements.into_iter().map(|e| (e, cursor_transform)));
 
 		let space_elements = Self::scene_render_elements(
 			&mut self.renderer,
@@ -2422,6 +2476,12 @@ impl MoonshineCompositor {
 					.map(|m| m.opacity as f32 / 255.0)
 					.unwrap_or(1.0)
 			},
+			|window| {
+				layer_transforms
+					.iter()
+					.find(|(layer, _)| layer.as_ref() == Some(window))
+					.map_or(base_transform, |(_, transform)| *transform)
+			},
 		);
 		elements.extend(space_elements);
 		// Resolve the composed frame from the real render list, not merely
@@ -2432,7 +2492,7 @@ impl MoonshineCompositor {
 			smithay::utils::Rectangle::from_size((self.width as i32, self.height as i32).into());
 		let hdr_source = source_surface.as_ref().and_then(|root| {
 			let cm = self.color_management.as_ref()?;
-			for element in &elements {
+			for (element, _) in &elements {
 				let geometry = element.geometry(scale);
 				if element.alpha() == 0.0 || !geometry.overlaps(bounds) {
 					continue;
@@ -2458,7 +2518,7 @@ impl MoonshineCompositor {
 			.as_ref()
 			.filter(|_| self.hdr)
 			.and_then(|s| self.color_management.as_ref()?.surface_hdr_metadata(s));
-		for element in &mut elements {
+		for (element, _) in &mut elements {
 			let source = self
 				.color_management
 				.as_ref()
@@ -2483,15 +2543,21 @@ impl MoonshineCompositor {
 			.map(|last| self.render_count - last)
 			.unwrap_or(0);
 
-		let render_result = if let Some((scale, origin)) = output_scale {
+		let render_result = if elements.iter().any(|(_, transform)| transform.is_some()) {
 			let output_scale = self.output.current_scale().fractional_scale();
-			let center = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-				(scale.offset_x * output_scale).round() as i32,
-				(scale.offset_y * output_scale).round() as i32,
-			));
 			let scaled: Vec<ScaledOutputElement> = elements
 				.into_iter()
-				.map(|e| {
+				.map(|(e, transform)| {
+					let Some((scale, origin)) = transform else {
+						// Unscaled layers (external overlays, or a Steam overlay
+						// that fills the output) keep their own placement.
+						let rescaled = RescaleRenderElement::from_element(e, (0, 0).into(), 1.0);
+						return RelocateRenderElement::from_element(rescaled, (0, 0), Relocate::Relative);
+					};
+					let center = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
+						(scale.offset_x * output_scale).round() as i32,
+						(scale.offset_y * output_scale).round() as i32,
+					));
 					let rescaled = RescaleRenderElement::from_element(e, origin, (scale.scale_x, scale.scale_y));
 					RelocateRenderElement::from_element(rescaled, center - origin, Relocate::Relative)
 				})
@@ -2506,6 +2572,7 @@ impl MoonshineCompositor {
 				[0.0, 0.0, 0.0, 1.0], // black clear color
 			)
 		} else {
+			let elements: Vec<OutputRenderElements> = elements.into_iter().map(|(e, _)| e).collect();
 			self.damage_tracker.render_output(
 				&mut self.renderer,
 				&mut framebuffer,
