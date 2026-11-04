@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.3] - 2026-11-04
+
 ### Fixed
 
 - **No stream audio from SDL and OpenAL applications in Game Mode.** Applications whose audio library prefers PipeWire (SDL3 and SDL2 games, emulators such as Eden and its AppImage forks, OpenMW and other OpenAL Soft programs) played on the host's speakers and showed the host's devices instead of the stream's output. Game Mode applications now reach only Pyroshine's audio server, so their sound reaches the client.
