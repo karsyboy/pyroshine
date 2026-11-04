@@ -1955,4 +1955,76 @@ mod receive_tests {
 			.expect("stop after recording");
 		drain.join().unwrap();
 	}
+
+	/// Clients that prefer native PipeWire over PulseAudio (OpenAL Soft here,
+	/// like SDL3) ignore `PULSE_SERVER`: with it alone, `openal-info` picks the
+	/// user's PipeWire and its devices. With the application unit's environment
+	/// it falls back to PulseAudio and finds the stream's output.
+	/// `MOONSHINE_TEST_PULSE_CLIENT=1 cargo test -p moonshine-core pipewire_preferring -- --ignored`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs openal-info and the user's PipeWire: MOONSHINE_TEST_PULSE_CLIENT=1"]
+	async fn pipewire_preferring_clients_use_the_stream_server() {
+		use std::process::Command;
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_PULSE_CLIENT").is_some(),
+			"set MOONSHINE_TEST_PULSE_CLIENT=1"
+		);
+		let server = Server::spawn();
+		// The encoder side keeps the clock's frames flowing.
+		let frames = server.frames.clone();
+		let drain = std::thread::spawn(move || while frames.recv_timeout(time::Duration::from_secs(1)).is_ok() {});
+		// No user OpenAL configuration may choose the backend.
+		let config_home = tempfile::tempdir().unwrap();
+		let openal_info = |envs: &[String]| {
+			let mut command = Command::new("openal-info");
+			command
+				.env_remove("PULSE_SERVER")
+				.env_remove("PULSE_RUNTIME_PATH")
+				.env_remove("PIPEWIRE_REMOTE")
+				.env_remove("ALSOFT_DRIVERS")
+				.env("XDG_CONFIG_HOME", config_home.path())
+				.env("ALSOFT_LOGLEVEL", "3");
+			for entry in envs {
+				let (key, value) = entry.split_once('=').unwrap();
+				command.env(key, value);
+			}
+			let output = command.output().expect("openal-info");
+			assert!(output.status.success(), "openal-info failed");
+			format!(
+				"{}{}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			)
+		};
+
+		let pulse_only = openal_info(&[format!("PULSE_SERVER=unix:{}", server.path.display())]);
+		assert!(
+			pulse_only.contains("Initialized backend \"pipewire\""),
+			"the user's PipeWire is reachable, so PULSE_SERVER alone is bypassed:\n{pulse_only}"
+		);
+
+		let context = crate::session::application::ApplicationContext {
+			unit_name: "test.service".into(),
+			pulse_socket_path: server.path.clone(),
+			xdisplay: 0,
+			wayland_display: "wayland-test".into(),
+			hdr: false,
+			extra_env: Default::default(),
+			frame_limit: None,
+		};
+		let envs = crate::session::application::make_envs(&context, &[], &Default::default()).unwrap();
+		let unit = openal_info(&envs);
+		assert!(
+			unit.contains("Initialized backend \"pulse\"") && !unit.contains("Initialized backend \"pipewire\""),
+			"the application unit's environment selects the stream server:\n{unit}"
+		);
+		assert!(
+			unit.contains("Default playback device: Moonshine virtual output")
+				&& unit.contains("** Info for device \"Moonshine virtual output\" **"),
+			"the stream's output is the default and opens:\n{unit}"
+		);
+
+		assert!(server.stop().await, "stop after the clients");
+		drain.join().unwrap();
+	}
 }

@@ -402,6 +402,14 @@ Applications inherit `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT`, and
 `MOONSHINE_CLIENT_FRAMERATE`; these are runtime environment variables, not TOML
 fields. See [tips](TIPS.md) for Gamescope and hooks.
 
+In Game Mode an application's sound goes only to the stream. PulseAudio clients
+reach Pyroshine's audio server through `PULSE_SERVER`; `PIPEWIRE_REMOTE` keeps
+native PipeWire clients away from the desktop's PipeWire, so libraries such as
+SDL and OpenAL Soft use PulseAudio instead. An application that can output only
+through PipeWire, JACK or ALSA's PipeWire plugin has no stream audio. To give
+one application the desktop's PipeWire anyway (its sound then plays on the
+host), set `env = { PIPEWIRE_REMOTE = "pipewire-0" }` for it.
+
 ```toml
 [[application]]
 title = "Plasma Desktop"

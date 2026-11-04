@@ -21,6 +21,8 @@
 #   xwayland             the Xwayland binary
 #   ffmpeg               the ffmpeg binary (decodes encoder output)
 #   pacat                libpulse's pacat client
+#   openal-info          OpenAL Soft's openal-info (1.23 or newer prefers PipeWire)
+#   pipewire             the user's PipeWire socket ($XDG_RUNTIME_DIR/pipewire-0)
 #   systemd-user         a reachable user systemd manager
 #   kde-wayland          a signed-in, unlocked KDE Wayland session
 #   desktop-takeover     explicit MOONSHINE_TEST_TAKEOVER=1 and a saved desktop input grant
@@ -135,6 +137,12 @@ env = { MOONSHINE_TEST_PULSE_CLIENT = "1" }
 name = "session::stream::audio::pulse_server::receive_tests::real_pulse_clients_record_the_microphone"
 requires = ["pacat"]
 env = { MOONSHINE_TEST_PULSE_CLIENT = "1" }
+
+[[test]]
+name = "session::stream::audio::pulse_server::receive_tests::pipewire_preferring_clients_use_the_stream_server"
+requires = ["openal-info", "pipewire"]
+env = { MOONSHINE_TEST_PULSE_CLIENT = "1" }
+timeout = 60
 
 [[test]]
 name = "session::stream::control::input::gamepad::compatibility_tests::native_devices_join_their_threads_on_destruction"

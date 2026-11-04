@@ -38,6 +38,8 @@ REQUIREMENTS = (
     "xwayland",
     "ffmpeg",
     "pacat",
+    "openal-info",
+    "pipewire",
     "systemd-user",
     "kde-wayland",
     "desktop-takeover",
@@ -173,9 +175,12 @@ def probe(args):
         found["vulkan-video-encode"] = (encode, "VK_KHR_video_encode_queue " + ("present" if encode else "absent"))
     else:
         found["vulkan-video-encode"] = (False, "vulkaninfo not installed; cannot confirm Vulkan Video encode")
-    for requirement, binary in (("xwayland", "Xwayland"), ("ffmpeg", "ffmpeg"), ("pacat", "pacat")):
+    for requirement, binary in (("xwayland", "Xwayland"), ("ffmpeg", "ffmpeg"), ("pacat", "pacat"),
+                                ("openal-info", "openal-info")):
         path = shutil.which(binary)
         found[requirement] = (bool(path), path or f"{binary} not found")
+    pipewire = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "pipewire-0")
+    found["pipewire"] = (os.path.exists(pipewire), pipewire if os.path.exists(pipewire) else f"no PipeWire socket at {pipewire}")
     systemd = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True) \
         if shutil.which("systemctl") else None
     state = systemd.stdout.strip() if systemd else ""

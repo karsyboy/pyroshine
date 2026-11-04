@@ -397,25 +397,34 @@ async fn frame_limit_environment(
 	applied.variables
 }
 
+/// File name, in the session's audio directory, that `PIPEWIRE_REMOTE` names.
+/// Nothing ever listens there (see [`make_envs`]).
+const NO_PIPEWIRE_REMOTE: &str = "no-pipewire";
+
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(
+pub(crate) fn make_envs(
 	context: &ApplicationContext,
 	frame_limit: &[(String, String)],
 	config_env: &BTreeMap<String, String>,
 ) -> Result<Vec<String>, SessionFailure> {
+	let audio_dir = context.pulse_socket_path.parent().ok_or_else(|| {
+		tracing::error!("Failed to get parent directory of PulseAudio socket.");
+		SessionFailure::see_log("internal_error", "The audio socket path is invalid.")
+	})?;
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
+		format!("PULSE_RUNTIME_PATH={}", audio_dir.to_string_lossy()),
+		// The stream's audio server speaks only the PulseAudio protocol. Native
+		// PipeWire clients ignore PULSE_SERVER and would reach the user's real
+		// PipeWire through $XDG_RUNTIME_DIR, playing on the host's devices
+		// instead of the stream. SDL3 (and SDL2 through sdl2-compat) and OpenAL
+		// Soft prefer PipeWire; a remote that never exists makes them fall back
+		// to their PulseAudio backend, as PROTON_USE_PIPEWIRE does for Proton.
+		// Portal clients connect through a passed fd and are unaffected.
 		format!(
-			"PULSE_RUNTIME_PATH={}",
-			context
-				.pulse_socket_path
-				.parent()
-				.ok_or_else(|| {
-					tracing::error!("Failed to get parent directory of PulseAudio socket.");
-					SessionFailure::see_log("internal_error", "The audio socket path is invalid.")
-				})?
-				.to_string_lossy()
+			"PIPEWIRE_REMOTE={}",
+			audio_dir.join(NO_PIPEWIRE_REMOTE).to_string_lossy()
 		),
 		format!("DISPLAY=:{}", context.xdisplay),
 		format!("WAYLAND_DISPLAY={}", context.wayland_display),
@@ -2043,6 +2052,11 @@ mod tests {
 		assert_eq!(limited.last().unwrap(), "DXVK_FRAME_RATE=60");
 		assert!(env.contains(&"DISPLAY=:5".into()));
 		assert!(env.contains(&"WAYLAND_DISPLAY=wayland-pyroshine-test".into()));
+		// Audio reaches only the stream's server: PulseAudio clients by
+		// PULSE_SERVER, native PipeWire clients by a remote that never exists
+		// (they fall back to PulseAudio) instead of the user's PipeWire.
+		assert!(env.contains(&"PULSE_SERVER=unix:/tmp/audio/socket".into()));
+		assert!(env.contains(&"PIPEWIRE_REMOTE=/tmp/audio/no-pipewire".into()));
 		assert!(env.iter().all(|e| !super::obsolete_presentation_environment(
 			e.split('=').next().unwrap(),
 			e.split_once('=').unwrap().1

@@ -211,7 +211,8 @@ sequenceDiagram
 2. **Launch.** An authenticated HTTPS `/launch` validates the request, creates an
    authorization generation and session keys, then initializes and launches the
    session: the compositor starts (with XWayland), and the application starts as
-   a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY` and `PULSE_SERVER`.
+   a systemd user unit with `WAYLAND_DISPLAY`, `DISPLAY`, `PULSE_SERVER` and a
+   `PIPEWIRE_REMOTE` that never exists (see [audio path](#audio-path)).
    A Steam command without `pre_command` hooks is refused first while another
    Steam client of the user runs (`session/steam_instance.rs`), since Steam's
    single-instance hand-off would open the game on the host's desktop. For a
@@ -579,7 +580,11 @@ application ─PulseAudio protocol─▶ pulse-server thread ─PCM─▶ audio-
 ```
 
 `stream/audio/pulse_server/` is an embedded PulseAudio-compatible server whose
-socket is passed to the application as `PULSE_SERVER`. It mixes and converts
+socket is passed to the application as `PULSE_SERVER`. Native PipeWire clients
+ignore that variable, and SDL3 (with SDL2 through sdl2-compat) and OpenAL Soft
+prefer PipeWire, so the unit's `PIPEWIRE_REMOTE` names a socket that never
+exists: they fail to reach the user's PipeWire, whose devices are the host's,
+and fall back to PulseAudio. It mixes and converts
 application streams into the negotiated layout (stereo, 5.1 or 7.1). The
 encoder produces Opus packets of the negotiated duration (5 or 10 ms), adds
 GameStream audio FEC and optional AES-CBC encryption, and the packet task sends
