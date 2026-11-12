@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 /// Upstream of the generated `vendor/pyrowave` tree and its base revision
 /// (`vendor/pyrowave-patches/UPSTREAM`, checked by `check-vendor-pins.py`).
 pub(crate) const SOURCE_URL: &str = "https://github.com/Themaister/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b";
+pub(crate) const SOURCE_REVISION: &str = "a32b05e03d70826b19d4d11ff74fe166ed74371b";
 /// Where the local changes on top of [`SOURCE_REVISION`] live.
 pub(crate) const SOURCE_PATCHES: &str = "vendor/pyrowave-patches";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
