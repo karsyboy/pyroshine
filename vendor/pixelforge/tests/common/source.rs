@@ -92,18 +92,31 @@ pub unsafe fn host_buffer(
 ///
 /// `GENERAL` because that is where the colour converter leaves its source after
 /// every conversion, so it is the layout the image is in for every conversion
-/// after the first. Starting it anywhere else means a second conversion told
-/// the wrong layout.
+/// after the first, and the one an encoder taking RGB input expects to copy
+/// from. Starting it anywhere else means a second conversion told the wrong
+/// layout.
 pub unsafe fn create_src_image(
     context: &VideoContext,
     width: u32,
     height: u32,
     pixels: &[u8],
 ) -> Result<SrcImage, Box<dyn std::error::Error>> {
+    unsafe { create_src_image_as(context, width, height, vk::Format::B8G8R8A8_UNORM, pixels) }
+}
+
+/// [`create_src_image`] for `pixels` in `format`, any format of 4 bytes per
+/// pixel.
+pub unsafe fn create_src_image_as(
+    context: &VideoContext,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    pixels: &[u8],
+) -> Result<SrcImage, Box<dyn std::error::Error>> {
     let device = context.device();
     let info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::B8G8R8A8_UNORM)
+        .format(format)
         .extent(vk::Extent3D {
             width,
             height,
@@ -113,7 +126,13 @@ pub unsafe fn create_src_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        // Sampled by the converter, and copied from by an encoder taking RGB
+        // input, which reads its source with a transfer.
+        .usage(
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe { device.create_image(&info, None) }?;
@@ -198,7 +217,7 @@ pub unsafe fn create_src_image(
                 .image(image)
                 .subresource_range(range)
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(
                 cb,
                 vk::PipelineStageFlags::TRANSFER,

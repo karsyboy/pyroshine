@@ -52,7 +52,7 @@ use dmabuf::{DmaBufImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
 use pixelforge::{
-	Codec, ColorDescription, EncodeConfig, Encoder, EncoderTuningMode, PixelFormat, RateControlMode, VideoContext,
+	Codec, ColorDescription, EncodeConfig, Encoder, EncoderTuningMode, RateControl, Source, StreamColor, VideoContext,
 };
 
 /// Useful-work credits of the conventional pipeline: frames submitted to the
@@ -211,7 +211,10 @@ fn conversion_error(error: vk::Result) -> EncodeError {
 			device_lost: true,
 		}
 	} else {
-		EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan(error))
+		EncodeError::Vulkan(pixelforge::PixelForgeError::Vulkan {
+			call: "GPU color conversion",
+			result: error,
+		})
 	}
 }
 
@@ -1473,16 +1476,13 @@ impl VideoPipelineInner {
 			return Err(format!("{codec:?} cannot be encoded on this GPU: {reason}"));
 		}
 
-		// Convert pixel format.
-		let pixel_format = match ctx.format.chroma {
-			ChromaFormat::Yuv420 => PixelFormat::Yuv420,
-			ChromaFormat::Yuv444 => PixelFormat::Yuv444,
+		let chroma_format = match ctx.format.chroma {
+			ChromaFormat::Yuv420 => pixelforge::ChromaFormat::Yuv420,
+			ChromaFormat::Yuv444 => pixelforge::ChromaFormat::Yuv444,
 		};
-
-		// Convert bit depth based on dynamic range.
 		let bit_depth = match ctx.format.bit_depth {
-			BitDepth::Eight => pixelforge::EncodeBitDepth::Eight,
-			BitDepth::Ten => pixelforge::EncodeBitDepth::Ten,
+			BitDepth::Eight => pixelforge::BitDepth::Eight,
+			BitDepth::Ten => pixelforge::BitDepth::Ten,
 		};
 
 		// Create encode configuration. The bitrate is set once the profile's
@@ -1493,13 +1493,14 @@ impl VideoPipelineInner {
 			Codec::AV1 => EncodeConfig::av1(ctx.width, ctx.height),
 		}
 		.with_encoder_tuning_mode(EncoderTuningMode::LowLatency)
-		.with_pixel_format(pixel_format)
+		.with_chroma_format(chroma_format)
 		.with_bit_depth(bit_depth)
-		.with_color_description(color_description)
-		.with_rate_control(RateControlMode::Cbr)
+		// The converter writes YUV in the stream's colour, so the encoder
+		// converts nothing and signals the description as it is.
+		.with_source(Source::Yuv)
+		.with_color(StreamColor::Other(color_description))
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
-		.with_b_frames(0) // No B-frames for low latency
 		.with_max_reference_frames(ctx.max_reference_frames)
 		// One frame of VBV, but never 0 ms for refresh rates above 1 kHz.
 		.with_virtual_buffer_size_ms((1000 / ctx.fps).max(1))
@@ -1519,7 +1520,9 @@ impl VideoPipelineInner {
 				"Encoding at this GPU's maximum {codec:?} bitrate, below the requested bitrate"
 			);
 		}
-		let config = config.with_target_bitrate(target_bitrate);
+		let config = config.with_rate_control(RateControl::Cbr {
+			bitrate: target_bitrate,
+		});
 		if let Some(alignment) = caps.av1_coded_picture_alignment
 			&& (!ctx.width.is_multiple_of(alignment.width.max(1))
 				|| !ctx.height.is_multiple_of(alignment.height.max(1)))
@@ -1543,7 +1546,7 @@ impl VideoPipelineInner {
 			));
 		}
 		Ok(EncoderSetup {
-			encoder: ConventionalEncoder::Vulkan(encoder),
+			encoder: ConventionalEncoder::Vulkan(backend::VulkanEncoder::new(encoder)),
 			convert,
 			extent,
 			row_alignment: 4,
@@ -3061,8 +3064,8 @@ mod tests {
 			written: 10,
 			capacity: 5,
 		};
-		let lost = PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST);
-		let transient = PixelForgeError::CommandBuffer("submit failed".to_string());
+		let lost = PixelForgeError::DeviceLost;
+		let transient = PixelForgeError::Driver("submit failed".to_string());
 		let overflow = EncodeError::Vulkan(overflow);
 		let lost = EncodeError::Vulkan(lost);
 		let transient = EncodeError::Vulkan(transient);
@@ -3115,10 +3118,14 @@ mod tests {
 
 	#[test]
 	fn device_lost_is_detected_by_driver_result() {
-		assert!(EncodeError::Vulkan(PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)).device_lost());
-		for operation in ["submit encode", "wait encode fence", "read encode feedback"] {
+		assert!(EncodeError::Vulkan(PixelForgeError::DeviceLost).device_lost());
+		for call in ["vkQueueSubmit2", "vkWaitSemaphores", "vkGetQueryPoolResults"] {
 			assert!(
-				EncodeError::Vulkan(PixelForgeError::vulkan(operation, vk::Result::ERROR_DEVICE_LOST)).device_lost()
+				EncodeError::Vulkan(PixelForgeError::Vulkan {
+					call,
+					result: vk::Result::ERROR_DEVICE_LOST
+				})
+				.device_lost()
 			);
 		}
 	}
@@ -3156,14 +3163,14 @@ mod tests {
 
 	#[test]
 	fn recoverable_errors_and_text_are_not_device_lost() {
-		assert!(!EncodeError::Vulkan(PixelForgeError::Vulkan(vk::Result::TIMEOUT)).device_lost());
-		assert!(!EncodeError::Vulkan(PixelForgeError::vulkan("wait encode fence", vk::Result::TIMEOUT)).device_lost());
 		assert!(
-			!EncodeError::Vulkan(PixelForgeError::CommandBuffer(
-				vk::Result::ERROR_DEVICE_LOST.to_string()
-			))
+			!EncodeError::Vulkan(PixelForgeError::Vulkan {
+				call: "vkWaitSemaphores",
+				result: vk::Result::TIMEOUT
+			})
 			.device_lost()
 		);
+		assert!(!EncodeError::Vulkan(PixelForgeError::Driver(vk::Result::ERROR_DEVICE_LOST.to_string())).device_lost());
 	}
 
 	#[test]

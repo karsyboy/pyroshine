@@ -20,8 +20,8 @@
 mod common;
 
 use pixelforge::{
-    Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
-    VideoContextBuilder,
+    BitDepth, ChromaFormat, Codec, EncodeConfig, Encoder, Frame, RateControl, VideoContextBuilder,
+    YuvLayout, YuvUploader,
 };
 use std::collections::VecDeque;
 use std::fs::File;
@@ -103,23 +103,14 @@ fn run_codec(
         Codec::H265 => EncodeConfig::h265(WIDTH, HEIGHT),
         Codec::AV1 => EncodeConfig::av1(WIDTH, HEIGHT),
     }
-    .with_rate_control(RateControlMode::Cqp)
-    .with_quality_level(10)
-    .with_pixel_format(PixelFormat::Yuv420)
-    .with_bit_depth(EncodeBitDepth::Eight)
+    .with_rate_control(RateControl::Cqp { qp: 10 })
+    .with_chroma_format(ChromaFormat::Yuv420)
+    .with_bit_depth(BitDepth::Eight)
     // Infinite GOP so the recovery can only come from RFI, never a periodic IDR.
-    .with_gop_size(0)
-    .with_b_frames(0);
+    .with_gop_size(0);
 
     let mut encoder = Encoder::new(context.clone(), config)?;
-    let mut input_image = InputImage::new(
-        context.clone(),
-        codec,
-        WIDTH,
-        HEIGHT,
-        EncodeBitDepth::Eight,
-        PixelFormat::Yuv420,
-    )?;
+    let mut input_image = YuvUploader::for_encoder(&encoder)?;
 
     let mut yuv_data = Vec::new();
     File::open(input_path)?.read_to_end(&mut yuv_data)?;
@@ -135,7 +126,7 @@ fn run_codec(
      -> Result<(), Box<dyn std::error::Error>> {
         let packet = pollster::block_on(pending.pop_front().unwrap())?;
         if packet.pts == INVALIDATE_AT {
-            *recovery_is_key = Some(packet.is_key_frame);
+            *recovery_is_key = Some(packet.is_key_frame());
         }
         output_file.write_all(&packet.data)?;
         Ok(())
@@ -155,9 +146,9 @@ fn run_codec(
             encoder.invalidate_reference_frames(first_lost);
         }
 
-        let encoder_image = encoder.input_image();
-        input_image.upload_yuv420_to(encoder_image, &yuv_data[start..end])?;
-        pending.push_back(encoder.encode(encoder_image)?);
+        let slot = encoder.input_slot()?;
+        input_image.upload_to(&slot, YuvLayout::I420, &yuv_data[start..end])?;
+        pending.push_back(encoder.submit(Frame::input(slot))?);
         while pending.len() > 2 {
             drain_one(&mut pending, &mut output_file, &mut recovery_is_key)?;
         }

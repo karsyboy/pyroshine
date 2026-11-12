@@ -3,51 +3,50 @@
 //! This module provides:
 //! - Core encoder types and configuration (`EncodeConfig`, `EncodedPacket`, etc.)
 //! - GOP structure management (`gop` module) - reusable for H.264/H.265.
-//! - Frame reordering for B-frame support (`reorder` module) - reusable for H.264/H.265.
 
-pub mod av1;
+mod api;
+pub(crate) mod av1;
 mod capabilities;
 pub use capabilities::{EncoderCapabilities, codec_block_size};
-pub mod bitwriter;
 pub(crate) mod codec;
-pub mod dpb;
-pub mod gop;
-pub mod h264;
-pub mod h265;
+#[cfg(feature = "dmabuf")]
+pub mod external;
+mod frame;
+pub(crate) mod gop;
+pub(crate) mod h264;
+pub(crate) mod h265;
+pub(crate) mod input;
 pub(crate) mod pipeline;
 pub(crate) mod profile;
-pub mod reorder;
-pub mod resources;
+pub(crate) mod resources;
+pub(crate) mod rgb;
+mod source;
+mod source_image;
 pub(crate) mod support;
 
 use ash::vk;
 
+use crate::converter::ColorRange;
+
 // Default encoder configuration constants.
 
-/// Default target bitrate in bits per second (4 Mbps).
-pub const DEFAULT_TARGET_BITRATE: u32 = 4_000_000;
-
-/// Default maximum bitrate in bits per second (6 Mbps).
-pub const DEFAULT_MAX_BITRATE: u32 = 6_000_000;
-
 /// Default frame rate (frames per second).
-pub const DEFAULT_FRAME_RATE: u32 = 30;
+pub(crate) const DEFAULT_FRAME_RATE: u32 = 30;
 
 /// Default GOP (Group of Pictures) size.
-pub const DEFAULT_GOP_SIZE: u32 = 30;
+pub(crate) const DEFAULT_GOP_SIZE: u32 = 30;
 
 /// Default QP (quantization parameter) for H.264.
-pub const DEFAULT_H264_QP: u32 = 26;
+pub(crate) const DEFAULT_H264_QP: u32 = 26;
 
 /// Default QP (quantization parameter) for H.265.
-pub const DEFAULT_H265_QP: u32 = 28;
+pub(crate) const DEFAULT_H265_QP: u32 = 28;
+
+/// Default quantizer index for AV1.
+pub(crate) const DEFAULT_AV1_Q_INDEX: u32 = 128;
 
 /// Default maximum number of reference frames.
-pub const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
-
-use crate::error::Result;
-use crate::sync::TimelinePoint;
-use crate::vulkan::VideoContext;
+pub(crate) const DEFAULT_MAX_REFERENCE_FRAMES: u32 = 4;
 
 /// Video codec types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +59,9 @@ pub enum Codec {
     AV1,
 }
 
-/// Pixel format / chroma subsampling.
+/// Chroma subsampling: how many chroma samples there are per luma sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PixelFormat {
+pub enum ChromaFormat {
     /// YUV 4:2:0 (half horizontal and vertical chroma resolution).
     #[default]
     Yuv420,
@@ -72,33 +71,33 @@ pub enum PixelFormat {
     Yuv444,
 }
 
-impl From<PixelFormat> for vk::VideoChromaSubsamplingFlagsKHR {
-    fn from(format: PixelFormat) -> Self {
+impl From<ChromaFormat> for vk::VideoChromaSubsamplingFlagsKHR {
+    fn from(format: ChromaFormat) -> Self {
         match format {
-            PixelFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
-            PixelFormat::Yuv422 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_422,
-            PixelFormat::Yuv444 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
+            ChromaFormat::Yuv420 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            ChromaFormat::Yuv422 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_422,
+            ChromaFormat::Yuv444 => vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
         }
     }
 }
 
-impl PixelFormat {
+impl ChromaFormat {
     /// Calculate frame size in bytes for given dimensions.
     pub fn frame_size(&self, width: u32, height: u32) -> usize {
         let luma_size = (width * height) as usize;
         match self {
-            PixelFormat::Yuv420 => luma_size * 3 / 2, // Y + U/4 + V/4
-            PixelFormat::Yuv422 => luma_size * 2,     // Y + U/2 + V/2
-            PixelFormat::Yuv444 => luma_size * 3,     // Y + U + V
+            ChromaFormat::Yuv420 => luma_size * 3 / 2, // Y + U/4 + V/4
+            ChromaFormat::Yuv422 => luma_size * 2,     // Y + U/2 + V/2
+            ChromaFormat::Yuv444 => luma_size * 3,     // Y + U + V
         }
     }
 
-    /// Returns chroma divisor (horizontal, vertical) for the pixel format.
+    /// Returns chroma divisor (horizontal, vertical) for the chroma format.
     pub fn chroma_div(&self) -> (u32, u32) {
         match self {
-            PixelFormat::Yuv444 => (1, 1),
-            PixelFormat::Yuv422 => (2, 1),
-            PixelFormat::Yuv420 => (2, 2),
+            ChromaFormat::Yuv444 => (1, 1),
+            ChromaFormat::Yuv422 => (2, 1),
+            ChromaFormat::Yuv420 => (2, 2),
         }
     }
 }
@@ -122,18 +121,65 @@ impl From<BitDepth> for vk::VideoComponentBitDepthFlagsKHR {
     }
 }
 
-/// Rate control modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RateControlMode {
-    /// Disabled rate control - constant QP.
-    #[default]
-    Disabled,
-    /// Constant QP mode.
-    Cqp,
-    /// Constant bitrate mode.
-    Cbr,
-    /// Variable bitrate mode.
-    Vbr,
+/// How the encoder spends bits, with the values that mode needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateControl {
+    /// Every frame at one quantizer, and no bitrate target.
+    Cqp {
+        /// The QP, 0 to 51, for H.264 and H.265; the quantizer index, 0 to
+        /// 255, for AV1. Lower is better quality and more bits.
+        qp: u32,
+    },
+    /// A constant bitrate.
+    Cbr {
+        /// Bits per second.
+        bitrate: u32,
+    },
+    /// A variable bitrate around a target, up to a peak.
+    Vbr {
+        /// Average bits per second.
+        target: u32,
+        /// Peak bits per second, at least `target`.
+        max: u32,
+    },
+}
+
+impl RateControl {
+    /// The default for `codec`: a constant quantizer of middling quality.
+    pub fn default_for(codec: Codec) -> Self {
+        Self::Cqp {
+            qp: match codec {
+                Codec::H264 => DEFAULT_H264_QP,
+                Codec::H265 => DEFAULT_H265_QP,
+                Codec::AV1 => DEFAULT_AV1_Q_INDEX,
+            },
+        }
+    }
+
+    /// Why this cannot be used for `codec`, if it cannot.
+    pub(crate) fn check(&self, codec: Codec) -> crate::error::Result<()> {
+        let invalid = |reason: String| Err(crate::error::PixelForgeError::InvalidInput(reason));
+        match *self {
+            Self::Cqp { qp } => {
+                let max = if codec == Codec::AV1 { 255 } else { 51 };
+                if qp > max {
+                    return invalid(format!(
+                        "{codec:?} takes a quantizer of 0 to {max}, not {qp}"
+                    ));
+                }
+            }
+            Self::Cbr { bitrate: 0 } | Self::Vbr { target: 0, .. } => {
+                return invalid("a bitrate of 0".to_string());
+            }
+            Self::Vbr { target, max } if max < target => {
+                return invalid(format!(
+                    "a peak bitrate of {max} is below the target of {target}"
+                ));
+            }
+            Self::Cbr { .. } | Self::Vbr { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 /// Encode usage hints.
@@ -230,15 +276,64 @@ pub enum FrameType {
     P,
     /// Bi-predicted frame.
     B,
-    /// Unknown frame type.
-    Unknown,
 }
 
 /// Video dimensions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dimensions {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+}
+
+/// Frames per second, as a fraction: 30000/1001 for 29.97.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRate {
+    /// Frames.
+    pub numerator: u32,
+    /// Seconds.
+    pub denominator: u32,
+}
+
+/// What the stream says about its colours: for an RGB source, also what the
+/// encoder converts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamColor {
+    /// SDR: BT.709 primaries, transfer and matrix.
+    Sdr {
+        /// The luma and chroma range.
+        range: ColorRange,
+    },
+    /// HDR10: BT.2020 primaries and matrix, with the PQ transfer.
+    Hdr10 {
+        /// The luma and chroma range.
+        range: ColorRange,
+    },
+    /// Any other H.273 description, for a YUV source whose pixels already
+    /// are in it. No conversion from RGB produces one, so [`Encoder::new`]
+    /// refuses it for [`Source::Rgb`].
+    Other(ColorDescription),
+}
+
+impl Default for StreamColor {
+    /// SDR, limited range: what players assume when a stream says nothing.
+    fn default() -> Self {
+        Self::Sdr {
+            range: ColorRange::Limited,
+        }
+    }
+}
+
+impl StreamColor {
+    /// The H.273 description written into the stream.
+    pub fn description(&self) -> ColorDescription {
+        match *self {
+            Self::Sdr { range } => ColorDescription::bt709().with_full_range(range.is_full()),
+            Self::Hdr10 { range } => ColorDescription::bt2020_pq().with_full_range(range.is_full()),
+            Self::Other(desc) => desc,
+        }
+    }
 }
 
 /// Video signal color description for VUI parameters.
@@ -268,10 +363,11 @@ pub struct ColorDescription {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChromaLocation {
     /// Not signaled.
-    #[default]
     Unspecified,
     /// Horizontally co-sited with even luma columns, vertically between rows
-    /// (H.273 chroma_sample_loc_type 0, AV1 CSP_VERTICAL).
+    /// (H.273 chroma_sample_loc_type 0, AV1 CSP_VERTICAL). Pixelforge's own
+    /// RGB conversion sites chroma here.
+    #[default]
     Left,
     /// Centered in each 2x2 luma block, as a box filter produces
     /// (chroma_sample_loc_type 1). AV1 has no code for it.
@@ -319,7 +415,7 @@ impl ColorDescription {
             transfer_characteristics: Self::TRANSFER_BT709,
             matrix_coefficients: Self::MATRIX_BT709,
             full_range: false,
-            chroma_location: ChromaLocation::Unspecified,
+            chroma_location: ChromaLocation::Left,
         }
     }
 
@@ -336,7 +432,7 @@ impl ColorDescription {
             transfer_characteristics: Self::TRANSFER_SRGB,
             matrix_coefficients: Self::MATRIX_BT709,
             full_range: false,
-            chroma_location: ChromaLocation::Unspecified,
+            chroma_location: ChromaLocation::Left,
         }
     }
 
@@ -347,7 +443,7 @@ impl ColorDescription {
             transfer_characteristics: Self::TRANSFER_ST2084_PQ,
             matrix_coefficients: Self::MATRIX_BT2020_NCL,
             full_range: false,
-            chroma_location: ChromaLocation::Unspecified,
+            chroma_location: ChromaLocation::Left,
         }
     }
 
@@ -380,42 +476,44 @@ pub struct EncodeConfig {
     pub codec: Codec,
     /// Video dimensions.
     pub dimensions: Dimensions,
-    /// Pixel format (chroma subsampling).
-    pub pixel_format: PixelFormat,
+    /// Chroma format (chroma subsampling).
+    pub chroma_format: ChromaFormat,
     /// Bit depth per component.
     pub bit_depth: BitDepth,
-    /// Rate control mode.
-    pub rate_control_mode: RateControlMode,
-    /// Target bitrate in bits per second.
-    pub target_bitrate: u32,
-    /// Maximum bitrate in bits per second.
-    pub max_bitrate: u32,
-    /// Quality level for CQP mode (QP value).
-    pub quality_level: u32,
-    /// Frame rate numerator.
-    pub frame_rate_numerator: u32,
-    /// Frame rate denominator.
-    pub frame_rate_denominator: u32,
+    /// How the encoder spends bits. Checked by [`Encoder::new`].
+    pub rate_control: RateControl,
+    /// Frames per second.
+    pub frame_rate: FrameRate,
     /// GOP size (distance between IDR frames).
     pub gop_size: u32,
-    /// Number of consecutive B-frames.
-    pub b_frame_count: u32,
-    /// Maximum number of reference frames.
+    /// Maximum number of reference frames kept in the DPB: the window that
+    /// [`Encoder::invalidate_reference_frames`](crate::Encoder::invalidate_reference_frames)
+    /// can recover from. Each frame predicts from only as many of the newest
+    /// as the device allows, which can be fewer. The device's DPB size can
+    /// also lower it.
     pub max_reference_frames: u32,
-    /// VBV/HRD virtual buffer size in milliseconds.
+    /// VBV/HRD virtual buffer size in milliseconds, for
+    /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
     /// Controls how much the encoder can deviate from the target bitrate
     /// on a per-frame basis. Smaller values produce more uniform frame
     /// sizes.
     pub virtual_buffer_size_ms: u32,
-    /// Initial VBV buffer fullness in milliseconds.
+    /// Initial VBV buffer fullness in milliseconds, for
+    /// [`RateControl::Cbr`] and [`RateControl::Vbr`].
     /// Controls how much budget the encoder has for IDR/I-frames.
     /// Setting this to 0 constrains IDR frames to the same budget as
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
-    /// Color description for VUI signaling.
-    /// Defaults to BT.709 (full-range) when `None`.
-    pub color_description: Option<ColorDescription>,
+    /// What the stream says about its colours. SDR, limited range, by
+    /// default; see [`Self::with_color`].
+    pub color: StreamColor,
+    /// What the frames handed to the encoder are. YUV by default; see
+    /// [`Self::with_source`].
+    pub source: Source,
+    /// Which conversion to use for an RGB source; see
+    /// [`Self::with_conversion`].
+    pub conversion: ConversionPreference,
     /// Usage hint for encoding.
     pub encode_usage_hint: EncodeUsageHint,
     /// Content hint for encoding.
@@ -425,99 +523,58 @@ pub struct EncodeConfig {
 }
 
 impl EncodeConfig {
-    /// Create a new H.264 encode configuration with default settings.
-    pub fn h264(width: u32, height: u32) -> Self {
+    /// Create a new `codec` encode configuration with default settings.
+    pub fn new(codec: Codec, width: u32, height: u32) -> Self {
         assert!(width > 0, "width must be non-zero");
         assert!(height > 0, "height must be non-zero");
 
         Self {
-            codec: Codec::H264,
+            codec,
             dimensions: Dimensions { width, height },
-            pixel_format: PixelFormat::Yuv420,
+            chroma_format: ChromaFormat::Yuv420,
             bit_depth: BitDepth::Eight,
-            rate_control_mode: RateControlMode::Disabled,
-            target_bitrate: DEFAULT_TARGET_BITRATE,
-            max_bitrate: DEFAULT_MAX_BITRATE,
-            quality_level: DEFAULT_H264_QP,
-            frame_rate_numerator: DEFAULT_FRAME_RATE,
-            frame_rate_denominator: 1,
+            rate_control: RateControl::default_for(codec),
+            frame_rate: FrameRate {
+                numerator: DEFAULT_FRAME_RATE,
+                denominator: 1,
+            },
             gop_size: DEFAULT_GOP_SIZE,
-            b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
             virtual_buffer_size_ms: 1000,
             initial_virtual_buffer_size_ms: 1000,
-            color_description: None,
+            color: StreamColor::default(),
+            source: Source::Yuv,
+            conversion: ConversionPreference::Auto,
             encode_usage_hint: EncodeUsageHint::Default,
             encode_content_hint: EncodeContentHint::Default,
             encoder_tuning_mode: EncoderTuningMode::Default,
         }
+    }
+
+    /// Create a new H.264 encode configuration with default settings.
+    pub fn h264(width: u32, height: u32) -> Self {
+        Self::new(Codec::H264, width, height)
     }
 
     /// Create a new H.265/HEVC encode configuration with default settings.
     pub fn h265(width: u32, height: u32) -> Self {
-        assert!(width > 0, "width must be non-zero");
-        assert!(height > 0, "height must be non-zero");
-
-        Self {
-            codec: Codec::H265,
-            dimensions: Dimensions { width, height },
-            pixel_format: PixelFormat::Yuv420,
-            bit_depth: BitDepth::Eight,
-            rate_control_mode: RateControlMode::Disabled,
-            target_bitrate: DEFAULT_TARGET_BITRATE,
-            max_bitrate: DEFAULT_MAX_BITRATE,
-            quality_level: DEFAULT_H265_QP,
-            frame_rate_numerator: DEFAULT_FRAME_RATE,
-            frame_rate_denominator: 1,
-            gop_size: DEFAULT_GOP_SIZE,
-            b_frame_count: 0, // Start without B-frames for simplicity.
-            max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
-            color_description: None,
-            encode_usage_hint: EncodeUsageHint::Default,
-            encode_content_hint: EncodeContentHint::Default,
-            encoder_tuning_mode: EncoderTuningMode::Default,
-        }
+        Self::new(Codec::H265, width, height)
     }
 
     /// Create a new AV1 encode configuration with default settings.
     pub fn av1(width: u32, height: u32) -> Self {
-        assert!(width > 0, "width must be non-zero");
-        assert!(height > 0, "height must be non-zero");
-
-        Self {
-            codec: Codec::AV1,
-            dimensions: Dimensions { width, height },
-            pixel_format: PixelFormat::Yuv420,
-            bit_depth: BitDepth::Eight,
-            rate_control_mode: RateControlMode::Disabled,
-            target_bitrate: DEFAULT_TARGET_BITRATE,
-            max_bitrate: DEFAULT_MAX_BITRATE,
-            quality_level: 128, // AV1 uses 0-255 QP range
-            frame_rate_numerator: DEFAULT_FRAME_RATE,
-            frame_rate_denominator: 1,
-            gop_size: DEFAULT_GOP_SIZE,
-            b_frame_count: 0, // Start without B-frames for simplicity.
-            max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
-            color_description: None,
-            encode_usage_hint: EncodeUsageHint::Default,
-            encode_content_hint: EncodeContentHint::Default,
-            encoder_tuning_mode: EncoderTuningMode::Default,
-        }
+        Self::new(Codec::AV1, width, height)
     }
 
-    /// Set the rate control mode.
-    pub fn with_rate_control(mut self, mode: RateControlMode) -> Self {
-        self.rate_control_mode = mode;
+    /// Set how the encoder spends bits.
+    pub fn with_rate_control(mut self, rate_control: RateControl) -> Self {
+        self.rate_control = rate_control;
         self
     }
 
-    /// Set the pixel format (chroma subsampling).
-    pub fn with_pixel_format(mut self, format: PixelFormat) -> Self {
-        self.pixel_format = format;
+    /// Set the chroma format (chroma subsampling).
+    pub fn with_chroma_format(mut self, format: ChromaFormat) -> Self {
+        self.chroma_format = format;
         self
     }
 
@@ -527,16 +584,12 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the quality level (QP for CQP mode).
-    pub fn with_quality_level(mut self, level: u32) -> Self {
-        self.quality_level = level;
-        self
-    }
-
     /// Set the frame rate.
     pub fn with_frame_rate(mut self, numerator: u32, denominator: u32) -> Self {
-        self.frame_rate_numerator = numerator;
-        self.frame_rate_denominator = denominator;
+        self.frame_rate = FrameRate {
+            numerator,
+            denominator,
+        };
         self
     }
 
@@ -546,27 +599,10 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the number of B-frames.
-    pub fn with_b_frames(mut self, count: u32) -> Self {
-        self.b_frame_count = count;
-        self
-    }
-
-    /// Set the maximum reference frames.
+    /// Set the maximum reference frames kept in the DPB (see
+    /// [`max_reference_frames`](Self::max_reference_frames)).
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
-        self
-    }
-
-    /// Set the target bitrate.
-    pub fn with_target_bitrate(mut self, bitrate: u32) -> Self {
-        self.target_bitrate = bitrate;
-        self
-    }
-
-    /// Set the maximum bitrate.
-    pub fn with_max_bitrate(mut self, bitrate: u32) -> Self {
-        self.max_bitrate = bitrate;
         self
     }
 
@@ -585,9 +621,28 @@ impl EncodeConfig {
         self
     }
 
-    /// Set the color description for VUI signaling.
-    pub fn with_color_description(mut self, desc: ColorDescription) -> Self {
-        self.color_description = Some(desc);
+    /// Set what the stream says about its colours.
+    ///
+    /// For [`Source::Rgb`] it is also what the encoder converts to:
+    /// [`StreamColor::Sdr`] or [`StreamColor::Hdr10`].
+    pub fn with_color(mut self, color: StreamColor) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// Say what the frames handed to the encoder are.
+    ///
+    /// For [`Source::Rgb`], the encoder converts them to the YUV that
+    /// [`Self::color`] says. [`Encoder::new`] picks how, see [`Conversion`].
+    pub fn with_source(mut self, source: Source) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Choose the conversion for an RGB source, rather than let
+    /// [`Encoder::new`] pick. For tests, and for comparing the two.
+    pub fn with_conversion(mut self, preference: ConversionPreference) -> Self {
+        self.conversion = preference;
         self
     }
 
@@ -610,16 +665,23 @@ impl EncodeConfig {
     }
 }
 
+pub use api::Encoder;
+pub use frame::{Frame, InputSlot};
 pub use pipeline::EncodeFuture;
+pub use source::{Conversion, ConversionPreference, RgbSource, Source};
+
+pub use source_image::{Handoff, SourceImage};
 
 /// Statistic about the encoded video packet.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EncodedPacketStats {
-    /// GPU encode time in nanoseconds
-    pub gpu_time_ns: u64,
+    /// GPU encode time in nanoseconds, or `None` when the video encode queue
+    /// has no timestamps.
+    pub gpu_time_ns: Option<u64>,
     /// CPU wall time in nanoseconds (submission + fence wait + readback)
     pub frame_latency_ns: u64,
-    /// Wall latency in nanoseconds (time between submit and bitstream ready)
+    /// Wall latency in nanoseconds, from the start of the encode submit until
+    /// the bitstream is read back.
     pub wall_latency_ns: u64,
 }
 
@@ -630,244 +692,18 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     /// Frame type.
     pub frame_type: FrameType,
-    /// Whether this is a keyframe.
-    pub is_key_frame: bool,
     /// Presentation timestamp.
     pub pts: u64,
     /// Decode timestamp.
     pub dts: u64,
-    /// Optional stats about the packet
-    pub stats: Option<EncodedPacketStats>,
+    /// Stats about the packet.
+    pub stats: EncodedPacketStats,
 }
 
-/// The codec-erased operations every [`codec::CodecEncoder`] exposes.
-///
-/// One blanket impl covers all codecs, so [`Encoder`] can hold any of them
-/// behind a single boxed pointer instead of an enum that re-dispatches by hand.
-trait EncoderApi: Send {
-    fn capabilities(&self) -> EncoderCapabilities;
-    fn coded_extent(&self) -> vk::Extent2D;
-    fn input_image_extent(&self) -> vk::Extent2D;
-    fn input_image(&self) -> vk::Image;
-    fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture>;
-    fn flush(&mut self) -> Result<()>;
-    fn set_bitrate(&mut self, requested: u32) -> Result<u32>;
-    fn next_display_order(&self) -> u64;
-    fn request_idr(&mut self);
-    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
-    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()>;
-}
-
-impl<C: codec::VideoCodec> EncoderApi for codec::CodecEncoder<C> {
-    fn capabilities(&self) -> EncoderCapabilities {
-        self.common.capabilities
-    }
-    fn coded_extent(&self) -> vk::Extent2D {
-        vk::Extent2D {
-            width: self.common.aligned_width,
-            height: self.common.aligned_height,
-        }
-    }
-    fn input_image_extent(&self) -> vk::Extent2D {
-        self.common.input_image_extent
-    }
-
-    fn input_image(&self) -> vk::Image {
-        codec::CodecEncoder::input_image(self)
-    }
-    fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture> {
-        codec::CodecEncoder::encode_after(self, src_image, wait)
-    }
-    fn flush(&mut self) -> Result<()> {
-        codec::CodecEncoder::flush(self)
-    }
-    fn set_bitrate(&mut self, requested: u32) -> Result<u32> {
-        codec::CodecEncoder::set_bitrate(self, requested)
-    }
-    fn next_display_order(&self) -> u64 {
-        self.common.input_frame_num
-    }
-    fn request_idr(&mut self) {
-        codec::CodecEncoder::request_idr(self)
-    }
-    fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
-        codec::CodecEncoder::invalidate_reference_frames(self, first_lost_display_order)
-    }
-    fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        codec::CodecEncoder::set_color_description(self, desc)
-    }
-}
-
-/// Video encoder supporting multiple codecs.
-///
-/// Constructed via [`Encoder::new`], which selects the codec from the config and
-/// boxes the corresponding `codec::CodecEncoder`. All codecs share one generic
-/// implementation; this type just erases which one is in use.
-pub struct Encoder(Box<dyn EncoderApi>);
-
-impl Encoder {
-    /// Capabilities queried during creation for this encoder's exact profile.
-    pub fn capabilities(&self) -> EncoderCapabilities {
-        self.0.capabilities()
-    }
-
-    /// Coded picture extent, distinct from the requested frame and allocated image.
-    pub fn coded_extent(&self) -> vk::Extent2D {
-        self.0.coded_extent()
-    }
-
-    /// Actual extent of every internal input slot, including NVIDIA width padding.
-    pub fn input_image_extent(&self) -> vk::Extent2D {
-        self.0.input_image_extent()
-    }
-
-    /// Create a new encoder for the codec named in `config`.
-    pub fn new(context: VideoContext, config: EncodeConfig) -> Result<Self> {
-        let inner: Box<dyn EncoderApi> = match config.codec {
-            Codec::H264 => Box::new(self::h264::H264::create(context, config)?),
-            Codec::H265 => Box::new(self::h265::H265::create(context, config)?),
-            Codec::AV1 => Box::new(self::av1::Av1::create(context, config)?),
-        };
-        Ok(Encoder(inner))
-    }
-
-    /// Get the internal input image.
-    ///
-    /// This image can be used as a target for `ColorConverter::convert` to avoid
-    /// an intermediate copy.
-    pub fn input_image(&self) -> vk::Image {
-        self.0.input_image()
-    }
-
-    /// Encode a frame from a GPU image.
-    ///
-    /// This accepts a source NV12 (YUV420) or planar YUV444 image on the GPU and encodes it directly.
-    /// The source image must match the format and dimensions in the encoder configuration.
-    ///
-    /// Encoding is asynchronous: this submits the frame without blocking and
-    /// returns an [`EncodeFuture`] that resolves with the encoded packet once the
-    /// GPU finishes and a background readback thread reads it back. The call only
-    /// blocks if every pipeline slot is still in flight (backpressure).
-    ///
-    /// Use `InputImage` to create an image from YUV data:
-    /// ```no_run
-    /// use pixelforge::{InputImage, Encoder, EncodeConfig, EncodeBitDepth, PixelFormat, VideoContext, Codec};
-    ///
-    /// # fn example(context: VideoContext) -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = EncodeConfig::h264(1920, 1080);
-    /// let mut encoder = Encoder::new(context.clone(), config)?;
-    /// let mut input = InputImage::new(
-    ///     context,
-    ///     Codec::H264,
-    ///     1920,
-    ///     1080,
-    ///     EncodeBitDepth::Eight,
-    ///     PixelFormat::Yuv420,
-    /// )?;
-    ///
-    /// // Upload YUV420 data to the input image
-    /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
-    /// input.upload_yuv420(&yuv_data)?;
-    ///
-    /// // Submit the frame and await its packet.
-    /// let future = encoder.encode(input.image())?;
-    /// let packet = pollster::block_on(future)?;
-    /// // ... use packet.data ...
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn encode(&mut self, src_image: vk::Image) -> Result<EncodeFuture> {
-        self.0.encode_after(src_image, &[])
-    }
-
-    /// Encode a frame once GPU work the caller submitted has finished.
-    ///
-    /// Like [`Self::encode`], but the frame's first GPU submission waits for
-    /// every point in `wait` before touching `src_image`. Pass the point
-    /// returned by [`ColorConverter::convert_async`](crate::ColorConverter::convert_async)
-    /// to encode what it converted without waiting for the conversion on the
-    /// CPU, or a point the caller's own rendering signals.
-    ///
-    /// Only a `src_image` that is [`Self::input_image`] avoids the CPU
-    /// entirely. Any other image is first copied into the input image, and
-    /// that copy is waited for on the CPU before the encode is recorded, so
-    /// this call then blocks until the points in `wait` are reached and the
-    /// copy is done. Render or convert into [`Self::input_image`] to keep the
-    /// whole handover on the GPU.
-    pub fn encode_after(
-        &mut self,
-        src_image: vk::Image,
-        wait: &[TimelinePoint],
-    ) -> Result<EncodeFuture> {
-        self.0.encode_after(src_image, wait)
-    }
-
-    /// Wait for all in-flight frames to finish encoding (end-of-stream barrier).
-    ///
-    /// Packets are delivered through the [`EncodeFuture`]s returned by
-    /// [`Encoder::encode`]; await those to obtain them. Once this returns, every
-    /// outstanding future has been resolved.
-    pub fn flush(&mut self) -> Result<()> {
-        self.0.flush()
-    }
-
-    /// Stage a CBR bitrate for the next submitted frame without resetting the
-    /// session or its references. Returns the accepted target, bounded by the
-    /// startup bitrate and this profile's device limit. A failed submission
-    /// retains the staged change for retry. CQP/VBR sessions reject this operation.
-    pub fn set_bitrate(&mut self, requested: u32) -> Result<u32> {
-        self.0.set_bitrate(requested)
-    }
-
-    /// Display order assigned by the next encode attempt. Failed attempts can
-    /// consume an order; callers must not infer this from successful packets.
-    pub fn next_display_order(&self) -> u64 {
-        self.0.next_display_order()
-    }
-
-    /// Request that the next frame be an IDR frame.
-    pub fn request_idr(&mut self) {
-        self.0.request_idr()
-    }
-
-    /// Recover from packet loss without a full IDR (reference frame invalidation).
-    ///
-    /// When a client reports that it could not decode a range of frames, every
-    /// reference picture the encoder still holds from the earliest lost frame
-    /// onward is transitively undecodable on the client. This drops those
-    /// references so the next P-frame is predicted from the most recent
-    /// *surviving* reference instead — a much cheaper recovery than re-sending a
-    /// full keyframe. If no reference survives (the loss covers the encoder's
-    /// whole reference window), it transparently falls back to forcing an IDR.
-    ///
-    /// `first_lost_display_order` is the display order — the `pts` reported on
-    /// [`EncodedPacket`]s — of the earliest frame the client lost.
-    ///
-    /// Effective recovery requires the encoder to keep more than one reference
-    /// (see [`EncodeConfig::with_max_reference_frames`]); with a single
-    /// reference this necessarily falls back to an IDR. This applies uniformly
-    /// across H.264, H.265, and AV1 — each keeps a multi-reference window and
-    /// re-anchors prediction to the most recent survivor, falling back to an
-    /// IDR (AV1: key frame) only when the loss covers the entire window.
-    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
-        self.0.invalidate_reference_frames(first_lost_display_order)
-    }
-
-    /// Update the color description (VUI parameters) for the encoder.
-    ///
-    /// This recreates the video session parameters with an updated SPS/VPS/sequence
-    /// header containing the new color description. The next frame will be encoded as
-    /// an IDR/key frame with the new parameters.
-    pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
-        self.0.set_color_description(desc)
+impl EncodedPacket {
+    /// Whether a decoder can start at this packet: an IDR frame.
+    pub fn is_key_frame(&self) -> bool {
+        self.frame_type == FrameType::Idr
     }
 }
 
@@ -875,14 +711,14 @@ impl Encoder {
 mod tests {
     use super::*;
 
-    // PixelFormat tests.
-    mod pixel_format_tests {
+    // ChromaFormat tests.
+    mod chroma_format_tests {
         use super::*;
 
         #[test]
         fn test_yuv420_frame_size() {
             // YUV420: Y = width * height, U = Y/4, V = Y/4 -> total = Y * 1.5
-            let size = PixelFormat::Yuv420.frame_size(1920, 1080);
+            let size = ChromaFormat::Yuv420.frame_size(1920, 1080);
             let expected = (1920 * 1080) * 3 / 2; // 3110400
             assert_eq!(size, expected);
         }
@@ -890,7 +726,7 @@ mod tests {
         #[test]
         fn test_yuv422_frame_size() {
             // YUV422: Y = width * height, U = Y/2, V = Y/2 -> total = Y * 2
-            let size = PixelFormat::Yuv422.frame_size(1920, 1080);
+            let size = ChromaFormat::Yuv422.frame_size(1920, 1080);
             let expected = (1920 * 1080) * 2; // 4147200
             assert_eq!(size, expected);
         }
@@ -898,7 +734,7 @@ mod tests {
         #[test]
         fn test_yuv444_frame_size() {
             // YUV444: Y = width * height, U = Y, V = Y -> total = Y * 3
-            let size = PixelFormat::Yuv444.frame_size(1920, 1080);
+            let size = ChromaFormat::Yuv444.frame_size(1920, 1080);
             let expected = (1920 * 1080) * 3; // 6220800
             assert_eq!(size, expected);
         }
@@ -906,7 +742,7 @@ mod tests {
         #[test]
         fn test_small_resolution() {
             // Test with small resolution.
-            let size = PixelFormat::Yuv420.frame_size(320, 240);
+            let size = ChromaFormat::Yuv420.frame_size(320, 240);
             let expected = (320 * 240) * 3 / 2; // 115200
             assert_eq!(size, expected);
         }
@@ -914,25 +750,25 @@ mod tests {
         #[test]
         fn test_4k_resolution() {
             // Test with 4K resolution.
-            let size = PixelFormat::Yuv420.frame_size(3840, 2160);
+            let size = ChromaFormat::Yuv420.frame_size(3840, 2160);
             let expected = (3840 * 2160) * 3 / 2; // 12441600
             assert_eq!(size, expected);
         }
 
         #[test]
         fn test_default() {
-            assert_eq!(PixelFormat::default(), PixelFormat::Yuv420);
+            assert_eq!(ChromaFormat::default(), ChromaFormat::Yuv420);
         }
 
         #[test]
         fn test_vk_chroma_subsampling_conversion() {
-            let vk_420: vk::VideoChromaSubsamplingFlagsKHR = PixelFormat::Yuv420.into();
+            let vk_420: vk::VideoChromaSubsamplingFlagsKHR = ChromaFormat::Yuv420.into();
             assert_eq!(vk_420, vk::VideoChromaSubsamplingFlagsKHR::TYPE_420);
 
-            let vk_422: vk::VideoChromaSubsamplingFlagsKHR = PixelFormat::Yuv422.into();
+            let vk_422: vk::VideoChromaSubsamplingFlagsKHR = ChromaFormat::Yuv422.into();
             assert_eq!(vk_422, vk::VideoChromaSubsamplingFlagsKHR::TYPE_422);
 
-            let vk_444: vk::VideoChromaSubsamplingFlagsKHR = PixelFormat::Yuv444.into();
+            let vk_444: vk::VideoChromaSubsamplingFlagsKHR = ChromaFormat::Yuv444.into();
             assert_eq!(vk_444, vk::VideoChromaSubsamplingFlagsKHR::TYPE_444);
         }
     }
@@ -956,13 +792,44 @@ mod tests {
         }
     }
 
-    // RateControlMode tests.
+    // RateControl tests.
     mod rate_control_tests {
         use super::*;
 
         #[test]
-        fn test_default() {
-            assert_eq!(RateControlMode::default(), RateControlMode::Disabled);
+        fn defaults_are_a_constant_quantizer() {
+            assert_eq!(
+                RateControl::default_for(Codec::H264),
+                RateControl::Cqp { qp: 26 }
+            );
+            assert_eq!(
+                RateControl::default_for(Codec::AV1),
+                RateControl::Cqp { qp: 128 }
+            );
+        }
+
+        #[test]
+        fn check_refuses_what_cannot_work() {
+            assert!(RateControl::Cqp { qp: 51 }.check(Codec::H264).is_ok());
+            assert!(RateControl::Cqp { qp: 52 }.check(Codec::H265).is_err());
+            assert!(RateControl::Cqp { qp: 255 }.check(Codec::AV1).is_ok());
+            assert!(RateControl::Cbr { bitrate: 0 }.check(Codec::H264).is_err());
+            assert!(
+                RateControl::Vbr {
+                    target: 8_000_000,
+                    max: 6_000_000
+                }
+                .check(Codec::H264)
+                .is_err()
+            );
+            assert!(
+                RateControl::Vbr {
+                    target: 6_000_000,
+                    max: 8_000_000
+                }
+                .check(Codec::H264)
+                .is_ok()
+            );
         }
     }
 
@@ -977,14 +844,12 @@ mod tests {
             assert_eq!(config.codec, Codec::H264);
             assert_eq!(config.dimensions.width, 1920);
             assert_eq!(config.dimensions.height, 1080);
-            assert_eq!(config.pixel_format, PixelFormat::Yuv420);
+            assert_eq!(config.chroma_format, ChromaFormat::Yuv420);
             assert_eq!(config.bit_depth, BitDepth::Eight);
-            assert_eq!(config.rate_control_mode, RateControlMode::Disabled);
-            assert_eq!(config.quality_level, 26);
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 26 });
             assert_eq!(config.gop_size, 30);
-            assert_eq!(config.b_frame_count, 0);
-            assert_eq!(config.frame_rate_numerator, 30);
-            assert_eq!(config.frame_rate_denominator, 1);
+            assert_eq!(config.frame_rate.numerator, 30);
+            assert_eq!(config.frame_rate.denominator, 1);
         }
 
         #[test]
@@ -994,21 +859,23 @@ mod tests {
             assert_eq!(config.codec, Codec::H265);
             assert_eq!(config.dimensions.width, 3840);
             assert_eq!(config.dimensions.height, 2160);
-            assert_eq!(config.quality_level, 28); // H.265 uses slightly higher QP
+            // H.265 uses slightly higher QP.
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 28 });
         }
 
         #[test]
         fn test_with_rate_control() {
-            let config = EncodeConfig::h264(1920, 1080).with_rate_control(RateControlMode::Cbr);
+            let rate_control = RateControl::Cbr { bitrate: 8_000_000 };
+            let config = EncodeConfig::h264(1920, 1080).with_rate_control(rate_control);
 
-            assert_eq!(config.rate_control_mode, RateControlMode::Cbr);
+            assert_eq!(config.rate_control, rate_control);
         }
 
         #[test]
-        fn test_with_pixel_format() {
-            let config = EncodeConfig::h264(1920, 1080).with_pixel_format(PixelFormat::Yuv444);
+        fn test_with_chroma_format() {
+            let config = EncodeConfig::h264(1920, 1080).with_chroma_format(ChromaFormat::Yuv444);
 
-            assert_eq!(config.pixel_format, PixelFormat::Yuv444);
+            assert_eq!(config.chroma_format, ChromaFormat::Yuv444);
         }
 
         #[test]
@@ -1019,18 +886,11 @@ mod tests {
         }
 
         #[test]
-        fn test_with_quality_level() {
-            let config = EncodeConfig::h264(1920, 1080).with_quality_level(20);
-
-            assert_eq!(config.quality_level, 20);
-        }
-
-        #[test]
         fn test_with_frame_rate() {
             let config = EncodeConfig::h264(1920, 1080).with_frame_rate(60, 1);
 
-            assert_eq!(config.frame_rate_numerator, 60);
-            assert_eq!(config.frame_rate_denominator, 1);
+            assert_eq!(config.frame_rate.numerator, 60);
+            assert_eq!(config.frame_rate.denominator, 1);
         }
 
         #[test]
@@ -1041,31 +901,10 @@ mod tests {
         }
 
         #[test]
-        fn test_with_b_frames() {
-            let config = EncodeConfig::h264(1920, 1080).with_b_frames(2);
-
-            assert_eq!(config.b_frame_count, 2);
-        }
-
-        #[test]
         fn test_with_max_reference_frames() {
             let config = EncodeConfig::h264(1920, 1080).with_max_reference_frames(8);
 
             assert_eq!(config.max_reference_frames, 8);
-        }
-
-        #[test]
-        fn test_with_target_bitrate() {
-            let config = EncodeConfig::h264(1920, 1080).with_target_bitrate(8_000_000);
-
-            assert_eq!(config.target_bitrate, 8_000_000);
-        }
-
-        #[test]
-        fn test_with_max_bitrate() {
-            let config = EncodeConfig::h264(1920, 1080).with_max_bitrate(12_000_000);
-
-            assert_eq!(config.max_bitrate, 12_000_000);
         }
 
         #[test]
@@ -1075,55 +914,51 @@ mod tests {
             assert_eq!(config.codec, Codec::AV1);
             assert_eq!(config.dimensions.width, 2560);
             assert_eq!(config.dimensions.height, 1440);
-            assert_eq!(config.pixel_format, PixelFormat::Yuv420);
+            assert_eq!(config.chroma_format, ChromaFormat::Yuv420);
             assert_eq!(config.bit_depth, BitDepth::Eight);
-            assert_eq!(config.rate_control_mode, RateControlMode::Disabled);
-            assert_eq!(config.quality_level, 128); // AV1 uses 0-255 QP range
+            // AV1 uses a 0-255 quantizer index.
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 128 });
             assert_eq!(config.gop_size, 30);
-            assert_eq!(config.b_frame_count, 0);
-            assert_eq!(config.frame_rate_numerator, 30);
-            assert_eq!(config.frame_rate_denominator, 1);
+            assert_eq!(config.frame_rate.numerator, 30);
+            assert_eq!(config.frame_rate.denominator, 1);
         }
 
         #[test]
         fn test_av1_builder_chaining() {
             let config = EncodeConfig::av1(1920, 1080)
-                .with_rate_control(RateControlMode::Vbr)
-                .with_target_bitrate(8_000_000)
-                .with_max_bitrate(12_000_000)
+                .with_rate_control(RateControl::Cqp { qp: 100 })
                 .with_gop_size(60)
                 .with_frame_rate(60, 1)
-                .with_quality_level(100)
                 .with_max_reference_frames(2);
 
             assert_eq!(config.codec, Codec::AV1);
-            assert_eq!(config.rate_control_mode, RateControlMode::Vbr);
-            assert_eq!(config.target_bitrate, 8_000_000);
-            assert_eq!(config.max_bitrate, 12_000_000);
+            assert_eq!(config.rate_control, RateControl::Cqp { qp: 100 });
             assert_eq!(config.gop_size, 60);
-            assert_eq!(config.frame_rate_numerator, 60);
-            assert_eq!(config.quality_level, 100);
+            assert_eq!(config.frame_rate.numerator, 60);
             assert_eq!(config.max_reference_frames, 2);
         }
 
         #[test]
         fn test_builder_chaining() {
             let config = EncodeConfig::h264(1920, 1080)
-                .with_rate_control(RateControlMode::Vbr)
-                .with_target_bitrate(6_000_000)
-                .with_max_bitrate(10_000_000)
+                .with_rate_control(RateControl::Vbr {
+                    target: 6_000_000,
+                    max: 10_000_000,
+                })
                 .with_gop_size(120)
-                .with_b_frames(2)
                 .with_frame_rate(60, 1)
-                .with_pixel_format(PixelFormat::Yuv420)
+                .with_chroma_format(ChromaFormat::Yuv420)
                 .with_bit_depth(BitDepth::Eight);
 
-            assert_eq!(config.rate_control_mode, RateControlMode::Vbr);
-            assert_eq!(config.target_bitrate, 6_000_000);
-            assert_eq!(config.max_bitrate, 10_000_000);
+            assert_eq!(
+                config.rate_control,
+                RateControl::Vbr {
+                    target: 6_000_000,
+                    max: 10_000_000
+                }
+            );
             assert_eq!(config.gop_size, 120);
-            assert_eq!(config.b_frame_count, 2);
-            assert_eq!(config.frame_rate_numerator, 60);
+            assert_eq!(config.frame_rate.numerator, 60);
         }
     }
 
@@ -1137,7 +972,6 @@ mod tests {
             assert_ne!(FrameType::Idr, FrameType::I);
             assert_ne!(FrameType::I, FrameType::P);
             assert_ne!(FrameType::P, FrameType::B);
-            assert_ne!(FrameType::B, FrameType::Unknown);
         }
     }
 
@@ -1150,15 +984,19 @@ mod tests {
             let packet = EncodedPacket {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x67],
                 frame_type: FrameType::Idr,
-                is_key_frame: true,
                 pts: 0,
                 dts: 0,
-                stats: None,
+                stats: EncodedPacketStats::default(),
             };
 
-            assert!(packet.is_key_frame);
-            assert_eq!(packet.frame_type, FrameType::Idr);
+            assert!(packet.is_key_frame());
             assert_eq!(packet.data.len(), 5);
+
+            let packet = EncodedPacket {
+                frame_type: FrameType::P,
+                ..packet
+            };
+            assert!(!packet.is_key_frame());
         }
     }
 
@@ -1187,6 +1025,26 @@ mod tests {
         }
 
         #[test]
+        fn test_chroma_location_codes() {
+            assert_eq!(
+                ColorDescription::bt709().chroma_location,
+                ChromaLocation::Left
+            );
+            assert_eq!(ChromaLocation::Unspecified.h26x_loc_type(), None);
+            assert_eq!(ChromaLocation::Left.h26x_loc_type(), Some(0));
+            assert_eq!(ChromaLocation::Center.h26x_loc_type(), Some(1));
+            assert_eq!(ChromaLocation::TopLeft.h26x_loc_type(), Some(2));
+            assert_eq!(ChromaLocation::Left.av1_sample_position(), 1);
+            assert_eq!(ChromaLocation::TopLeft.av1_sample_position(), 2);
+            assert_eq!(ChromaLocation::Center.av1_sample_position(), 0);
+            let cd = ColorDescription::srgb().with_chroma_location(ChromaLocation::Center);
+            assert_eq!(
+                cd.with_chroma_location(ChromaLocation::Left),
+                ColorDescription::srgb()
+            );
+        }
+
+        #[test]
         fn test_srgb() {
             let cd = ColorDescription::srgb();
             assert_eq!(cd.color_primaries, 1);
@@ -1211,20 +1069,6 @@ mod tests {
             assert!(cd.full_range);
             // Only the range changes; the preset stays intact.
             assert_eq!(cd.with_full_range(false), ColorDescription::bt709());
-        }
-
-        #[test]
-        fn test_chroma_location_codes() {
-            assert_eq!(ColorDescription::bt709().chroma_location, ChromaLocation::Unspecified);
-            assert_eq!(ChromaLocation::Unspecified.h26x_loc_type(), None);
-            assert_eq!(ChromaLocation::Left.h26x_loc_type(), Some(0));
-            assert_eq!(ChromaLocation::Center.h26x_loc_type(), Some(1));
-            assert_eq!(ChromaLocation::TopLeft.h26x_loc_type(), Some(2));
-            assert_eq!(ChromaLocation::Left.av1_sample_position(), 1);
-            assert_eq!(ChromaLocation::TopLeft.av1_sample_position(), 2);
-            assert_eq!(ChromaLocation::Center.av1_sample_position(), 0);
-            let cd = ColorDescription::srgb().with_chroma_location(ChromaLocation::Center);
-            assert_eq!(cd.with_chroma_location(ChromaLocation::Unspecified), ColorDescription::srgb());
         }
 
         #[test]

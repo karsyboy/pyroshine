@@ -1,4 +1,5 @@
 //! Vulkan context and initialization for video encoding.
+use crate::decoder::profile::DecodeProfile;
 use crate::encoder::Codec;
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -7,7 +8,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
 
-mod encode_device;
+mod adopt;
 mod queues;
 use queues::QueueOverrides;
 pub use queues::{DeviceQueue, QueueRoles};
@@ -295,59 +296,13 @@ impl VideoContextBuilder {
         VideoContext::new(self)
     }
 
-    /// What a caller-created device must provide for pixelforge to decode on it.
-    ///
-    /// Use this when you already have your own Vulkan device (e.g. a renderer's)
-    /// and want to decode into images that device can use directly, without the
-    /// cross-device copy a separate context would require.
-    pub fn decode_device_requirements(
-        &self,
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> Result<DeviceRequirements> {
-        let families = find_decode_queue_families(
-            entry,
-            instance,
-            physical_device,
-            &self.required_decode_codecs,
-        )?;
-        let unified_image_layouts = supports_unified_image_layouts(instance, physical_device);
-        let mut extensions = decode_extension_names(&self.required_decode_codecs);
-        if unified_image_layouts {
-            extensions.push(ash::khr::unified_image_layouts::NAME);
-        }
-        let queues = QueueRoles {
-            encode: None,
-            decode: Some(families.decode),
-            transfer: families.transfer,
-            compute: families.compute,
-        };
-        Ok(DeviceRequirements {
-            queue_families: queues.unique_families(),
-            queues,
-            extensions,
-            features: DeviceFeatures {
-                synchronization2: true,
-                timeline_semaphore: true,
-                ..DeviceFeatures::default()
-            },
-            unified_image_layouts,
-            internally_synchronized_queues: supports_internally_synchronized_queues(
-                instance,
-                physical_device,
-                &DeviceExtensions::of(instance, physical_device),
-            ),
-        })
-    }
-
     /// Declare that the adopted device was created with
     /// `VK_KHR_unified_image_layouts` enabled, including both
     /// `unifiedImageLayouts` and `unifiedImageLayoutsVideo`.
     ///
-    /// Only meaningful for [`Self::build_from_existing_decode`]: a context that
-    /// creates its own device enables the extension itself when the hardware
-    /// has it. Vulkan offers no way to ask a device which features were enabled
+    /// Only meaningful for [`Self::build_from_existing`] with a decode codec:
+    /// a context that creates its own device enables the extension itself when
+    /// the hardware has it. Vulkan offers no way to ask a device which features were enabled
     /// on it, so this is a promise pixelforge cannot verify. What it *can*
     /// check, and does, is that the physical device supports both bits; a
     /// declaration on hardware that cannot support them is a clean error rather
@@ -375,41 +330,12 @@ impl VideoContextBuilder {
         self.unified_image_layouts = Some(false);
         self
     }
-
-    /// Adopt a caller-created device for decoding, rather than creating one.
-    ///
-    /// The device must have been created with the queue families and extensions
-    /// reported by [`Self::decode_device_requirements`] for the same
-    /// `physical_device`, and with the `synchronization2` and
-    /// `timelineSemaphore` features enabled (the decoder orders its pipelined
-    /// submissions with timeline semaphores). The
-    /// resulting context **borrows** `instance` and `device`: dropping it frees
-    /// neither, so the caller must keep both alive for at least as long as the
-    /// context and anything decoded with it.
-    pub fn build_from_existing_decode(
-        self,
-        entry: ash::Entry,
-        instance: ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: ash::Device,
-    ) -> Result<VideoContext> {
-        VideoContext::from_existing_decode(
-            self.required_decode_codecs,
-            self.unified_image_layouts.unwrap_or(false),
-            self.queues,
-            entry,
-            instance,
-            physical_device,
-            device,
-        )
-    }
 }
 
 /// Queue families, extensions and features a caller's device must provide for
 /// pixelforge to work on it.
 ///
-/// Returned by [`VideoContextBuilder::decode_device_requirements`] and
-/// [`VideoContextBuilder::encode_device_requirements`]. Enable every extension
+/// Returned by [`VideoContextBuilder::device_requirements`]. Enable every extension
 /// in [`Self::extensions`] and every feature set in [`Self::features`]:
 /// pixelforge assumes all of them are on, since Vulkan cannot be asked
 /// afterwards which were.
@@ -482,6 +408,9 @@ pub struct DeviceFeatures {
     pub ycbcr_2plane_444_formats: bool,
     /// `videoEncodeAV1`, from `VkPhysicalDeviceVideoEncodeAV1FeaturesKHR`.
     pub video_encode_av1: bool,
+    /// `videoEncodeRgbConversion`, from
+    /// `VkPhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE`.
+    pub video_encode_rgb_conversion: bool,
 }
 
 /// The queue families pixelforge selects for decoding on a given device.
@@ -630,7 +559,7 @@ fn find_decode_queue_families(
     let available = query_decode_codecs(entry, instance, physical_device);
     for codec in decode_codecs {
         if !available.contains(codec) {
-            return Err(PixelForgeError::CodecNotSupported(format!(
+            return Err(PixelForgeError::NoSuitableDevice(format!(
                 "Physical device does not support decoding {:?}",
                 codec
             )));
@@ -663,6 +592,66 @@ impl DeviceExtensions {
         self.0
             .iter()
             .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) } == name)
+    }
+}
+
+/// Which of the extensions behind DMA-BUF and sync_file input a context has
+/// enabled. All off without the `dmabuf` feature.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExternalSupport {
+    /// Import and export of DMA-BUF images with DRM format modifiers.
+    pub dmabuf: bool,
+    /// Import and export of sync_file fences.
+    pub sync_file: bool,
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT`, the right owner for memory shared with
+    /// another process or API.
+    pub foreign_queue: bool,
+}
+
+impl ExternalSupport {
+    const DMABUF: [&'static CStr; 4] = [
+        ash::khr::external_memory_fd::NAME,
+        ash::ext::external_memory_dma_buf::NAME,
+        ash::ext::image_drm_format_modifier::NAME,
+        // Required by the modifier extension; core since 1.2.
+        ash::khr::image_format_list::NAME,
+    ];
+
+    /// What a device offering the extensions `has` says it has can enable.
+    pub(crate) fn detect(has: impl Fn(&CStr) -> bool) -> Self {
+        if !cfg!(feature = "dmabuf") {
+            return Self::default();
+        }
+        Self {
+            dmabuf: Self::DMABUF.iter().all(|name| has(name)),
+            sync_file: has(ash::khr::external_semaphore_fd::NAME),
+            foreign_queue: has(ash::ext::queue_family_foreign::NAME),
+        }
+    }
+
+    /// The extensions to enable for this.
+    pub(crate) fn extension_names(&self) -> Vec<&'static CStr> {
+        let mut names = Vec::new();
+        if self.dmabuf {
+            names.extend(Self::DMABUF);
+        }
+        if self.sync_file {
+            names.push(ash::khr::external_semaphore_fd::NAME);
+        }
+        if self.foreign_queue {
+            names.push(ash::ext::queue_family_foreign::NAME);
+        }
+        names
+    }
+
+    /// The queue family to acquire shared memory from and release it to.
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    pub(crate) fn foreign_family(&self) -> u32 {
+        if self.foreign_queue {
+            vk::QUEUE_FAMILY_FOREIGN_EXT
+        } else {
+            vk::QUEUE_FAMILY_EXTERNAL
+        }
     }
 }
 
@@ -700,6 +689,15 @@ fn supports_internally_synchronized_queues(
     features.internally_synchronized_queues != 0
 }
 
+/// Whether `physical_device` has the `videoEncodeRgbConversion` feature. The
+/// caller checks for the extension first.
+fn supports_rgb_conversion(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let mut features = vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default();
+    let mut query = vk::PhysicalDeviceFeatures2::default().push(&mut features);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut query) };
+    features.video_encode_rgb_conversion != 0
+}
+
 /// Device extensions required to decode the given codecs.
 fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CStr> {
     // Synchronization2 and timeline semaphores are core in 1.3 and 1.2, but
@@ -712,11 +710,23 @@ fn decode_extension_names(decode_codecs: &[Codec]) -> Vec<&'static std::ffi::CSt
         ash::khr::synchronization2::NAME,
         ash::khr::timeline_semaphore::NAME,
     ];
-    if decode_codecs.contains(&Codec::H264) {
-        names.push(ash::khr::video_decode_h264::NAME);
+    for codec in decode_codecs {
+        names.push(decode_extension_name(*codec));
     }
     names
 }
+
+/// The device extension that decodes `codec`.
+fn decode_extension_name(codec: Codec) -> &'static std::ffi::CStr {
+    match codec {
+        Codec::H264 => ash::khr::video_decode_h264::NAME,
+        Codec::H265 => ash::khr::video_decode_h265::NAME,
+        Codec::AV1 => ash::khr::video_decode_av1::NAME,
+    }
+}
+
+/// The codecs pixelforge can decode, on a device that supports them.
+const DECODE_CODECS: &[Codec] = &[Codec::H264, Codec::H265, Codec::AV1];
 
 /// The decode codecs `physical_device` supports.
 fn query_decode_codecs(
@@ -724,11 +734,76 @@ fn query_decode_codecs(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<Codec> {
-    let mut codecs = Vec::new();
-    if VideoContext::check_h264_decode_support(entry, instance, physical_device) {
-        codecs.push(Codec::H264);
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .unwrap_or_default();
+    let has_extension = |name: &std::ffi::CStr| {
+        extensions
+            .iter()
+            .any(|ext| ext.extension_name_as_c_str() == Ok(name))
+    };
+    DECODE_CODECS
+        .iter()
+        .copied()
+        .filter(|&codec| {
+            has_extension(decode_extension_name(codec))
+                && check_decode_support(entry, instance, physical_device, codec)
+        })
+        .collect()
+}
+
+/// Whether `physical_device` decodes `codec` in its base profile: 8-bit
+/// 4:2:0, H.264 High, H.265 Main or AV1 Main.
+fn check_decode_support(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    codec: Codec,
+) -> bool {
+    let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
+    let profile = DecodeProfile::base(codec);
+
+    let mut h264_capabilities = vk::VideoDecodeH264CapabilitiesKHR::default();
+    let mut h265_capabilities = vk::VideoDecodeH265CapabilitiesKHR::default();
+    let mut av1_capabilities = vk::VideoDecodeAV1CapabilitiesKHR::default();
+    let mut decode_capabilities = vk::VideoDecodeCapabilitiesKHR::default();
+    let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut decode_capabilities);
+    let mut capabilities = match codec {
+        Codec::H264 => capabilities.push(&mut h264_capabilities),
+        Codec::H265 => capabilities.push(&mut h265_capabilities),
+        Codec::AV1 => capabilities.push(&mut av1_capabilities),
+    };
+
+    let result = unsafe {
+        (video_queue.fp().get_physical_device_video_capabilities_khr)(
+            physical_device,
+            profile.info(),
+            &mut capabilities,
+        )
+    };
+
+    match result {
+        vk::Result::SUCCESS => {
+            debug!(
+                "{:?} decode supported: max {}x{}, {} DPB slots",
+                codec,
+                capabilities.max_coded_extent.width,
+                capabilities.max_coded_extent.height,
+                capabilities.max_dpb_slots
+            );
+            true
+        }
+        vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
+            debug!("{:?} decode not supported on this device", codec);
+            false
+        }
+        _ => {
+            warn!(
+                "Failed to query {:?} decode capabilities: {:?}",
+                codec, result
+            );
+            false
+        }
     }
-    codecs
 }
 
 /// Inner struct holding the actual Vulkan resources.
@@ -745,6 +820,9 @@ struct VideoContextInner {
     /// calling them crashes. The KHR names are valid on any device with
     /// `VK_KHR_synchronization2` enabled, which pixelforge requires either way.
     sync2: ash::khr::synchronization2::Device,
+    /// `VK_KHR_timeline_semaphore` entry points, for the same reason as
+    /// `sync2`.
+    timeline: ash::khr::timeline_semaphore::Device,
     video_encode_queue_family: Option<u32>,
     video_encode_timestamp_valid_bits: u32,
     video_encode_queue: Option<vk::Queue>,
@@ -765,7 +843,10 @@ struct VideoContextInner {
     encode_unsupported: Vec<(Codec, String)>,
     supported_decode_codecs: Vec<Codec>,
     has_push_descriptor: bool,
+    has_video_encode_rgb_conversion: bool,
     has_unified_image_layouts: bool,
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    external: ExternalSupport,
     /// Whether this context created (and therefore must destroy) the device and
     /// instance. A context adopted from a caller's device borrows them and
     /// destroys neither.
@@ -777,9 +858,6 @@ struct VideoContextInner {
     /// Validation message sink, present only when validation is enabled and the
     /// instance is ours. Destroyed before the instance it belongs to.
     debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
-    /// Whether `VK_EXT_queue_family_foreign` is enabled. Only a context that
-    /// creates its own device enables it; an adopted device reports false.
-    has_queue_family_foreign: bool,
 }
 
 impl Drop for VideoContextInner {
@@ -831,11 +909,39 @@ impl VideoContext {
         &self.inner.sync2
     }
 
+    /// The DMA-BUF and sync_file extensions this context enabled.
+    #[cfg_attr(not(feature = "dmabuf"), allow(dead_code))]
+    pub(crate) fn external(&self) -> ExternalSupport {
+        self.inner.external
+    }
+
+    /// Whether `VK_EXT_queue_family_foreign` is enabled (with the `dmabuf`
+    /// feature, wherever the device offers it).
+    ///
+    /// Memory written by another driver, such as a VA-API surface exported as
+    /// DMA-BUF, must be acquired from and released to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` only covers
+    /// the same device and driver identity.
+    pub fn has_queue_family_foreign(&self) -> bool {
+        self.inner.external.foreign_queue
+    }
+
+    /// Wait on the CPU until `point` is reached.
+    pub(crate) fn wait_point(&self, point: crate::sync::TimelinePoint) -> crate::error::Result<()> {
+        let semaphores = [point.semaphore];
+        let values = [point.value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        unsafe { self.inner.timeline.wait_semaphores(&info, u64::MAX) }
+            .map_err(PixelForgeError::vk("vkWaitSemaphores"))
+    }
+
     /// Hand over a semaphore to be destroyed with the context rather than now.
     ///
     /// For a semaphore whose owner is being dropped while a submission from
     /// elsewhere may still wait on it: the colour converter's timeline, which
-    /// an encode submitted with [`crate::Encoder::encode_after`] can still be
+    /// an encode that waits on it with [`crate::Frame::wait`] can still be
     /// waiting on when the converter goes. Every encoder holds the context and
     /// waits for its queues when dropped, so by the time the context goes,
     /// nothing of pixelforge's waits on these any more.
@@ -861,6 +967,11 @@ impl VideoContext {
     /// (VUID-vkCmdWriteTimestamp-timestampValidBits-00829).
     pub(crate) fn encode_timestamps_supported(&self) -> bool {
         self.inner.video_encode_timestamp_valid_bits > 0
+    }
+
+    /// The selected video encode queue family's `timestampValidBits`.
+    pub(crate) fn encode_timestamp_valid_bits(&self) -> u32 {
+        self.inner.video_encode_timestamp_valid_bits
     }
 
     pub(crate) fn video_decode_queue_family(&self) -> Option<u32> {
@@ -930,6 +1041,14 @@ impl VideoContext {
         self.inner.has_push_descriptor
     }
 
+    /// Whether `VK_VALVE_video_encode_rgb_conversion` is enabled, extension
+    /// and feature both: encoders can then take RGB input and convert it
+    /// themselves, see
+    /// [`Conversion::Encoder`](crate::Conversion::Encoder).
+    pub fn has_video_encode_rgb_conversion(&self) -> bool {
+        self.inner.has_video_encode_rgb_conversion
+    }
+
     /// Whether `VK_KHR_unified_image_layouts` is enabled, with its video bit.
     ///
     /// When it is, `VK_IMAGE_LAYOUT_GENERAL` is valid for every use including
@@ -937,13 +1056,6 @@ impl VideoContext {
     /// to be sampled, copied from, or used as a reference.
     pub fn has_unified_image_layouts(&self) -> bool {
         self.inner.has_unified_image_layouts
-    }
-
-    /// Returns true if `VK_EXT_queue_family_foreign` is enabled, so resources
-    /// shared with another driver (for example a media API's DMA-BUF
-    /// surfaces) can be transferred to and from `VK_QUEUE_FAMILY_FOREIGN_EXT`.
-    pub fn has_queue_family_foreign(&self) -> bool {
-        self.inner.has_queue_family_foreign
     }
 }
 
@@ -972,7 +1084,7 @@ impl VideoContext {
         let mut enable_validation = builder.enable_validation;
         if enable_validation {
             let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
-                .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
             let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
             let has_validation_layer = available_layers.iter().any(|layer| {
                 let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
@@ -997,7 +1109,7 @@ impl VideoContext {
             let available_exts = unsafe {
                 entry.enumerate_instance_extension_properties(Some(validation_layer_name))
             }
-            .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
             let validation_features_name = c"VK_EXT_validation_features";
             let has_validation_features = available_exts.iter().any(|ext| {
                 let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
@@ -1014,7 +1126,7 @@ impl VideoContext {
         let mut has_debug_utils = false;
         if enable_validation {
             let available_exts = unsafe { entry.enumerate_instance_extension_properties(None) }
-                .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
             has_debug_utils = available_exts.iter().any(|ext| {
                 let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
                 name == ash::ext::debug_utils::NAME
@@ -1035,7 +1147,7 @@ impl VideoContext {
             .enabled_extension_names(&instance_extensions);
 
         let instance = unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
 
         let mut instance_guard = InstanceGuard {
             instance: &instance,
@@ -1060,7 +1172,7 @@ impl VideoContext {
                 )
                 .pfn_user_callback(Some(debug_utils_callback));
             let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
-                .map_err(|e| PixelForgeError::vulkan("Vulkan instance operation", e))?;
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
             info!("Validation layer messages are routed to tracing");
             instance_guard.debug_messenger = Some((debug_utils.clone(), messenger));
             Some((debug_utils, messenger))
@@ -1070,7 +1182,7 @@ impl VideoContext {
 
         // Find physical device with video support.
         let physical_devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| PixelForgeError::vulkan("Vulkan device query", e))?;
+            .map_err(|e| PixelForgeError::NoSuitableDevice(e.to_string()))?;
 
         let mut selected_device = None;
         let mut selected_device_exts = None;
@@ -1083,7 +1195,6 @@ impl VideoContext {
         let mut supported_encode_codecs = Vec::new();
         let mut encode_unsupported = Vec::new();
         let mut supported_decode_codecs = Vec::new();
-        let mut has_queue_family_foreign_ext = false;
 
         let has_extension =
             |extensions: &[vk::ExtensionProperties], name: &std::ffi::CStr| -> bool {
@@ -1197,9 +1308,6 @@ impl VideoContext {
                 encode_queue = None;
             }
 
-            has_queue_family_foreign_ext =
-                has_extension(&available_extensions, ash::ext::queue_family_foreign::NAME);
-
             // Check codec support for encoding, keeping why each codec is unusable.
             let mut encode_codecs = Vec::new();
             let mut device_unsupported = Vec::new();
@@ -1251,25 +1359,13 @@ impl VideoContext {
             }
 
             // Check codec support for decoding.
-            let mut decode_codecs = Vec::new();
-            if decode_queue.is_some() {
-                let available_extensions =
-                    unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                        .unwrap_or_default();
-                let has_extension = |name: &std::ffi::CStr| -> bool {
-                    available_extensions.iter().any(|ext| {
-                        let ext_name =
-                            unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        ext_name == name
-                    })
-                };
-
-                if has_extension(ash::khr::video_decode_h264::NAME)
-                    && Self::check_h264_decode_support(&entry, &instance, physical_device)
-                {
-                    decode_codecs.push(Codec::H264);
-                    debug!("Device {} supports H.264 decode", device_name);
-                }
+            let decode_codecs = if decode_queue.is_some() {
+                query_decode_codecs(&entry, &instance, physical_device)
+            } else {
+                Vec::new()
+            };
+            for codec in &decode_codecs {
+                debug!("Device {} supports {:?} decode", device_name, codec);
             }
 
             // Check if all required encode/decode codecs are supported.
@@ -1402,19 +1498,22 @@ impl VideoContext {
 
         // Required device extensions; the video queue extension only with a
         // video queue (a compute-only context must not require it).
-        let mut extension_names = vec![ash::khr::synchronization2::NAME.as_ptr()];
+        let mut extension_names = vec![
+            ash::khr::synchronization2::NAME.as_ptr(),
+            ash::khr::timeline_semaphore::NAME.as_ptr(),
+        ];
         if video_encode_queue_family.is_some() || video_decode_queue_family.is_some() {
             extension_names.push(ash::khr::video_queue::NAME.as_ptr());
         }
 
-        // External memory extensions for DMA-BUF support (optional, enabled with "dmabuf" feature).
-        #[cfg(feature = "dmabuf")]
-        {
-            extension_names.push(ash::khr::external_memory::NAME.as_ptr());
-            extension_names.push(ash::khr::external_memory_fd::NAME.as_ptr());
-            extension_names.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
-            extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
-        }
+        // DMA-BUF and sync_file input, with the `dmabuf` feature, wherever the
+        // device offers them.
+        let external = ExternalSupport::detect(|name| {
+            selected_device_exts
+                .as_ref()
+                .is_some_and(|exts| has_extension(exts, name))
+        });
+        extension_names.extend(external.extension_names().iter().map(|name| name.as_ptr()));
 
         let mut push_ext = |name: *const std::ffi::c_char| {
             if !extension_names.contains(&name) {
@@ -1442,11 +1541,6 @@ impl VideoContext {
             }
         }
 
-        // Optional: ownership transfers with other drivers' external memory.
-        if has_queue_family_foreign_ext {
-            push_ext(ash::ext::queue_family_foreign::NAME.as_ptr());
-        }
-
         // The colour converter binds its two descriptors with push descriptors.
         let has_push_descriptor = selected_device_exts
             .as_ref()
@@ -1455,6 +1549,23 @@ impl VideoContext {
             push_ext(ash::khr::push_descriptor::NAME.as_ptr());
         } else {
             warn!("VK_KHR_push_descriptor not available; the colour converter will be unavailable");
+        }
+
+        // Lets an encoder take RGB input and convert it to YUV itself, so a
+        // plain matrix conversion needs no shader at all. Extension and feature
+        // both, or the profile struct is parsed and ignored.
+        let has_rgb_conversion_ext = video_encode_queue_family.is_some()
+            && selected_device_exts.as_ref().is_some_and(|exts| {
+                has_extension(exts, ash::valve::video_encode_rgb_conversion::NAME)
+            });
+        let has_rgb_conversion =
+            has_rgb_conversion_ext && supports_rgb_conversion(&instance, physical_device);
+        let mut rgb_conversion_features =
+            vk::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE::default()
+                .video_encode_rgb_conversion(true);
+        if has_rgb_conversion {
+            push_ext(ash::valve::video_encode_rgb_conversion::NAME.as_ptr());
+            debug!("Video encode RGB conversion available");
         }
 
         // Enable synchronization2 feature.
@@ -1573,6 +1684,9 @@ impl VideoContext {
         if has_ycbcr_conversion {
             device_create_info = device_create_info.push(&mut ycbcr_features);
         }
+        if has_rgb_conversion {
+            device_create_info = device_create_info.push(&mut rgb_conversion_features);
+        }
         // Enable YCbCr 2-plane 444 formats feature (required for YUV444 encoding with NVIDIA).
         // Its extension is enabled above whenever present, so the feature has
         // to follow it unconditionally: an extension without its feature bit
@@ -1582,7 +1696,7 @@ impl VideoContext {
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
-            .map_err(|e| PixelForgeError::vulkan("Vulkan device creation", e))?;
+            .map_err(PixelForgeError::vk("vkCreateDevice"))?;
 
         // Get queues.
         let video_encode_queue =
@@ -1610,6 +1724,7 @@ impl VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
                 entry,
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
+                timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
                 instance,
                 physical_device,
                 device,
@@ -1630,120 +1745,12 @@ impl VideoContext {
                 encode_unsupported,
                 supported_decode_codecs,
                 has_push_descriptor,
+                has_video_encode_rgb_conversion: has_rgb_conversion,
                 has_unified_image_layouts: has_unified_layouts,
+                external,
                 owns_device: true,
                 retired_semaphores: Default::default(),
                 debug_messenger,
-                has_queue_family_foreign: has_queue_family_foreign_ext,
-            }),
-        })
-    }
-
-    /// Adopt a caller-created device for decoding.
-    ///
-    /// See [`VideoContextBuilder::build_from_existing_decode`], the public entry
-    /// point. The returned context borrows `instance` and `device` and destroys
-    /// neither on drop.
-    fn from_existing_decode(
-        required_decode_codecs: Vec<Codec>,
-        declared_unified_image_layouts: bool,
-        queue_overrides: QueueOverrides,
-        entry: ash::Entry,
-        instance: ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: ash::Device,
-    ) -> Result<VideoContext> {
-        let families = find_decode_queue_families(
-            &entry,
-            &instance,
-            physical_device,
-            &required_decode_codecs,
-        )?;
-
-        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-        let decode = queues::resolve(
-            &instance,
-            physical_device,
-            "decode",
-            queue_overrides.decode,
-            families.decode,
-            vk::QueueFlags::VIDEO_DECODE_KHR,
-        )?;
-        let transfer = queues::resolve(
-            &instance,
-            physical_device,
-            "transfer",
-            queue_overrides.transfer,
-            families.transfer,
-            vk::QueueFlags::TRANSFER,
-        )?;
-        let compute = queues::resolve(
-            &instance,
-            physical_device,
-            "compute",
-            queue_overrides.compute,
-            families.compute,
-            vk::QueueFlags::COMPUTE,
-        )?;
-
-        let video_decode_queue = unsafe { device.get_device_queue(decode.family, decode.index) };
-        let transfer_queue = unsafe { device.get_device_queue(transfer.family, transfer.index) };
-        let compute_queue = unsafe { device.get_device_queue(compute.family, compute.index) };
-
-        let supported_decode_codecs = query_decode_codecs(&entry, &instance, physical_device);
-
-        // The declaration is a promise about what the caller enabled, which
-        // cannot be verified. That the hardware could support it can be, so a
-        // declaration that is impossible fails here rather than in the driver.
-        if declared_unified_image_layouts
-            && !supports_unified_image_layouts(&instance, physical_device)
-        {
-            return Err(PixelForgeError::NoSuitableDevice(
-                "unified image layouts were declared, but this device does not support \
-                 VK_KHR_unified_image_layouts with both unifiedImageLayouts and \
-                 unifiedImageLayoutsVideo"
-                    .to_string(),
-            ));
-        }
-
-        info!(
-            "Adopted caller device for decode: decode queue {:?}, transfer queue {:?}, compute queue {:?}",
-            decode, transfer, compute
-        );
-
-        Ok(VideoContext {
-            inner: std::sync::Arc::new(VideoContextInner {
-                entry,
-                sync2: ash::khr::synchronization2::Device::load(&instance, &device),
-                instance,
-                physical_device,
-                device,
-                video_encode_queue_family: None,
-                video_encode_timestamp_valid_bits: 0u32,
-                video_encode_queue: None,
-                video_decode_queue_family: Some(decode.family),
-                video_decode_queue: Some(video_decode_queue),
-                transfer_queue_family: transfer.family,
-                transfer_queue,
-                compute_queue_family: compute.family,
-                compute_queue,
-                graphics_queue_family: compute.family,
-                graphics_queue: compute_queue,
-                memory_properties,
-                device_properties,
-                supported_encode_codecs: Vec::new(),
-                encode_unsupported: Vec::new(),
-                has_queue_family_foreign: false,
-                supported_decode_codecs,
-                has_push_descriptor: false,
-                has_unified_image_layouts: declared_unified_image_layouts,
-                owns_device: false,
-                retired_semaphores: Default::default(),
-                // The caller owns the instance; reporting is theirs to set up.
-                debug_messenger: None,
             }),
         })
     }
@@ -1919,63 +1926,6 @@ impl VideoContext {
             }
             err => {
                 warn!("Failed to query AV1 encode capabilities: {:?}", err);
-                false
-            }
-        }
-    }
-
-    /// Check if a codec is supported for encoding.
-    fn check_h264_decode_support(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> bool {
-        let video_queue = ash::khr::video_queue::Instance::load(entry, instance);
-
-        // H.264 decode profile: High profile, progressive, 8-bit 4:2:0.
-        let mut h264_profile = vk::VideoDecodeH264ProfileInfoKHR::default()
-            .std_profile_idc(
-                ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
-            )
-            .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
-
-        let profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push(&mut h264_profile);
-
-        let mut h264_capabilities = vk::VideoDecodeH264CapabilitiesKHR::default();
-        let mut decode_capabilities = vk::VideoDecodeCapabilitiesKHR::default();
-        let mut capabilities = vk::VideoCapabilitiesKHR::default()
-            .push(&mut h264_capabilities)
-            .push(&mut decode_capabilities);
-
-        let result = unsafe {
-            (video_queue.fp().get_physical_device_video_capabilities_khr)(
-                physical_device,
-                &profile_info,
-                &mut capabilities,
-            )
-        };
-
-        match result {
-            vk::Result::SUCCESS => {
-                debug!(
-                    "H.264 decode supported: max {}x{}, {} DPB slots",
-                    capabilities.max_coded_extent.width,
-                    capabilities.max_coded_extent.height,
-                    capabilities.max_dpb_slots
-                );
-                true
-            }
-            vk::Result::ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR => {
-                debug!("H.264 decode not supported on this device");
-                false
-            }
-            _ => {
-                warn!("Failed to query H.264 decode capabilities: {:?}", result);
                 false
             }
         }

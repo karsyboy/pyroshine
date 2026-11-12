@@ -6,7 +6,7 @@
 //! resource management (encode slot pipelines, decode DPB pools) lives in
 //! `encoder::resources` and `decoder` respectively, built on these primitives.
 
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
@@ -77,7 +77,7 @@ fn allocate_and_bind_image_memory(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for image".to_string())
+        PixelForgeError::NoSuitableDevice("No suitable memory type for image".to_string())
     })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -85,13 +85,13 @@ fn allocate_and_bind_image_memory(
         .memory_type_index(memory_type_index);
 
     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
     match unsafe { context.device().bind_image_memory(image, memory, 0) } {
         Ok(()) => Ok(memory),
         Err(e) => {
             unsafe { context.device().free_memory(memory, None) };
-            Err(PixelForgeError::vulkan("memory operation", e))
+            Err(PixelForgeError::vulkan("vkBindImageMemory", e))
         }
     }
 }
@@ -133,7 +133,7 @@ fn create_video_image_raw(
     }
 
     let image = unsafe { context.device().create_image(&create_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("image creation", e))?;
+        .map_err(PixelForgeError::vk("vkCreateImage"))?;
 
     match allocate_and_bind_image_memory(context, image) {
         Ok(memory) => Ok((image, memory)),
@@ -153,7 +153,7 @@ fn create_video_image_raw(
 /// must carry a `VkSamplerYcbcrConversion`, and a video picture resource must
 /// not have one. Declaring the narrower usage says what this view is actually
 /// for and keeps both requirements satisfiable at once.
-fn create_video_image_view(
+pub(crate) fn create_video_image_view(
     context: &VideoContext,
     image: vk::Image,
     format: vk::Format,
@@ -177,7 +177,7 @@ fn create_video_image_view(
         });
 
     unsafe { context.device().create_image_view(&view_create_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("image view creation", e))
+        .map_err(PixelForgeError::vk("vkCreateImageView"))
 }
 
 /// The single-plane formats a multi-planar picture format's planes can be
@@ -280,26 +280,26 @@ pub(crate) fn query_supported_video_formats(
         .collect())
 }
 
-/// Get the Vulkan format for a given pixel format and bit depth.
+/// Get the Vulkan format for a given chroma format and bit depth.
 ///
 /// Supports YUV420 and YUV444 in 8-bit and 10-bit.
 /// For YUV444, uses 2-plane (semi-planar) formats from VK_EXT_ycbcr_2plane_444_formats
 /// which are supported by NVIDIA hardware for video encoding.
-pub(crate) fn get_video_format(pixel_format: PixelFormat, bit_depth: BitDepth) -> vk::Format {
-    match (pixel_format, bit_depth) {
-        (PixelFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
-        (PixelFormat::Yuv420, BitDepth::Ten) => {
+pub(crate) fn get_video_format(chroma_format: ChromaFormat, bit_depth: BitDepth) -> vk::Format {
+    match (chroma_format, bit_depth) {
+        (ChromaFormat::Yuv420, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+        (ChromaFormat::Yuv420, BitDepth::Ten) => {
             vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
         }
         // Use 2-plane semi-planar formats for YUV444 (supported by NVIDIA for video encoding).
-        (PixelFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
-        (PixelFormat::Yuv444, BitDepth::Ten) => {
+        (ChromaFormat::Yuv444, BitDepth::Eight) => vk::Format::G8_B8R8_2PLANE_444_UNORM,
+        (ChromaFormat::Yuv444, BitDepth::Ten) => {
             vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16
         }
         // TODO: Add support for YUV422 formats.
         _ => unimplemented!(
-            "Unsupported pixel format / bit depth combination: {:?} / {:?}",
-            pixel_format,
+            "Unsupported chroma format / bit depth combination: {:?} / {:?}",
+            chroma_format,
             bit_depth
         ),
     }
@@ -334,7 +334,7 @@ pub(crate) fn create_bitstream_buffer(
         .push(&mut profile_list);
 
     let buffer = unsafe { context.device().create_buffer(&create_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("buffer creation", e))?;
+        .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
 
     let mem_requirements = unsafe { context.device().get_buffer_memory_requirements(buffer) };
 
@@ -344,7 +344,7 @@ pub(crate) fn create_bitstream_buffer(
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for buffer".to_string())
+        PixelForgeError::NoSuitableDevice("No suitable memory type for buffer".to_string())
     })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -352,10 +352,10 @@ pub(crate) fn create_bitstream_buffer(
         .memory_type_index(memory_type_index);
 
     let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
     unsafe { context.device().bind_buffer_memory(buffer, memory, 0) }
-        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+        .map_err(PixelForgeError::vk("vkBindBufferMemory"))?;
 
     Ok((buffer, memory))
 }
@@ -367,7 +367,7 @@ pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Se
     let create_info = vk::SemaphoreCreateInfo::default().push(&mut type_info);
 
     unsafe { context.device().create_semaphore(&create_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("semaphore creation", e))
+        .map_err(PixelForgeError::vk("vkCreateSemaphore"))
 }
 
 /// Create an image for video encoding (input or DPB).
@@ -419,7 +419,10 @@ pub(crate) fn allocate_session_memory(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
+        return Err(PixelForgeError::vulkan(
+            "vkGetVideoSessionMemoryRequirementsKHR",
+            result,
+        ));
     }
 
     // Query actual requirements.
@@ -436,7 +439,10 @@ pub(crate) fn allocate_session_memory(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
+        return Err(PixelForgeError::vulkan(
+            "vkGetVideoSessionMemoryRequirementsKHR",
+            result,
+        ));
     }
 
     // Allocate and bind memory for each requirement.
@@ -457,7 +463,7 @@ pub(crate) fn allocate_session_memory(
             )
         })
         .ok_or_else(|| {
-            PixelForgeError::MemoryAllocation(format!(
+            PixelForgeError::NoSuitableDevice(format!(
                 "No suitable memory type for video session (type_bits: 0x{:x})",
                 req.memory_requirements.memory_type_bits
             ))
@@ -468,7 +474,7 @@ pub(crate) fn allocate_session_memory(
             .memory_type_index(memory_type_index);
 
         let memory = unsafe { context.device().allocate_memory(&alloc_info, None) }
-            .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+            .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
         bind_infos.push(
             vk::BindVideoSessionMemoryInfoKHR::default()
@@ -491,7 +497,10 @@ pub(crate) fn allocate_session_memory(
         )
     };
     if result != vk::Result::SUCCESS {
-        return Err(PixelForgeError::MemoryAllocation(format!("{:?}", result)));
+        return Err(PixelForgeError::vulkan(
+            "vkBindVideoSessionMemoryKHR",
+            result,
+        ));
     }
 
     Ok(session_memory)
@@ -511,8 +520,7 @@ pub(crate) fn map_bitstream_buffer(
             vk::MemoryMapFlags::empty(),
         )
     }
-    .map_err(|e| PixelForgeError::vulkan("Failed to map bitstream buffer", e))?
-        as *mut u8;
+    .map_err(PixelForgeError::vk("vkMapMemory"))? as *mut u8;
 
     Ok(ptr)
 }
@@ -588,19 +596,12 @@ pub(crate) fn create_dpb_images(
 }
 
 /// A command pool for `family`, with per-buffer reset.
-///
-/// `label` names the pool in the error message, since a decoder holds several
-/// for different queue families.
-pub(crate) fn create_command_pool(
-    context: &VideoContext,
-    family: u32,
-    label: &str,
-) -> Result<vk::CommandPool> {
+pub(crate) fn create_command_pool(context: &VideoContext, family: u32) -> Result<vk::CommandPool> {
     let pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(family)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     unsafe { context.device().create_command_pool(&pool_info, None) }
-        .map_err(|e| PixelForgeError::ResourceCreation(format!("{} command pool: {}", label, e)))
+        .map_err(PixelForgeError::vk("vkCreateCommandPool"))
 }
 
 /// Allocate `count` primary command buffers from `pool`.
@@ -614,7 +615,7 @@ pub(crate) fn allocate_command_buffers(
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(count);
     unsafe { context.device().allocate_command_buffers(&info) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))
+        .map_err(PixelForgeError::vk("vkAllocateCommandBuffers"))
 }
 
 /// A fence, created signaled when it will be waited on before its first submit.
@@ -624,7 +625,7 @@ pub(crate) fn create_fence(context: &VideoContext, signaled: bool) -> Result<vk:
         info = info.flags(vk::FenceCreateFlags::SIGNALED);
     }
     unsafe { context.device().create_fence(&info, None) }
-        .map_err(|e| PixelForgeError::vulkan("fence creation", e))
+        .map_err(PixelForgeError::vk("vkCreateFence"))
 }
 
 /// A chain of submissions ordered by one timeline semaphore.

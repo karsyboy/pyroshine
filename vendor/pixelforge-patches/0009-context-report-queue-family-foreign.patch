@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
+Date: Thu, 12 Nov 2026 11:35:46 -0500
+Subject: [PATCH] context: report whether VK_EXT_queue_family_foreign is
+ enabled
+
+Media APIs such as VA-API export DMA-BUF surfaces from a different driver
+than the Vulkan device that writes them. Ownership transfers of such
+resources use VK_QUEUE_FAMILY_FOREIGN_EXT. Upstream enables the extension
+with the dmabuf feature wherever the device offers it; expose that through
+VideoContext::has_queue_family_foreign so callers that record their own
+transfers can choose the family.
+---
+ src/vulkan.rs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/vulkan.rs b/src/vulkan.rs
+index e0cac34..11f5b5a 100644
+--- a/src/vulkan.rs
++++ b/src/vulkan.rs
+@@ -892,6 +892,17 @@ impl VideoContext {
+         self.inner.external
+     }
+ 
++    /// Whether `VK_EXT_queue_family_foreign` is enabled (with the `dmabuf`
++    /// feature, wherever the device offers it).
++    ///
++    /// Memory written by another driver, such as a VA-API surface exported as
++    /// DMA-BUF, must be acquired from and released to
++    /// `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` only covers
++    /// the same device and driver identity.
++    pub fn has_queue_family_foreign(&self) -> bool {
++        self.inner.external.foreign_queue
++    }
++
+     /// Wait on the CPU until `point` is reached.
+     pub(crate) fn wait_point(&self, point: crate::sync::TimelinePoint) -> crate::error::Result<()> {
+         let semaphores = [point.semaphore];

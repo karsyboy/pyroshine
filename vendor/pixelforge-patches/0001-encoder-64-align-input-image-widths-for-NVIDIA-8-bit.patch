@@ -18,10 +18,10 @@ columns.
  3 files changed, 39 insertions(+), 4 deletions(-)
 
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index 32444f6..ba659de 100644
+index 8f243cc..f0f740f 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -516,6 +516,26 @@ pub(crate) fn query_video_caps(
+@@ -840,6 +840,26 @@ pub(crate) fn query_video_caps(
      })
  }
  
@@ -48,7 +48,7 @@ index 32444f6..ba659de 100644
  /// Query capabilities, create the video session, DPB images, command resources,
  /// the encode pipeline and the GOP structure — the ~85% of encoder
  /// initialization that is identical across codecs.
-@@ -696,8 +716,8 @@ pub(crate) fn build_encoder_common(req: &CommonInitRequest) -> Result<CommonInit
+@@ -1063,8 +1083,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
  
      let pipeline = EncodePipeline::new(&PipelineConfig {
          context,
@@ -56,13 +56,13 @@ index 32444f6..ba659de 100644
          aligned_height,
 +        input_width: input_image_width(aligned_width, capabilities.max_coded_extent.width),
          picture_format,
-         pixel_format: config.pixel_format,
-         bit_depth: config.bit_depth,
+         rgb_input: req.rgb_input.is_some(),
+         chroma_format: config.chroma_format,
 diff --git a/src/encoder/pipeline.rs b/src/encoder/pipeline.rs
-index d46ef58..d3fc202 100644
+index c44b41e..62b6f3f 100644
 --- a/src/encoder/pipeline.rs
 +++ b/src/encoder/pipeline.rs
-@@ -162,8 +162,10 @@ pub(crate) struct EncodeSlot {
+@@ -192,8 +192,10 @@ pub(crate) struct EncodeSlot {
  /// Configuration for building an [`EncodePipeline`].
  pub(crate) struct PipelineConfig<'a> {
      pub context: &'a VideoContext,
@@ -72,9 +72,9 @@ index d46ef58..d3fc202 100644
 +    /// `input_image_width`). Pictures are still encoded at `aligned_width`.
 +    pub input_width: u32,
      pub picture_format: vk::Format,
-     pub pixel_format: PixelFormat,
-     pub bit_depth: BitDepth,
-@@ -224,7 +226,7 @@ impl EncodePipeline {
+     /// Whether the input image is RGB, for the encoder to convert.
+     pub rgb_input: bool,
+@@ -257,7 +259,7 @@ impl EncodePipeline {
          for &encode_command_buffer in &command_buffers {
              let (input_image, input_image_memory, input_image_view) = create_image(
                  context,
@@ -83,20 +83,20 @@ index d46ef58..d3fc202 100644
                  config.aligned_height,
                  config.picture_format,
                  false,
-@@ -252,7 +254,7 @@ impl EncodePipeline {
+@@ -285,7 +287,7 @@ impl EncodePipeline {
                      fence: config.upload_fence,
                      queue: context.transfer_queue(),
                      image: input_image,
 -                    width: config.aligned_width,
 +                    width: config.input_width,
                      height: config.aligned_height,
-                     pixel_format: config.pixel_format,
+                     chroma_format: config.chroma_format,
                      bit_depth: config.bit_depth,
 diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
-index ccf17d5..0b69dfd 100644
+index 1a5d4ed..012f8f0 100644
 --- a/src/encoder/resources.rs
 +++ b/src/encoder/resources.rs
-@@ -1167,6 +1167,19 @@ mod tests {
+@@ -1192,6 +1192,19 @@ mod tests {
          assert_eq!(lcm(7, 7), 7);
      }
  

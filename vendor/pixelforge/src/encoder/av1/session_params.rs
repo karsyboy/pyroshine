@@ -4,7 +4,7 @@ use super::Av1;
 
 use crate::encoder::codec::EncoderCommon;
 use crate::encoder::resources::get_encoded_session_params;
-use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, ColorDescription};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -55,9 +55,9 @@ impl Av1 {
             BitDepth::Ten => 10,
         };
 
-        let (subsampling_x, subsampling_y) = match config.pixel_format {
-            PixelFormat::Yuv420 => (1u8, 1u8),
-            PixelFormat::Yuv444 => (0u8, 0u8),
+        let (subsampling_x, subsampling_y) = match config.chroma_format {
+            ChromaFormat::Yuv420 => (1u8, 1u8),
+            ChromaFormat::Yuv444 => (0u8, 0u8),
             _ => (1u8, 1u8),
         };
 
@@ -71,7 +71,7 @@ impl Av1 {
             transfer_characteristics: av1_transfer,
             matrix_coefficients: av1_matrix,
             // Only 4:2:0 carries a position (AV1 spec 5.5.2).
-            chroma_sample_position: if (subsampling_x, subsampling_y) == (1, 1) {
+            chroma_sample_position: if subsampling_x == 1 && subsampling_y == 1 {
                 ash::vk::native::StdVideoAV1ChromaSamplePosition::from(
                     desc.chroma_location.av1_sample_position(),
                 )
@@ -80,8 +80,8 @@ impl Av1 {
             },
         };
 
-        let profile = match config.pixel_format {
-            PixelFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+        let profile = match config.chroma_format {
+            ChromaFormat::Yuv420 => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
             _ => ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
         };
 
@@ -169,7 +169,7 @@ impl Av1 {
             common
                 .video_queue_fn
                 .create_video_session_parameters(&session_params_create_info, None)
-                .map_err(|e| PixelForgeError::vulkan("Failed to create AV1 session parameters", e))
+                .map_err(PixelForgeError::vk("vkCreateVideoSessionParametersKHR"))
         }
     }
 

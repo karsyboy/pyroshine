@@ -1,10 +1,10 @@
-//! Profile construction and frame/image extents shared by queries and encoders.
+//! Encode capabilities and frame/image extents shared by queries and encoders.
 use ash::vk;
 use ash::vk::TaggedStructure;
 
 use super::codec::{DeviceVideoCaps, input_image_width, query_video_caps};
-use super::profile::{av1_profile, h264_profile_idc, h265_profile_idc};
-use super::{Codec, EncodeConfig, RateControlMode};
+use super::profile::EncodeProfile;
+use super::{Codec, EncodeConfig, RateControl};
 use crate::VideoContext;
 use crate::error::{PixelForgeError, Result};
 use crate::video::gcd;
@@ -37,10 +37,25 @@ pub struct EncoderCapabilities {
 
 impl EncoderCapabilities {
     /// Query without allocating a session or encoder images. Uses the same
-    /// profile, usage hints and capability chain as encoder initialization.
+    /// profile (for YUV input), usage hints and capability chain as encoder
+    /// initialization.
     pub fn query(context: &VideoContext, config: &EncodeConfig) -> Result<Self> {
-        let mut profile = EncodeProfile::new(config)?;
-        let caps = query_video_caps(context, &profile.info())?;
+        let profile = EncodeProfile::new(config, false)?;
+        let profile_info = profile.info();
+        let mut encode = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut h264 = vk::VideoEncodeH264CapabilitiesKHR::default();
+        let mut h265 = vk::VideoEncodeH265CapabilitiesKHR::default();
+        let mut av1 = vk::VideoEncodeAV1CapabilitiesKHR::default();
+        let capabilities = vk::VideoCapabilitiesKHR::default().push(&mut encode);
+        let mut capabilities = match config.codec {
+            Codec::H264 => capabilities.push(&mut h264),
+            Codec::H265 => capabilities.push(&mut h265),
+            Codec::AV1 => capabilities.push(&mut av1),
+        };
+        let mut caps = query_video_caps(context, profile_info, &mut capabilities)?;
+        if config.codec == Codec::AV1 {
+            caps.av1_coded_picture_alignment = Some(av1.coded_picture_alignment);
+        }
         Ok(Self::from_caps(&caps))
     }
 
@@ -63,25 +78,25 @@ impl EncoderCapabilities {
     /// disabled rate control, and NVIDIA limits H.264 and HEVC to 120 Mbps on
     /// an RTX 3080; drivers do not report a violation, so it must be caught here.
     pub fn check_rate_control(&self, config: &EncodeConfig) -> Result<()> {
-        let mode = match config.rate_control_mode {
-            RateControlMode::Disabled | RateControlMode::Cqp => {
-                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
+        let (mode, peak) = match config.rate_control {
+            RateControl::Cqp { .. } => (vk::VideoEncodeRateControlModeFlagsKHR::DISABLED, None),
+            RateControl::Cbr { bitrate } => {
+                (vk::VideoEncodeRateControlModeFlagsKHR::CBR, Some(bitrate))
             }
-            RateControlMode::Cbr => vk::VideoEncodeRateControlModeFlagsKHR::CBR,
-            RateControlMode::Vbr => vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+            RateControl::Vbr { target, max } => (
+                vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+                Some(target.max(max)),
+            ),
         };
         if !self.rate_control_modes.contains(mode) {
             return Err(PixelForgeError::InvalidInput(format!(
                 "{:?} on this GPU does not support {:?} rate control (supported: {:?})",
-                config.codec, config.rate_control_mode, self.rate_control_modes
+                config.codec, mode, self.rate_control_modes
             )));
         }
-        let peak = match config.rate_control_mode {
-            RateControlMode::Cbr => config.target_bitrate,
-            RateControlMode::Vbr => config.target_bitrate.max(config.max_bitrate),
-            RateControlMode::Disabled | RateControlMode::Cqp => return Ok(()),
-        };
-        if u64::from(peak) > self.max_bitrate {
+        if let Some(peak) = peak
+            && u64::from(peak) > self.max_bitrate
+        {
             return Err(PixelForgeError::InvalidInput(format!(
                 "{:?} on this GPU encodes at most {} bps; {peak} bps requested",
                 config.codec, self.max_bitrate
@@ -102,7 +117,7 @@ impl EncoderCapabilities {
                 .max(minimum)
                 .checked_next_multiple_of(unit)
         };
-        let extent = match (
+        match (
             align(
                 width,
                 self.picture_access_granularity.width,
@@ -120,19 +135,16 @@ impl EncoderCapabilities {
                     && w <= self.max_coded_extent.width
                     && h <= self.max_coded_extent.height =>
             {
-                vk::Extent2D {
+                Ok(vk::Extent2D {
                     width: w,
                     height: h,
-                }
+                })
             }
-            _ => {
-                return Err(PixelForgeError::InvalidInput(format!(
-                    "{codec:?} on this GPU encodes frames of at most {}x{}; {width}x{height} has no valid coded extent",
-                    self.max_coded_extent.width, self.max_coded_extent.height
-                )));
-            }
-        };
-        Ok(extent)
+            _ => Err(PixelForgeError::InvalidInput(format!(
+                "{codec:?} on this GPU encodes frames of at most {}x{}; {width}x{height} has no valid coded extent",
+                self.max_coded_extent.width, self.max_coded_extent.height
+            ))),
+        }
     }
 
     /// AV1 frame size (`max_frame_*` and every picture's `codedExtent`): the
@@ -177,72 +189,9 @@ impl EncoderCapabilities {
     }
 }
 
-/// Own every structure referenced by the profile chain until the Vulkan call
-/// or encoder initialization completes. Never expose pointers beyond this borrow.
-pub(crate) struct EncodeProfile {
-    codec: Codec,
-    chroma: vk::VideoChromaSubsamplingFlagsKHR,
-    depth: vk::VideoComponentBitDepthFlagsKHR,
-    pub(crate) profile_idc: u32,
-    h264: vk::VideoEncodeH264ProfileInfoKHR<'static>,
-    h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
-    av1: vk::VideoEncodeAV1ProfileInfoKHR<'static>,
-    usage: vk::VideoEncodeUsageInfoKHR<'static>,
-}
-
-impl EncodeProfile {
-    pub(crate) fn new(config: &EncodeConfig) -> Result<Self> {
-        // Profile choice stays in `profile.rs`, shared with `supports_encode_format`.
-        let profile_idc = match config.codec {
-            Codec::H264 => h264_profile_idc(config.pixel_format),
-            Codec::H265 => {
-                h265_profile_idc(config.pixel_format, config.bit_depth).ok_or_else(|| {
-                    PixelForgeError::InvalidInput(format!(
-                        "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
-                        config.pixel_format, config.bit_depth
-                    ))
-                })?
-            }
-            Codec::AV1 => av1_profile(config.pixel_format),
-        };
-        Ok(Self {
-            codec: config.codec,
-            chroma: config.pixel_format.into(),
-            depth: config.bit_depth.into(),
-            profile_idc,
-            h264: vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc),
-            h265: vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc),
-            av1: vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile_idc),
-            usage: vk::VideoEncodeUsageInfoKHR::default()
-                .video_usage_hints(config.encode_usage_hint.into())
-                .video_content_hints(config.encode_content_hint.into())
-                .tuning_mode(config.encoder_tuning_mode.into()),
-        })
-    }
-
-    pub(crate) fn info(&mut self) -> vk::VideoProfileInfoKHR<'_> {
-        let info = vk::VideoProfileInfoKHR::default()
-            .chroma_subsampling(self.chroma)
-            .luma_bit_depth(self.depth)
-            .chroma_bit_depth(self.depth);
-        let info = match self.codec {
-            Codec::H264 => info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-                .push(&mut self.h264),
-            Codec::H265 => info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-                .push(&mut self.h265),
-            Codec::AV1 => info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
-                .push(&mut self.av1),
-        };
-        info.push(&mut self.usage)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{BitDepth, PixelFormat};
+    use super::super::{BitDepth, ChromaFormat};
     use super::*;
 
     fn caps(minimum: (u32, u32), granularity: (u32, u32), max_width: u32) -> EncoderCapabilities {
@@ -270,9 +219,7 @@ mod tests {
     #[test]
     fn unsupported_rate_control_and_excess_bitrate_are_rejected() {
         let cbr = |bitrate| {
-            EncodeConfig::h264(1920, 1080)
-                .with_rate_control(RateControlMode::Cbr)
-                .with_target_bitrate(bitrate)
+            EncodeConfig::h264(1920, 1080).with_rate_control(RateControl::Cbr { bitrate })
         };
         let limits = caps((1, 1), (1, 1), 8192);
         assert!(limits.check_rate_control(&cbr(120_000_000)).is_ok());
@@ -281,12 +228,13 @@ mod tests {
             error.to_string().contains("at most 120000000 bps"),
             "{error}"
         );
-        let vbr = cbr(50_000_000)
-            .with_rate_control(RateControlMode::Vbr)
-            .with_max_bitrate(130_000_000);
+        let vbr = EncodeConfig::h264(1920, 1080).with_rate_control(RateControl::Vbr {
+            target: 50_000_000,
+            max: 130_000_000,
+        });
         assert!(limits.check_rate_control(&vbr).is_err());
         // Constant QP ignores the bitrate.
-        let cqp = cbr(500_000_000).with_rate_control(RateControlMode::Cqp);
+        let cqp = EncodeConfig::h264(1920, 1080).with_rate_control(RateControl::Cqp { qp: 30 });
         assert!(limits.check_rate_control(&cqp).is_ok());
 
         let disabled_only = EncoderCapabilities {
@@ -298,7 +246,7 @@ mod tests {
             .check_rate_control(&cbr(10_000_000))
             .unwrap_err();
         assert!(
-            error.to_string().contains("does not support Cbr"),
+            error.to_string().contains("does not support CBR"),
             "{error}"
         );
         assert!(disabled_only.check_rate_control(&cqp).is_ok());
@@ -389,31 +337,34 @@ mod tests {
     #[test]
     fn profile_chain_preserves_chroma_depth_and_usage_hints() {
         for codec in [Codec::H264, Codec::H265, Codec::AV1] {
-            for chroma in [PixelFormat::Yuv420, PixelFormat::Yuv444] {
+            for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv444] {
                 for depth in [BitDepth::Eight, BitDepth::Ten] {
-                    let mut config = EncodeConfig::h264(1920, 1080);
-                    config.codec = codec;
-                    config.pixel_format = chroma;
+                    let mut config = EncodeConfig::new(codec, 1920, 1080);
+                    config.chroma_format = chroma;
                     config.bit_depth = depth;
                     config.encoder_tuning_mode = super::super::EncoderTuningMode::LowLatency;
-                    let mut profile = EncodeProfile::new(&config).unwrap();
+                    let profile = EncodeProfile::new(&config, false).unwrap();
                     let info = profile.info();
                     assert_eq!(info.chroma_subsampling, chroma.into());
                     assert_eq!(info.luma_bit_depth, depth.into());
                     assert_eq!(info.chroma_bit_depth, depth.into());
+                    assert!(!info.p_next.is_null());
                     // SAFETY: info borrows profile; these are the exact structures it owns.
-                    let usage = unsafe { &*info.p_next.cast::<vk::VideoEncodeUsageInfoKHR>() };
-                    assert_eq!(usage.video_usage_hints, config.encode_usage_hint.into());
-                    assert_eq!(usage.video_content_hints, config.encode_content_hint.into());
-                    assert_eq!(usage.tuning_mode, vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
-                    assert!(!usage.p_next.is_null());
-                    let codec_info = unsafe { &*usage.p_next.cast::<vk::BaseInStructure>() };
+                    let codec_info = unsafe { &*info.p_next.cast::<vk::BaseInStructure>() };
                     let expected = match codec {
                         Codec::H264 => vk::StructureType::VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
                         Codec::H265 => vk::StructureType::VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
                         Codec::AV1 => vk::StructureType::VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
                     };
                     assert_eq!(codec_info.s_type, expected);
+                    assert!(!codec_info.p_next.is_null());
+                    // SAFETY: the codec profile chains the usage info next.
+                    let usage =
+                        unsafe { &*codec_info.p_next.cast::<vk::VideoEncodeUsageInfoKHR>() };
+                    assert_eq!(usage.s_type, vk::StructureType::VIDEO_ENCODE_USAGE_INFO_KHR);
+                    assert_eq!(usage.video_usage_hints, config.encode_usage_hint.into());
+                    assert_eq!(usage.video_content_hints, config.encode_content_hint.into());
+                    assert_eq!(usage.tuning_mode, vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
                 }
             }
         }

@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ash::vk::TaggedStructure;
-use pixelforge::{
-	Codec, EncodeBitDepth, EncodeConfig, Encoder, EncoderCapabilities, PixelFormat, RateControlMode, VideoContext,
-};
+use pixelforge::{Codec, EncodeConfig, Encoder, EncoderCapabilities, RateControl, VideoContext};
 
 use crate::config::Config;
 use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL};
@@ -1095,16 +1093,15 @@ fn vulkan_probe_config(
 		VideoCodec::PyroWave => return Err("PyroWave is not a Vulkan Video codec".into()),
 	};
 	let config = base
-		.with_pixel_format(match chroma {
-			ChromaFormat::Yuv420 => PixelFormat::Yuv420,
-			ChromaFormat::Yuv444 => PixelFormat::Yuv444,
+		.with_chroma_format(match chroma {
+			ChromaFormat::Yuv420 => pixelforge::ChromaFormat::Yuv420,
+			ChromaFormat::Yuv444 => pixelforge::ChromaFormat::Yuv444,
 		})
 		.with_bit_depth(match depth {
-			BitDepth::Eight => EncodeBitDepth::Eight,
-			BitDepth::Ten => EncodeBitDepth::Ten,
+			BitDepth::Eight => pixelforge::BitDepth::Eight,
+			BitDepth::Ten => pixelforge::BitDepth::Ten,
 		})
-		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(PROBE_BITRATE);
+		.with_rate_control(RateControl::Cbr { bitrate: PROBE_BITRATE });
 	Ok((codec, config))
 }
 

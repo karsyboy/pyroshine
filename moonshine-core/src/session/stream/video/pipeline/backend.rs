@@ -15,7 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use pixelforge::{ColorDescription, PixelForgeError};
+use pixelforge::{ColorDescription, Frame, InputSlot, PixelForgeError, Source, StreamColor};
 
 use super::convert::{ConvertFormat, Target};
 use crate::session::stream::video::{BitDepth, ChromaFormat, VideoCodec};
@@ -147,7 +147,14 @@ impl EncodeError {
 
 	pub(crate) fn device_lost(&self) -> bool {
 		match self {
-			Self::Vulkan(error) => error.vulkan_result() == Some(ash::vk::Result::ERROR_DEVICE_LOST),
+			Self::Vulkan(error) => matches!(
+				error,
+				PixelForgeError::DeviceLost
+					| PixelForgeError::Vulkan {
+						result: ash::vk::Result::ERROR_DEVICE_LOST,
+						..
+					}
+			),
 			Self::Native { device_lost, .. } => *device_lost,
 		}
 	}
@@ -182,8 +189,8 @@ impl Future for PacketFuture {
 			Self::Vulkan(future) => Pin::new(future).poll(cx).map(|result| {
 				result
 					.map(|packet| Packet {
+						is_key_frame: packet.is_key_frame(),
 						data: packet.data,
-						is_key_frame: packet.is_key_frame,
 					})
 					.map_err(EncodeError::Vulkan)
 			}),
@@ -198,9 +205,70 @@ impl Future for PacketFuture {
 	}
 }
 
+/// A Pixelforge encoder and the input slot handed out for the next frame.
+///
+/// Pixelforge hands out its input image as an [`InputSlot`] that is valid
+/// until the encoder's next submission. The conventional loop converts into
+/// the slot's image and then submits it, so the slot is kept from
+/// `input_target` to `encode`; asking again before a submission returns the
+/// same slot.
+pub(crate) struct VulkanEncoder {
+	encoder: pixelforge::Encoder,
+	slot: Option<InputSlot>,
+}
+
+impl VulkanEncoder {
+	pub(crate) fn new(encoder: pixelforge::Encoder) -> Self {
+		Self { encoder, slot: None }
+	}
+
+	/// The current slot's image, waiting until its previous encode is done.
+	fn input_target(&mut self) -> Result<Target, EncodeError> {
+		let slot = match &mut self.slot {
+			Some(slot) => slot,
+			slot @ None => slot.insert(self.encoder.input_slot().map_err(EncodeError::Vulkan)?),
+		};
+		Ok(Target::encoder_input(slot.image()))
+	}
+
+	/// Encode the slot `target` names, which the caller converted into.
+	fn encode(&mut self, target: Target) -> Result<PacketFuture, EncodeError> {
+		let Target::Image { image, .. } = target else {
+			return Err(EncodeError::native("Vulkan Video encodes from its own input images"));
+		};
+		let slot = self
+			.slot
+			.take()
+			.ok_or_else(|| EncodeError::native("no Vulkan Video input slot was taken for this frame"))?;
+		if slot.image() != image {
+			return Err(EncodeError::native("the frame was converted into another input slot"));
+		}
+		// The conversion completed on the CPU before this call, so the encode
+		// waits for nothing on the GPU.
+		self.encoder
+			.submit(Frame::input(slot))
+			.map(PacketFuture::Vulkan)
+			.map_err(EncodeError::Vulkan)
+	}
+}
+
+impl std::ops::Deref for VulkanEncoder {
+	type Target = pixelforge::Encoder;
+
+	fn deref(&self) -> &pixelforge::Encoder {
+		&self.encoder
+	}
+}
+
+impl std::ops::DerefMut for VulkanEncoder {
+	fn deref_mut(&mut self) -> &mut pixelforge::Encoder {
+		&mut self.encoder
+	}
+}
+
 /// A conventional encoder of one stream epoch.
 pub(crate) enum ConventionalEncoder {
-	Vulkan(pixelforge::Encoder),
+	Vulkan(VulkanEncoder),
 	Vaapi(super::vaapi::VaapiEncoder),
 	Nvenc(super::nvenc::NvencEncoder),
 }
@@ -254,7 +322,11 @@ impl ConventionalEncoder {
 	/// Change the signalled color description; takes effect with a key frame.
 	pub(crate) fn set_color_description(&mut self, description: ColorDescription) -> Result<(), EncodeError> {
 		match self {
-			Self::Vulkan(encoder) => encoder.set_color_description(description).map_err(EncodeError::Vulkan),
+			// The source stays YUV the conversion writes; a changed colour
+			// makes the next frame a key frame with the new headers.
+			Self::Vulkan(encoder) => encoder
+				.reconfigure(Source::Yuv, StreamColor::Other(description))
+				.map_err(EncodeError::Vulkan),
 			Self::Vaapi(encoder) => encoder.set_color_description(description),
 			Self::Nvenc(encoder) => encoder.set_color_description(description),
 		}
@@ -290,7 +362,7 @@ impl EncoderInput for ConventionalEncoder {
 
 	fn input_target(&mut self) -> Result<Target, EncodeError> {
 		match self {
-			Self::Vulkan(encoder) => Ok(Target::encoder_input(encoder.input_image())),
+			Self::Vulkan(encoder) => encoder.input_target(),
 			Self::Vaapi(encoder) => encoder.input_target(),
 			Self::Nvenc(encoder) => encoder.input_target(),
 		}
@@ -298,15 +370,7 @@ impl EncoderInput for ConventionalEncoder {
 
 	fn encode(&mut self, target: Target) -> Result<PacketFuture, EncodeError> {
 		match self {
-			Self::Vulkan(encoder) => {
-				let Target::Image { image, .. } = target else {
-					return Err(EncodeError::native("Vulkan Video encodes from its own input images"));
-				};
-				encoder
-					.encode(image)
-					.map(PacketFuture::Vulkan)
-					.map_err(EncodeError::Vulkan)
-			},
+			Self::Vulkan(encoder) => encoder.encode(target),
 			Self::Vaapi(encoder) => encoder.encode(target),
 			Self::Nvenc(encoder) => encoder.encode(target),
 		}

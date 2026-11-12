@@ -19,8 +19,8 @@ use pixelforge::decoder::{DecodeConfig, Decoder};
 use pixelforge::encoder::Codec;
 use pixelforge::vulkan::{DeviceQueue, DeviceRequirements, VideoContext, VideoContextBuilder};
 use pixelforge::{
-    ColorConverter, ColorConverterConfig, ColorRange, ColorSpec, EncodeConfig, Encoder,
-    InputFormat, OutputFormat, RateControlMode, TimelinePoint,
+    ColorSpec, ConversionPreference, EncodeConfig, Encoder, Frame, Handoff, RateControl, RgbFormat,
+    RgbSource, Source, SourceImage, TimelinePoint,
 };
 
 /// An instance and device the test owns, destroyed on drop after everything
@@ -144,7 +144,10 @@ fn decode_all(
     stream: &[u8],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut readback = Readback::new(context)?;
-    let mut decoder = Decoder::new(context.clone(), DecodeConfig::h264().with_byte_stream())?;
+    let mut decoder = Decoder::new(
+        context.clone(),
+        DecodeConfig::new(Codec::H264).with_byte_stream(),
+    )?;
     let mut frames = Vec::new();
     decode_stream(&mut decoder, stream, |frame| {
         let data = readback.read(&frame)?;
@@ -183,7 +186,7 @@ fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     let builder = VideoContextBuilder::new().require_decode(Codec::H264);
     let physical_device = same_gpu(&instance, &own);
     drop(own);
-    let reqs = builder.decode_device_requirements(&entry, &instance, physical_device)?;
+    let reqs = builder.device_requirements(&entry, &instance, physical_device)?;
     let app = create_app_device(entry, instance, physical_device, &reqs)?;
 
     let mut builder = builder
@@ -193,7 +196,7 @@ fn decode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
     if reqs.unified_image_layouts {
         builder = builder.declare_unified_image_layouts();
     }
-    let context = builder.build_from_existing_decode(
+    let context = builder.build_from_existing(
         app.entry.clone(),
         app.instance.clone(),
         app.physical_device,
@@ -228,49 +231,38 @@ fn moving_frame(n: u32) -> Vec<u8> {
     data
 }
 
-/// How [`encode_all`] hands each frame from the converter to the encoder.
+/// How [`encode_all`] orders each frame against the caller's rendering.
 #[derive(Clone, Copy, PartialEq)]
-enum Handoff {
-    /// `convert`, which waits on the CPU, then `encode`.
+enum Wait {
+    /// Each frame is submitted once rendered, and its source is waited for
+    /// on the CPU before the next one.
     Cpu,
-    /// `convert_async` waiting on a point the caller signals, then
-    /// `encode_after` waiting on the conversion: ordered on the GPU, with
-    /// nothing waited for on the CPU until the packets are collected.
+    /// Each frame waits on the GPU for a point the caller signals only after
+    /// the submission: the conversion has to wait for it, and nothing waits
+    /// on the CPU until the packets are collected.
     Gpu,
 }
 
-/// Convert and encode `ENCODE_FRAMES` frames as H.264 on `context`, the way a
-/// capture pipeline would: an RGB image goes through the colour converter
-/// straight into the encoder's input.
-fn encode_all(
-    context: &VideoContext,
-    handoff: Handoff,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+/// Encode `ENCODE_FRAMES` RGB frames as H.264 on `context`, the way a capture
+/// pipeline would: the encoder converts each one with the colour converter's
+/// shader, straight into its input image.
+fn encode_all(context: &VideoContext, wait: Wait) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let device = context.device();
     let mut encoder = Encoder::new(
         context.clone(),
         EncodeConfig::h264(ENCODE_WIDTH, ENCODE_HEIGHT)
-            .with_rate_control(RateControlMode::Cqp)
-            .with_quality_level(22)
+            .with_rate_control(RateControl::Cqp { qp: 22 })
             .with_frame_rate(30, 1)
-            .with_b_frames(0),
-    )?;
-    let mut converter = ColorConverter::new(
-        context.clone(),
-        ColorConverterConfig::new(
-            ENCODE_WIDTH,
-            ENCODE_HEIGHT,
-            InputFormat::BGRA,
-            OutputFormat::NV12,
-            ColorSpec::Srgb,
-            ColorSpec::Srgb,
-            ColorRange::Limited,
-        ),
+            .with_source(Source::Rgb(RgbSource::new(
+                RgbFormat::BGRA,
+                ColorSpec::Srgb,
+            )))
+            .with_conversion(ConversionPreference::Shader),
     )?;
 
-    // Stands in for the caller's own rendering: each frame's conversion waits
-    // for a value the "renderer" signals once the frame is ready. The KHR
-    // entry points, since the adopted device is Vulkan 1.1.
+    // Stands in for the caller's own rendering: each frame waits for a value
+    // the "renderer" signals once the frame is ready. The KHR entry points,
+    // since the adopted device is Vulkan 1.1.
     let timeline_fns = ash::khr::timeline_semaphore::Device::load(context.instance(), device);
     let mut type_info = vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -282,32 +274,32 @@ fn encode_all(
         )?
     };
 
-    // Signalled after the converter is dropped, see the last encode below.
-    let after_drop = u64::from(ENCODE_FRAMES) + 1;
-
-    // Every source stays alive until the end: with a GPU handoff nothing says
-    // a conversion has finished reading one until its packet is back.
+    // Every source stays alive until the end. The images are dropped after
+    // their `SourceImage`s, which wait for the frames that read them.
+    let mut images = Vec::new();
     let mut sources = Vec::new();
     let mut pending = Vec::new();
     for n in 0..ENCODE_FRAMES {
-        let src =
+        let image =
             unsafe { create_src_image(context, ENCODE_WIDTH, ENCODE_HEIGHT, &moving_frame(n))? };
-        let target = encoder.input_image();
-        let future = match handoff {
-            Handoff::Cpu => {
-                converter.convert(src.image, vk::ImageLayout::GENERAL, target)?;
-                encoder.encode(target)?
+        let source = SourceImage::new(
+            context,
+            image.image,
+            Handoff::Device {
+                layout: vk::ImageLayout::GENERAL,
+            },
+        )?;
+        let future = match wait {
+            Wait::Cpu => {
+                let future = encoder.submit(Frame::image(&source))?;
+                source.wait_released()?;
+                future
             }
-            Handoff::Gpu => {
+            Wait::Gpu => {
                 let ready = TimelinePoint::new(rendered, u64::from(n) + 1);
-                let converted = converter.convert_async(
-                    src.image,
-                    vk::ImageLayout::GENERAL,
-                    target,
-                    &[ready],
-                )?;
-                // Signalled only after the conversion was submitted, so it
-                // really has to wait.
+                let future = encoder.submit(Frame::image(&source).wait(&[ready]))?;
+                // Signalled only after the frame was submitted, so it really
+                // has to wait.
                 unsafe {
                     timeline_fns.signal_semaphore(
                         &vk::SemaphoreSignalInfo::default()
@@ -315,38 +307,20 @@ fn encode_all(
                             .value(ready.value),
                     )?
                 };
-                // The last encode also waits for a point signalled only once
-                // the converter is gone, so it is certainly still queued,
-                // waiting on the converter's semaphore, when that happens.
-                let mut waits = vec![converted];
-                if n + 1 == ENCODE_FRAMES {
-                    waits.push(TimelinePoint::new(rendered, after_drop));
-                }
-                encoder.encode_after(target, &waits)?
+                future
             }
         };
-        sources.push(src);
+        images.push(image);
+        sources.push(source);
         pending.push(future);
-    }
-    // Dropped while an encode that waits on its points is still queued, as a
-    // caller rebuilding its converter might: its semaphore has to outlive
-    // that wait.
-    drop(converter);
-    if matches!(handoff, Handoff::Gpu) {
-        unsafe {
-            timeline_fns.signal_semaphore(
-                &vk::SemaphoreSignalInfo::default()
-                    .semaphore(rendered)
-                    .value(after_drop),
-            )?
-        };
     }
     let mut stream = Vec::new();
     for future in pending {
         stream.extend_from_slice(&pollster::block_on(future)?.data);
     }
-    drop(encoder);
     drop(sources);
+    drop(encoder);
+    drop(images);
     unsafe { device.destroy_semaphore(rendered, None) };
     Ok(stream)
 }
@@ -376,12 +350,12 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
         .require_encode(Codec::H264)
         .require_decode(Codec::H264)
         .build()?;
-    let expected = encode_all(&own, Handoff::Cpu)?;
+    let expected = encode_all(&own, Wait::Cpu)?;
 
     let (entry, instance) = instance_1_1()?;
     let builder = VideoContextBuilder::new().require_encode(Codec::H264);
     let physical_device = same_gpu(&instance, &own);
-    let reqs = builder.encode_device_requirements(&entry, &instance, physical_device)?;
+    let reqs = builder.device_requirements(&entry, &instance, physical_device)?;
     assert!(
         reqs.extensions.contains(&ash::khr::push_descriptor::NAME),
         "the converter needs push descriptors, which every driver this runs on has"
@@ -391,13 +365,13 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
         .with_encode_queue(spare(&app, reqs.queues.encode.unwrap()))
         .with_transfer_queue(spare(&app, reqs.queues.transfer))
         .with_compute_queue(spare(&app, reqs.queues.compute))
-        .build_from_existing_encode(
+        .build_from_existing(
             app.entry.clone(),
             app.instance.clone(),
             app.physical_device,
             app.device.clone(),
         )?;
-    let actual = encode_all(&context, Handoff::Gpu)?;
+    let actual = encode_all(&context, Wait::Gpu)?;
     drop(context);
 
     // Both streams decoded by the same decoder, so any difference is the
@@ -426,5 +400,60 @@ fn encode_on_a_vulkan_1_1_device() -> Result<(), Box<dyn std::error::Error>> {
             "frame {i}: {psnr:.2} dB against the own-context encode"
         );
     }
+    Ok(())
+}
+
+/// One adopted device that both encodes and decodes: what it encodes decodes
+/// on it to what a context pixelforge created decodes from the same stream.
+#[test]
+#[ignore = "requires a Vulkan Video device"]
+fn encode_and_decode_on_one_adopted_device() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logging();
+    let own = VideoContextBuilder::new()
+        .enable_validation(validation_requested())
+        .require_encode(Codec::H264)
+        .require_decode(Codec::H264)
+        .build()?;
+
+    let (entry, instance) = instance_1_1()?;
+    let physical_device = same_gpu(&instance, &own);
+    assert!(
+        VideoContextBuilder::new()
+            .device_requirements(&entry, &instance, physical_device)
+            .is_err(),
+        "requirements without a codec"
+    );
+    let builder = VideoContextBuilder::new()
+        .require_encode(Codec::H264)
+        .require_decode(Codec::H264);
+    let reqs = builder.device_requirements(&entry, &instance, physical_device)?;
+    for name in [
+        ash::khr::video_encode_h264::NAME,
+        ash::khr::video_decode_h264::NAME,
+    ] {
+        assert!(reqs.extensions.contains(&name), "{name:?} is missing");
+    }
+    let app = create_app_device(entry, instance, physical_device, &reqs)?;
+    let mut builder = builder
+        .with_encode_queue(spare(&app, reqs.queues.encode.unwrap()))
+        .with_decode_queue(spare(&app, reqs.queues.decode.unwrap()))
+        .with_transfer_queue(spare(&app, reqs.queues.transfer))
+        .with_compute_queue(spare(&app, reqs.queues.compute));
+    if reqs.unified_image_layouts {
+        builder = builder.declare_unified_image_layouts();
+    }
+    let context = builder.build_from_existing(
+        app.entry.clone(),
+        app.instance.clone(),
+        app.physical_device,
+        app.device.clone(),
+    )?;
+    let stream = encode_all(&context, Wait::Gpu)?;
+    let actual = decode_all(&context, &stream)?;
+    drop(context);
+
+    let expected = decode_all(&own, &stream)?;
+    assert_eq!(actual.len(), ENCODE_FRAMES as usize, "frame count");
+    assert!(actual == expected, "the adopted decode differs");
     Ok(())
 }

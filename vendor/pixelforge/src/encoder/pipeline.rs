@@ -45,7 +45,7 @@ use crate::encoder::resources::{
     create_image, map_bitstream_buffer, query_timestamp_diff, submit_encode_only,
     wait_and_read_bitstream,
 };
-use crate::encoder::{BitDepth, EncodedPacket, FrameType, PixelFormat};
+use crate::encoder::{BitDepth, ChromaFormat, EncodedPacket, FrameType};
 use crate::error::{PixelForgeError, Result};
 use crate::sync::TimelinePoint;
 use crate::video::{SlotSync, TimelineChain};
@@ -54,7 +54,7 @@ use crate::vulkan::VideoContext;
 /// A handle to the packet a single `EncodePipeline::submit_current` will
 /// eventually produce.
 ///
-/// Returned by `Encoder::encode`, one per submitted frame. Awaiting it yields
+/// Returned by `Encoder::submit`, one per submitted frame. Awaiting it yields
 /// that frame's [`EncodedPacket`] once the GPU finishes encoding and the
 /// completion thread reads the bitstream back. Futures resolve in submission
 /// order (one submission → one readback → one packet) as long as you await them
@@ -64,22 +64,51 @@ use crate::vulkan::VideoContext;
 /// still reads the slot back (its send simply finds no receiver) and frees it.
 pub struct EncodeFuture {
     rx: oneshot::Receiver<Result<EncodedPacket>>,
+    released: TimelinePoint,
+    /// Added to the packet's timestamps, so they carry on across an encoder
+    /// that was made again for a colour change.
+    pub(crate) pts_offset: u64,
+    #[cfg(feature = "dmabuf")]
+    pub(crate) release_sync_file: Option<std::os::fd::OwnedFd>,
+}
+
+impl EncodeFuture {
+    /// The point after which this frame's source may be written again: the
+    /// copy into the encoder's input image, the colour conversion, or the
+    /// encode itself for a source read directly.
+    pub(crate) fn source_released(&self) -> TimelinePoint {
+        self.released
+    }
+
+    /// The sync_file asked for with
+    /// [`Frame::signal_sync_file`](crate::Frame::signal_sync_file): it
+    /// signals once the frame is done with its source. `None` if it was not asked for,
+    /// was already taken, or had already signalled when it was made, which
+    /// the driver may report that way.
+    #[cfg(feature = "dmabuf")]
+    pub fn take_release_sync_file(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.release_sync_file.take()
+    }
+
+    pub(crate) fn set_released(&mut self, point: TimelinePoint) {
+        self.released = point;
+    }
 }
 
 impl Future for EncodeFuture {
     type Output = Result<EncodedPacket>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let offset = self.pts_offset;
         match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Ok(result)) => Poll::Ready(result.map(|mut packet| {
+                packet.pts += offset;
+                packet.dts += offset;
+                packet
+            })),
             // The sender was dropped without sending. The completion thread only
             // drops a sender after sending, so this indicates encoder teardown.
-            Poll::Ready(Err(oneshot::Canceled)) => {
-                Poll::Ready(Err(PixelForgeError::CommandBuffer(
-                    "encode cancelled: encoder shut down before the frame was read back"
-                        .to_string(),
-                )))
-            }
+            Poll::Ready(Err(oneshot::Canceled)) => Poll::Ready(Err(PixelForgeError::Cancelled)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -96,7 +125,6 @@ pub(crate) const ENCODE_PIPELINE_DEPTH: usize = 2;
 /// when the completion thread reads the slot back.
 pub(crate) struct SlotPacketMetadata {
     pub frame_type: FrameType,
-    pub is_key_frame: bool,
     pub pts: u64,
     pub dts: u64,
     /// Codec header (SPS/PPS, VPS/SPS/PPS, or AV1 sequence header) to prepend.
@@ -127,6 +155,7 @@ struct WorkItem {
     metadata: SlotPacketMetadata,
     /// Timestamping resources
     timestamp_period: f32,
+    timestamp_valid_bits: u32,
     timestamp_query_pool: vk::QueryPool,
     submit_time: std::time::Instant,
     /// Resolves this frame's [`EncodeFuture`] once the bitstream is read back.
@@ -152,6 +181,7 @@ pub(crate) struct EncodeSlot {
     pub query_pool: vk::QueryPool,
 
     pub timestamp_period: f32,
+    pub timestamp_valid_bits: u32,
     pub timestamp_query_pool: vk::QueryPool,
 
     /// Packet metadata recorded before submit, moved to the completion thread
@@ -167,7 +197,9 @@ pub(crate) struct PipelineConfig<'a> {
     /// `input_image_width`). Pictures are still encoded at `aligned_width`.
     pub input_width: u32,
     pub picture_format: vk::Format,
-    pub pixel_format: PixelFormat,
+    /// Whether the input image is RGB, for the encoder to convert.
+    pub rgb_input: bool,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
     pub bitstream_buffer_size: usize,
     /// Codec profile (with the codec-specific profile chained in) used for the
@@ -214,6 +246,7 @@ impl EncodePipeline {
         // a null pool as "timestamps disabled".
         let timestamps_supported = context.encode_timestamps_supported();
         let timestamp_period = context.device_properties().limits.timestamp_period;
+        let timestamp_valid_bits = context.encode_timestamp_valid_bits();
         if !timestamps_supported {
             tracing::info!(
                 "Video encode queue family {:?} reports timestampValidBits=0; \
@@ -256,8 +289,9 @@ impl EncodePipeline {
                     image: input_image,
                     width: config.input_width,
                     height: config.aligned_height,
-                    pixel_format: config.pixel_format,
+                    chroma_format: config.chroma_format,
                     bit_depth: config.bit_depth,
+                    rgb: config.rgb_input,
                 },
             )?;
 
@@ -287,6 +321,7 @@ impl EncodePipeline {
                 encode_fence,
                 query_pool,
                 timestamp_period,
+                timestamp_valid_bits,
                 timestamp_query_pool,
                 pending_metadata: None,
             });
@@ -305,7 +340,10 @@ impl EncodePipeline {
             .spawn(move || {
                 run_completion_thread(thread_device, work_rx, thread_sync);
             })
-            .map_err(|e| PixelForgeError::CommandBuffer(format!("spawn readback thread: {e}")))?;
+            .map_err(|source| PixelForgeError::Io {
+                what: "spawning the readback thread",
+                source,
+            })?;
 
         Ok(Self {
             slots,
@@ -362,7 +400,8 @@ impl EncodePipeline {
         device: &ash::Device,
         sync2: &ash::khr::synchronization2::Device,
         encode_queue: vk::Queue,
-        external_waits: &[TimelinePoint],
+        external_waits: &[vk::SemaphoreSubmitInfo<'static>],
+        extra_signals: &[vk::SemaphoreSubmitInfo<'static>],
     ) -> Result<EncodeFuture> {
         let wait = self.timeline.wait();
         let signal = self.timeline.pending_signal();
@@ -377,12 +416,13 @@ impl EncodePipeline {
             bitstream_ptr,
             bitstream_buffer_size,
             timestamp_period,
+            timestamp_valid_bits,
             timestamp_query_pool,
             metadata,
         ) = {
             let slot = &mut self.slots[slot_index];
             let metadata = slot.pending_metadata.take().ok_or_else(|| {
-                PixelForgeError::CommandBuffer(
+                PixelForgeError::InvalidInput(
                     "submit_current called without pending packet metadata".to_string(),
                 )
             })?;
@@ -393,6 +433,7 @@ impl EncodePipeline {
                 slot.bitstream_buffer_ptr as *const u8,
                 slot.bitstream_buffer_size,
                 slot.timestamp_period,
+                slot.timestamp_valid_bits,
                 slot.timestamp_query_pool,
                 metadata,
             )
@@ -408,8 +449,22 @@ impl EncodePipeline {
                     .value(value)
                     .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
             })
-            .chain(external_waits.iter().map(TimelinePoint::wait_info))
+            .chain(external_waits.iter().copied())
             .collect();
+        // ALL_COMMANDS rather than the encode stage: the timeline value is
+        // also handed out as the point after which a directly read source is
+        // free, and its release barrier comes after the encode.
+        let signals: Vec<vk::SemaphoreSubmitInfo> = std::iter::once(
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(signal.0)
+                .value(signal.1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        )
+        .chain(extra_signals.iter().copied())
+        .collect();
+        // Before the submit, not after: the driver can block in the submit
+        // while the GPU already runs the work.
+        let submit_time = std::time::Instant::now();
         unsafe {
             submit_encode_only(
                 device,
@@ -418,10 +473,9 @@ impl EncodePipeline {
                 fence,
                 encode_queue,
                 &waits,
-                Some(signal),
+                &signals,
             )?;
         }
-        let submit_time = std::time::Instant::now();
 
         self.timeline.commit();
 
@@ -437,6 +491,7 @@ impl EncodePipeline {
             bitstream_ptr: SendPtr(bitstream_ptr),
             bitstream_buffer_size,
             timestamp_period,
+            timestamp_valid_bits,
             timestamp_query_pool,
             submit_time,
             metadata,
@@ -448,7 +503,29 @@ impl EncodePipeline {
             let _ = tx.send(work);
         }
 
-        Ok(EncodeFuture { rx: result_rx })
+        Ok(EncodeFuture {
+            rx: result_rx,
+            released: TimelinePoint::new(signal.0, signal.1),
+            pts_offset: 0,
+            #[cfg(feature = "dmabuf")]
+            release_sync_file: None,
+        })
+    }
+
+    /// The slot at `index`.
+    pub(crate) fn slot(&self, index: usize) -> &EncodeSlot {
+        &self.slots[index]
+    }
+
+    /// Index of the slot the next frame will be encoded into.
+    pub(crate) fn current_index(&self) -> usize {
+        self.current_slot
+    }
+
+    /// The timeline the encodes signal. Retired to the context rather than
+    /// destroyed, since a caller may still wait on a point it handed out.
+    pub(crate) fn timeline_semaphore(&self) -> vk::Semaphore {
+        self.timeline.semaphore()
     }
 
     /// Advance to the next slot after a frame has been submitted.
@@ -477,7 +554,8 @@ impl EncodePipeline {
         }
     }
 
-    /// Destroy all slot resources and the timeline semaphore.
+    /// Destroy all slot resources. The timeline semaphore is left for the
+    /// caller to retire, see [`Self::timeline_semaphore`].
     ///
     /// # Safety
     ///
@@ -508,9 +586,6 @@ impl EncodePipeline {
                 device.free_memory(slot.input_image_memory, None);
             }
         }
-        unsafe {
-            self.timeline.destroy(device);
-        }
     }
 }
 
@@ -537,28 +612,25 @@ fn run_completion_thread(
         };
         let bitstream_ready_time = std::time::Instant::now();
 
-        let mut stats: Option<super::EncodedPacketStats> = None;
-        if let Some(gpu_encode_ns) = unsafe {
-            query_timestamp_diff(
-                &device,
-                work.timestamp_query_pool,
-                work.metadata.timestamps,
-                work.timestamp_period,
-            )
-        } {
-            stats = Some(super::EncodedPacketStats {
-                gpu_time_ns: gpu_encode_ns,
-                frame_latency_ns: work.metadata.now.elapsed().as_nanos() as u64,
-                wall_latency_ns: bitstream_ready_time
-                    .duration_since(work.submit_time)
-                    .as_nanos() as u64,
-            });
-        }
+        let stats = super::EncodedPacketStats {
+            gpu_time_ns: unsafe {
+                query_timestamp_diff(
+                    &device,
+                    work.timestamp_query_pool,
+                    work.metadata.timestamps,
+                    work.timestamp_period,
+                    work.timestamp_valid_bits,
+                )
+            },
+            frame_latency_ns: work.metadata.now.elapsed().as_nanos() as u64,
+            wall_latency_ns: bitstream_ready_time
+                .duration_since(work.submit_time)
+                .as_nanos() as u64,
+        };
 
         let packet = result.map(|()| EncodedPacket {
             data,
             frame_type: work.metadata.frame_type,
-            is_key_frame: work.metadata.is_key_frame,
             pts: work.metadata.pts,
             dts: work.metadata.dts,
             stats,

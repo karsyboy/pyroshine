@@ -570,7 +570,7 @@ fn static_recovery_decodes_to_the_latest_frame_on_gpu() {
 /// Each codec's 8-bit 4:2:0 profile on this GPU: an encoder is created at
 /// exactly the profile's maximum bitrate, one above it is rejected before the
 /// driver sees it, and a profile without constant-bitrate rate control
-/// cannot create the stream's CBR encoder (Pixelforge patch 0009).
+/// cannot create the stream's CBR encoder (Pixelforge patch 0008).
 /// `MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core encoder_rate_control_limits -- --ignored --nocapture`
 #[test]
 #[ignore = "needs a Vulkan Video GPU: MOONSHINE_TEST_GPU=1"]
@@ -589,7 +589,11 @@ fn converter_timing_on_gpu() {
 }
 
 mod gpu {
-	use pixelforge::{EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, RateControlMode};
+	use pixelforge::{
+		BitDepth as EncodeBitDepth, ChromaFormat as PixelFormat, EncodeConfig, Encoder, RateControl, StreamColor,
+	};
+
+	use crate::session::stream::video::pipeline::backend::{ConventionalEncoder, EncoderInput, VulkanEncoder};
 
 	use super::*;
 	use crate::session::stream::video::pipeline::encode_caps::check_frame;
@@ -625,8 +629,8 @@ mod gpu {
 				Codec::H264 => EncodeConfig::h264(1920, 1080),
 				Codec::H265 => EncodeConfig::h265(1920, 1080),
 				Codec::AV1 => EncodeConfig::av1(1920, 1080),
-			}
-			.with_rate_control(RateControlMode::Cbr);
+			};
+			let cbr_at = |bitrate| base.clone().with_rate_control(RateControl::Cbr { bitrate });
 			let caps = EncoderCapabilities::query(&context, &base).unwrap();
 			let cbr = caps
 				.rate_control_modes
@@ -637,15 +641,15 @@ mod gpu {
 			);
 			if !cbr {
 				assert!(cbr_target(&caps, codec, 10_000_000).is_err());
-				assert!(Encoder::new(context.clone(), base.with_target_bitrate(10_000_000)).is_err());
+				assert!(Encoder::new(context.clone(), cbr_at(10_000_000)).is_err());
 				checked += 1;
 				continue;
 			}
 			let max = cbr_target(&caps, codec, u64::MAX).unwrap();
 			assert_eq!(u64::from(max), caps.max_bitrate.min(u64::from(u32::MAX)));
-			drop(Encoder::new(context.clone(), base.clone().with_target_bitrate(max)).expect("maximum bitrate"));
+			drop(Encoder::new(context.clone(), cbr_at(max)).expect("maximum bitrate"));
 			if let Some(above) = max.checked_add(1).filter(|_| caps.max_bitrate < u64::from(u32::MAX)) {
-				let error = Encoder::new(context.clone(), base.with_target_bitrate(above))
+				let error = Encoder::new(context.clone(), cbr_at(above))
 					.err()
 					.expect("a bitrate above the maximum must be rejected");
 				assert!(error.to_string().contains("at most"), "{error}");
@@ -1847,19 +1851,18 @@ mod gpu {
 			Codec::H265 => EncodeConfig::h265(w, h),
 			Codec::AV1 => EncodeConfig::av1(w, h),
 		}
-		.with_pixel_format(case.pixel_format)
+		.with_chroma_format(case.pixel_format)
 		.with_bit_depth(case.depth)
-		.with_color_description(pixelforge::ColorDescription::bt709().with_full_range(stream))
-		.with_rate_control(RateControlMode::Cqp)
-		.with_quality_level(12)
-		.with_gop_size(0)
-		.with_b_frames(0);
+		.with_color(StreamColor::Other(
+			pixelforge::ColorDescription::bt709().with_full_range(stream),
+		))
+		.with_rate_control(RateControl::Cqp { qp: 12 })
+		.with_gop_size(0);
 		if stream {
 			config
 				.with_encoder_tuning_mode(pixelforge::EncoderTuningMode::LowLatency)
-				.with_rate_control(RateControlMode::Cbr)
 				// RTX 3080 H.264 caps maxBitrate at 120 Mbps.
-				.with_target_bitrate(100_000_000)
+				.with_rate_control(RateControl::Cbr { bitrate: 100_000_000 })
 				.with_frame_rate(116, 1)
 				.with_max_reference_frames(1)
 				.with_virtual_buffer_size_ms(1000 / 116)
@@ -2041,10 +2044,12 @@ mod gpu {
 					eprintln!("{label}: rejected as the stream setup does: {e}");
 					continue;
 				}
-				let Some((context, mut encoder)) = encoder_on(context, case, frame, stream_config) else {
+				let Some((context, encoder)) = encoder_on(context, case, frame, stream_config) else {
 					eprintln!("{label}: not encoded by this GPU; skipped");
 					continue;
 				};
+				// Through the production encoder interface, as the loop uses it.
+				let mut encoder = ConventionalEncoder::Vulkan(VulkanEncoder::new(encoder));
 				checked += 1;
 				let rgb = smooth(frame);
 				let bytes: Vec<u8> = (0..frame.1)
@@ -2072,7 +2077,10 @@ mod gpu {
 				let mut padding_bytes = 0;
 				for index in 0..frame_count {
 					if stream_config {
-						let ceiling = encoder_config(case, frame, true).target_bitrate;
+						let RateControl::Cbr { bitrate: ceiling } = encoder_config(case, frame, true).rate_control
+						else {
+							unreachable!("stream encoders use CBR");
+						};
 						let requested = match index {
 							2 => Some(ceiling / 2),
 							5 => Some(ceiling),
@@ -2083,18 +2091,11 @@ mod gpu {
 							assert_eq!(encoder.set_bitrate(rate).unwrap(), rate.min(ceiling));
 						}
 					}
+					let target = encoder.input_target().unwrap();
 					converter
-						.convert(
-							&source,
-							vk::Format::R8G8B8A8_UNORM,
-							false,
-							false,
-							&[None, None],
-							Target::encoder_input(encoder.input_image()),
-						)
+						.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
 						.unwrap();
-					let image = encoder.input_image();
-					let packet = block_on(encoder.encode(image).unwrap()).unwrap();
+					let packet = block_on(encoder.encode(target).unwrap()).unwrap();
 					if stream_config {
 						assert_eq!(
 							packet.is_key_frame,
@@ -2580,12 +2581,17 @@ mod gpu {
 	}
 
 	pub(super) fn slot_rotation() {
-		let (_context, mut encoder, _) = recovery_encoder(CODEC_CASES[2]).expect("HEVC encoder");
-		let mut inputs = vec![encoder.input_image()];
+		let (_context, encoder, _) = recovery_encoder(CODEC_CASES[2]).expect("HEVC encoder");
+		let mut encoder = ConventionalEncoder::Vulkan(VulkanEncoder::new(encoder));
+		let image = |target: Target| match target {
+			Target::Image { image, .. } => image,
+			_ => unreachable!("Vulkan Video encodes from its own input images"),
+		};
+		let mut inputs = vec![image(encoder.input_target().unwrap())];
 		for _ in 0..4 {
-			let image = encoder.input_image();
-			block_on(encoder.encode(image).unwrap()).unwrap();
-			inputs.push(encoder.input_image());
+			let target = encoder.input_target().unwrap();
+			block_on(encoder.encode(target).unwrap()).unwrap();
+			inputs.push(image(encoder.input_target().unwrap()));
 		}
 		assert_ne!(inputs[0], inputs[1], "encode advances the input slot");
 		assert_eq!(inputs[0], inputs[2], "the pinned encoder has two input slots");
@@ -2612,7 +2618,7 @@ mod gpu {
 				continue;
 			};
 			// Through the production encoder interface, as the loop uses it.
-			let mut encoder = super::super::super::backend::ConventionalEncoder::Vulkan(encoder);
+			let mut encoder = ConventionalEncoder::Vulkan(VulkanEncoder::new(encoder));
 			checked += 1;
 			let extent = conversion_extent(case.codec, w, h).unwrap();
 			let mut converter = InputConverter::new(
@@ -2631,7 +2637,6 @@ mod gpu {
 				let pixels: Vec<u8> = (0..w * h).flat_map(|_| [level, level, level, 255]).collect();
 				let source = source_image(&context, (w, h), vk::Format::R8G8B8A8_UNORM, &pixels);
 				// The conventional loop's per-frame step.
-				use super::super::super::backend::EncoderInput;
 				let target = encoder.input_target().unwrap();
 				converter
 					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, false, &[None, None], target)
@@ -2645,7 +2650,10 @@ mod gpu {
 					Ok(true) => Ok(()),
 					Ok(false) => panic!("a conversion completed"),
 					Err(e) => Err(super::super::super::backend::EncodeError::Vulkan(
-						pixelforge::PixelForgeError::Vulkan(e),
+						pixelforge::PixelForgeError::Vulkan {
+							call: "copy the last conversion",
+							result: e,
+						},
 					)),
 				};
 				let recovery =
@@ -2710,7 +2718,9 @@ mod gpu {
 				let bytes = pattern(&mut rng, vk::Format::R8G8B8A8_UNORM, frame);
 				let source = source_image(&context, frame, vk::Format::R8G8B8A8_UNORM, &bytes);
 				let extent = conversion_extent(codec, frame.0, frame.1).unwrap();
-				let target = Target::encoder_input(encoder.input_image());
+				// Conversions only: the slot is never submitted.
+				let slot = encoder.input_slot().unwrap();
+				let target = Target::encoder_input(slot.image());
 				for mode in [ConversionQueueMode::Graphics, ConversionQueueMode::Auto] {
 					let mut converter = InputConverter::new(
 						context.clone(),

@@ -12,7 +12,7 @@ Subject: [PATCH] h265: complete Main 4:4:4 profile constraints in cached
  create mode 100644 src/encoder/h265/profile.rs
 
 diff --git a/src/encoder/h265/mod.rs b/src/encoder/h265/mod.rs
-index 533e5b9..258ea1b 100644
+index 0c32ca8..226c294 100644
 --- a/src/encoder/h265/mod.rs
 +++ b/src/encoder/h265/mod.rs
 @@ -5,6 +5,7 @@
@@ -25,7 +25,7 @@ index 533e5b9..258ea1b 100644
  
 diff --git a/src/encoder/h265/profile.rs b/src/encoder/h265/profile.rs
 new file mode 100644
-index 0000000..8e01c8a
+index 0000000..f8ebae5
 --- /dev/null
 +++ b/src/encoder/h265/profile.rs
 @@ -0,0 +1,218 @@
@@ -35,7 +35,7 @@ index 0000000..8e01c8a
 +use crate::error::{PixelForgeError, Result};
 +
 +fn invalid(reason: &str) -> PixelForgeError {
-+    PixelForgeError::SessionParametersCreation(format!("HEVC 4:4:4 header: {reason}"))
++    PixelForgeError::Driver(format!("HEVC 4:4:4 header: {reason}"))
 +}
 +
 +fn start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
@@ -248,10 +248,10 @@ index 0000000..8e01c8a
 +    }
 +}
 diff --git a/src/encoder/h265/session_params.rs b/src/encoder/h265/session_params.rs
-index 4deca2f..ffe2ca4 100644
+index cd562f6..0d55d16 100644
 --- a/src/encoder/h265/session_params.rs
 +++ b/src/encoder/h265/session_params.rs
-@@ -376,11 +376,16 @@ impl H265 {
+@@ -378,11 +378,16 @@ impl H265 {
          let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
          let mut feedback =
              vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);
@@ -263,7 +263,7 @@ index 4deca2f..ffe2ca4 100644
              &mut feedback,
 -        )
 +        )?;
-+        if common.config.pixel_format == PixelFormat::Yuv444 {
++        if common.config.chroma_format == ChromaFormat::Yuv444 {
 +            super::profile::normalize_444_header(&header, common.config.bit_depth)
 +        } else {
 +            Ok(header)

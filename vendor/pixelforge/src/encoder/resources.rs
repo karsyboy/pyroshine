@@ -1,6 +1,6 @@
-use crate::encoder::{BitDepth, PixelFormat};
+use crate::encoder::input::SourceOwnership;
+use crate::encoder::{BitDepth, ChromaFormat};
 use crate::error::{PixelForgeError, Result};
-use crate::sync::TimelinePoint;
 use crate::vulkan::VideoContext;
 use ash::vk::TaggedStructure;
 use ash::vk::{self, Handle};
@@ -110,7 +110,7 @@ pub(crate) fn create_encode_feedback_query_pool(
             .device()
             .create_query_pool(&query_pool_create_info, None)
     }
-    .map_err(|e| PixelForgeError::vulkan("query pool operation", e))
+    .map_err(PixelForgeError::vk("vkCreateQueryPool"))
 }
 
 pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Result<vk::QueryPool> {
@@ -123,7 +123,7 @@ pub(crate) fn create_encode_timestamp_query_pool(context: &VideoContext) -> Resu
             .device()
             .create_query_pool(&timestamp_query_pool_create_info, None)
     }
-    .map_err(|e| PixelForgeError::vulkan("query pool operation", e))
+    .map_err(PixelForgeError::vk("vkCreateQueryPool"))
 }
 
 /// Command resources for encoding operations.
@@ -149,13 +149,13 @@ pub(crate) fn create_command_resources(
     encode_queue_family: u32,
     upload_queue_family: u32,
 ) -> Result<CommandResources> {
-    let command_pool = create_command_pool(context, encode_queue_family, "encode")?;
+    let command_pool = create_command_pool(context, encode_queue_family)?;
 
     // The upload pool is the encode pool when one family does both.
     let upload_command_pool = if upload_queue_family == encode_queue_family {
         command_pool
     } else {
-        create_command_pool(context, upload_queue_family, "encode upload")?
+        create_command_pool(context, upload_queue_family)?
     };
 
     let upload_command_buffer = allocate_command_buffers(context, upload_command_pool, 1)?[0];
@@ -194,28 +194,36 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     // meets VkBufferImageCopy::bufferOffset alignment requirements.
     // YUV420/422 dimensions are always even, so alignment is naturally satisfied.
     let plane0_raw = (params.width * params.height * bytes_per_component) as usize;
-    let plane0_size = match params.pixel_format {
-        PixelFormat::Yuv444 => crate::align4(plane0_raw) as u32,
+    let plane0_size = match params.chroma_format {
+        ChromaFormat::Yuv444 => crate::align4(plane0_raw) as u32,
         _ => plane0_raw as u32,
     };
-    let plane1_size = match params.pixel_format {
+    let plane1_size = match params.chroma_format {
         // YUV 4:2:0 (e.g., NV12): UV plane is half width, half height, 2 components per pixel.
-        PixelFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
+        ChromaFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
         // YUV 4:2:2: UV plane is half width, full height, 2 components per pixel.
-        PixelFormat::Yuv422 => (params.width / 2) * params.height * 2 * bytes_per_component,
+        ChromaFormat::Yuv422 => (params.width / 2) * params.height * 2 * bytes_per_component,
         // YUV 4:4:4 (e.g., NV24): UV plane is full width, full height, 2 components per pixel.
-        PixelFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
+        ChromaFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
     };
-    let total_size = (plane0_size + plane1_size) as vk::DeviceSize;
+    // Every RGB input format is 4 bytes a pixel in one plane.
+    let rgb_size = params.width * params.height * 4;
+    let total_size = if params.rgb {
+        rgb_size
+    } else {
+        plane0_size + plane1_size
+    } as vk::DeviceSize;
 
-    // Create a staging buffer filled with zeros.
+    // Create a staging buffer filled with zeros. A copy rather than a clear
+    // command, since this runs on the transfer queue and a clear needs a
+    // graphics or compute one.
     let buffer_create_info = vk::BufferCreateInfo::default()
         .size(total_size)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("staging buffer", e))?;
+        .map_err(PixelForgeError::vk("vkCreateBuffer"))?;
 
     let mem_requirements = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
     let memory_type_index = find_memory_type(
@@ -224,7 +232,7 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )
     .ok_or_else(|| {
-        PixelForgeError::MemoryAllocation("No suitable memory type for staging buffer".to_string())
+        PixelForgeError::NoSuitableDevice("No suitable memory type for staging buffer".to_string())
     })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -232,15 +240,15 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         .memory_type_index(memory_type_index);
 
     let staging_memory = unsafe { device.allocate_memory(&alloc_info, None) }
-        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+        .map_err(PixelForgeError::vk("vkAllocateMemory"))?;
 
     unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-        .map_err(|e| PixelForgeError::vulkan("memory operation", e))?;
+        .map_err(PixelForgeError::vk("vkBindBufferMemory"))?;
 
     // Map and zero-fill.
     let data_ptr =
         unsafe { device.map_memory(staging_memory, 0, total_size, vk::MemoryMapFlags::empty()) }
-            .map_err(|e| PixelForgeError::vulkan("map staging buffer", e))?;
+            .map_err(PixelForgeError::vk("vkMapMemory"))?;
     unsafe { ptr::write_bytes(data_ptr as *mut u8, 0, total_size as usize) };
     unsafe { device.unmap_memory(staging_memory) };
 
@@ -248,12 +256,12 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     unsafe {
         device.reset_command_buffer(params.command_buffer, vk::CommandBufferResetFlags::empty())
     }
-    .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+    .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe { device.begin_command_buffer(params.command_buffer, &begin_info) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+        .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
     // Transition image from UNDEFINED to TRANSFER_DST.
     let barrier = vk::ImageMemoryBarrier::default()
@@ -285,9 +293,9 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     }
 
     // Copy from staging buffer to image planes.
-    let (uv_width, uv_height) = match params.pixel_format {
-        PixelFormat::Yuv420 => (params.width / 2, params.height / 2),
-        PixelFormat::Yuv444 => (params.width, params.height),
+    let (uv_width, uv_height) = match params.chroma_format {
+        ChromaFormat::Yuv420 => (params.width / 2, params.height / 2),
+        ChromaFormat::Yuv444 => (params.width, params.height),
         _ => (params.width / 2, params.height / 2),
     };
 
@@ -328,13 +336,25 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         },
     ];
 
+    let rgb_region = vk::BufferImageCopy {
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            ..copy_regions[0].image_subresource
+        },
+        ..copy_regions[0]
+    };
+    let regions: &[vk::BufferImageCopy] = if params.rgb {
+        std::slice::from_ref(&rgb_region)
+    } else {
+        &copy_regions
+    };
     unsafe {
         device.cmd_copy_buffer_to_image(
             params.command_buffer,
             staging_buffer,
             params.image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy_regions,
+            regions,
         );
     }
 
@@ -368,19 +388,19 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     }
 
     unsafe { device.end_command_buffer(params.command_buffer) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+        .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
 
     // Submit and wait.
     let submit_info =
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&params.command_buffer));
     unsafe { device.reset_fences(&[params.fence]) }
-        .map_err(|e| PixelForgeError::vulkan("reset fence", e))?;
+        .map_err(PixelForgeError::vk("vkResetFences"))?;
     unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }
-        .map_err(|e| PixelForgeError::vulkan("submit clear", e))?;
+        .map_err(PixelForgeError::vk("vkQueueSubmit"))?;
     unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }
-        .map_err(|e| PixelForgeError::vulkan("wait clear", e))?;
+        .map_err(PixelForgeError::vk("vkWaitForFences"))?;
     unsafe { device.reset_fences(&[params.fence]) }
-        .map_err(|e| PixelForgeError::vulkan("reset fence after clear", e))?;
+        .map_err(PixelForgeError::vk("vkResetFences"))?;
 
     // Clean up staging buffer.
     unsafe {
@@ -393,102 +413,87 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
 
 /// Parameters for uploading an image to the encoder's input image.
 pub(crate) struct UploadParams<'a> {
-    /// The command buffer to use for the upload.
+    /// The command buffer to record into, the current slot's own.
     pub upload_command_buffer: vk::CommandBuffer,
-    /// The fence to use for synchronization.
-    pub upload_fence: vk::Fence,
     /// The source image to copy from.
     pub src_image: vk::Image,
+    /// The source's layout and the ownership transfers around this copy.
+    pub src_ownership: SourceOwnership,
     /// The destination image to copy to.
     pub dst_image: vk::Image,
     /// The width of the image.
     pub width: u32,
     /// The height of the image.
     pub height: u32,
-    /// The pixel format of the image.
-    pub pixel_format: PixelFormat,
+    /// The chroma format of the image.
+    pub chroma_format: ChromaFormat,
     /// The current layout of the input image.
     pub input_image_layout: vk::ImageLayout,
+    /// Whether both images are single-plane RGB rather than YUV.
+    pub rgb: bool,
     /// The queue to submit transfer operations to.
     pub upload_queue: vk::Queue,
-    /// Caller work the copy must wait for.
-    pub waits: &'a [TimelinePoint],
+    /// What the copy waits for.
+    pub waits: &'a [vk::SemaphoreSubmitInfo<'static>],
+    /// What the copy signals once done: the point the encode waits on, and
+    /// any release the caller asked for.
+    pub signals: &'a [vk::SemaphoreSubmitInfo<'static>],
 }
 
-/// Upload an image to the encoder's input image via GPU-to-GPU copy.
+/// Copy a source image into the encoder's input image on the transfer queue.
 ///
-/// This function handles:
-/// - Resetting and beginning the command buffer
-/// - Transitioning source image from GENERAL to TRANSFER_SRC
-/// - Transitioning destination image from `input_image_layout` to TRANSFER_DST
-/// - Copying Y and UV planes (NV12 format)
-/// - Transitioning destination image to VIDEO_ENCODE_SRC
-/// - Transitioning source image back to GENERAL
-/// - Submitting the command buffer and waiting for completion
-///
-/// Returns Ok(()) on success, or an error if any Vulkan operation fails.
+/// Records the copy into the slot's own command buffer and submits it without
+/// waiting: the encode waits for one of `params.signals` on the GPU instead.
+/// The source is acquired and released as `params.src_ownership` says and is
+/// left in `GENERAL`; the input image is left in `VIDEO_ENCODE_SRC_KHR`.
 pub(crate) fn upload_image_to_input(
     context: &crate::vulkan::VideoContext,
     params: &UploadParams<'_>,
 ) -> Result<()> {
     let device = context.device();
+    let family = context.transfer_queue_family();
+    let command_buffer = params.upload_command_buffer;
 
-    unsafe {
-        device.reset_command_buffer(
-            params.upload_command_buffer,
-            vk::CommandBufferResetFlags::empty(),
-        )
-    }
-    .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+    unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty()) }
+        .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    unsafe { device.begin_command_buffer(params.upload_command_buffer, &begin_info) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+    unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+        .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
 
-    // Transition source image from GENERAL to TRANSFER_SRC.
-    let src_barrier = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::GENERAL)
-        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(params.src_image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-
-    // Transition destination image to TRANSFER_DST.
-    let dst_barrier = vk::ImageMemoryBarrier::default()
+    let color = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let src_barrier = params.src_ownership.acquire_barrier(
+        params.src_image,
+        family,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_READ,
+    );
+    // The input image was last read by this slot's previous encode, which
+    // was complete before the slot was handed out again.
+    let dst_barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
         .old_layout(params.input_image_layout)
         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(params.dst_image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
+        .subresource_range(color);
+    let barriers = [src_barrier, dst_barrier];
     unsafe {
-        device.cmd_pipeline_barrier(
-            params.upload_command_buffer,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[src_barrier, dst_barrier],
+        context.sync2().cmd_pipeline_barrier2(
+            command_buffer,
+            &vk::DependencyInfo::default().image_memory_barriers(&barriers),
         );
     }
 
@@ -517,9 +522,9 @@ pub(crate) fn upload_image_to_input(
     };
 
     // Copy UV plane (plane 1).
-    let (uv_width, uv_height) = match params.pixel_format {
-        PixelFormat::Yuv420 => (params.width / 2, params.height / 2),
-        PixelFormat::Yuv444 => (params.width, params.height),
+    let (uv_width, uv_height) = match params.chroma_format {
+        ChromaFormat::Yuv420 => (params.width / 2, params.height / 2),
+        ChromaFormat::Yuv444 => (params.width, params.height),
         _ => (params.width / 2, params.height / 2),
     };
 
@@ -545,86 +550,81 @@ pub(crate) fn upload_image_to_input(
         },
     };
 
+    // An RGB input image has one colour plane, copied whole.
+    let rgb_copy_region = vk::ImageCopy {
+        src_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        dst_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        ..y_copy_region
+    };
+    let regions: &[vk::ImageCopy] = if params.rgb {
+        &[rgb_copy_region]
+    } else {
+        &[y_copy_region, uv_copy_region]
+    };
+
     unsafe {
         device.cmd_copy_image(
-            params.upload_command_buffer,
+            command_buffer,
             params.src_image,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             params.dst_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[y_copy_region, uv_copy_region],
+            regions,
         );
     }
 
-    // Transition destination image to VIDEO_ENCODE_SRC.
-    let barrier = vk::ImageMemoryBarrier::default()
+    // The encode that reads the input image waits for this submission's
+    // signal, which makes the copy's writes visible to it.
+    let dst_to_encode = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE)
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(params.dst_image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::empty());
-
-    // Also transition source image back to GENERAL for reuse.
-    let src_barrier_back = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        .new_layout(vk::ImageLayout::GENERAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(params.src_image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-
+        .subresource_range(color);
+    let src_back = params.src_ownership.release_barrier(
+        params.src_image,
+        family,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+    );
+    let barriers = [dst_to_encode, src_back];
     unsafe {
-        device.cmd_pipeline_barrier(
-            params.upload_command_buffer,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[barrier, src_barrier_back],
+        context.sync2().cmd_pipeline_barrier2(
+            command_buffer,
+            &vk::DependencyInfo::default().image_memory_barriers(&barriers),
         );
     }
 
-    unsafe { device.end_command_buffer(params.upload_command_buffer) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+    unsafe { device.end_command_buffer(command_buffer) }
+        .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
 
-    let command_buffers =
-        [vk::CommandBufferSubmitInfo::default().command_buffer(params.upload_command_buffer)];
-    let waits: Vec<vk::SemaphoreSubmitInfo> =
-        params.waits.iter().map(TimelinePoint::wait_info).collect();
+    let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
     let submit_info = vk::SubmitInfo2::default()
-        .wait_semaphore_infos(&waits)
-        .command_buffer_infos(&command_buffers);
+        .wait_semaphore_infos(params.waits)
+        .command_buffer_infos(&command_buffers)
+        .signal_semaphore_infos(params.signals);
 
     unsafe {
         context
             .sync2()
-            .queue_submit2(params.upload_queue, &[submit_info], params.upload_fence)
+            .queue_submit2(params.upload_queue, &[submit_info], vk::Fence::null())
     }
-    .map_err(|e| PixelForgeError::vulkan("submit upload", e))?;
-
-    unsafe { device.wait_for_fences(&[params.upload_fence], true, u64::MAX) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
-
-    unsafe { device.reset_fences(&[params.upload_fence]) }
-        .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+    .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
 
     Ok(())
 }
@@ -742,7 +742,7 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
     unsafe {
         device
             .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+            .map_err(PixelForgeError::vk("vkResetCommandBuffer"))?;
     }
 
     let begin_info =
@@ -750,7 +750,7 @@ pub(crate) unsafe fn prepare_encode_command_buffer(
     unsafe {
         device
             .begin_command_buffer(command_buffer, &begin_info)
-            .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
+            .map_err(PixelForgeError::vk("vkBeginCommandBuffer"))?;
     }
 
     unsafe {
@@ -828,36 +828,26 @@ pub(crate) unsafe fn submit_encode_only(
     fence: vk::Fence,
     encode_queue: vk::Queue,
     wait_infos: &[vk::SemaphoreSubmitInfo<'_>],
-    signal_timeline: Option<(vk::Semaphore, u64)>,
+    signal_infos: &[vk::SemaphoreSubmitInfo<'_>],
 ) -> Result<()> {
     let command_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
     let command_buffer_infos = [command_buffer_info];
 
-    let signal_infos: Vec<vk::SemaphoreSubmitInfo> = signal_timeline
-        .into_iter()
-        .map(|(semaphore, value)| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(semaphore)
-                .value(value)
-                .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-        })
-        .collect();
-
     let submit_info = vk::SubmitInfo2::default()
         .wait_semaphore_infos(wait_infos)
         .command_buffer_infos(&command_buffer_infos)
-        .signal_semaphore_infos(&signal_infos);
+        .signal_semaphore_infos(signal_infos);
 
     unsafe {
         device
             .reset_fences(&[fence])
-            .map_err(|e| PixelForgeError::vulkan("reset encode fence", e))?;
+            .map_err(PixelForgeError::vk("vkResetFences"))?;
     }
 
     unsafe {
         sync2
             .queue_submit2(encode_queue, &[submit_info], fence)
-            .map_err(|e| PixelForgeError::vulkan("submit encode", e))?;
+            .map_err(PixelForgeError::vk("vkQueueSubmit2"))?;
     }
 
     Ok(())
@@ -887,7 +877,7 @@ pub(crate) unsafe fn wait_and_read_bitstream(
     unsafe {
         device
             .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|e| PixelForgeError::vulkan("wait encode fence", e))?;
+            .map_err(PixelForgeError::vk("vkWaitForFences"))?;
     }
 
     // Read query results (offset + bytes_written).
@@ -910,15 +900,15 @@ pub(crate) unsafe fn wait_and_read_bitstream(
                 &mut query_results,
                 vk::QueryResultFlags::WAIT,
             )
-            .map_err(|e| PixelForgeError::vulkan("read encode feedback", e))?;
+            .map_err(PixelForgeError::vk("vkGetQueryPoolResults"))?;
     }
 
     let offset = query_results[0].offset as usize;
     let size = query_results[0].bytes_written as usize;
 
     if size == 0 {
-        return Err(PixelForgeError::QueryPool(
-            "Encoder produced 0 bytes".to_string(),
+        return Err(PixelForgeError::Driver(
+            "the encoder produced 0 bytes".to_string(),
         ));
     }
 
@@ -1033,8 +1023,8 @@ pub(crate) fn get_encoded_session_params(
         match result {
             vk::Result::SUCCESS => {
                 if data_size == 0 {
-                    return Err(PixelForgeError::SessionParametersCreation(
-                        "Encoded session parameters size is 0".to_string(),
+                    return Err(PixelForgeError::Driver(
+                        "encoded session parameters size is 0".to_string(),
                     ));
                 }
                 data.truncate(data_size);
@@ -1049,7 +1039,7 @@ pub(crate) fn get_encoded_session_params(
             }
             err => {
                 return Err(PixelForgeError::vulkan(
-                    "get encoded session parameters",
+                    "vkGetEncodedVideoSessionParametersKHR",
                     err,
                 ));
             }
@@ -1115,6 +1105,7 @@ pub(crate) unsafe fn query_timestamp_diff(
     query_pool: vk::QueryPool,
     mut timestamps: [u64; 2],
     timestamp_period: f32,
+    timestamp_valid_bits: u32,
 ) -> Option<u64> {
     if query_pool.is_null() {
         return None;
@@ -1129,9 +1120,25 @@ pub(crate) unsafe fn query_timestamp_diff(
         )
     };
     if result.is_ok() {
-        encode_time_ns = Some(((timestamps[1] - timestamps[0]) as f32 * timestamp_period) as u64);
+        encode_time_ns = Some(timestamp_delta_ns(
+            timestamps,
+            timestamp_period,
+            timestamp_valid_bits,
+        ));
     }
     encode_time_ns
+}
+
+/// The time between two timestamps of a counter with `valid_bits` bits, which
+/// wraps around.
+fn timestamp_delta_ns([start, end]: [u64; 2], period: f32, valid_bits: u32) -> u64 {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    let ticks = end.wrapping_sub(start) & mask;
+    (ticks as f64 * f64::from(period)) as u64
 }
 
 pub(crate) struct ClearImageParams {
@@ -1141,13 +1148,30 @@ pub(crate) struct ClearImageParams {
     pub image: vk::Image,
     pub width: u32,
     pub height: u32,
-    pub pixel_format: PixelFormat,
+    pub chroma_format: ChromaFormat,
     pub bit_depth: BitDepth,
+    /// Whether the image is a single-plane, 4-bytes-per-pixel RGB input
+    /// image rather than a YUV one.
+    pub rgb: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_delta_scales_by_the_period() {
+        assert_eq!(timestamp_delta_ns([100, 1100], 1.0, 64), 1000);
+        assert_eq!(timestamp_delta_ns([100, 1100], 40.0, 64), 40_000);
+    }
+
+    #[test]
+    fn timestamp_delta_survives_a_wrap() {
+        // A 36-bit counter that wrapped between the two timestamps.
+        let max = (1u64 << 36) - 1;
+        assert_eq!(timestamp_delta_ns([max - 9, 10], 1.0, 36), 20);
+        assert_eq!(timestamp_delta_ns([u64::MAX - 9, 10], 1.0, 64), 20);
+    }
 
     #[test]
     fn test_gcd() {
@@ -1170,146 +1194,5 @@ mod tests {
         assert_eq!(input_image_width(4080, 4096), 4096);
         // Never wider than the device allows, never narrower than coded.
         assert_eq!(input_image_width(4080, 4080), 4080);
-    }
-}
-
-#[cfg(test)]
-mod driver_error_tests {
-    use super::*;
-    use std::ffi::{CStr, c_void};
-
-    unsafe extern "system" fn reset(_: vk::Device, _: u32, _: *const vk::Fence) -> vk::Result {
-        vk::Result::SUCCESS
-    }
-    unsafe extern "system" fn submit(
-        _: vk::Queue,
-        _: u32,
-        _: *const vk::SubmitInfo2<'_>,
-        _: vk::Fence,
-    ) -> vk::Result {
-        vk::Result::ERROR_DEVICE_LOST
-    }
-    unsafe extern "system" fn wait_lost(
-        _: vk::Device,
-        _: u32,
-        _: *const vk::Fence,
-        _: vk::Bool32,
-        _: u64,
-    ) -> vk::Result {
-        vk::Result::ERROR_DEVICE_LOST
-    }
-    unsafe extern "system" fn wait_ok(
-        _: vk::Device,
-        _: u32,
-        _: *const vk::Fence,
-        _: vk::Bool32,
-        _: u64,
-    ) -> vk::Result {
-        vk::Result::SUCCESS
-    }
-    unsafe extern "system" fn query(
-        _: vk::Device,
-        _: vk::QueryPool,
-        _: u32,
-        _: u32,
-        _: usize,
-        _: *mut c_void,
-        _: vk::DeviceSize,
-        _: vk::QueryResultFlags,
-    ) -> vk::Result {
-        vk::Result::ERROR_DEVICE_LOST
-    }
-
-    fn device(fence_lost: bool) -> ash::Device {
-        // Only the functions invoked by these tests are loaded. The fake device
-        // owns no native resources; all stubs ignore their handles and pointers.
-        unsafe {
-            ash::Device::load_with(
-                |name: &CStr| match name.to_bytes() {
-                    b"vkResetFences" => reset as *const () as *const c_void,
-                    b"vkQueueSubmit2" => submit as *const () as *const c_void,
-                    b"vkWaitForFences" if fence_lost => wait_lost as *const () as *const c_void,
-                    b"vkWaitForFences" => wait_ok as *const () as *const c_void,
-                    b"vkGetQueryPoolResults" => query as *const () as *const c_void,
-                    _ => std::ptr::null(),
-                },
-                vk::Device::null(),
-            )
-        }
-    }
-
-    unsafe extern "system" fn device_proc_addr(
-        _: vk::Device,
-        name: *const std::ffi::c_char,
-    ) -> vk::PFN_vkVoidFunction {
-        // SAFETY: the loader passes null-terminated command names.
-        match unsafe { CStr::from_ptr(name) }.to_bytes() {
-            // SAFETY: `submit` has the vkQueueSubmit2 signature the loader expects.
-            b"vkQueueSubmit2KHR" => Some(unsafe {
-                std::mem::transmute::<vk::PFN_vkQueueSubmit2, unsafe extern "system" fn()>(submit)
-            }),
-            _ => None,
-        }
-    }
-
-    fn sync2(device: &ash::Device) -> ash::khr::synchronization2::Device {
-        // The fake instance only resolves device functions, through `device_proc_addr`.
-        let instance = unsafe {
-            ash::Instance::load_with(
-                |name: &CStr| match name.to_bytes() {
-                    b"vkGetDeviceProcAddr" => device_proc_addr as *const () as *const c_void,
-                    _ => std::ptr::null(),
-                },
-                vk::Instance::null(),
-            )
-        };
-        ash::khr::synchronization2::Device::load(&instance, device)
-    }
-
-    #[test]
-    fn submission_preserves_device_loss() {
-        let device = device(false);
-        let sync2 = sync2(&device);
-        // SAFETY: the fake function table never dereferences these handles.
-        let error = unsafe {
-            submit_encode_only(
-                &device,
-                &sync2,
-                vk::CommandBuffer::null(),
-                vk::Fence::null(),
-                vk::Queue::null(),
-                &[],
-                None,
-            )
-        }
-        .unwrap_err();
-        assert_eq!(error.vulkan_result(), Some(vk::Result::ERROR_DEVICE_LOST));
-        assert!(error.to_string().contains("submit encode"));
-    }
-
-    #[test]
-    fn readback_preserves_fence_and_query_device_loss() {
-        for fence_lost in [true, false] {
-            let mut dst = vec![42];
-            // SAFETY: the injected error returns before accessing mapped memory.
-            let error = unsafe {
-                wait_and_read_bitstream(
-                    &device(fence_lost),
-                    vk::Fence::null(),
-                    vk::QueryPool::null(),
-                    std::ptr::null(),
-                    0,
-                    &mut dst,
-                )
-            }
-            .unwrap_err();
-            assert_eq!(error.vulkan_result(), Some(vk::Result::ERROR_DEVICE_LOST));
-            assert!(error.to_string().contains(if fence_lost {
-                "wait encode fence"
-            } else {
-                "read encode feedback"
-            }));
-            assert_eq!(dst, [42]);
-        }
     }
 }

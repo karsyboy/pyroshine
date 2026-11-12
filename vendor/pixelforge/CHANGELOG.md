@@ -5,7 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] - 06-11-2026
+
+### Added
+
+- Add H.265 and AV1 decoding: `DecodeConfig::new(codec)`.
+- Add `EncodeConfig::new(codec, width, height)` for a codec chosen at runtime.
+- Add RGB input: `Source::Rgb`, converted by the encoder where the device supports it. (#46, @DatCaptainHorse)
+- Add `Encoder::submit` and `Frame`, to submit frames without CPU waits.
+- Add `Encoder::input_slot` and `InputSlot`, to write frames directly into the encoder's input image.
+- Add `Encoder::repeat`, to encode the last frame again.
+- Add `PixelForgeError::DeviceLost`, reported when the device is lost.
+- Add `VideoContext::supports_rgb_encode_input`.
+
+### Changed
+
+- **Breaking:** `Encoder::encode`, `encode_after` and `input_image` are removed. Use `Encoder::submit` instead.
+- **Breaking:** `RateControl` replaces `RateControlMode`, `quality_level`, `target_bitrate` and `max_bitrate`.
+- **Breaking:** `DecodeConfig::h264()` is replaced by `DecodeConfig::new(codec)`.
+- **Breaking:** `ColorConverter` is no longer public.
+- **Breaking:** `EncodeConfig::with_b_frames` is removed. No codec encodes B-frames yet.
+- **Breaking:** `StreamColor` replaces `ColorDescription` in the encode API.
+- **Breaking:** `EncodedPacket::is_key_frame` is a method. IDR frames are `FrameType::Idr`.
+- **Breaking:** Several types are renamed, including `InputImage` to `YuvUploader` and `PixelFormat` to `ChromaFormat`.
+- **Breaking:** `PixelForgeError` has fewer, typed variants.
+- `Encoder::reconfigure(source, color)` changes the source and stream colour together.
+- `EncodedPacket::stats` is always present. Only `gpu_time_ns` is optional.
+
+### Fixed
+
+- Fix the reference window being smaller than the references per frame.
+- Fix H.264 encoding on profiles the device does not support.
+- Fix shaders to SPIR-V 1.3, so Vulkan 1.1 devices accept them.
+- Fix packet wall latency, which started after the encode submit.
+- Fix RGB chroma siting for drivers that site chroma differently. (#49, @porkloin)
+
+### Removed
+
+- The encoder's internal modules are no longer public.
 
 ## [0.10.0] - 19-10-2026
 

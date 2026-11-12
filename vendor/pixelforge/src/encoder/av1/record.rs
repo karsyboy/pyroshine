@@ -3,13 +3,10 @@
 
 use super::Av1;
 
-use crate::encoder::codec::{EncoderCommon, FramePlan, RateControlPlan};
+use crate::encoder::codec::{EncodeCommands, EncoderCommon, FramePlan, RateControlPlan};
 use crate::encoder::pipeline::EncodeFuture;
-use crate::encoder::resources::{
-    end_timestamp, prepare_encode_command_buffer, record_dpb_barriers,
-    record_post_encode_dpb_barrier, reset_start_timestamp,
-};
-use crate::error::{PixelForgeError, Result};
+use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
+use crate::error::Result;
 use ash::vk;
 use ash::vk::TaggedStructure;
 use tracing::debug;
@@ -29,10 +26,9 @@ impl Av1 {
         let slot = common.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
-        let timestamp_query_pool = slot.timestamp_query_pool;
         let bitstream_buffer = slot.bitstream_buffer;
         let bitstream_buffer_size = slot.bitstream_buffer_size;
-        let input_image_view = slot.input_image_view;
+        let input_image_view = common.source_view();
 
         debug!(
             "av1 record: key={}, refs_len={}, dpb_slot={}",
@@ -47,7 +43,9 @@ impl Av1 {
         unsafe {
             prepare_encode_command_buffer(common.device(), command_buffer, query_pool)?;
         }
-        let ref_dpb_slots: Vec<u8> = self.references.iter().map(|r| r.dpb_slot).collect();
+        // Only the references this frame predicts from go to the encode. The
+        // rest of the window stays in its DPB slots, untouched.
+        let ref_dpb_slots: Vec<u8> = self.used_references().iter().map(|r| r.dpb_slot).collect();
         unsafe {
             record_dpb_barriers(
                 common.context.sync2(),
@@ -58,6 +56,7 @@ impl Av1 {
                 &ref_dpb_slots,
                 common.dpb_slot_active[current_dpb_slot as usize],
             );
+            common.record_source_acquire(command_buffer);
         }
 
         let frame_type = if is_key_frame {
@@ -119,15 +118,15 @@ impl Av1 {
             .picture_resource(&setup_picture_resource)
             .push(&mut setup_av1_dpb_info_ref0);
 
-        // Reference frames for inter frames: declare each distinct DPB slot we
-        // still hold, most-recent first. The vectors hold the data so the
+        // Reference frames for inter frames: declare each distinct DPB slot
+        // this frame predicts from, most-recent first. The vectors hold the data so the
         // pointers the slot infos take into them stay stable.
         //
         // `distinct_refs` dedups by DPB slot (a reference can be mapped to more
         // than one AV1 reference name below, but each slot is declared once).
         let mut distinct_refs: Vec<&super::ReferenceInfo> = Vec::new();
         if !is_key_frame {
-            for r in &self.references {
+            for r in self.used_references() {
                 if !distinct_refs.iter().any(|d| d.dpb_slot == r.dpb_slot) {
                     distinct_refs.push(r);
                 }
@@ -249,18 +248,14 @@ impl Av1 {
             pBufferRemovalTimes: std::ptr::null(),
         };
 
-        // Map the 7 AV1 reference names to DPB slots. The N most-recent
-        // references take the first N forward names (LAST, LAST2, LAST3,
-        // GOLDEN, ...); any remaining names reuse the oldest surviving
-        // reference so every name resolves to a valid, decodable DPB slot. This
+        // Map the AV1 reference names this frame predicts from to DPB slots
+        // (see `reference_names`); the others stay -1. The names that are set
         // must mirror `ref_frame_idx` from `calculate_reference_frame_mapping`.
-        let mut reference_name_slot_indices = [-1i32; 7];
-        if !is_key_frame && !self.references.is_empty() {
-            let n = self.references.len();
-            for (name, idx) in reference_name_slot_indices.iter_mut().enumerate() {
-                *idx = self.references[name.min(n - 1)].dpb_slot as i32;
-            }
-        }
+        let reference_name_slot_indices = if !is_key_frame && !self.references.is_empty() {
+            self.reference_names()
+        } else {
+            [-1i32; 7]
+        };
 
         let (prediction_mode, rate_control_group) = if is_key_frame {
             (
@@ -301,27 +296,6 @@ impl Av1 {
                 .use_max_q_index(false);
         }
 
-        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(common.config.frame_rate_numerator)
-            .frame_rate_denominator(common.config.frame_rate_denominator)
-            .push(&mut av1_rc_layer_info);
-        let rc_layers = [rc_layer_info];
-        // Begin describes the state left by the previous submission; the
-        // control command below installs the new target inside this scope.
-        let begin_layers = [rc_layer_info
-            .average_bitrate(u64::from(common.installed_bitrate))
-            .max_bitrate(u64::from(common.installed_bitrate))];
-
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(common.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(common.config.initial_virtual_buffer_size_ms);
-        }
-
         // Begin coding: setup slot (slot_index -1) plus any active reference slots.
         let mut all_reference_slots = Vec::new();
         if is_reference {
@@ -333,78 +307,14 @@ impl Av1 {
         }
         all_reference_slots.extend_from_slice(&reference_slots);
 
-        let is_first_frame = plan.is_first_frame();
-        let should_reset_coding_state = is_first_frame || (is_key_frame && !rc.is_disabled());
         // Clamp GOP values to at least 1; a value of 0 is undefined in
         // Vulkan and causes undefined behavior on some drivers (RADV).
         let gop_frames = common.config.gop_size.max(1);
-        let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
+        let codec_rate_control = vk::VideoEncodeAV1RateControlInfoKHR::default()
             .gop_frame_count(gop_frames)
             .key_frame_period(gop_frames)
             .consecutive_bipredictive_frame_count(0)
             .temporal_layer_count(1);
-
-        // Reset and write start timestamp
-        reset_start_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-        // Ash links pNext chains in place, so each command needs its own extension structs.
-        let mut begin_rc_info = if common.rate_changed() {
-            rc_info.layers(&begin_layers)
-        } else {
-            rc_info
-        };
-        let mut begin_av1_rc_info = av1_rc_info;
-        let begin_coding_info = if is_first_frame {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&all_reference_slots)
-                .push(&mut begin_av1_rc_info)
-        } else {
-            vk::VideoBeginCodingInfoKHR::default()
-                .video_session(common.session)
-                .video_session_parameters(common.session_params)
-                .reference_slots(&all_reference_slots)
-                .push(&mut begin_rc_info)
-                .push(&mut begin_av1_rc_info)
-        };
-
-        unsafe {
-            common
-                .video_queue_fn
-                .cmd_begin_video_coding(command_buffer, &begin_coding_info);
-        }
-
-        if should_reset_coding_state {
-            let mut quality_level_info =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
-                .push(&mut rc_info)
-                .push(&mut av1_rc_info)
-                .push(&mut quality_level_info);
-            unsafe {
-                common
-                    .video_queue_fn
-                    .cmd_control_video_coding(command_buffer, &control_info);
-            }
-        }
-
-        if !should_reset_coding_state && common.rate_changed() {
-            let control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL)
-                .push(&mut rc_info)
-                .push(&mut av1_rc_info);
-            unsafe {
-                common
-                    .video_queue_fn
-                    .cmd_control_video_coding(command_buffer, &control);
-            }
-        }
 
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -425,41 +335,18 @@ impl Av1 {
         }
         encode_info = encode_info.push(&mut av1_picture_info);
 
-        unsafe {
-            let device = common.device();
-            device.cmd_begin_query(
-                command_buffer,
-                query_pool,
-                0,
-                vk::QueryControlFlags::empty(),
-            );
-            common
-                .video_encode_fn
-                .cmd_encode_video(command_buffer, &encode_info);
-            device.cmd_end_query(command_buffer, query_pool, 0);
-
-            // Write end timestamp
-            end_timestamp(common.device(), command_buffer, timestamp_query_pool);
-
-            record_post_encode_dpb_barrier(
-                device,
-                command_buffer,
-                &common.dpb_images,
-                common.use_layered_dpb,
-                current_dpb_slot,
-            );
-
-            let end_coding_info = vk::VideoEndCodingInfoKHR::default();
-            common
-                .video_queue_fn
-                .cmd_end_video_coding(command_buffer, &end_coding_info);
-
-            device
-                .end_command_buffer(command_buffer)
-                .map_err(|e| PixelForgeError::vulkan("command buffer operation", e))?;
-        }
-
-        common.submit_frame()
+        // A key frame with a bitrate controller resets it too.
+        let first_frame = plan.is_first_frame();
+        common.record_encode(EncodeCommands {
+            begin_slots: &all_reference_slots,
+            encode_info: &encode_info,
+            rate_control: &rc,
+            codec_rate_control,
+            codec_layer: av1_rc_layer_info,
+            first_frame,
+            reset: first_frame || (is_key_frame && !rc.is_disabled()),
+            post_encode_barrier: true,
+        })
     }
 
     /// Build `ref_frame_idx`, `ref_order_hint`, `primary_ref_frame` and
@@ -487,19 +374,31 @@ impl Av1 {
 
         let mut ref_frame_idx = [0i8; 7];
         let mut ref_order_hint = [0u8; 8];
-        let n = self.references.len();
-        // Most-recent references take the first forward names; surplus names
-        // reuse the oldest survivor. Matches `reference_name_slot_indices`.
-        for (name, idx) in ref_frame_idx.iter_mut().enumerate() {
-            *idx = self.references[name.min(n - 1)].dpb_slot as i8;
+        // The names this frame predicts from match `reference_name_slot_indices`.
+        // The bitstream needs a slot for every name, so the others point at
+        // the most recent reference, which no block then uses.
+        let names = self.reference_names();
+        let newest = self.references[0].dpb_slot as i8;
+        for (idx, &slot) in ref_frame_idx.iter_mut().zip(&names) {
+            *idx = if slot >= 0 { slot as i8 } else { newest };
         }
-        // Order hints keyed by DPB slot.
+        // Order hints keyed by DPB slot, for every reference still held.
         for r in &self.references {
             ref_order_hint[r.dpb_slot as usize] = r.order_hint as u8;
         }
-        // Load the frame context from the most recent (LAST) reference, and
-        // refresh only the current slot so this frame becomes the new LAST.
+        // Load the frame context from the most recent reference, under the
+        // first name it took, and refresh only the current slot so this frame
+        // becomes the newest reference.
+        let primary_ref_frame = names
+            .iter()
+            .position(|&slot| slot >= 0)
+            .map_or(PRIMARY_REF_NONE, |name| name as u8);
         let refresh_flags = 1u8 << current_dpb_slot;
-        (ref_frame_idx, ref_order_hint, 0u8, refresh_flags)
+        (
+            ref_frame_idx,
+            ref_order_hint,
+            primary_ref_frame,
+            refresh_flags,
+        )
     }
 }

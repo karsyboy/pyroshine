@@ -1,80 +1,87 @@
 use super::H265;
 
+use crate::converter::RgbFormat;
+use crate::encoder::EncodeConfig;
 use crate::encoder::codec::{
     CodecEncoder, CommonInitRequest, build_encoder_common, query_video_caps,
 };
-use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
+use crate::encoder::profile::EncodeProfile;
+use crate::encoder::profile::h265_profile_idc;
 use crate::encoder::resources::MIN_BITSTREAM_BUFFER_SIZE;
-use crate::encoder::{ColorDescription, EncodeConfig};
+use crate::encoder::rgb::RgbConversionCaps;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
+use ash::vk;
+use ash::vk::TaggedStructure;
 use tracing::info;
 
 impl H265 {
     /// Create a new H.265/HEVC encoder.
-    pub fn create(context: VideoContext, config: EncodeConfig) -> Result<CodecEncoder<Self>> {
-        // Reachable from safe caller code via `with_b_frames`, so report it
-        // rather than panicking inside the library.
-        if config.b_frame_count != 0 {
-            return Err(PixelForgeError::InvalidInput(format!(
-                "H.265 encode: B-frames are not yet supported; set b_frame_count = 0 (got {})",
-                config.b_frame_count
-            )));
-        }
-
+    pub(crate) fn create(
+        context: VideoContext,
+        config: EncodeConfig,
+        rgb_input: Option<RgbFormat>,
+    ) -> Result<CodecEncoder<Self>> {
         info!(
-            "Creating H.265 encoder: {}x{}, pixel_format={:?}",
-            config.dimensions.width, config.dimensions.height, config.pixel_format
+            "Creating H.265 encoder: {}x{}, chroma_format={:?}",
+            config.dimensions.width, config.dimensions.height, config.chroma_format
         );
 
-        let mut profile = super::super::capabilities::EncodeProfile::new(&config)?;
-        let profile_idc = profile.profile_idc;
+        let profile_idc =
+            h265_profile_idc(config.chroma_format, config.bit_depth).ok_or_else(|| {
+                PixelForgeError::InvalidInput(format!(
+                    "Unsupported pixel format / bit depth for H.265: {:?} / {:?}",
+                    config.chroma_format, config.bit_depth
+                ))
+            })?;
+
+        let profile = EncodeProfile::new(&config, rgb_input.is_some())?;
         let profile_info = profile.info();
 
-        let caps = query_video_caps(&context, &profile_info)?;
+        // Query device capabilities with the H.265-specific capability struct
+        // chained in (required by the driver).
+        let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+        let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut encode_caps)
+            .push(&mut h265_caps);
+        let mut rgb_caps = vk::VideoEncodeRgbConversionCapabilitiesVALVE::default();
+        if rgb_input.is_some() {
+            capabilities = capabilities.push(&mut rgb_caps);
+        }
+        let caps = query_video_caps(&context, profile_info, &mut capabilities)?;
+        let rgb_caps = rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
 
         // Scale the bitstream buffer by resolution so a single frame can't overflow (matches AV1).
         let bitstream_buffer_size = MIN_BITSTREAM_BUFFER_SIZE
             .max(config.dimensions.width as usize * config.dimensions.height as usize);
 
-        let init = build_encoder_common(&CommonInitRequest {
+        let init = build_encoder_common(CommonInitRequest {
             context: &context,
             config: &config,
-            profile_info: &profile_info,
+            profile,
+            rgb_input,
             caps: &caps,
-            max_active_refs_cap: 15,
+            max_reference_window: 15,
+            max_frame_references: h265_caps.max_p_picture_l0_reference_count as usize,
             bitstream_buffer_size,
             allow_layered_dpb: true,
+            rgb_caps,
         })?;
+        let reference_window = init.reference_window;
         let active_reference_count = init.active_reference_count;
         let common = init.common;
 
-        let mut dpb = DecodedPictureBuffer::new();
-        dpb.h265.sequence_start(DpbConfig {
-            dpb_size: common.dpb_slot_count as u32,
-            max_num_ref_frames: if config.b_frame_count > 0 { 2 } else { 1 },
-            use_multiple_references: config.b_frame_count > 0,
-            max_long_term_refs: 0,
-            log2_max_frame_num_minus4: 0,
-            log2_max_pic_order_cnt_lsb_minus4: 4,
-            num_temporal_layers: 1,
-        });
-
         let codec = H265 {
-            dpb,
             header_data: None,
-            has_backward_reference: false,
-            backward_reference_poc: 0,
-            backward_reference_dpb_slot: 2,
             l0_references: Vec::new(),
+            reference_window,
             active_reference_count,
             profile_idc,
         };
 
         let mut encoder = CodecEncoder { common, codec };
-        let color_desc = config
-            .color_description
-            .unwrap_or(ColorDescription::bt709());
+        let color_desc = config.color.description();
         encoder.common.session_params = encoder
             .codec
             .build_session_params(&encoder.common, &color_desc)?;

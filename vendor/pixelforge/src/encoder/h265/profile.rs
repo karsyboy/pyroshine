@@ -4,7 +4,7 @@ use crate::encoder::BitDepth;
 use crate::error::{PixelForgeError, Result};
 
 fn invalid(reason: &str) -> PixelForgeError {
-    PixelForgeError::SessionParametersCreation(format!("HEVC 4:4:4 header: {reason}"))
+    PixelForgeError::Driver(format!("HEVC 4:4:4 header: {reason}"))
 }
 
 fn start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
