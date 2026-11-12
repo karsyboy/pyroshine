@@ -1080,10 +1080,7 @@ impl MoonshineCompositor {
 			smithay::backend::renderer::utils::with_renderer_surface_state(s, |st| st.buffer().is_some())
 				.unwrap_or(false)
 		};
-		if window.wl_surface().is_some_and(|s| surface_has_buffer(&s)) {
-			return true;
-		}
-		false
+		window.wl_surface().is_some_and(|s| surface_has_buffer(&s))
 	}
 
 	/// Defer to the Steam UI only while `requested` hasn't presented yet.
@@ -1368,7 +1365,8 @@ impl MoonshineCompositor {
 					for window in candidates {
 						let accepts = self.window_metadata.get(window).is_some_and(|m| {
 							m.app_id == *appid
-								&& m.is_dropdown() && focus::is_good_override_candidate(m, &fm)
+								&& m.is_dropdown()
+								&& focus::is_good_override_candidate(m, &fm)
 								&& m.app_id == fm.app_id
 						});
 						if accepts {

@@ -1385,7 +1385,8 @@ pub(crate) mod tests {
 			"schema": config_schema(),
 			"defaults": Config::default(),
 		}))
-		.unwrap() + "\n";
+		.unwrap()
+			+ "\n";
 		if std::env::var_os("MOONSHINE_UPDATE_UI_FIXTURES").is_some() {
 			std::fs::write(&path, &fixture).unwrap();
 		}

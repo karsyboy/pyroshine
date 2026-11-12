@@ -98,7 +98,8 @@ fn matches(observed: &Output, expected: &Output) -> bool {
 					.mode
 					.refresh_millihertz
 					.abs_diff(expected.mode.refresh_millihertz)
-					<= 100 && observed.x == expected.x
+					<= 100
+				&& observed.x == expected.x
 				&& observed.y == expected.y
 				&& (observed.scale - expected.scale).abs() < 0.001
 				&& observed.transform == expected.transform

@@ -1628,7 +1628,8 @@ mod xwayland_tests {
 					name,
 					interface,
 					version,
-				} = event && interface == "zwp_linux_dmabuf_v1"
+				} = event
+					&& interface == "zwp_linux_dmabuf_v1"
 				{
 					state.dmabuf = Some(registry.bind(name, version.min(3), qh, ()));
 				}

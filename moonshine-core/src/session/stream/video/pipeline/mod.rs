@@ -2336,7 +2336,8 @@ impl VideoPipelineInner {
 					// re-encode the static scene from the latest converted frame
 					// (see `encode_static_recovery`).
 					if (pending_idr || pending_replay || pending_rate.is_some())
-						&& has_encoded && last_output
+						&& has_encoded
+						&& last_output
 						&& conventional_can_admit(&in_flight, credit_limit)
 						&& self.demand.may_replay(2 * frame_interval)
 					{

@@ -58,7 +58,8 @@ pub(crate) fn valid_host_entry(entry: &str) -> bool {
 		&& name.len() <= 253
 		&& name.split('.').all(|label| {
 			!label.is_empty() && label.len() <= 63 && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-		}) && port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
+		})
+		&& port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
 }
 
 impl Hosts {

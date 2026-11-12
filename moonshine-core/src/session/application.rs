@@ -507,7 +507,8 @@ fn obsolete_presentation_environment(key: &str, value: &str) -> bool {
 				| "MOONSHINE_WAYLAND_DISPLAY"
 				| "MOONSHINE_HDR"
 				| "MOONSHINE_LIMITER_FILE"
-		) || (key == "VK_INSTANCE_LAYERS" && value.split(':').any(|layer| layer == "VK_LAYER_MOONSHINE_wsi"))
+		)
+		|| (key == "VK_INSTANCE_LAYERS" && value.split(':').any(|layer| layer == "VK_LAYER_MOONSHINE_wsi"))
 }
 
 /// Wait for a `JobRemoved` signal matching the given job path, accepting only

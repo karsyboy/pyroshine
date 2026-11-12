@@ -966,7 +966,9 @@ impl NvencEncoder {
 				unsafe {
 					shared.check(
 						api.nvEncCreateBitstreamBuffer
-							.ok_or(EncodeError::native("NVENC table"))?(shared.session, &mut bitstream),
+							.ok_or(EncodeError::native("NVENC table"))?(
+							shared.session, &mut bitstream
+						),
 						"create bitstream buffer",
 					)?;
 				}
@@ -1026,7 +1028,9 @@ impl NvencEncoder {
 				shared
 					.api
 					.nvEncReconfigureEncoder
-					.ok_or(EncodeError::native("NVENC reconfigure unavailable"))?(shared.session, &mut params),
+					.ok_or(EncodeError::native("NVENC reconfigure unavailable"))?(
+					shared.session, &mut params
+				),
 				"live bitrate reconfigure",
 			)?;
 		}

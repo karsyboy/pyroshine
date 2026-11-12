@@ -248,7 +248,8 @@ impl CaptureReceiver {
 			&& self
 				.state
 				.compare_exchange(idle, requested, Ordering::AcqRel, Ordering::Acquire)
-				.is_ok() && let Some(ping) = &self.demand
+				.is_ok()
+			&& let Some(ping) = &self.demand
 		{
 			ping.ping();
 		}

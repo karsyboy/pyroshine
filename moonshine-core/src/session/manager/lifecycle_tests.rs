@@ -1414,11 +1414,12 @@ async fn first_play_publishes_the_negotiated_output_mode() {
 		fps: 120,
 		..video()
 	};
-	let accepted =
-		h.core
-			.set_stream_context(&grant, negotiated, audio(), false)
-			.await
-			.is_ok() && h.core.start_session(&grant).await.is_ok();
+	let accepted = h
+		.core
+		.set_stream_context(&grant, negotiated, audio(), false)
+		.await
+		.is_ok()
+		&& h.core.start_session(&grant).await.is_ok();
 	if accepted {
 		let context = h.core.get_session_context().await.unwrap();
 		assert!(

@@ -32,7 +32,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 			name,
 			interface,
 			version,
-		} = event && interface == "zwp_linux_dmabuf_v1"
+		} = event
+			&& interface == "zwp_linux_dmabuf_v1"
 			&& version >= 4
 		{
 			state.dmabuf = Some(registry.bind(name, 4, queue, ()));
