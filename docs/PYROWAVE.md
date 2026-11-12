@@ -19,7 +19,7 @@ PyroWave is vendored like Pixelforge and Inputtino ([vendor guide](../vendor/REA
 series in `vendor/pyrowave-patches/`, and is never edited by hand.
 
 - upstream: `https://github.com/Themaister/pyrowave`
-- base: `vendor/pyrowave-patches/UPSTREAM` (`7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b`)
+- base: `vendor/pyrowave-patches/UPSTREAM` (`a32b05e03d70826b19d4d11ff74fe166ed74371b`)
 - C API: 1.1.0 (upstream 1.0 plus the series' additions)
 - Granite: `53090429539bf3404250d18fe58db971f0907c04`
 - Volk: `47cddf7ed97b94118a08aacb548a411188e016cc`

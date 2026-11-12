@@ -11,7 +11,7 @@ let
   # vendor/README.md); scripts/check-vendor-pins.py keeps this revision equal
   # to vendor/pyrowave-patches/UPSTREAM.
   upstreamUrl = "https://github.com/Themaister/pyrowave";
-  upstreamRevision = "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b";
+  upstreamRevision = "a32b05e03d70826b19d4d11ff74fe166ed74371b";
   graniteRevision = "53090429539bf3404250d18fe58db971f0907c04";
   volkRevision = "47cddf7ed97b94118a08aacb548a411188e016cc";
   vulkanHeadersRevision = "6802bb4733b63ed5efd3adb308a6c885ef180ea1";

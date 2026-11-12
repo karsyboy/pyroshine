@@ -1,7 +1,7 @@
 # Local PyroWave patches
 
 Base: https://github.com/Themaister/pyrowave, the revision recorded in
-`../pyrowave-patches/UPSTREAM` (`7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b`).
+`../pyrowave-patches/UPSTREAM` (`a32b05e03d70826b19d4d11ff74fe166ed74371b`).
 The files the standalone library build and its tests need (CMake, the C API and
 codec sources, `shaders/`, `bitstream/`, `pkg-config/`, `tests/`, the Granite
 checkout script) are copied with their MIT license. Metal, Android, evaluation
