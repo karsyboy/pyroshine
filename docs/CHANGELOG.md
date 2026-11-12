@@ -14,6 +14,18 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.4] - 2026-11-12
+
+### Changed
+
+- **Vulkan Video encoding uses Pixelforge v0.11.0.** H.264, HEVC and AV1 frames go through Pixelforge's new frame submission API; Pyroshine's own changes to it are carried forward (two are now part of Pixelforge). Streams, bitrates and colour signalling are unchanged.
+- **PyroWave updated to upstream `a32b05e`.** Decoding is fixed on GPUs whose subgroups are narrower than 16 lanes (such as Mali); Pyrolight builds its decoder from this source.
+
+### Fixed
+
+- A capture whose render fence hangs up without signalling now fails at once instead of waiting out its timeout.
+- `moonshine-bench` exits with a failure when a run encoded no frames.
+
 ## [v0.18.3] - 2026-11-04
 
 ### Fixed
