@@ -932,10 +932,14 @@ async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 		Err(err) => failed_record(args, &args.resolution, args.fps, &args.codec, args.duration, err),
 	};
 	let unsupported = record["status"] == "unsupported";
+	let no_frames = record["status"] == "no_frames";
 	write_json(args, capabilities.as_ref(), vec![record], started);
 	result?;
 	if unsupported {
 		std::process::exit(EXIT_UNSUPPORTED);
+	}
+	if no_frames {
+		return Err(boxed_error("No frames were encoded during the benchmark session"));
 	}
 	Ok(())
 }
@@ -1056,10 +1060,13 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 				.await
 				{
 					Ok(report) => {
+						let no_frames = report.record["status"] == "no_frames";
 						records.push(report.record);
 						interrupted = report.interrupted;
 						let status = if report.interrupted {
 							MatrixStatus::Interrupted(report.summary)
+						} else if no_frames {
+							MatrixStatus::Failed("no frames were encoded".to_string())
 						} else {
 							MatrixStatus::Ok(report.summary)
 						};

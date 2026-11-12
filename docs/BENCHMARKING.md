@@ -237,7 +237,7 @@ comparable. It contains:
 | `environment` | variables that change what is measured (`MOONSHINE_PYROWAVE_LIBRARY`, `MOONSHINE_CONVENTIONAL_FRAMES_IN_FLIGHT`, `MOONSHINE_APPLICATION_UNIT`, `VK_DRIVER_FILES`, `ANV_DEBUG`, `RADV_*`, …) |
 | `capabilities` | probed GPU name, codec profiles, HDR and DMA-BUF support (with `--capabilities` or `--skip-unsupported`) |
 | `runs[].workload` | codec, resolution, FPS, bitrate, negotiated chroma/bit depth/range, HDR, encoder implementation (`pixelforge-vulkan-video` or `pyrowave`), capture mode, VRR, cursor, encryption, FEC, packet size, queue preferences, duration, warmup, application |
-| `runs[].status` | `ok`, `no_frames`, `interrupted`, `failed` (with `error`) or `unsupported` (with `reason`) |
+| `runs[].status` | `ok`, `no_frames`, `interrupted`, `failed` (with `error`) or `unsupported` (with `reason`); a `no_frames` run counts as a failure in the exit status |
 | `runs[].summary` | frames, FPS, encoded and submitted UDP Mbps, effective FEC (`fec.effective_percentage`, `fec.reduced_frames`), latency distributions (avg/min/p50/p95/p99/max µs) for `total`, `frame_age`, `submit`, `encode_wait`, `slot_wait`, `source_interval`; the average stage breakdown; frame sizes; packets; capture paths and composition reasons |
 | `runs[].pacing` | target interval, expected/delivered frames, delivery ratio, arrival-interval distribution, standard deviation, late intervals and missed frame slots |
 | `runs[].resources` | benchmark-process CPU (percent of one core) and per-engine GPU busy ms/s from DRM fdinfo over the measured window; RSS, peak RSS, threads, descriptors and DMA-BUF descriptors; device-wide busy percentage where the driver exposes it (amdgpu `gpu_busy_percent`) |

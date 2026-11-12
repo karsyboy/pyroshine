@@ -480,8 +480,14 @@ impl ExportedFrame {
 					}
 					return Err(format!("cannot wait for the compositor's render: {error}"));
 				},
-				_ if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 => {
-					return Err("the compositor's render fence reported an error".into());
+				// poll() reports a descriptor with an error or hangup as ready.
+				// A sync file only ever reports POLLIN (also for a fence that
+				// signalled with an error), so anything else is not a fence.
+				_ if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 => {
+					return Err(format!(
+						"the compositor's render fence reported poll events {:#x}",
+						poll.revents
+					));
 				},
 				_ if poll.revents & libc::POLLIN != 0 => break,
 				_ => continue,
@@ -557,7 +563,7 @@ impl ExportedFrame {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::os::fd::OwnedFd;
+	use std::os::fd::{FromRawFd, OwnedFd};
 	use std::sync::atomic::Ordering;
 
 	use smithay::backend::allocator::dmabuf::DmabufFlags;
@@ -585,6 +591,54 @@ mod tests {
 		let mut builder = Dmabuf::builder((64, 64), Fourcc::Xrgb8888, Modifier::Linear, DmabufFlags::empty());
 		assert!(builder.add_plane(file, 0, 256));
 		builder.build().unwrap()
+	}
+
+	/// A descriptor that hangs up without becoming readable is not a
+	/// signalled fence: the wait fails at once instead of spinning on POLLHUP
+	/// until the timeout.
+	#[test]
+	fn wait_ready_rejects_a_hangup_without_a_signal() {
+		let mut fds = [0; 2];
+		// SAFETY: `fds` is a valid two-element out array.
+		assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+		// SAFETY: pipe2 returned two new descriptors that nothing else owns.
+		let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+		drop(write);
+		let mut frame = ExportedFrame::from_dmabuf(
+			&source("hangup"),
+			0,
+			Arc::new(AtomicBool::new(false)),
+			FrameColorSpace::Srgb,
+			None,
+		);
+		frame.ready = Some(read);
+		let started = Instant::now();
+		let error = frame.wait_ready(Duration::from_secs(5)).unwrap_err();
+		assert!(error.contains("poll events"), "{error}");
+		assert!(started.elapsed() < Duration::from_secs(1), "waited for the timeout");
+		assert!(frame.ready.is_some(), "a failed wait keeps the fence");
+	}
+
+	/// A readable descriptor is a signalled fence.
+	#[test]
+	fn wait_ready_accepts_a_signalled_fence() {
+		let mut fds = [0; 2];
+		// SAFETY: `fds` is a valid two-element out array.
+		assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+		// SAFETY: pipe2 returned two new descriptors that nothing else owns.
+		let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+		// SAFETY: one valid byte written to the pipe this test owns.
+		assert_eq!(unsafe { libc::write(write.as_raw_fd(), [1u8].as_ptr().cast(), 1) }, 1);
+		let mut frame = ExportedFrame::from_dmabuf(
+			&source("signalled"),
+			0,
+			Arc::new(AtomicBool::new(false)),
+			FrameColorSpace::Srgb,
+			None,
+		);
+		frame.ready = Some(read);
+		frame.wait_ready(Duration::from_secs(1)).unwrap();
+		assert!(frame.ready.is_none());
 	}
 
 	#[test]
