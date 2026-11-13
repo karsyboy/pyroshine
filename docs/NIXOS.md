@@ -57,6 +57,10 @@ itself while its user is signed in to a desktop, as on other distributions.
    }
    ```
 
+   This module replaces the nixpkgs `services.moonshine` module (through
+   `disabledModules`), so use the options shown here rather than the ones on
+   search.nixos.org: for example `openFirewall` instead of `firewallInterfaces`.
+
    Set up your GPU driver through your NixOS hardware configuration. The module
    enables `hardware.graphics`, but it does not select/configure a proprietary
    NVIDIA driver for you. The built package includes the PyroWave library,

@@ -23,6 +23,36 @@ const MAX_OPUS_PAYLOAD_SIZE: usize =
 	MAX_PACKET_SIZE - std::mem::size_of::<RtpHeader>() - std::mem::size_of::<AudioFecHeader>() - 16;
 const MAX_SHARD_SIZE: usize = MAX_PACKET_SIZE.div_ceil(16) * 16;
 
+/// Moonlight's audio FEC reconstructs timestamps by adding the negotiated
+/// packet duration (in milliseconds) for each successive RTP sequence number.
+/// A wall-clock timestamp makes packets in one FEC block disagree on their base
+/// timestamp, which defeats recovery (upstream moonshine 70ed9d3/e85815d).
+#[derive(Debug)]
+struct AudioRtpClock {
+	next_timestamp_ms: u32,
+	packet_duration_ms: u32,
+}
+
+impl AudioRtpClock {
+	fn new(packet_duration_ms: u32) -> Self {
+		// Negotiation only accepts 5 or 10 ms; fall back to Pulse's 5 ms default.
+		let packet_duration_ms = match packet_duration_ms {
+			5 | 10 => packet_duration_ms,
+			_ => 5,
+		};
+		Self {
+			next_timestamp_ms: 0,
+			packet_duration_ms,
+		}
+	}
+
+	fn next_timestamp(&mut self) -> u32 {
+		let timestamp = self.next_timestamp_ms;
+		self.next_timestamp_ms = timestamp.wrapping_add(self.packet_duration_ms);
+		timestamp
+	}
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct AudioFecHeader {
@@ -73,6 +103,7 @@ impl AudioEncoder {
 				let _worker = worker;
 				inner.run(
 					sample_rate,
+					context.packet_duration_ms,
 					frame_rx,
 					frame_recycle_tx,
 					fec_encoder,
@@ -141,6 +172,7 @@ impl AudioEncoderInner {
 	fn run(
 		self,
 		sample_rate: u32,
+		packet_duration_ms: u32,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		mut fec_encoder: ReedSolomon,
@@ -167,7 +199,7 @@ impl AudioEncoderInner {
 		let mut started = false;
 		let not_started = crossbeam_channel::never::<AudioFrame>();
 		let mut sequence_number = 0u16;
-		let mut stream_start_time = std::time::Instant::now();
+		let mut rtp_clock = AudioRtpClock::new(packet_duration_ms);
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation.
 		// doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -196,7 +228,7 @@ impl AudioEncoderInner {
 			let frame = loop {
 				if !started && start.is_open() {
 					started = true;
-					stream_start_time = std::time::Instant::now();
+					rtp_clock = AudioRtpClock::new(rtp_clock.packet_duration_ms);
 					// Pre-seed the recycling pipeline with empty frames.
 					for _ in 0..3 {
 						let _ = frame_recycle_tx.send(AudioFrame {
@@ -224,7 +256,7 @@ impl AudioEncoderInner {
 						generation = command.generation;
 						keys = command.keys;
 						sequence_number = 0;
-						stream_start_time = std::time::Instant::now();
+						rtp_clock = AudioRtpClock::new(command.context.packet_duration_ms);
 						fec_encoder.reset_force();
 						for shard in &mut shards {
 							shard.fill(0);
@@ -271,8 +303,6 @@ impl AudioEncoderInner {
 				}
 			};
 
-			// TODO: Figure out the 1000 / 90 value.
-			let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
 			let encoded_size = match encoder.encode_float(&frame.buf, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {
@@ -309,6 +339,11 @@ impl AudioEncoderInner {
 				},
 				false => encoded_audio[..encoded_size].to_vec(),
 			};
+
+			// Advance only when a packet is ready to transmit, together with the
+			// sequence number: a skipped packet must not shift the FEC block's
+			// inferred base timestamp.
+			let timestamp = rtp_clock.next_timestamp();
 
 			let shard = &mut shards[sequence_number as usize % NR_DATA_SHARDS];
 
@@ -439,6 +474,38 @@ impl AudioEncoderInner {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn timestamps_match_moonlight_audio_fec_block_layout() {
+		for duration_ms in [5, 10] {
+			let mut clock = AudioRtpClock::new(duration_ms);
+			for block in 0..3u32 {
+				let timestamps: [u32; NR_DATA_SHARDS] = std::array::from_fn(|_| clock.next_timestamp());
+				let base = block * NR_DATA_SHARDS as u32 * duration_ms;
+				for (index, timestamp) in timestamps.into_iter().enumerate() {
+					assert_eq!(timestamp, base + index as u32 * duration_ms);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn timestamps_wrap_without_overflow() {
+		let mut clock = AudioRtpClock {
+			next_timestamp_ms: u32::MAX - 4,
+			packet_duration_ms: 5,
+		};
+		assert_eq!(clock.next_timestamp(), u32::MAX - 4);
+		assert_eq!(clock.next_timestamp(), 0);
+		assert_eq!(clock.next_timestamp(), 5);
+	}
+
+	#[test]
+	fn unsupported_packet_duration_falls_back_to_five_ms() {
+		let mut clock = AudioRtpClock::new(0);
+		assert_eq!(clock.next_timestamp(), 0);
+		assert_eq!(clock.next_timestamp(), 5);
+	}
 
 	/// Review 2026-10-05 PERF-001: while no client receives audio, PCM is
 	/// recycled without being encoded; encoding resumes with demand.
