@@ -14,6 +14,12 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.5] - 2026-11-13
+
+### Fixed
+
+- **Lost audio packets can be recovered again.** Audio RTP timestamps now advance by the negotiated packet duration instead of the wall clock, so Moonlight clients can rebuild a lost packet from its FEC block (from upstream Moonshine).
+
 ## [v0.18.4] - 2026-11-12
 
 ### Changed
