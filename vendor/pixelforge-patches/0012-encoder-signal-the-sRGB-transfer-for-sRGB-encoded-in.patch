@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 26 Oct 2026 20:45:28 -0400
-Subject: [PATCH] encoder: signal the sRGB transfer for sRGB-encoded input
+Subject: [PATCH 12/13] encoder: signal the sRGB transfer for sRGB-encoded
+ input
 
 Desktop and game framebuffers are sRGB-encoded, and a converter that only
 applies the YCbCr matrix keeps that encoding. Signaling it as the BT.709
@@ -15,10 +16,10 @@ code point unchanged.
  2 files changed, 29 insertions(+), 1 deletion(-)
 
 diff --git a/src/encoder/av1/session_params.rs b/src/encoder/av1/session_params.rs
-index 7d56b9d..bb4a30a 100644
+index 7ca8e2d..561256b 100644
 --- a/src/encoder/av1/session_params.rs
 +++ b/src/encoder/av1/session_params.rs
-@@ -29,6 +29,7 @@ impl Av1 {
+@@ -31,6 +31,7 @@ impl Av1 {
              _ => ash::vk::native::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_709,
          };
          let av1_transfer = match desc.transfer_characteristics {
@@ -27,10 +28,10 @@ index 7d56b9d..bb4a30a 100644
              _ => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
          };
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index 3ec6fb8..13c912a 100644
+index 0380bb8..65357be 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
-@@ -345,7 +345,7 @@ impl StreamColor {
+@@ -347,7 +347,7 @@ impl StreamColor {
  pub struct ColorDescription {
      /// Color primaries (1=BT.709, 9=BT.2020).
      pub color_primaries: u8,
@@ -39,7 +40,7 @@ index 3ec6fb8..13c912a 100644
      pub transfer_characteristics: u8,
      /// Matrix coefficients (1=BT.709, 9=BT.2020 NCL).
      pub matrix_coefficients: u8,
-@@ -358,6 +358,7 @@ impl ColorDescription {
+@@ -360,6 +360,7 @@ impl ColorDescription {
      const PRIMARIES_BT709: u8 = 1;
      const PRIMARIES_BT2020: u8 = 9;
      const TRANSFER_BT709: u8 = 1;
@@ -47,7 +48,7 @@ index 3ec6fb8..13c912a 100644
      const TRANSFER_ST2084_PQ: u8 = 16;
      const MATRIX_BT709: u8 = 1;
      const MATRIX_BT2020_NCL: u8 = 9;
-@@ -372,6 +373,22 @@ impl ColorDescription {
+@@ -374,6 +375,22 @@ impl ColorDescription {
          }
      }
  
@@ -70,7 +71,7 @@ index 3ec6fb8..13c912a 100644
      /// BT.2020 with PQ transfer function (HDR10).
      pub fn bt2020_pq() -> Self {
          Self {
-@@ -953,6 +970,16 @@ mod tests {
+@@ -1028,6 +1045,16 @@ mod tests {
              assert!(!cd.full_range);
          }
  

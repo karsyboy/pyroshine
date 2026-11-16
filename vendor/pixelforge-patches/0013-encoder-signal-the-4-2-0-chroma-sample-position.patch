@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Thu, 12 Nov 2026 11:38:22 -0500
-Subject: [PATCH] encoder: signal the producer's 4:2:0 chroma sample position
+Subject: [PATCH 13/13] encoder: signal the producer's 4:2:0 chroma sample
+ position
 
 Upstream writes chroma_sample_loc_type 0 (left) for every 4:2:0 H.264/H.265
 stream and the AV1 vertical position, which matches its own RGB conversion.
@@ -15,14 +16,14 @@ chroma_loc_info and AV1 chroma_sample_position, for 4:2:0 only.
  src/encoder/h264/session_params.rs | 16 +++----
  src/encoder/h265/session_params.rs | 14 ++++--
  src/encoder/mod.rs                 | 74 ++++++++++++++++++++++++++++++
- src/lib.rs                         |  6 +--
- 5 files changed, 98 insertions(+), 19 deletions(-)
+ src/lib.rs                         |  8 ++--
+ 5 files changed, 99 insertions(+), 20 deletions(-)
 
 diff --git a/src/encoder/av1/session_params.rs b/src/encoder/av1/session_params.rs
-index bb4a30a..7a3a5ab 100644
+index 561256b..2be6fe4 100644
 --- a/src/encoder/av1/session_params.rs
 +++ b/src/encoder/av1/session_params.rs
-@@ -70,10 +70,11 @@ impl Av1 {
+@@ -72,10 +72,11 @@ impl Av1 {
              color_primaries: av1_color_primaries,
              transfer_characteristics: av1_transfer,
              matrix_coefficients: av1_matrix,
@@ -38,10 +39,10 @@ index bb4a30a..7a3a5ab 100644
                  ash::vk::native::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN
              },
 diff --git a/src/encoder/h264/session_params.rs b/src/encoder/h264/session_params.rs
-index f9f644a..f507cba 100644
+index 1604338..eb2c1cb 100644
 --- a/src/encoder/h264/session_params.rs
 +++ b/src/encoder/h264/session_params.rs
-@@ -78,12 +78,12 @@ impl H264 {
+@@ -92,12 +92,12 @@ impl H264 {
          vui_flags.set_video_signal_type_present_flag(1);
          vui_flags.set_video_full_range_flag(if desc.full_range { 1 } else { 0 });
          vui_flags.set_color_description_present_flag(1);
@@ -60,10 +61,10 @@ index f9f644a..f507cba 100644
          // Avoid HRD with zeroed bitrates (device loss on some drivers).
          vui_flags.set_nal_hrd_parameters_present_flag(0);
          vui_flags.set_bitstream_restriction_flag(1);
-@@ -102,8 +102,8 @@ impl H264 {
+@@ -116,8 +116,8 @@ impl H264 {
              time_scale: 0,
-             max_num_reorder_frames: 0,
-             max_dec_frame_buffering: window + 1,
+             max_num_reorder_frames: reorder_delay,
+             max_dec_frame_buffering: dpb_frames,
 -            chroma_sample_loc_type_top_field: 0,
 -            chroma_sample_loc_type_bottom_field: 0,
 +            chroma_sample_loc_type_top_field: chroma_loc_type.unwrap_or(0),
@@ -72,10 +73,10 @@ index f9f644a..f507cba 100644
              pHrdParameters: ptr::null(),
          };
 diff --git a/src/encoder/h265/session_params.rs b/src/encoder/h265/session_params.rs
-index 0d55d16..99a74e4 100644
+index d9a8806..b4ea316 100644
 --- a/src/encoder/h265/session_params.rs
 +++ b/src/encoder/h265/session_params.rs
-@@ -119,6 +119,11 @@ impl H265 {
+@@ -123,6 +123,11 @@ impl H265 {
              ),
          };
  
@@ -87,7 +88,7 @@ index 0d55d16..99a74e4 100644
          let vui_flags = ash::vk::native::StdVideoH265SpsVuiFlags {
              _bitfield_align_1: [],
              _bitfield_1: ash::vk::native::StdVideoH265SpsVuiFlags::new_bitfield_1(
-@@ -128,9 +133,8 @@ impl H265 {
+@@ -132,9 +137,8 @@ impl H265 {
                  1,
                  if desc.full_range { 1 } else { 0 },
                  1,
@@ -99,7 +100,7 @@ index 0d55d16..99a74e4 100644
                  0,
                  0,
                  0,
-@@ -156,8 +160,8 @@ impl H265 {
+@@ -160,8 +164,8 @@ impl H265 {
              colour_primaries: desc.color_primaries,
              transfer_characteristics: desc.transfer_characteristics,
              matrix_coeffs: desc.matrix_coefficients,
@@ -111,10 +112,10 @@ index 0d55d16..99a74e4 100644
              reserved2: 0,
              def_disp_win_left_offset: 0,
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index 13c912a..c34eec4 100644
+index 65357be..f6c5b64 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
-@@ -351,6 +351,51 @@ pub struct ColorDescription {
+@@ -353,6 +353,51 @@ pub struct ColorDescription {
      pub matrix_coefficients: u8,
      /// Full range (true) or limited/TV range (false).
      pub full_range: bool,
@@ -166,7 +167,7 @@ index 13c912a..c34eec4 100644
  }
  
  impl ColorDescription {
-@@ -370,6 +415,7 @@ impl ColorDescription {
+@@ -372,6 +417,7 @@ impl ColorDescription {
              transfer_characteristics: Self::TRANSFER_BT709,
              matrix_coefficients: Self::MATRIX_BT709,
              full_range: false,
@@ -174,7 +175,7 @@ index 13c912a..c34eec4 100644
          }
      }
  
-@@ -386,6 +432,7 @@ impl ColorDescription {
+@@ -388,6 +434,7 @@ impl ColorDescription {
              transfer_characteristics: Self::TRANSFER_SRGB,
              matrix_coefficients: Self::MATRIX_BT709,
              full_range: false,
@@ -182,7 +183,7 @@ index 13c912a..c34eec4 100644
          }
      }
  
-@@ -396,6 +443,7 @@ impl ColorDescription {
+@@ -398,6 +445,7 @@ impl ColorDescription {
              transfer_characteristics: Self::TRANSFER_ST2084_PQ,
              matrix_coefficients: Self::MATRIX_BT2020_NCL,
              full_range: false,
@@ -190,7 +191,7 @@ index 13c912a..c34eec4 100644
          }
      }
  
-@@ -405,6 +453,12 @@ impl ColorDescription {
+@@ -407,6 +455,12 @@ impl ColorDescription {
          self
      }
  
@@ -203,7 +204,7 @@ index 13c912a..c34eec4 100644
      /// Whether this description makes the stream HDR.
      ///
      /// The PQ (ST 2084) transfer function is what decides it; primaries and
-@@ -970,6 +1024,26 @@ mod tests {
+@@ -1045,6 +1099,26 @@ mod tests {
              assert!(!cd.full_range);
          }
  
@@ -231,19 +232,21 @@ index 13c912a..c34eec4 100644
          fn test_srgb() {
              let cd = ColorDescription::srgb();
 diff --git a/src/lib.rs b/src/lib.rs
-index ff6ad1a..8f51a6e 100644
+index b7c931e..789a8c2 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -399,9 +399,9 @@ pub use decoder::{
+@@ -460,10 +460,10 @@ pub use decoder::{
  #[cfg(feature = "dmabuf")]
  pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, DmaBufPlane};
  pub use encoder::{
--    BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions, EncodeConfig, EncodeContentHint,
--    EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderCapabilities, EncoderTuningMode,
--    Frame, FrameRate, FrameType, RateControl, codec_block_size,
-+    BitDepth, ChromaFormat, ChromaLocation, Codec, ColorDescription, Dimensions, EncodeConfig,
-+    EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderCapabilities,
-+    EncoderTuningMode, Frame, FrameRate, FrameType, RateControl, codec_block_size,
+-    BFrameReferences, BFrameSupport, BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions,
+-    EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder,
+-    EncoderCapabilities, EncoderTuningMode, Frame, FrameRate, FrameType, MAX_B_FRAMES, RateControl,
+-    codec_block_size,
++    BFrameReferences, BFrameSupport, BitDepth, ChromaFormat, ChromaLocation, Codec,
++    ColorDescription, Dimensions, EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint,
++    EncodedPacket, Encoder, EncoderCapabilities, EncoderTuningMode, Frame, FrameRate, FrameType,
++    MAX_B_FRAMES, RateControl, codec_block_size,
  };
  pub use encoder::{
      Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,

@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 12 Oct 2026 16:43:18 -0400
-Subject: [PATCH] Select the capture device by DRM identity with PCI fallback
+Subject: [PATCH 04/13] Select the capture device by DRM identity with PCI
+ fallback
 
 ---
  src/lib.rs    |   2 +-
@@ -9,12 +10,12 @@ Subject: [PATCH] Select the capture device by DRM identity with PCI fallback
  2 files changed, 161 insertions(+), 1 deletion(-)
 
 diff --git a/src/lib.rs b/src/lib.rs
-index 7845bf7..ff6ad1a 100644
+index e9a15de..b7c931e 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -410,7 +410,7 @@ pub use encoder::{
+@@ -472,7 +472,7 @@ pub use encoder::{
  pub use error::PixelForgeError;
- pub use image::{YuvLayout, YuvUploader};
+ pub use image::{DownloadedFrame, YuvDownloader, YuvLayout, YuvUploader};
  pub use sync::TimelinePoint;
 -pub use vulkan::VideoContextBuilder;
 +pub use vulkan::{DeviceSelector, VideoContextBuilder};

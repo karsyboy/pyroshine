@@ -175,14 +175,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ash"
-version = "0.38.0+1.4.352"
-source = "git+https://github.com/ash-rs/ash?rev=f4c2ca3e4f6b998d5254ad101a32f024d87cdec2#f4c2ca3e4f6b998d5254ad101a32f024d87cdec2"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2529,7 +2521,6 @@ version = "0.18.5"
 dependencies = [
  "aes",
  "aes-gcm",
- "ash",
  "async-shutdown",
  "aws-lc-rs",
  "bitflags",
@@ -2564,6 +2555,7 @@ dependencies = [
  "opus",
  "pipewire",
  "pixelforge",
+ "pixelforge-ash",
  "pkcs8 0.11.0",
  "pulseaudio",
  "quinn-udp",
@@ -3029,13 +3021,22 @@ dependencies = [
 
 [[package]]
 name = "pixelforge"
-version = "0.11.0"
+version = "0.12.1"
 dependencies = [
- "ash",
  "futures-channel",
  "futures-core",
+ "pixelforge-ash",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "pixelforge-ash"
+version = "0.38.1+1.4.352.f4c2ca3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d81c4ac49b6f49a334783c30092ad10953deb6345f6e0fc287ed49f47675232"
+dependencies = [
+ "libloading 0.8.9",
 ]
 
 [[package]]

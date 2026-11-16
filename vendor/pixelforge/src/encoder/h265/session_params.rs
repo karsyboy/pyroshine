@@ -20,6 +20,10 @@ impl H265 {
         let config = &common.config;
 
         let ctb_log2_size_y: u8 = 5;
+        // 16x16. An 8x8 minimum makes streams 3% to 18% smaller, but on NVIDIA
+        // (RTX 5080, 615.78.08) it makes the encode about ten times slower:
+        // about 11 ms instead of 1 ms per 1080p frame. Vulkan has no capability
+        // that tells which minimum a driver encodes fast.
         let min_cb_log2_size_y: u8 = 4;
         let log2_min_transform_block_size: u8 = 2;
         let log2_max_transform_block_size: u8 = 5;
@@ -52,7 +56,7 @@ impl H265 {
         let dec_pic_buf_mgr = ash::vk::native::StdVideoH265DecPicBufMgr {
             max_latency_increase_plus1: [0; 7],
             max_dec_pic_buffering_minus1: [(common.dpb_slot_count - 1) as u8, 0, 0, 0, 0, 0, 0],
-            max_num_reorder_pics: [0; 7],
+            max_num_reorder_pics: [common.gop.reorder_delay() as u8, 0, 0, 0, 0, 0, 0],
         };
 
         let short_term_ref_pic_set = ash::vk::native::StdVideoH265ShortTermRefPicSet {
@@ -339,7 +343,8 @@ impl H265 {
                 .max_std_pps_count(1)
                 .parameters_add_info(&h265_add_info);
 
-        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
+            .quality_level(common.config.quality_level);
 
         let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(common.session)

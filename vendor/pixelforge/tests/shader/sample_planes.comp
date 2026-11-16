@@ -1,0 +1,45 @@
+#version 450
+// texelFetch on a bare `texture2D` (no sampler) needs this in GLSL; it is core
+// behaviour in SPIR-V, so nothing is required of the device.
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Read a decoded frame through per-plane views and write NV12 back out.
+//
+// The contrast with sample_frame.comp is the point. No sampler-YCbCr
+// conversion, no immutable sampler, no combined image sampler: two ordinary
+// single-plane textures bound as separate `texture2D` descriptors, which is
+// exactly the shape a toolchain that cannot express a ycbcr sampler produces
+// (naga, and so wgpu). A real renderer would apply the YUV to RGB matrix here;
+// this writes the samples straight through, so the result can be compared
+// byte-for-byte against the decoder's own NV12 output.
+//
+// `texelFetch` needs no sampler at all, which is also what makes the comparison
+// exact: no filtering, no chroma reconstruction, no coordinate rounding.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// PLANE_0 of the decoded picture, viewed as R8_UNORM: luma, full resolution.
+layout(set = 0, binding = 0) uniform texture2D luma;
+// PLANE_1, viewed as R8G8_UNORM: interleaved chroma, half resolution.
+layout(set = 0, binding = 1) uniform texture2D chroma;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D luma_out;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D chroma_out;
+
+layout(push_constant) uniform Push {
+    uvec2 visible;
+} push;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= push.visible.x || pixel.y >= push.visible.y) {
+        return;
+    }
+    imageStore(luma_out, ivec2(pixel), texelFetch(luma, ivec2(pixel), 0));
+
+    // One chroma sample per 2x2 luma block, so only a quarter of the
+    // invocations have chroma work to do.
+    if ((pixel.x & 1u) == 0u && (pixel.y & 1u) == 0u) {
+        ivec2 c = ivec2(pixel >> 1u);
+        imageStore(chroma_out, c, texelFetch(chroma, c, 0));
+    }
+}

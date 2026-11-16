@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Karsy <karsy@localhost>
 Date: Mon, 12 Oct 2026 15:57:05 -0400
-Subject: [PATCH] h265: complete Main 4:4:4 profile constraints in cached
+Subject: [PATCH 02/13] h265: complete Main 4:4:4 profile constraints in cached
  headers
 
 ---
@@ -12,7 +12,7 @@ Subject: [PATCH] h265: complete Main 4:4:4 profile constraints in cached
  create mode 100644 src/encoder/h265/profile.rs
 
 diff --git a/src/encoder/h265/mod.rs b/src/encoder/h265/mod.rs
-index 0c32ca8..226c294 100644
+index bf63aba..546691e 100644
 --- a/src/encoder/h265/mod.rs
 +++ b/src/encoder/h265/mod.rs
 @@ -5,6 +5,7 @@
@@ -248,10 +248,10 @@ index 0000000..f8ebae5
 +    }
 +}
 diff --git a/src/encoder/h265/session_params.rs b/src/encoder/h265/session_params.rs
-index cd562f6..0d55d16 100644
+index 4fcd6ce..d9a8806 100644
 --- a/src/encoder/h265/session_params.rs
 +++ b/src/encoder/h265/session_params.rs
-@@ -378,11 +378,16 @@ impl H265 {
+@@ -383,11 +383,16 @@ impl H265 {
          let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
          let mut feedback =
              vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);

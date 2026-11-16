@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: karsyboy <karsyboy@k-ops.cloud>
 Date: Mon, 26 Oct 2026 10:06:50 -0400
-Subject: [PATCH] live CBR controls preserve session and DPB
+Subject: [PATCH 10/13] live CBR controls preserve session and DPB
 
 ---
  src/encoder/api.rs   |  34 +++++++++-
@@ -9,18 +9,18 @@ Subject: [PATCH] live CBR controls preserve session and DPB
  2 files changed, 175 insertions(+), 2 deletions(-)
 
 diff --git a/src/encoder/api.rs b/src/encoder/api.rs
-index 98ea870..22edd17 100644
+index 06aa31c..585222e 100644
 --- a/src/encoder/api.rs
 +++ b/src/encoder/api.rs
-@@ -25,6 +25,7 @@ pub(crate) trait EncoderApi: Send {
-     fn input_image(&self) -> vk::Image;
+@@ -26,6 +26,7 @@ pub(crate) trait EncoderApi: Send {
      fn encode_frame(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
+     fn encode_frame_now(&mut self, input: FrameInput, sync: FrameSync) -> Result<EncodeFuture>;
      fn flush(&mut self) -> Result<()>;
 +    fn set_bitrate(&mut self, requested: u32) -> Result<u32>;
      fn request_idr(&mut self);
      fn invalidate_reference_frames(&mut self, first_lost_display_order: u64);
      fn set_color(&mut self, color: StreamColor) -> Result<()>;
-@@ -43,6 +44,9 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
+@@ -47,6 +48,9 @@ impl<C: VideoCodec> EncoderApi for CodecEncoder<C> {
      fn flush(&mut self) -> Result<()> {
          CodecEncoder::flush(self)
      }
@@ -30,7 +30,7 @@ index 98ea870..22edd17 100644
      fn request_idr(&mut self) {
          CodecEncoder::request_idr(self)
      }
-@@ -416,6 +420,23 @@ impl Encoder {
+@@ -439,6 +443,23 @@ impl Encoder {
          self.inner.flush()
      }
  
@@ -54,7 +54,7 @@ index 98ea870..22edd17 100644
      /// Request that the next frame be an IDR frame.
      pub fn request_idr(&mut self) {
          self.inner.request_idr()
-@@ -512,7 +533,18 @@ impl Encoder {
+@@ -543,7 +564,18 @@ impl Encoder {
      fn rebuild(&mut self, config: EncodeConfig) -> Result<()> {
          self.inner.flush()?;
          let encoded = self.inner.common().input_frame_num;
@@ -75,10 +75,10 @@ index 98ea870..22edd17 100644
          next.id = self.id;
          // A slot taken before is not a slot of the new encoder.
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index b5d22c4..c9394f7 100644
+index 375e74e..bf1e63d 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -47,6 +47,11 @@ pub(crate) const MAX_DPB_SLOTS: usize = 16;
+@@ -51,6 +51,11 @@ pub(crate) const MAX_DPB_SLOTS: usize = 16;
  pub(crate) struct EncoderCommon {
      pub context: VideoContext,
      pub config: EncodeConfig,
@@ -90,7 +90,7 @@ index b5d22c4..c9394f7 100644
  
      pub video_queue_fn: ash::khr::video_queue::Device,
      pub video_encode_fn: ash::khr::video_encode_queue::Device,
-@@ -112,7 +117,20 @@ pub(crate) struct EncoderCommon {
+@@ -122,7 +127,20 @@ pub(crate) struct EncoderCommon {
      pub rgb_input: Option<RgbFormat>,
  }
  
@@ -108,10 +108,10 @@ index b5d22c4..c9394f7 100644
 +        matches!(self.config.rate_control, RateControl::Cbr { bitrate } if bitrate != self.installed_bitrate)
 +    }
 +
-     /// Prologue: wait until the slot we are about to record over has been read
-     /// back, pull the next GOP position, and snapshot the counters this frame
-     /// will encode with.
-@@ -357,11 +375,22 @@ impl EncoderCommon {
+     /// Set up what a frame's encode reads, copying the source into the input
+     /// image of `slot` first when it has to. Returns the frame, ready to wait
+     /// for its encode, and the point where its source is free again if
+@@ -372,11 +390,22 @@ impl EncoderCommon {
  
          reset_start_timestamp(self.device(), command_buffer, timestamp_query_pool);
  
@@ -135,7 +135,7 @@ index b5d22c4..c9394f7 100644
          let mut begin_info = vk::VideoBeginCodingInfoKHR::default()
              .video_session(self.session)
              .video_session_parameters(self.session_params)
-@@ -394,6 +423,18 @@ impl EncoderCommon {
+@@ -409,6 +438,18 @@ impl EncoderCommon {
                  self.video_queue_fn
                      .cmd_control_video_coding(command_buffer, &control_info);
              }
@@ -154,7 +154,7 @@ index b5d22c4..c9394f7 100644
          }
  
          unsafe {
-@@ -561,6 +602,33 @@ impl RateControlPlan {
+@@ -657,6 +698,33 @@ fn b_frame_qp_offset(plan: &FramePlan, b_offset: u32) -> u32 {
      }
  }
  
@@ -188,15 +188,16 @@ index b5d22c4..c9394f7 100644
  /// A video codec plugged into the generic [`CodecEncoder`].
  ///
  /// Implementors are small state structs (reference lists, syntax counters,
-@@ -655,12 +723,26 @@ impl<C: VideoCodec> CodecEncoder<C> {
-         });
+@@ -919,6 +987,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
  
-         let future = self.codec.record_picture(&mut self.common, &plan)?;
+         let dpb_slot = self.common.current_dpb_slot;
+         self.codec.record_picture(&mut self.common, plan)?;
 +        self.common.installed_bitrate = cbr_bitrate(&self.common.config);
          self.common.encode_frame_num += 1;
-         self.codec.end_picture(&mut self.common, &plan);
-         self.common.advance();
-         Ok(future)
+         if plan.hidden {
+             self.common.hidden_frames.push(HiddenFrame {
+@@ -936,6 +1005,19 @@ impl<C: VideoCodec> CodecEncoder<C> {
+             .expect("record_picture submits the frame"))
      }
  
 +    /// Stage a CBR target for the next successfully submitted frame. The
@@ -212,10 +213,10 @@ index b5d22c4..c9394f7 100644
 +        Ok(accepted)
 +    }
 +
-     /// End-of-stream barrier: wait for all in-flight frames to be read back.
+     /// End-of-stream barrier: encode the frames that wait, then wait for all
+     /// in-flight frames to be read back.
      pub fn flush(&mut self) -> Result<()> {
-         self.common.pipeline.flush();
-@@ -1130,6 +1212,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1474,6 +1556,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
      let common = EncoderCommon {
          context: context.clone(),
          config: config.clone(),
@@ -224,9 +225,9 @@ index b5d22c4..c9394f7 100644
          video_queue_fn,
          video_encode_fn,
          session,
-@@ -1173,3 +1257,60 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
-         active_reference_count: max_active_reference_pictures as u32,
-     })
+@@ -1549,3 +1633,60 @@ mod tests {
+         assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 8), 12);
+     }
  }
 +
 +#[cfg(test)]

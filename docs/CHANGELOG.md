@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Changed
+
+- **Vulkan Video encoding uses Pixelforge v0.12.1.** H.264 streams keep the deblocking filter on and AV1 streams use CDEF and loop restoration, which improves picture quality at the same bitrate. Pyroshine's own changes to Pixelforge are carried forward; B-frames stay off.
+
 ## [v0.18.5] - 2026-11-13
 
 ### Fixed

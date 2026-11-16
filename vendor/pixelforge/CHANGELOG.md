@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 15-11-2026
+
+### Fixed
+
+- Make 16x16 the smallest H.265 coding block again. With 8x8, NVIDIA encodes about ten times slower (about 11 ms instead of 1 ms per 1080p frame on an RTX 5080), so latency went up. Streams are 3% to 18% larger again.
+
+## [0.12.0] - 13-11-2026
+
+### Added
+
+- Add B-frame encoding for H.264, H.265 and AV1: `EncodeConfig::with_b_frames`, `with_b_frame_references` (pyramids), `VideoContext::supports_b_frames` and `BFrameSupport`.
+- Add `EncodeConfig::with_quality_level` and `VideoContext::encode_quality_levels`.
+- Add `YuvDownloader` and `DownloadedFrame`, to copy decoded frames to CPU memory.
+- Add the `encode_gpu` example, which encodes RGB frames drawn into the application's own Vulkan image.
+- Add the `tools` workspace crate (not published), with `encode` and `decode` tools for checking the library.
+
+### Changed
+
+- **Breaking:** `EncodedPacket::dts` is an `i64`, as it starts below zero with B-frames.
+- **Breaking:** A future from `Encoder::submit` resolves with the next packet in decode order, which with B-frames is not the packet of the submitted frame.
+- Reference frame invalidation works with B-frames.
+- The H.264 encoder writes the lowest level that the stream needs, not always 4.1.
+- The AV1 encoder uses CDEF and loop restoration. Streams are 3% to 10% smaller at the same quality, and encoding is slightly slower.
+- The examples are short and show one use each. The testing options moved to the tools.
+
+### Fixed
+
+- Fix the H.264 encoder turning the deblocking filter off. Streams are about 10% smaller.
+- Fix the H.264 encoder's CBR and VBR holding the QP between 18 and 42.
+- Fix H.264 reference frame invalidation, where the next P-frame predicted from lost frames.
+- Fix the H.264 decoder's reorder depth for streams without a VUI.
+- Let the H.265 encoder use 8x8 coding blocks. Streams are 3% to 18% smaller.
+- Fix the H.265 picture order count wrapping after 256 frames between IDR frames.
+- Honour the AV1 coded picture alignment of the device in the encoder.
+- Fix AV1 `show_existing_frame` copies in the decoder starting before the slot was free.
+
 ## [0.11.0] - 06-11-2026
 
 ### Added

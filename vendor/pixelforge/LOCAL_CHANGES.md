@@ -1,7 +1,7 @@
 # Local Pixelforge patches
 
 Base: https://github.com/hgaiser/pixelforge, the revision recorded in
-`../pixelforge-patches/UPSTREAM` (v0.11.0, `b4e2d1f5c4a04e4c36d2e16e5df67c790afe4165`).
+`../pixelforge-patches/UPSTREAM` (v0.12.1, `e4ac68b73e49d7d7199fd91ad392cd6767a847b8`).
 The crate files Pyroshine builds (`Cargo.toml`, `src/`, `shader/`, license, README,
 changelog) are copied with their BSD-2-Clause license, with `benches/` and `tests/`
 so the crate builds and tests on its own: the manifest names a bench target and
@@ -10,7 +10,9 @@ it is exactly that revision plus the numbered patches in `../pixelforge-patches/
 
 `moonshine-core` keeps depending on the upstream Git tag; the workspace `[patch]` in
 the root `Cargo.toml` substitutes this directory, so `Cargo.lock` changes only the
-source of `pixelforge`. Nix builds it as part of the source tree.
+source of `pixelforge`. Nix builds it as part of the source tree. From v0.12 Pixelforge
+uses `pixelforge-ash` (a crates.io release of the ash revision it used before), so
+`moonshine-core` depends on the same package for its `ash` types.
 
 ## Changes from upstream
 
@@ -21,7 +23,7 @@ source of `pixelforge`. Nix builds it as part of the source tree.
 | `0003-encoder-capabilities-and-image-extents.patch` | Public `EncoderCapabilities::query` on upstream's `EncodeProfile`, with the coded extent and the allocated input-image extent; `Encoder::capabilities`, `coded_extent` and `input_image_extent`. | Pyroshine uses the actual image bounds without duplicating profiles or the maintained NVIDIA padding rule. Extent arithmetic rejects overflow and device-limit violations before allocating resources. |
 | `0004-select-capture-device-by-drm-and-pci-identity.patch` | Add a DRM/PCI selector to context construction and clean up the instance on failed setup. | Select the opened capture GPU, with no fallback to another GPU when support or identity is unavailable. Pyroshine independently verifies the resulting device. |
 | `0005-encoder-allocate-DPB-images-at-the-input-image-width.patch` | DPB images use the 64-aligned input-image width; pictures keep the coded extent. | NVIDIA writes reconstructed 8-bit 4:4:4 chroma with the same mis-computed pitch as patch 0001. At coded width the writes overran the DPB image: reference corruption growing over P frames (chroma errors of ~200 codes at 1440x768 H.264 4:4:4) and, when the overrun reached unmapped memory, an NVENC MMU fault (Xid 31) and `ERROR_DEVICE_LOST`. Verified on an RTX 3080 (driver 615.78). |
-| `0006-av1-code-frames-on-the-coded-picture-grid.patch` | AV1 `max_frame_*` and picture `codedExtent` use the requested size rounded up to `codedPictureAlignment` (within the coded extent); `render_size` keeps the requested size. Exposes `EncoderCapabilities::av1_frame_extent`. A display-sized DMA-BUF input is copied, not encoded in place, when the grid frame is larger. | Implementations code AV1 on that grid but read the source only within `codedExtent`. RADV (8x2) coded 1365x767 as 1368x768 with a black last row, which clients that ignore `render_size` display. |
+| `0006-av1-code-frames-on-the-coded-picture-grid.patch` | AV1 `max_frame_*` and picture `codedExtent` use the requested size rounded up to `codedPictureAlignment`, at least 8x8 (within the coded extent); `render_size` keeps the requested size. Replaces upstream v0.12's `coded_size`, which sizes only the sequence header to the grid. Exposes `EncoderCapabilities::av1_frame_extent`. A display-sized DMA-BUF input is copied, not encoded in place, when the grid frame is larger. | Implementations code AV1 on that grid but read the source only within `codedExtent`. RADV (8x2) coded 1365x767 as 1368x768 with a black last row, which clients that ignore `render_size` display. |
 | `0007-context-compute-only-selected-device-without-encode.patch` | Encode support requires `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` as well as a video encode queue family; each unsupported codec keeps a reason (`encode_unsupported_reason`); `allow_without_encode()` builds a compute/transfer-only context on the selected device; the video queue extension is enabled only with an encode or decode queue. | Intel Xe2/Xe3 (verified: Arc B390, Mesa 26.2.4) expose no Vulkan Video encode, so Pyroshine could not start there even for PyroWave, which encodes with compute. With `ANV_DEBUG=video-encode` ANV reports an encode queue family without the extensions, and device creation failed with `ERROR_EXTENSION_NOT_PRESENT`. |
 | `0008-encoder-validate-rate-control-capabilities.patch` | `EncoderCapabilities` carries the profile's `rateControlModes` and `maxBitrate`; `check_rate_control()` rejects an unsupported `RateControl` mode or a bitrate above the maximum, and encoder creation applies it. | Both are valid-usage requirements drivers do not report. ANV's Gen12 encoder (UHD 730, `ANV_DEBUG=video-encode`) offers only disabled rate control, yet a CBR encoder was created; an RTX 3080 limits H.264 and HEVC to 120 Mbps, and higher client bitrates were passed through. |
 | `0009-context-report-queue-family-foreign.patch` | Report through `has_queue_family_foreign()` whether `VK_EXT_queue_family_foreign` is enabled. | VA-API surfaces come from another driver than the Vulkan device that writes them. Their ownership transfers must use `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity. Upstream enables the extension with the `dmabuf` feature. |
@@ -37,6 +39,13 @@ Upstream v0.11.0 provides the former typed-error patch (`PixelForgeError::Vulkan
 keeps the call and result, and a lost device is always `DeviceLost`) and the
 former converter foreign-queue patch (its colour converter is now private and
 acquires shared memory from `VK_QUEUE_FAMILY_FOREIGN_EXT` when enabled).
+
+Upstream v0.12 adds B-frames (off by default; Pyroshine never enables them, since
+they add a frame of latency), turns H.264 deblocking on, drops the H.264 CBR QP
+bounds and enables AV1 CDEF and loop restoration. Its 8x8 minimum H.265 coding
+block made NVIDIA encode about ten times slower and was reverted to 16x16 in
+v0.12.1. Patch 0010 records the installed CBR bitrate after each encode in
+upstream's new encode-order flow (`encode_planned`).
 
 Pyroshine converts frames itself and submits them with
 `Encoder::submit(Frame::input(slot))` from a YUV `Source`, so none of upstream's

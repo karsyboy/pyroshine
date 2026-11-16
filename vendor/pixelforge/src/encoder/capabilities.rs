@@ -156,15 +156,15 @@ impl EncoderCapabilities {
     /// RADV (8x2 grid) coded a 1365x767 frame as 1368x768 with a black last
     /// row. Covering the whole grid encodes the caller's padding instead,
     /// which decoders that ignore `render_size` display.
+    ///
+    /// The grid is at least 8x8, AV1's mode-info block (as upstream's
+    /// `coded_size`): ANV reports no alignment yet codes 8x8-aligned frames.
     pub fn av1_frame_extent(&self, width: u32, height: u32) -> Result<vk::Extent2D> {
         let coded = self.coded_extent(Codec::AV1, width, height)?;
-        let grid = self.av1_coded_picture_alignment.unwrap_or(vk::Extent2D {
-            width: 1,
-            height: 1,
-        });
+        let grid = self.av1_coded_picture_alignment.unwrap_or_default();
         let on_grid = |value: u32, unit: u32, limit: u32| {
             value
-                .checked_next_multiple_of(unit.max(1))
+                .checked_next_multiple_of(unit.max(8))
                 .map_or(limit, |aligned| aligned.min(limit))
         };
         Ok(vk::Extent2D {
@@ -297,10 +297,12 @@ mod tests {
     #[test]
     fn av1_frames_cover_the_coded_picture_grid() {
         let mut limits = caps((1, 1), (1, 1), 8192);
-        // Without a reported grid the frame keeps the requested size.
+        // Without a reported grid (ANV reports 0x0) frames are 8x8-aligned.
         let extent = limits.av1_frame_extent(1365, 767).unwrap();
-        assert_eq!((extent.width, extent.height), (1365, 767));
-        // RADV: 8x2.
+        assert_eq!((extent.width, extent.height), (1368, 768));
+        let extent = limits.av1_frame_extent(1920, 1080).unwrap();
+        assert_eq!((extent.width, extent.height), (1920, 1080));
+        // RADV: 8x2, raised to the 8x8 minimum.
         limits.av1_coded_picture_alignment = Some(vk::Extent2D {
             width: 8,
             height: 2,
@@ -308,9 +310,15 @@ mod tests {
         let extent = limits.av1_frame_extent(1365, 767).unwrap();
         assert_eq!((extent.width, extent.height), (1368, 768));
         let extent = limits.av1_frame_extent(1366, 766).unwrap();
-        assert_eq!((extent.width, extent.height), (1368, 766));
+        assert_eq!((extent.width, extent.height), (1368, 768));
         let extent = limits.av1_frame_extent(1920, 1080).unwrap();
         assert_eq!((extent.width, extent.height), (1920, 1080));
+        limits.av1_coded_picture_alignment = Some(vk::Extent2D {
+            width: 16,
+            height: 16,
+        });
+        let extent = limits.av1_frame_extent(1920, 1080).unwrap();
+        assert_eq!((extent.width, extent.height), (1920, 1088));
         // Never beyond the coded extent (64x64 superblocks: 1408x768).
         limits.av1_coded_picture_alignment = Some(vk::Extent2D {
             width: 256,

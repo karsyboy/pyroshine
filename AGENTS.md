@@ -274,8 +274,8 @@ their own upstreams: PyroWave (`Themaister/pyrowave`, vendored with local
 patches; see `vendor/pyrowave/LOCAL_CHANGES.md`), Inputtino
 (`games-on-whales/inputtino`; see `vendor/inputtino/LOCAL_CHANGES.md`), Pixelforge
 (`hgaiser/pixelforge`, vendored with local patches; see
-`vendor/pixelforge/LOCAL_CHANGES.md`), and the Git-pinned Smithay and ash
-revisions in `Cargo.toml`.
+`vendor/pixelforge/LOCAL_CHANGES.md`), the Git-pinned Smithay revision in
+`Cargo.toml`, and `pixelforge-ash`, the ash release Pixelforge depends on.
 
 Staying reasonably compatible with upstream is an ongoing goal. Bug fixes,
 security fixes, performance, compatibility and maintenance improvements, useful

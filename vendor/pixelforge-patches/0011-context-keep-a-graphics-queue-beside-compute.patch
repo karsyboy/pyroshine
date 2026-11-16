@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 26 Oct 2026 10:22:28 -0400
-Subject: [PATCH] context: keep a graphics queue beside the compute-only family
+Subject: [PATCH 11/13] context: keep a graphics queue beside the compute-only
+ family
 
 v0.10.0 picks a compute family without graphics when the device has one
 (RADV, NVIDIA), so a context that creates its own device no longer has a

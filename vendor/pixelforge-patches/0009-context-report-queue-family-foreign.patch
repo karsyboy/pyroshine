@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Thu, 12 Nov 2026 11:35:46 -0500
-Subject: [PATCH] context: report whether VK_EXT_queue_family_foreign is
+Subject: [PATCH 09/13] context: report whether VK_EXT_queue_family_foreign is
  enabled
 
 Media APIs such as VA-API export DMA-BUF surfaces from a different driver

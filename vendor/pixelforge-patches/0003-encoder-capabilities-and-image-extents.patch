@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pyroshine Vendor Maintenance <vendor@pyroshine.invalid>
 Date: Mon, 12 Oct 2026 16:38:22 -0400
-Subject: [PATCH] Expose encoder capabilities and actual extents from shared
- profile construction
+Subject: [PATCH 03/13] Expose encoder capabilities and actual extents from
+ shared profile construction
 
 ---
  src/encoder/api.rs          |  19 +++
@@ -13,16 +13,16 @@ Subject: [PATCH] Expose encoder capabilities and actual extents from shared
  src/encoder/h265/init.rs    |   3 +-
  src/encoder/mod.rs          |   2 +
  src/encoder/resources.rs    |  32 +----
- src/lib.rs                  |   4 +-
+ src/lib.rs                  |   3 +-
  src/video.rs                |   9 --
- 10 files changed, 289 insertions(+), 76 deletions(-)
+ 10 files changed, 289 insertions(+), 75 deletions(-)
  create mode 100644 src/encoder/capabilities.rs
 
 diff --git a/src/encoder/api.rs b/src/encoder/api.rs
-index bdca213..98ea870 100644
+index 73e281f..06aa31c 100644
 --- a/src/encoder/api.rs
 +++ b/src/encoder/api.rs
-@@ -124,6 +124,25 @@ impl Encoder {
+@@ -129,6 +129,25 @@ impl Encoder {
          })
      }
  
@@ -49,26 +49,26 @@ index bdca213..98ea870 100644
      pub fn conversion(&self) -> Conversion {
          self.conversion
 diff --git a/src/encoder/av1/init.rs b/src/encoder/av1/init.rs
-index aa04ece..5d1e23d 100644
+index ce6bf5d..7ee8d16 100644
 --- a/src/encoder/av1/init.rs
 +++ b/src/encoder/av1/init.rs
 @@ -1,4 +1,4 @@
 -use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 +use super::{Av1, MIN_BITSTREAM_BUFFER_SIZE};
+ use crate::encoder::references::ReferenceSet;
  
  use crate::converter::RgbFormat;
- use crate::encoder::EncodeConfig;
-@@ -42,7 +42,8 @@ impl Av1 {
+@@ -43,7 +43,8 @@ impl Av1 {
          if rgb_input.is_some() {
              capabilities = capabilities.push(&mut rgb_caps);
          }
 -        let caps = query_video_caps(&context, profile_info, &mut capabilities)?;
 +        let mut caps = query_video_caps(&context, profile_info, &mut capabilities)?;
 +        caps.av1_coded_picture_alignment = Some(av1_caps.coded_picture_alignment);
+         check_quality_level(&config, encode_caps.max_quality_levels)?;
          let rgb_caps = rgb_input.map(|_| RgbConversionCaps::from(&rgb_caps));
  
-         let init = build_encoder_common(CommonInitRequest {
-@@ -51,7 +52,6 @@ impl Av1 {
+@@ -53,7 +54,6 @@ impl Av1 {
              profile,
              rgb_input,
              caps: &caps,
@@ -321,10 +321,10 @@ index 0000000..7c7d666
 +    }
 +}
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index f0f740f..3b6e694 100644
+index 8d16b45..f21f6d3 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -23,8 +23,8 @@ use crate::encoder::pipeline::{
+@@ -24,8 +24,8 @@ use crate::encoder::pipeline::{
  };
  use crate::encoder::profile::EncodeProfile;
  use crate::encoder::resources::{
@@ -335,7 +335,7 @@ index f0f740f..3b6e694 100644
      query_supported_video_formats, record_post_encode_dpb_barrier, reset_start_timestamp,
      upload_image_to_input,
  };
-@@ -54,6 +54,11 @@ pub(crate) struct EncoderCommon {
+@@ -58,6 +58,11 @@ pub(crate) struct EncoderCommon {
      pub session_params: vk::VideoSessionParametersKHR,
      pub session_memory: Vec<vk::DeviceMemory>,
  
@@ -347,7 +347,7 @@ index f0f740f..3b6e694 100644
      /// Coded extent (display dimensions aligned to the codec block size and the
      /// device's picture-access granularity).
      pub aligned_width: u32,
-@@ -754,8 +759,6 @@ pub(crate) struct CommonInitRequest<'a> {
+@@ -1046,8 +1051,6 @@ pub(crate) struct CommonInitRequest<'a> {
      pub rgb_input: Option<RgbFormat>,
      /// Device capabilities for this profile, resolved by [`query_video_caps`].
      pub caps: &'a DeviceVideoCaps,
@@ -356,7 +356,7 @@ index f0f740f..3b6e694 100644
      /// Upper bound on the reference window the codec's syntax allows.
      pub max_reference_window: usize,
      /// How many references one frame may predict from, from the codec's own
-@@ -790,6 +793,9 @@ pub(crate) struct DeviceVideoCaps {
+@@ -1089,6 +1092,9 @@ pub(crate) struct DeviceVideoCaps {
      pub max_active_reference_pictures: u32,
      pub flags: vk::VideoCapabilityFlagsKHR,
      pub std_header_version: vk::ExtensionProperties,
@@ -365,8 +365,8 @@ index f0f740f..3b6e694 100644
 +    pub av1_coded_picture_alignment: Option<vk::Extent2D>,
  }
  
- /// Call `vkGetPhysicalDeviceVideoCapabilitiesKHR` and return its raw result.
-@@ -837,6 +843,7 @@ pub(crate) fn query_video_caps(
+ /// Check `config.quality_level` against the device's
+@@ -1153,6 +1159,7 @@ pub(crate) fn query_video_caps(
          max_active_reference_pictures: capabilities.max_active_reference_pictures,
          flags: capabilities.flags,
          std_header_version: capabilities.std_header_version,
@@ -374,7 +374,7 @@ index f0f740f..3b6e694 100644
      })
  }
  
-@@ -880,33 +887,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1197,33 +1204,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
  
      // Align the coded extent to lcm(codec block size, device granularity), then
      // clamp up to the device minimum and re-align.
@@ -413,7 +413,7 @@ index f0f740f..3b6e694 100644
      tracing::info!(
          "Using coded extent {}x{} (granularity {}x{}, min {}x{}, max {}x{})",
          aligned_width,
-@@ -1084,7 +1071,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1426,7 +1413,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
      let pipeline = EncodePipeline::new(&PipelineConfig {
          context,
          aligned_height,
@@ -422,7 +422,7 @@ index f0f740f..3b6e694 100644
          picture_format,
          rgb_input: req.rgb_input.is_some(),
          chroma_format: config.chroma_format,
-@@ -1109,6 +1096,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1453,6 +1440,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
          session,
          session_params: vk::VideoSessionParametersKHR::null(),
          session_memory,
@@ -432,7 +432,7 @@ index f0f740f..3b6e694 100644
          aligned_height,
          pipeline,
 diff --git a/src/encoder/h264/init.rs b/src/encoder/h264/init.rs
-index c1ece12..6638719 100644
+index e27a478..1ffadc5 100644
 --- a/src/encoder/h264/init.rs
 +++ b/src/encoder/h264/init.rs
 @@ -1,4 +1,4 @@
@@ -441,7 +441,7 @@ index c1ece12..6638719 100644
  
  use crate::converter::RgbFormat;
  use crate::encoder::EncodeConfig;
-@@ -63,7 +63,6 @@ impl H264 {
+@@ -66,7 +66,6 @@ impl H264 {
              profile,
              rgb_input,
              caps: &caps,
@@ -450,16 +450,16 @@ index c1ece12..6638719 100644
              max_frame_references: h264_caps.max_p_picture_l0_reference_count as usize,
              bitstream_buffer_size,
 diff --git a/src/encoder/h265/init.rs b/src/encoder/h265/init.rs
-index 484418d..5ce0b1c 100644
+index 1fe928f..f4008b3 100644
 --- a/src/encoder/h265/init.rs
 +++ b/src/encoder/h265/init.rs
 @@ -1,4 +1,4 @@
 -use super::{CTB_SIZE, H265};
 +use super::H265;
+ use crate::encoder::references::ReferenceSet;
  
  use crate::converter::RgbFormat;
- use crate::encoder::EncodeConfig;
-@@ -62,7 +62,6 @@ impl H265 {
+@@ -64,7 +64,6 @@ impl H265 {
              profile,
              rgb_input,
              caps: &caps,
@@ -468,13 +468,13 @@ index 484418d..5ce0b1c 100644
              max_frame_references: h265_caps.max_p_picture_l0_reference_count as usize,
              bitstream_buffer_size,
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index b0ad634..3ec6fb8 100644
+index 6d667a5..0380bb8 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
-@@ -6,6 +6,8 @@
- 
+@@ -7,6 +7,8 @@
  mod api;
  pub(crate) mod av1;
+ mod bframes;
 +mod capabilities;
 +pub use capabilities::{EncoderCapabilities, codec_block_size};
  pub(crate) mod codec;
@@ -536,17 +536,16 @@ index 012f8f0..dee41ee 100644
 -    }
  }
 diff --git a/src/lib.rs b/src/lib.rs
-index ec1f8a8..7845bf7 100644
+index 9648670..e9a15de 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -400,8 +400,8 @@ pub use decoder::{
- pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, DmaBufPlane};
+@@ -462,7 +462,8 @@ pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, D
  pub use encoder::{
-     BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions, EncodeConfig, EncodeContentHint,
--    EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderTuningMode, Frame, FrameRate,
--    FrameType, RateControl,
-+    EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder, EncoderCapabilities, EncoderTuningMode,
-+    Frame, FrameRate, FrameType, RateControl, codec_block_size,
+     BFrameReferences, BFrameSupport, BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions,
+     EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder,
+-    EncoderTuningMode, Frame, FrameRate, FrameType, MAX_B_FRAMES, RateControl,
++    EncoderCapabilities, EncoderTuningMode, Frame, FrameRate, FrameType, MAX_B_FRAMES, RateControl,
++    codec_block_size,
  };
  pub use encoder::{
      Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,

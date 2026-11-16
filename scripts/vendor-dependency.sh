@@ -57,7 +57,13 @@ if [[ "${mode}" == test ]]; then
     copy="$(mktemp -d)"
     trap 'rm -rf "${copy}"' EXIT
     cp -a "${vendor}/." "${copy}/"
-    printf '\n[workspace]\n' >> "${copy}/Cargo.toml"
+    # A standalone workspace for the copy. Upstream's own `[workspace]` names
+    # its `tools` crate, which is not vendored, so keep only the root package.
+    if grep -q '^\[workspace\]' "${copy}/Cargo.toml"; then
+      sed -i '/^\[workspace\]/,/^\[/{/^members = /d}' "${copy}/Cargo.toml"
+    else
+      printf '\n[workspace]\n' >> "${copy}/Cargo.toml"
+    fi
     cargo test --manifest-path "${copy}/Cargo.toml" \
       --target-dir "${CARGO_TARGET_DIR:-${root}/target}/vendor-pixelforge" --lib
   elif [[ "${dependency}" == pyrowave ]]; then
