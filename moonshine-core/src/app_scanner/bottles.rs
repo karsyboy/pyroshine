@@ -492,6 +492,7 @@ fn build_application(config: &BottlesApplicationScannerConfig, title: &str, comm
 		post_command: config.post_command.clone(),
 		command,
 		output_scale: None,
+		working_directory: None,
 		boxart: None,
 		stdout: config.stdout.clone(),
 		stderr: config.stderr.clone(),

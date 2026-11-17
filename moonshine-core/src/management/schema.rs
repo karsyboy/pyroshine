@@ -405,6 +405,15 @@ fn application_fields() -> Vec<FieldSpec> {
 		.required()
 		.0,
 		Field::new(
+			"working_directory",
+			section,
+			"Working directory",
+			"Directory the application, and its before-launch and after-session commands, start in. Unset uses the home directory. ~ and environment variables are expanded; the directory must exist.",
+			path(true, true, true),
+		)
+		.advanced()
+		.0,
+		Field::new(
 			"mode",
 			section,
 			"Mode",
@@ -536,6 +545,30 @@ fn scanner_variants() -> Vec<ScannerVariant> {
 					FieldKind::Command {
 						placeholders: vec!["{umu_game}".into(), "{name}".into()],
 					},
+				)
+				.0,
+			],
+		),
+		variant(
+			"faugus",
+			"Faugus Launcher",
+			"Games in the Faugus Launcher library, each started in the folder holding its executable. Games using Faugus' Steam runner are left to the Steam scanner.",
+			vec![
+				Field::new(
+					"data_dir",
+					section,
+					"Faugus data directory",
+					"The directory holding games.json. Defaults to the native data directory when it holds a library, otherwise the Flatpak one (~/.var/app/io.github.Faugus.faugus-launcher/data/faugus-launcher), then the configuration directories older releases used.",
+					path(false, true, true),
+				)
+				.0,
+				scanner_command(&["{game_id}"]),
+				Field::new(
+					"include_hidden",
+					section,
+					"Include hidden games",
+					"Also offer games hidden in the Faugus library.",
+					FieldKind::Bool,
 				)
 				.0,
 			],
@@ -1248,6 +1281,7 @@ pub(crate) mod tests {
 			"title": "Game",
 			"mode": "desktop",
 			"command": ["/usr/bin/game"],
+			"working_directory": "~/Games/Game",
 			"boxart": "/tmp/art.png",
 			"output_scale": 1.5,
 		});
@@ -1258,6 +1292,7 @@ pub(crate) mod tests {
 			json!({"type": "lutris", "pga_db": "/tmp/pga.db", "command": ["lutris"]}),
 			json!({"type": "heroic", "config_dir": "/tmp/heroic", "command": ["heroic"]}),
 			json!({"type": "bottles", "data_dir": "/tmp/bottles", "command": ["bottles-cli"], "umu_command": ["bottles-cli", "umu"]}),
+			json!({"type": "faugus", "data_dir": "/tmp/faugus-launcher", "command": ["faugus-launcher"], "include_hidden": true}),
 			json!({"type": "desktop", "directories": ["/tmp"], "include_terminal": true, "resolve_icons": false}),
 		];
 		config["application_scanner"] = Value::Array(

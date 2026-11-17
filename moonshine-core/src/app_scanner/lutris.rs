@@ -126,6 +126,7 @@ pub(crate) fn scan(config: &LutrisApplicationScannerConfig) -> SourceScan {
 			post_command: config.post_command.clone(),
 			command: config.command.iter().map(|cmd| cmd.replace("{slug}", &slug)).collect(),
 			output_scale: None,
+			working_directory: None,
 			boxart: None,
 			stdout: config.stdout.clone(),
 			stderr: config.stderr.clone(),

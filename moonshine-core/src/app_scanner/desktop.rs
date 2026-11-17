@@ -270,6 +270,7 @@ fn parse_desktop_application(
 			boxart: None,
 			command,
 			output_scale: None,
+			working_directory: None,
 			pre_command: config.pre_command.clone(),
 			post_command: config.post_command.clone(),
 			stdout: config.stdout.clone(),

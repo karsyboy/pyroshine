@@ -153,6 +153,7 @@ fn discovered(
 			.map(|cmd| cmd.replace("{game_id}", &game_id))
 			.collect(),
 		output_scale: None,
+		working_directory: None,
 		boxart: None,
 		stdout: config.stdout.clone(),
 		stderr: config.stderr.clone(),

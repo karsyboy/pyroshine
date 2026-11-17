@@ -1,9 +1,9 @@
 //! Application discovery and the managed application catalog.
 //!
-//! Scanners (`steam`, `lutris`, `heroic`, `bottles`, `desktop`) read launcher metadata
-//! and report what they found per *unit*: a Steam library folder, a Heroic
-//! library file, a desktop-entry directory, the Lutris database, the Bottles
-//! Library. A unit that
+//! Scanners (`steam`, `lutris`, `heroic`, `bottles`, `faugus`, `desktop`) read
+//! launcher metadata and report what they found per *unit*: a Steam library
+//! folder, a Heroic library file, a desktop-entry directory, the Lutris database,
+//! the Bottles Library, the Faugus `games.json`. A unit that
 //! cannot be read reports an error instead of an empty list, so the catalog
 //! keeps its last known-good entries rather than dropping a library that is
 //! briefly unavailable or half-written.
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use bottles::BottlesApplicationScannerConfig;
 use desktop::DesktopApplicationScannerConfig;
+use faugus::FaugusApplicationScannerConfig;
 use heroic::HeroicApplicationScannerConfig;
 use lutris::LutrisApplicationScannerConfig;
 use steam::SteamApplicationScannerConfig;
@@ -28,6 +29,7 @@ pub(crate) mod artwork;
 pub mod bottles;
 pub mod catalog;
 pub mod desktop;
+pub mod faugus;
 pub mod heroic;
 pub(crate) mod icons;
 pub(crate) mod identity;
@@ -61,6 +63,9 @@ pub enum ApplicationScannerConfig {
 
 	/// Scans the Bottles Library.
 	Bottles(BottlesApplicationScannerConfig),
+
+	/// Scans the Faugus Launcher library.
+	Faugus(FaugusApplicationScannerConfig),
 }
 
 /// Launcher a scanner reads.
@@ -72,6 +77,7 @@ pub enum ScannerKind {
 	Lutris,
 	Heroic,
 	Bottles,
+	Faugus,
 }
 
 impl ScannerKind {
@@ -83,6 +89,7 @@ impl ScannerKind {
 			Self::Lutris => "lutris",
 			Self::Heroic => "heroic",
 			Self::Bottles => "bottles",
+			Self::Faugus => "faugus",
 		}
 	}
 
@@ -93,6 +100,7 @@ impl ScannerKind {
 			Self::Lutris => "Lutris",
 			Self::Heroic => "Heroic",
 			Self::Bottles => "Bottles",
+			Self::Faugus => "Faugus Launcher",
 		}
 	}
 
@@ -100,6 +108,7 @@ impl ScannerKind {
 	pub fn short_label(self) -> &'static str {
 		match self {
 			Self::Desktop => "Desktop",
+			Self::Faugus => "Faugus",
 			other => other.label(),
 		}
 	}
@@ -113,6 +122,7 @@ impl ApplicationScannerConfig {
 			Self::Lutris(_) => ScannerKind::Lutris,
 			Self::Heroic(_) => ScannerKind::Heroic,
 			Self::Bottles(_) => ScannerKind::Bottles,
+			Self::Faugus(_) => ScannerKind::Faugus,
 		}
 	}
 
@@ -124,6 +134,7 @@ impl ApplicationScannerConfig {
 			Self::Lutris(config) => &config.frame_limit,
 			Self::Heroic(config) => &config.frame_limit,
 			Self::Bottles(config) => &config.frame_limit,
+			Self::Faugus(config) => &config.frame_limit,
 		}
 	}
 
@@ -135,6 +146,7 @@ impl ApplicationScannerConfig {
 			Self::Lutris(config) => &config.env,
 			Self::Heroic(config) => &config.env,
 			Self::Bottles(config) => &config.env,
+			Self::Faugus(config) => &config.env,
 		}
 	}
 
@@ -145,6 +157,7 @@ impl ApplicationScannerConfig {
 			Self::Lutris(config) => config.pga_db.display().to_string(),
 			Self::Heroic(config) => config.config_dir.display().to_string(),
 			Self::Bottles(config) => config.data_dir.display().to_string(),
+			Self::Faugus(config) => config.data_dir.display().to_string(),
 			Self::Desktop(config) => config
 				.directories
 				.iter()
@@ -162,6 +175,7 @@ impl ApplicationScannerConfig {
 			Self::Lutris(config) => lutris::scan(config),
 			Self::Heroic(config) => heroic::scan(config),
 			Self::Bottles(config) => bottles::scan(config),
+			Self::Faugus(config) => faugus::scan(config),
 		}
 	}
 
@@ -173,6 +187,7 @@ impl ApplicationScannerConfig {
 			Self::Lutris(config) => lutris::watch_targets(config),
 			Self::Heroic(config) => heroic::watch_targets(config),
 			Self::Bottles(config) => bottles::watch_targets(config),
+			Self::Faugus(config) => faugus::watch_targets(config),
 		}
 	}
 
@@ -190,7 +205,8 @@ impl ApplicationScannerConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Discovered {
 	/// Launcher-native identity, unique per launcher: Steam app ID, Lutris
-	/// slug, Heroic `runner/app_name`, Bottles program ID, desktop file ID.
+	/// slug, Heroic `runner/app_name`, Bottles program ID, Faugus game ID,
+	/// desktop file ID.
 	pub native_id: String,
 	pub application: ApplicationConfig,
 	/// Further images to try, in order, when `application.boxart` is missing
@@ -330,10 +346,10 @@ pub(crate) fn expand_path(path: &std::path::Path) -> Option<PathBuf> {
 /// Identity a launcher command starts, when it is a shortcut to an
 /// application another scanner owns: `steam://rungameid/<id>`,
 /// `lutris:rungameid/<id>`, `lutris:rungame/<slug>`,
-/// `heroic://launch/<runner>/<app>`, `heroic://launch?appName=..&runner=..`
-/// or `bottles-cli run -b <bottle> -p <program>`.
+/// `heroic://launch/<runner>/<app>`, `heroic://launch?appName=..&runner=..`,
+/// `bottles-cli run -b <bottle> -p <program>` or `faugus-launcher --game <id>`.
 pub(crate) fn launcher_target(command: &[String]) -> Option<String> {
-	if let Some(target) = bottles_shortcut_target(command) {
+	if let Some(target) = bottles_shortcut_target(command).or_else(|| faugus::shortcut_target(command)) {
 		return Some(target);
 	}
 	for argument in command {

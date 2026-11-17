@@ -140,7 +140,7 @@ changes. See the [reference](CONFIGURATION.md) for command fields and scanners.
 - [Gamescope resolution](#use-gamescope-with-the-clients-resolution)
 - [Game fullscreen resolution](#match-a-games-fullscreen-resolution-to-the-stream)
 - [Flatpak Steam](#run-flatpak-steam-inside-pyroshines-compositor)
-- [Flatpak Bottles](#run-flatpak-bottles-inside-pyroshines-compositor)
+- [Flatpak Bottles or Faugus Launcher](#run-flatpak-bottles-or-faugus-launcher-inside-pyroshines-compositor)
 - [A full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Application logs](#debug-a-failing-application)
 
@@ -283,7 +283,7 @@ The separate D-Bus session prevents host portals from redirecting Flatpak to the
 physical desktop. It keeps Pyroshine's display and audio environment effective.
 Quit any existing Flatpak Steam before launching the stream.
 
-## Run Flatpak Bottles inside Pyroshine's compositor
+## Run Flatpak Bottles or Faugus Launcher inside Pyroshine's compositor
 
 Wrap the Bottles scanner's commands the same way:
 
@@ -299,6 +299,18 @@ umu_command = [
     "dbus-run-session", "--",
     "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
     "umu", "run", "--game", "{umu_game}",
+]
+```
+
+Flatpak Faugus Launcher works the same way:
+
+```toml
+[[application_scanner]]
+type = "faugus"
+command = [
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=/app/bin/faugus-launcher", "io.github.Faugus.faugus-launcher",
+    "--game", "{game_id}",
 ]
 ```
 
@@ -322,7 +334,15 @@ Or COSMIC:
 [[application]]
 title = "COSMIC Desktop"
 command = ["/usr/bin/start-cosmic"]
+env = { COSMIC_BACKEND = "winit" }
 ```
+
+Run a nested compositor as a Wayland client, not as an X11 client. Pyroshine's
+compositor gives a Wayland window the stream's resolution, but keeps an X11
+window at the size it asks for and scales it to the stream, as it does for
+games. COSMIC's compositor uses its X11 backend when `DISPLAY` is set, and its
+X11 window asks for 1280x800, so the desktop would stay at 1280x800 whatever the
+stream's resolution; `COSMIC_BACKEND = "winit"` selects its Wayland backend.
 
 Other nested compositors use the same mechanism, such as `/usr/bin/sway`.
 The packaged service supplies the runtime directory and session bus; Plasma

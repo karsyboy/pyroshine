@@ -136,6 +136,7 @@ export const scannerPresets: Record<string, Item> = {
     command: ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"],
     umu_command: ["bottles-cli", "umu", "run", "--game", "{umu_game}"],
   },
+  faugus: { command: ["faugus-launcher", "--game", "{game_id}"] },
   desktop: { directories: ["$HOME/.local/share/applications", "/usr/share/applications"], include_terminal: false, resolve_icons: true },
 };
 

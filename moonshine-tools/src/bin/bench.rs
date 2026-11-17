@@ -821,8 +821,13 @@ impl StatsAccumulator {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	// Logs go to stderr, so stdout carries only results (`--capabilities` JSON).
 	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
+		.with(
+			tracing_subscriber::fmt::layer()
+				.with_writer(std::io::stderr)
+				.with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+		)
 		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
 		.init();
 

@@ -33,6 +33,7 @@ Identities are the catalog keys described in the
 | `heroic` | store and app name | `heroic:legendary/Fortnite` |
 | `lutris` | game slug | `lutris:quake` |
 | `bottles` | program ID, or `umu:` and the UMU game for UMU entries | `bottles:3f2c9e1a-6b4d-4f8e-9a1c-2d7e5b8c0f14`, `bottles:umu:umu-1245620` |
+| `faugus` | Faugus game ID | `faugus:hades` |
 | `desktop` | desktop file ID | `desktop:org.prismlauncher.PrismLauncher.desktop` |
 
 Keep native IDs as strings. Steam store app IDs are below `0x80000000`;

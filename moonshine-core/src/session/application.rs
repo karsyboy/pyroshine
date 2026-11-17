@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
@@ -55,6 +55,13 @@ pub struct ApplicationConfig {
 	/// The command to run.
 	pub command: Vec<String>,
 
+	/// The directory to start the application in. `~` and environment
+	/// variables are expanded; the result has to be an absolute path to an
+	/// existing directory. If not set, the application starts in the home
+	/// directory. The pre and post commands run there too.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub working_directory: Option<PathBuf>,
+
 	/// Optional scale advertised by the compositor for this application's output.
 	/// The stream resolution remains the physical framebuffer size.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +105,7 @@ impl Default for ApplicationConfig {
 			mode: SessionMode::Game,
 			boxart: None,
 			command: Vec::new(),
+			working_directory: None,
 			output_scale: None,
 			pre_command: Vec::new(),
 			post_command: Vec::new(),
@@ -161,6 +169,8 @@ pub(crate) struct LaunchOptions<'a> {
 	pub program: &'a str,
 	pub args: &'a [String],
 	pub envs: &'a [String],
+	/// The expanded, absolute working directory, if one is configured.
+	pub working_directory: Option<&'a str>,
 	pub timeout: Duration,
 	pub pre_commands: &'a Vec<Vec<String>>,
 	pub post_commands: &'a Vec<Vec<String>>,
@@ -215,8 +225,13 @@ impl Application {
 			.with_hint("Set its command in the Pyroshine configuration."));
 		};
 		let args = &config.command[1..];
+		let working_directory = config
+			.working_directory
+			.as_deref()
+			.map(|directory| resolve_working_directory(&config.title, directory))
+			.transpose()?;
 
-		tracing::info!(program, ?args, "Launching application.");
+		tracing::info!(program, ?args, ?working_directory, "Launching application.");
 
 		// Connect to the user session bus.
 		let conn = Connection::session().await.map_err(|e| {
@@ -263,6 +278,7 @@ impl Application {
 			program,
 			args,
 			envs: &envs,
+			working_directory: working_directory.as_deref(),
 			timeout: Duration::from_secs(config.launch_timeout_secs),
 			pre_commands: &config.pre_command,
 			post_commands: &config.post_command,
@@ -1268,6 +1284,37 @@ fn split_standard_io(value: &Option<String>) -> (String, Option<(&'static str, S
 ///
 /// Returns the unit's object path and a watch subscribed before the unit
 /// started, so the exit monitor sees how the application ends.
+/// Expand a configured working directory and check it before launch.
+///
+/// systemd needs an absolute path, and fails the unit with a bare `CHDIR`
+/// status when the directory does not exist; checking here gives a clear error.
+fn resolve_working_directory(title: &str, directory: &Path) -> Result<String, SessionFailure> {
+	let configured = directory.to_string_lossy();
+	let invalid = |reason: String| {
+		tracing::error!(directory = %configured, "{reason}");
+		SessionFailure::new(
+			"application_working_directory_invalid",
+			format!("The working directory of \"{title}\" {reason}."),
+		)
+		.with_hint("Fix the application's working_directory in the Pyroshine configuration.")
+	};
+	let expanded =
+		shellexpand::full(&configured).map_err(|e| invalid(format!("cannot be expanded ({configured}: {e})")))?;
+	let path = Path::new(expanded.as_ref());
+	if !path.is_absolute() {
+		return Err(invalid(format!("{} is not an absolute path", path.display())));
+	}
+	if !path.is_dir() {
+		return Err(invalid(format!(
+			"{} does not exist or is not a directory",
+			path.display()
+		)));
+	}
+	path.to_str()
+		.map(str::to_string)
+		.ok_or_else(|| invalid(format!("{} is not valid UTF-8", path.display())))
+}
+
 async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<UnitWatch, SessionFailure> {
 	let internal = |message: &str| SessionFailure::see_log("application_start_failed", message.to_string());
 	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
@@ -1368,6 +1415,11 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 	}
 	if let Some((prop, path)) = stderr_path {
 		properties.push((format!("StandardError{prop}"), zvariant::Value::Str(path.into())));
+	}
+
+	// The pre and post commands run there too, as `ExecStartPre`/`ExecStopPost` do.
+	if let Some(directory) = options.working_directory {
+		properties.push(("WorkingDirectory".to_string(), zvariant::Value::Str(directory.into())));
 	}
 
 	// Only include ExecStartPre/ExecStopPost when non-empty: an empty a(sasb) array still
@@ -1732,6 +1784,7 @@ mod tests {
 				program: "sh",
 				args: &args,
 				envs: &[],
+				working_directory: None,
 				timeout: Duration::from_millis(500),
 				pre_commands: &Vec::new(),
 				post_commands: &post,
@@ -1758,6 +1811,52 @@ mod tests {
 
 	/// Launch failures and exits name the exit status systemd reported, even
 	/// though the unit is unloaded as soon as it exits.
+	/// The unit, and its pre-command, start in the configured working directory.
+	/// `MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core working_directory_reaches -- --ignored`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs a user systemd session: MOONSHINE_TEST_SYSTEMD=1"]
+	async fn working_directory_reaches_the_unit_and_its_hooks() {
+		use super::*;
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_SYSTEMD").is_some(),
+			"set MOONSHINE_TEST_SYSTEMD=1"
+		);
+		let conn = Connection::session().await.unwrap();
+		subscribe_to_systemd_signals(&conn).await.unwrap();
+		let directory = tempfile::tempdir().unwrap();
+		let resolved = resolve_working_directory("Game", directory.path()).unwrap();
+		let unit = format!("pyroshine-test-{}-working-directory.service", std::process::id());
+		// Relative paths: the files appear only if both run in the directory.
+		let args = vec!["-c".to_string(), "pwd > main.txt; exec sleep 30".to_string()];
+		let pre = vec![vec!["sh".to_string(), "-c".to_string(), "pwd > pre.txt".to_string()]];
+		let options = LaunchOptions {
+			title: "Game",
+			unit_name: &unit,
+			program: "sh",
+			args: &args,
+			envs: &[],
+			working_directory: Some(&resolved),
+			timeout: Duration::from_millis(500),
+			pre_commands: &pre,
+			post_commands: &Vec::new(),
+			stdout_value: &None,
+			stderr_value: &None,
+		};
+		start_transient_service(&conn, &options).await.unwrap();
+		let main = directory.path().join("main.txt");
+		for _ in 0..50 {
+			if main.is_file() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		stop_unit(&conn, &unit, Settled::Unloaded).await.unwrap();
+		for file in ["pre.txt", "main.txt"] {
+			let written = std::fs::read_to_string(directory.path().join(file)).unwrap();
+			assert_eq!(written.trim(), resolved, "{file}");
+		}
+	}
+
 	/// `MOONSHINE_TEST_SYSTEMD=1 cargo test -p moonshine-core exit_status -- --ignored --nocapture`
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	#[ignore = "needs a user systemd session: MOONSHINE_TEST_SYSTEMD=1"]
@@ -1782,6 +1881,7 @@ mod tests {
 				program: "sh",
 				args: &args,
 				envs: &[],
+				working_directory: None,
 				timeout: Duration::from_millis(1500),
 				pre_commands: &Vec::new(),
 				post_commands: &Vec::new(),
@@ -1810,6 +1910,7 @@ mod tests {
 			program: "pyroshine-test-no-such-program",
 			args: &[],
 			envs: &[],
+			working_directory: None,
 			timeout: Duration::from_millis(500),
 			pre_commands: &Vec::new(),
 			post_commands: &Vec::new(),
@@ -1830,6 +1931,7 @@ mod tests {
 			program: "sh",
 			args: &args,
 			envs: &[],
+			working_directory: None,
 			timeout: Duration::from_millis(200),
 			pre_commands: &Vec::new(),
 			post_commands: &Vec::new(),
@@ -1874,6 +1976,7 @@ mod tests {
 			program: "sleep",
 			args: &args,
 			envs: &[],
+			working_directory: None,
 			timeout: Duration::from_millis(200),
 			pre_commands: &Vec::new(),
 			post_commands: &Vec::new(),
@@ -2089,6 +2192,35 @@ mod tests {
 	}
 
 	use super::{ApplicationConfig, split_standard_io};
+
+	#[test]
+	fn working_directory_is_optional() {
+		let unset: ApplicationConfig = toml::from_str("title = \"Game\"\ncommand = [\"g\"]").unwrap();
+		assert_eq!(unset.working_directory, None);
+		let set: ApplicationConfig =
+			toml::from_str("title = \"Game\"\ncommand = [\"g\"]\nworking_directory = \"~/Games/Game\"").unwrap();
+		assert_eq!(set.working_directory, Some(std::path::PathBuf::from("~/Games/Game")));
+	}
+
+	#[test]
+	fn working_directory_is_expanded_and_checked() {
+		use super::resolve_working_directory as resolve;
+		use std::path::Path;
+		let tempdir = tempfile::tempdir().unwrap();
+		let directory = tempdir.path().to_str().unwrap();
+		assert_eq!(resolve("Game", tempdir.path()).unwrap(), directory);
+
+		let home = dirs::home_dir().unwrap();
+		assert_eq!(resolve("Game", Path::new("~")).unwrap(), home.to_str().unwrap());
+
+		let relative = resolve("Game", Path::new("relative/directory")).unwrap_err();
+		assert_eq!(relative.code, "application_working_directory_invalid");
+		assert!(relative.message.contains("\"Game\""), "{}", relative.message);
+		assert!(resolve("Game", &tempdir.path().join("missing")).is_err());
+		let file = tempdir.path().join("file");
+		std::fs::write(&file, b"").unwrap();
+		assert!(resolve("Game", &file).is_err());
+	}
 
 	#[test]
 	fn application_env_names_are_validated() {

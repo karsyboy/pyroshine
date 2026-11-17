@@ -226,6 +226,7 @@ At the end of the run, a final summary covers the entire session (excluding the 
 
 ### Machine-readable results
 
+Logs go to stderr, so stdout carries only results.
 `--json` writes a `pyroshine-bench/1` document. Fields are only ever added;
 a change of meaning gets a new schema version so stored baselines stay
 comparable. It contains:

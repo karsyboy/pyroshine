@@ -14,6 +14,16 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- **Faugus Launcher games.** A new `faugus` application scanner offers the games in the Faugus Launcher library (native or Flatpak) with their cover art, and starts each in the folder holding its executable, as Faugus' own window does. See [application scanners](CONFIGURATION.md#application_scanner) (from upstream Moonshine, by István Urbán).
+- **Application working directory.** `[[application]]` entries accept `working_directory`, the directory the application and its pre/post commands start in (from upstream Moonshine).
+
+### Changed
+
+- **`moonshine-bench` logs to stderr**, so stdout carries only results such as the `--capabilities` JSON (from upstream Moonshine).
+- **COSMIC desktop recipe.** The remote-desktop tip now runs COSMIC on its Wayland backend (`COSMIC_BACKEND = "winit"`), so the desktop follows the stream's resolution instead of staying at 1280x800 (from upstream Moonshine).
+
 ## [v0.18.6] - 2026-11-16
 
 ### Changed

@@ -379,6 +379,7 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 | --- | --- | --- |
 | `title` | string, required | Application name shown to clients. Also used to derive its ID, so keep titles distinct and stable. A discovered game with the same title (ignoring case) is replaced by this entry, which lets you override its command or box art. |
 | `command` | array of strings, required for Game Mode | Executable followed by arguments. Use a nonempty array and an absolute executable path. |
+| `working_directory` | optional path string, unset | Directory the application starts in, for a game that loads its data relative to where it runs. `~` and environment variables are expanded; the result must be an absolute path to an existing directory, or the launch fails. `pre_command` and `post_command` run there too. Unset starts in your home directory. |
 | `boxart` | optional path string, unset | Local cover image (PNG, JPEG, WebP, BMP or ICO). Missing art is resolved from an icon named like the title when possible. |
 | `output_scale` | optional number, effective `1.0` | Wayland output scale for this application. Finite values from `0.25` through `8.0` are accepted; other values fall back to `1.0`. The physical video resolution stays at the client's requested size. |
 | `pre_command` | array of command arrays, `[]` | Run in order before launching the app, via systemd `ExecStartPre`. A failed command can prevent launch. Every entry must name an executable found in `PATH` (or an absolute path); otherwise the launch fails and the log names the entry (for example `pre_command[1]`). |
@@ -394,7 +395,7 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 Commands are argument arrays rather than shell scripts. For shell syntax,
 variable expansion, pipes, or redirection, explicitly run a shell, for example
 `["/usr/bin/bash", "-c", "your script"]`. Do not assume `~` or `$HOME` expands
-in arbitrary argument strings or boxart paths. Empty or unresolvable hook
+in arbitrary argument strings or boxart paths (`working_directory` does expand them). Empty or unresolvable hook
 commands fail launch, with the entry named in the log. TLS paths and scanner
 source paths explicitly support shell-style path expansion.
 
@@ -464,7 +465,7 @@ All scanner types accept `pre_command`, `post_command`, `stdout`, `stderr`,
 `launch_timeout_secs`, `env` and the `frame_limit_*` overrides, with the same defaults
 and behavior as applications.
 Those values are copied to each discovered application. Scanners do not accept
-`output_scale`, `title`, or `boxart` overrides.
+`output_scale`, `title`, `boxart` or `working_directory` overrides.
 
 | `type` | Source setting | Launch setting | Discovery |
 | --- | --- | --- | --- |
@@ -472,6 +473,7 @@ Those values are copied to each discovered application. Scanners do not accept
 | `lutris` | `pga_db`: path string, defaults to the user's data directory + `/lutris/pga.db` (usually `~/.local/share/lutris/pga.db`) | `command`: required array; `{slug}` is replaced | Installed entries from the Lutris database. |
 | `heroic` | `config_dir`: path string, defaults to native Heroic config when present, otherwise an existing Flatpak Heroic config, otherwise the native path | `command`: required array; `{app_name}` and `{runner}` are replaced | Installed games across Heroic stores and sideloaded apps; excludes DLC. Native config is usually `~/.config/heroic`; Flatpak config is `~/.var/app/com.heroicgameslauncher.hgl/config/heroic`. |
 | `bottles` | `data_dir`: path string, defaults to the first of `~/.local/share/bottles` and `~/.var/app/com.usebottles.bottles/data/bottles` that holds a `library.yml` | `command`: required array; `{bottle}`, `{program_id}` and `{name}` are replaced. `umu_command`: optional array for UMU entries; `{umu_game}` and `{name}` are replaced | Programs added to the Bottles Library ("Add to Library"), not every program Bottles finds. UMU entries appear once Bottles reports them ready, and only with `umu_command`; entries Bottles starts through Steam are left to the Steam scanner. |
+| `faugus` | `data_dir`: path string, defaults to the first of `~/.local/share/faugus-launcher` and `~/.var/app/io.github.Faugus.faugus-launcher/data/faugus-launcher` that holds a `games.json`, then the same under `~/.config` and the Flatpak `config` directory, where older Faugus releases kept it | `command`: required array; `{game_id}` is replaced. `include_hidden`: boolean, `false` | Games in the [Faugus Launcher](https://github.com/Faugus/faugus-launcher) library. Each starts in the folder holding its executable (its `working_directory`), as from Faugus' own window; `faugus-launcher --game` alone keeps the caller's directory, and some games quit at once elsewhere. Hidden games are skipped unless `include_hidden = true`; games using Faugus' Steam runner are left to the Steam scanner. |
 | `desktop` | `directories`: required array of path strings | No `command` field; uses the desktop entry's `Exec` | Recursively scan `.desktop` files in the supplied directories. |
 
 Scanner source paths support `~` and environment-variable expansion. Placeholder
@@ -493,14 +495,14 @@ Steam (`userdata/*/config/grid`), then the portrait, capsule and header art
 Steam caches in `appcache/librarycache`, then the icon of a Steam desktop
 shortcut; for Lutris, cover art, banners and its shortcut icon; for Heroic, the
 cover art it cached; for Bottles, the grid art it downloaded, then the
-program's icon; for desktop entries, the entry's icon. If an image cannot
+program's icon; for Faugus, the game's cover, then its banner and icon; for desktop entries, the entry's icon. If an image cannot
 be read or decoded, the next one is used; clients show a placeholder when none
 works. Nothing is downloaded.
 
 Each discovered game keeps its client-facing ID across rescans, renames,
 reinstalls and restarts (see [Applications](MANAGEMENT.md#applications)). The
 catalog leaves out what clients do not need twice: a desktop shortcut that
-starts a Steam, Lutris, Heroic or Bottles game already in the catalog, the same game
+starts a Steam, Lutris, Heroic, Bottles or Faugus game already in the catalog, the same game
 found by two scanners of one launcher, Steam's Proton and runtime tools, and
 DLC. Games with equal titles from different launchers get the launcher in their
 title, for example `Hades (Steam)` and `Hades (Heroic)`. Individual games can be
@@ -542,6 +544,10 @@ command = ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}
 umu_command = ["bottles-cli", "umu", "run", "--game", "{umu_game}"]
 
 [[application_scanner]]
+type = "faugus"
+command = ["faugus-launcher", "--game", "{game_id}"]
+
+[[application_scanner]]
 type = "desktop"
 directories = ["$HOME/.local/share/applications", "/usr/share/applications"]
 include_terminal = false
@@ -549,7 +555,7 @@ resolve_icons = true
 ```
 
 For Flatpak Steam, see the [D-Bus wrapper recipe](TIPS.md#run-flatpak-steam-inside-pyroshines-compositor);
-Flatpak Bottles uses [the same wrapper](TIPS.md#run-flatpak-bottles-inside-pyroshines-compositor).
+Flatpak Bottles and Flatpak Faugus Launcher use [the same wrapper](TIPS.md#run-flatpak-bottles-or-faugus-launcher-inside-pyroshines-compositor).
 A bare `bottles-cli` only works for a natively installed Bottles. Bottles starts
 programs that live outside the bottle (for example on a separate game drive)
 through `wine start`, which exits at once, so the session ends shortly after
@@ -564,7 +570,7 @@ running, and clients see the change in their app list.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests, library folders and non-Steam shortcuts, the Lutris database, Heroic library files, the Bottles Library, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
+| `auto_refresh` | boolean, `true` | Watch each scanner's launcher metadata (Steam manifests, library folders and non-Steam shortcuts, the Lutris database, Heroic library files, the Bottles Library, the Faugus library and its art, desktop-entry directories) and rescan a launcher a few seconds after it changes. When `false`, the list changes only at startup and with **Rescan** in the web interface. |
 | `poll_interval_secs` | integer, `300`; `30`–`86400` | Seconds between checks for changes that file notifications cannot report, such as network file systems, a drive that is mounted later or an exhausted inotify watch limit. A check compares file metadata only; a launcher is rescanned only when it changed. |
 
 A launcher location that cannot be read (an unmounted drive holding a Steam

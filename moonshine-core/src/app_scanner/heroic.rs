@@ -285,6 +285,7 @@ pub(crate) fn scan(config: &HeroicApplicationScannerConfig) -> SourceScan {
 					.map(|cmd| cmd.replace("{app_name}", &game.app_name).replace("{runner}", runner))
 					.collect(),
 				output_scale: None,
+				working_directory: None,
 				boxart: None,
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),
