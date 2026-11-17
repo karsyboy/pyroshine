@@ -14,9 +14,11 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.18.7] - 2026-11-17
+
 ### Added
 
-- **Faugus Launcher games.** A new `faugus` application scanner offers the games in the Faugus Launcher library (native or Flatpak) with their cover art, and starts each in the folder holding its executable, as Faugus' own window does. See [application scanners](CONFIGURATION.md#application_scanner) (from upstream Moonshine, by István Urbán).
+- **Faugus Launcher games.** A new `faugus` application scanner offers the games in the Faugus Launcher library (native or Flatpak) with their cover art, and starts each in the folder holding its executable, as Faugus' own window does. See [application scanners](CONFIGURATION.md#application_scanner) (from upstream Moonshine, by István Urbán). Checked against a real Faugus 2.5.7 library; a Faugus game has not yet been streamed.
 - **Application working directory.** `[[application]]` entries accept `working_directory`, the directory the application and its pre/post commands start in (from upstream Moonshine).
 
 ### Changed
