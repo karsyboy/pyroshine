@@ -60,6 +60,11 @@ requires = ["systemd-user"]
 env = { MOONSHINE_TEST_SYSTEMD = "1" }
 
 [[test]]
+name = "session::application::tests::working_directory_reaches_the_unit_and_its_hooks"
+requires = ["systemd-user"]
+env = { MOONSHINE_TEST_SYSTEMD = "1" }
+
+[[test]]
 name = "session::compositor::color_management::tests::invalid_native_color_constructors_disconnect_only_the_offending_client"
 requires = ["render-node", "xwayland"]
 timeout = 120
