@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::session::SessionKeysReceiver;
 use crate::session::keys::KeyNonces;
 
-use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
+use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf, ShardBufferPool};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub(crate) const MAX_SHARDS: usize = 255;
@@ -204,6 +204,8 @@ pub(crate) struct Packetizer {
 	last_fec_warning: Option<Instant>,
 	/// The stream's FEC thread pool (see [`fec_thread_pool`]).
 	fec_pool: Option<Arc<rayon::ThreadPool>>,
+	/// Recycled backing allocations shared with emitted [`ShardBatch`]es.
+	shard_pool: ShardBufferPool,
 }
 
 impl Packetizer {
@@ -216,6 +218,7 @@ impl Packetizer {
 			encryption: VideoEncryption::Disabled,
 			last_fec_warning: None,
 			fec_pool: None,
+			shard_pool: Arc::default(),
 		};
 		if encrypt {
 			packetizer.encryption = packetizer.current_encryption();
@@ -434,7 +437,7 @@ impl Packetizer {
 			frame_shards += data + parity;
 		}
 		let allocated = Instant::now();
-		let mut shard_buf = ShardBuf::new(frame_shards, requested_shard_size, prefix_size);
+		let mut shard_buf = ShardBuf::from_pool(frame_shards, requested_shard_size, prefix_size, &self.shard_pool);
 		let mut block_start = 0;
 
 		let total_alloc_us = allocated.elapsed().as_micros();
@@ -623,6 +626,7 @@ impl Packetizer {
 		);
 
 		let mut all_shards = shard_buf.into_batch();
+		all_shards.set_buffer_pool(self.shard_pool.clone());
 		all_shards.set_frame_metadata(
 			frame_number,
 			encoded_data.len(),

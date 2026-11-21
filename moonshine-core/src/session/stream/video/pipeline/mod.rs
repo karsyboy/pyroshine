@@ -36,7 +36,7 @@ use crate::session::stream::video::fec::{FecController, FrameFecStatus};
 use crate::session::stream::video::gso_socket::duration_micros_u64;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::pyrowave::{
-	EncodedFrame, PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
+	PyroWaveEncoder, SOURCE_PATCHES, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
 };
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
@@ -548,7 +548,327 @@ enum ConsumerMessage {
 struct PyroWaveCompletion {
 	epoch: u64,
 	frame_number: u32,
+	rate_generation: Option<u64>,
 	send: std::time::Duration,
+}
+
+/// Captured and encoded PyroWave frame handed to the packetization consumer so
+/// Reed-Solomon FEC, encryption, and shard buffer preparation overlap with the
+/// next frame's GPU capture and encode.
+struct PyroWaveFrameContext {
+	encoded: super::pyrowave::EncodedFrame,
+	encoded_at: std::time::Instant,
+	created_at: std::time::Instant,
+	source_time: std::time::Instant,
+	pacing_origin: std::time::Instant,
+	buffer_index: usize,
+	channel_wait: std::time::Duration,
+	vrr_capture: bool,
+	capture_origin: CaptureOrigin,
+	credit: InFlightGuard,
+	outstanding: usize,
+	epoch: u64,
+	rate_generation: Option<u64>,
+	credit_waits: u64,
+	credit_wait: std::time::Duration,
+	import_cache_len: usize,
+}
+
+/// Replay of the last encoded PyroWave frame held by the packet consumer when
+/// the stream goes idle or a reconnecting client requests an IDR.
+struct PyroWaveReplayContext {
+	created_at: std::time::Instant,
+	credit: InFlightGuard,
+	outstanding: usize,
+	epoch: u64,
+	import_cache_len: usize,
+	credit_waits: u64,
+	credit_wait: std::time::Duration,
+}
+
+/// Message from the PyroWave encoding thread to its packet consumer, in
+/// submission order.
+#[allow(clippy::large_enum_variant)]
+enum PyroWaveConsumerMessage {
+	Frame(PyroWaveFrameContext),
+	ReplayLast(PyroWaveReplayContext),
+	PacingBitrate(u64),
+	ResetCounters(EpochActivation),
+}
+
+struct PyroWavePacketTarget {
+	created_at: std::time::Instant,
+	source_time: std::time::Instant,
+	pacing_origin: std::time::Instant,
+	buffer_index: usize,
+	channel_wait: std::time::Duration,
+	consumer_queue: std::time::Duration,
+	vrr_capture: bool,
+	capture_origin: CaptureOrigin,
+	new_content: bool,
+	credit: InFlightGuard,
+	outstanding: usize,
+	epoch: u64,
+	rate_generation: Option<u64>,
+	import_cache_len: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pyrowave_packet_consumer(
+	mut ctx_rx: mpsc::Receiver<PyroWaveConsumerMessage>,
+	packet_tx: mpsc::Sender<VideoPacketMessage>,
+	stats_tx: broadcast::Sender<FrameStats>,
+	completion_tx: std::sync::mpsc::SyncSender<PyroWaveCompletion>,
+	credits_in_flight: Arc<super::shard_batch::FrameCredits>,
+	network_queue: Arc<super::shard_batch::QueueDepth>,
+	encoded_pool: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+	mut packetizer: Packetizer,
+	ctx: VideoStreamContext,
+	config: VideoStreamConfig,
+	mut fec_feedback_rx: watch::Receiver<FrameFecStatus>,
+) -> Result<(), String> {
+	let mut frame_number = 0u32;
+	let mut sequence_number = 0u32;
+	let mut rtp_clock = super::rtp_clock::RtpClock::new();
+	let mut fec_controller = FecController::new(
+		config.fec_mode,
+		config.fec_percentage,
+		config.fec_min_percentage,
+		config.fec_max_percentage,
+		true,
+	);
+	let mut diagnostics = PipelineWindow::new(config.log_stats);
+	let mut last_encoded: Option<super::pyrowave::EncodedFrame> = None;
+	let return_encoded_buf = |buf: Vec<u8>| {
+		if !buf.is_empty()
+			&& let Ok(mut guard) = encoded_pool.lock()
+			&& guard.len() < 4
+		{
+			guard.push(buf);
+		}
+	};
+	let record_credit_waits = |diagnostics: &mut PipelineWindow, waits: u64, waited: std::time::Duration| {
+		for _ in 0..waits.saturating_sub(1) {
+			diagnostics.record_credit_wait(std::time::Duration::ZERO);
+		}
+		if waits > 0 {
+			diagnostics.record_credit_wait(waited);
+		}
+	};
+
+	while let Some(msg) = ctx_rx.recv().await {
+		if fec_feedback_rx.has_changed().unwrap_or(false) {
+			fec_controller.observe(*fec_feedback_rx.borrow_and_update());
+		}
+		let (encoded, target, is_replay) = match msg {
+			PyroWaveConsumerMessage::PacingBitrate(bitrate) => {
+				if packet_tx
+					.send(VideoPacketMessage::PacingBitrate(bitrate))
+					.await
+					.is_err()
+				{
+					return Err("video packet channel closed".to_string());
+				}
+				continue;
+			},
+			PyroWaveConsumerMessage::ResetCounters(EpochActivation { generation, applied }) => {
+				frame_number = 0;
+				sequence_number = 0;
+				rtp_clock.reset(std::time::Instant::now());
+				let (ready, waiting) = tokio::sync::oneshot::channel();
+				if packet_tx
+					.send(VideoPacketMessage::BeginEpoch {
+						context: ctx.clone(),
+						generation,
+						ready,
+					})
+					.await
+					.is_err()
+				{
+					let _ = applied.send(Err(()));
+					return Err("video packet channel closed".to_string());
+				}
+				let result = waiting.await.map_err(|_| ());
+				let failed = result.is_err();
+				let _ = applied.send(result);
+				if failed {
+					return Err("video epoch activation cancelled".to_string());
+				}
+				continue;
+			},
+			PyroWaveConsumerMessage::Frame(msg) => {
+				record_credit_waits(&mut diagnostics, msg.credit_waits, msg.credit_wait);
+				let consumer_queue = std::time::Instant::now().saturating_duration_since(msg.encoded_at);
+				let target = PyroWavePacketTarget {
+					created_at: msg.created_at,
+					source_time: msg.source_time,
+					pacing_origin: msg.pacing_origin,
+					buffer_index: msg.buffer_index,
+					channel_wait: msg.channel_wait,
+					consumer_queue,
+					vrr_capture: msg.vrr_capture,
+					capture_origin: msg.capture_origin,
+					new_content: true,
+					credit: msg.credit,
+					outstanding: msg.outstanding,
+					epoch: msg.epoch,
+					rate_generation: msg.rate_generation,
+					import_cache_len: msg.import_cache_len,
+				};
+				(msg.encoded, target, false)
+			},
+			PyroWaveConsumerMessage::ReplayLast(msg) => {
+				record_credit_waits(&mut diagnostics, msg.credit_waits, msg.credit_wait);
+				let Some(encoded) = last_encoded.take() else {
+					continue;
+				};
+				let target = PyroWavePacketTarget {
+					created_at: msg.created_at,
+					source_time: msg.created_at,
+					pacing_origin: msg.created_at,
+					buffer_index: usize::MAX,
+					channel_wait: std::time::Duration::ZERO,
+					consumer_queue: std::time::Duration::ZERO,
+					vrr_capture: false,
+					capture_origin: CaptureOrigin::default(),
+					new_content: false,
+					credit: msg.credit,
+					outstanding: msg.outstanding,
+					epoch: msg.epoch,
+					rate_generation: None,
+					import_cache_len: msg.import_cache_len,
+				};
+				(encoded, target, true)
+			},
+		};
+
+		frame_number = frame_number.wrapping_add(1);
+		let before_packetize = std::time::Instant::now();
+		let latency =
+			(before_packetize.duration_since(target.created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
+		let rtp_timestamp = rtp_clock.timestamp(target.source_time);
+		let source_interval = if target.new_content {
+			rtp_clock.content_interval(target.source_time)
+		} else {
+			std::time::Duration::ZERO
+		};
+		let encoded_bytes = encoded.data_size;
+		let encoded_import = encoded.import;
+		let encoded_submit = encoded.submit;
+		let encoded_wait = encoded.encode_wait;
+		let mut packetize = || {
+			packetizer.packetize(
+				&encoded.data[..encoded.data_size],
+				true,
+				ctx.packet_size,
+				fec_controller.minimum_packets(ctx.minimum_fec_packets),
+				fec_controller.percentage(),
+				frame_number,
+				&mut sequence_number,
+				rtp_timestamp,
+				latency,
+			)
+		};
+		let offload = encoded.data_size >= PACKETIZE_OFFLOAD_BYTES
+			&& tokio::runtime::Handle::current().runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread;
+		let mut shards = if offload {
+			tokio::task::block_in_place(packetize)
+		} else {
+			packetize()
+		}
+		.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
+
+		if is_replay {
+			return_encoded_buf(encoded.data);
+		} else if let Some(prev) = last_encoded.replace(encoded) {
+			return_encoded_buf(prev.data);
+		}
+
+		shards.set_pacing_origin(target.pacing_origin);
+		let packet_count = shards.shard_count();
+		let packetized = std::time::Instant::now();
+		shards.hold_until_release(target.credit);
+		shards.track_queue(network_queue.clone());
+		let stats = FrameStats {
+			channel_wait: target.channel_wait,
+			import: encoded_import,
+			convert: std::time::Duration::ZERO,
+			slot_wait: std::time::Duration::ZERO,
+			outstanding: target.outstanding.min(u8::MAX as usize) as u8,
+			submit: encoded_submit,
+			consumer_queue: target.consumer_queue,
+			encode_wait: encoded_wait,
+			packetize: packetized.duration_since(before_packetize),
+			enqueue: std::time::Duration::ZERO,
+			send: std::time::Duration::ZERO,
+			total: std::time::Duration::ZERO,
+			encoded_bytes,
+			wire_bytes: 0,
+			packet_count: 0,
+			attempted_packet_count: 0,
+			failed_packet_count: 0,
+			discarded_packet_count: 0,
+			data_shards: shards.data_shards(),
+			parity_shards: shards.parity_shards(),
+			fec_percentage: shards.fec_percentage(),
+			requested_fec_percentage: shards.requested_fec_percentage(),
+			stale_frames_dropped: 0,
+			is_key_frame: true,
+			source_interval,
+			content_age: target.created_at.saturating_duration_since(target.source_time),
+			vrr_capture: target.vrr_capture,
+			capture_origin: target.capture_origin,
+		};
+		let completion_stats = stats.clone();
+		let completion_stats_tx = stats_tx.clone();
+		let completion_tx = completion_tx.clone();
+		let completion_epoch = target.epoch;
+		let rate_generation = target.rate_generation;
+		let created_at = target.created_at;
+		shards.observe_completion(move |completion| {
+			let mut stats = completion_stats;
+			let started = completion.send_started_at.unwrap_or(completion.finished_at);
+			stats.enqueue = started.saturating_duration_since(packetized);
+			stats.send = completion.finished_at.saturating_duration_since(started);
+			stats.total = completion.finished_at.saturating_duration_since(created_at);
+			stats.wire_bytes = completion.outcome.submitted_payload_bytes;
+			stats.packet_count = completion.outcome.submitted_datagrams;
+			stats.attempted_packet_count = completion.outcome.attempted_datagrams;
+			stats.failed_packet_count = completion.outcome.failed_datagrams;
+			stats.discarded_packet_count = packet_count.saturating_sub(stats.packet_count + stats.failed_packet_count);
+			let _ = completion_tx.try_send(PyroWaveCompletion {
+				epoch: completion_epoch,
+				frame_number,
+				rate_generation,
+				send: stats.send,
+			});
+			let _ = completion_stats_tx.send(stats);
+		});
+		if packet_tx.send(VideoPacketMessage::Batch(shards)).await.is_err() {
+			return Err("video packet channel closed".to_string());
+		}
+		let queued = std::time::Instant::now();
+		tracing::trace!(
+			frame_number,
+			buffer_index = target.buffer_index,
+			encoded_bytes,
+			outstanding = target.outstanding,
+			encode_wait_us = duration_micros_u64(encoded_wait),
+			packet_channel_wait_us = duration_micros_u64(queued.duration_since(packetized)),
+			"PyroWave frame handed to the sender"
+		);
+		diagnostics.record(
+			&FrameStats {
+				send: queued.duration_since(packetized),
+				total: queued.saturating_duration_since(created_at),
+				..stats
+			},
+			credits_in_flight.outstanding(),
+			packet_tx.max_capacity() - packet_tx.capacity(),
+			Some(target.import_cache_len),
+		);
+	}
+	Ok(())
 }
 
 /// A request to activate the next client epoch: the authorization generation
@@ -1588,7 +1908,7 @@ impl VideoPipelineInner {
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 		let quality_reference_bytes =
 			quality_reference_frame_bytes(ctx.width, ctx.height, ctx.format.chroma, ctx.format.bit_depth);
-		let mut fec_controller = FecController::new(
+		let fec_controller = FecController::new(
 			self.config.fec_mode,
 			self.config.fec_percentage,
 			self.config.fec_min_percentage,
@@ -1642,36 +1962,46 @@ impl VideoPipelineInner {
 			Packetizer::new(ctx.encrypt_video, self.keys_rx.clone()).with_fec_pool(self.fec_pool.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		packetizer.set_fec_layout(ctx.fec_layout);
-		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
+		let fec_feedback_rx = self.fec_feedback_rx.clone();
 		packetizer.warm_up(
 			fec_controller.percentage(),
 			fec_controller.minimum_packets(ctx.minimum_fec_packets),
 			|| stop_session_manager.is_shutdown_triggered(),
 		);
-		let mut frame_number = 0u32;
-		let mut sequence_number = 0u32;
-		// Pacing of the last captured frame, reported for resends of it.
-		let mut last_vrr_capture = false;
-		let mut last_capture_origin = CaptureOrigin::default();
-		let mut rtp_clock = super::rtp_clock::RtpClock::new();
-		let mut last_encoded = None;
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
 		let mut consecutive_slow_sends = 0u32;
 		let mut last_slow_send_warning: Option<std::time::Instant> = None;
 		// Frames admitted and not yet transport-complete (see
 		// `DEFAULT_PYROWAVE_FRAMES_IN_FLIGHT`). Capture admission itself ends
-		// once a frame is encoded; these credits travel with each batch to the
-		// sender and wake this thread when released.
-		let credits = super::shard_batch::FrameCredits::new(pyrowave_credit_limit());
+		// once a frame is encoded; these credits travel through packetization to
+		// the sender and wake this thread when released.
+		let credits = Arc::new(super::shard_batch::FrameCredits::new(pyrowave_credit_limit()));
 		let network_queue = Arc::new(super::shard_batch::QueueDepth::default());
+		let encoded_pool: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
 		// Each batch reports its completion here once. The credits bound the
 		// number outstanding, so a send never finds the channel full.
 		let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel::<PyroWaveCompletion>(MAX_FRAMES_IN_FLIGHT);
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<PyroWaveConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
+		let consumer = ConsumerTask::new(
+			runtime,
+			runtime.spawn(run_pyrowave_packet_consumer(
+				frame_ctx_rx,
+				packet_tx,
+				stats_tx,
+				completion_tx,
+				credits.clone(),
+				network_queue,
+				encoded_pool.clone(),
+				packetizer,
+				ctx.clone(),
+				self.config.clone(),
+				fec_feedback_rx,
+			)),
+		);
 		// Counts epochs, so a completion of an older epoch cannot apply a rate
-		// staged in a newer one whose frame numbers restarted.
+		// staged in a newer one.
 		let mut epoch = 0u64;
-		let mut diagnostics = PipelineWindow::new(self.config.log_stats);
 		let mut gpu_report_started = std::time::Instant::now();
 		let mut gpu_window_frames = 0u64;
 		let mut gpu_window_encodes = 0u64;
@@ -1681,10 +2011,13 @@ impl VideoPipelineInner {
 		// Imports were released for the current pause.
 		let mut imports_released = false;
 		// A live bitrate installed in the encoder, applied once the first frame
-		// encoded with it has been sent; with the frame number of that frame
-		// once it is handed to the sender.
-		let mut pending_rate: Option<super::rate::PendingRate> = None;
-		let mut pending_rate_frame: Option<u32> = None;
+		// encoded with it has been sent; tracked by rate_generation so a newer
+		// rate never receives an older frame's completion.
+		let mut rate_generation = 0u64;
+		let mut pending_rate: Option<(u64, super::rate::PendingRate)> = None;
+		let mut pending_rate_assigned = false;
+		let mut pending_credit_waits = 0u64;
+		let mut pending_credit_wait = std::time::Duration::ZERO;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let wakes = self.demand.wakes();
@@ -1692,10 +2025,11 @@ impl VideoPipelineInner {
 			frame_rx.set_delivering(self.demand.wanted());
 			while let Ok(done) = completion_rx.try_recv() {
 				if done.epoch == epoch
-					&& pending_rate_frame == Some(done.frame_number)
-					&& let Some(rate) = pending_rate.take()
+					&& let Some((staged_gen, _)) = &pending_rate
+					&& done.rate_generation == Some(*staged_gen)
+					&& let Some((_, rate)) = pending_rate.take()
 				{
-					pending_rate_frame = None;
+					pending_rate_assigned = false;
 					rate.finish(
 						super::rate::RateState::Applied,
 						Some(u64::from(done.frame_number)),
@@ -1724,42 +2058,39 @@ impl VideoPipelineInner {
 					Ok(accepted) => {
 						// Ordered ahead of the next batch, which is the first one
 						// encoded with this budget.
-						if packet_tx
-							.blocking_send(VideoPacketMessage::PacingBitrate(accepted as u64))
+						if frame_ctx_tx
+							.blocking_send(PyroWaveConsumerMessage::PacingBitrate(accepted as u64))
 							.is_err()
 						{
 							return Err("video packet channel closed".to_string());
 						}
-						if let Some(old) = pending_rate.take() {
+						if let Some((_, old)) = pending_rate.take() {
 							old.finish(super::rate::RateState::Superseded, None, None);
 						}
+						rate_generation = rate_generation.wrapping_add(1);
 						rate.stage(u32::try_from(accepted).unwrap_or(u32::MAX));
-						pending_rate = Some(rate);
-						pending_rate_frame = None;
+						pending_rate = Some((rate_generation, rate));
+						pending_rate_assigned = false;
 					},
 					Err(error) => rate.finish(super::rate::RateState::Failed, None, Some(error)),
 				}
 			}
 			if let Ok(command) = reconfigure_rx.try_recv() {
 				frame_rx.reset();
+				drop(frame_ctx_tx);
+				consumer.join()?;
 				return Ok(LoopExit::Reconfigure(command));
-			}
-			if fec_feedback_rx.has_changed().unwrap_or(false) {
-				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 			}
 			while let Ok(activation) = reset_request_rx.try_recv() {
 				frame_rx.reset();
-				frame_number = 0;
-				sequence_number = 0;
 				epoch += 1;
-				rtp_clock.reset(std::time::Instant::now());
-				// BeginEpoch is queued behind every batch of the old epoch; the
-				// sender delivers or discards those before activating this one.
-				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(activation))?;
-				// The resumed generation negotiated its own rate; BeginEpoch
-				// restored the sender's pacing to it.
+				// The consumer orders BeginEpoch behind every batch of the old
+				// epoch so those complete or discard before activating this one.
+				frame_ctx_tx
+					.blocking_send(PyroWaveConsumerMessage::ResetCounters(activation))
+					.map_err(|_| "video consumer stopped during resume".to_string())?;
 				pending_rate = None;
-				pending_rate_frame = None;
+				pending_rate_assigned = false;
 				encoder.set_bitrate(ctx.bitrate, ctx.fps)?;
 				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
@@ -1783,6 +2114,8 @@ impl VideoPipelineInner {
 				}
 				// Release only once every encode and send has completed.
 				if self.demand.release_due() && credits.outstanding() == 0 {
+					drop(frame_ctx_tx);
+					consumer.join()?;
 					return Ok(LoopExit::Release);
 				}
 			} else {
@@ -1797,7 +2130,8 @@ impl VideoPipelineInner {
 				if !credits.wait_available(frame_interval) {
 					recv_timeout = frame_interval.saturating_sub(waited.elapsed());
 				}
-				diagnostics.record_credit_wait(waited.elapsed());
+				pending_credit_waits += 1;
+				pending_credit_wait = pending_credit_wait.saturating_add(waited.elapsed());
 			}
 			let received = if self.demand.wanted() {
 				frame_rx.recv_timeout_if(recv_timeout, credits.available())
@@ -1809,240 +2143,153 @@ impl VideoPipelineInner {
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
 			};
-			let stale_frames_dropped = 0u32;
-			// A frame credit, taken before encoding so every early exit returns it.
-			let admitted;
-			let (encoded, created_at, source_time, pacing_origin, buffer_index, channel_wait, new_content) =
-				if let Some(mut frame) = received {
-					// Demand is raised only below the bound, but a capture claimed
-					// before a replay took the last credit can still arrive. It is
-					// released unencoded rather than exceed the bound.
-					if !credits.available() {
-						frame.consumed.store(true, Ordering::Release);
-						continue;
-					}
-					admitted = credits.take();
-					if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
-						// Overlays are composited only into unscaled input. A capture
-						// that raced an extent change is dropped rather than encoded
-						// without its cursor; the next one is composited by GLES.
-						frame.consumed.store(true, Ordering::Release);
-						continue;
-					}
-					gpu_window_encodes += 1;
-					resend_last = false;
-					let received_at = std::time::Instant::now();
-					let created_at = frame.created_at;
-					let source_time = frame.source_time;
-					last_vrr_capture = frame.vrr_capture;
-					last_capture_origin = frame.origin;
-					let pacing_origin = frame.pacing_origin();
-					let buffer_index = frame.buffer_index;
-					let reusable = last_encoded
-						.take()
-						.map(|encoded: EncodedFrame| encoded.data)
-						.unwrap_or_default();
-					// A composited capture is handed over before its render finished.
-					if let Err(error) = frame.wait_ready(RENDER_READY_BOUND) {
-						let failure =
-							EncodeFailure::new(EncodeStage::Import, Recovery::Terminal, SourceAccess::Unknown, error);
+			if let Some(mut frame) = received {
+				// Demand is raised only below the bound, but a capture claimed
+				// before a replay took the last credit can still arrive. It is
+				// released unencoded rather than exceed the bound.
+				if !credits.available() {
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				}
+				let (credit, outstanding) = credits.take();
+				if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
+					// Overlays are composited only into unscaled input. A capture
+					// that raced an extent change is dropped rather than encoded
+					// without its cursor; the next one is composited by GLES.
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				}
+				gpu_window_encodes += 1;
+				resend_last = false;
+				let received_at = std::time::Instant::now();
+				let created_at = frame.created_at;
+				let source_time = frame.source_time;
+				let pacing_origin = frame.pacing_origin();
+				let buffer_index = frame.buffer_index;
+				let reusable = encoded_pool
+					.lock()
+					.ok()
+					.and_then(|mut pool| pool.pop())
+					.unwrap_or_default();
+				// A composited capture is handed over before its render finished.
+				if let Err(error) = frame.wait_ready(RENDER_READY_BOUND) {
+					let failure =
+						EncodeFailure::new(EncodeStage::Import, Recovery::Terminal, SourceAccess::Unknown, error);
+					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+					continue;
+				}
+				let encoded = match encoder.encode(&frame, reusable) {
+					Ok(encoded) => encoded,
+					Err(failure) => {
+						// PyroWave has no inter-frame references: a dropped frame
+						// needs no IDR, only the source release the failure allows.
 						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 						continue;
-					}
-					let encoded = match encoder.encode(&frame, reusable) {
-						Ok(encoded) => encoded,
-						Err(failure) => {
-							// PyroWave has no inter-frame references: a dropped frame
-							// needs no IDR, only the source release the failure allows.
-							apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-							continue;
-						},
+					},
+				};
+				failures.record_success();
+				// compute_num_packets/packetize waited for the GPU read, so the
+				// compositor buffer is no longer referenced by PyroWave.
+				frame.consumed.store(true, Ordering::Release);
+				if ctx.format.hdr {
+					// The client is told whether this frame is HDR10 or the
+					// 10-bit sRGB SDR sent to a client that presents by HDR
+					// mode. The mode travels on the control stream, apart
+					// from the frame, so such a client may convert a frame
+					// or two around a switch with the previous mode.
+					let enabled = encoder.encodes_as_hdr(frame.color_space);
+					let state = HdrModeState {
+						enabled,
+						metadata: frame.hdr_metadata.filter(|_| enabled),
 					};
-					failures.record_success();
-					// compute_num_packets/packetize waited for the GPU read, so the
-					// compositor buffer is no longer referenced by PyroWave.
-					frame.consumed.store(true, Ordering::Release);
-					if ctx.format.hdr {
-						// The client is told whether this frame is HDR10 or the
-						// 10-bit sRGB SDR sent to a client that presents by HDR
-						// mode. The mode travels on the control stream, apart
-						// from the frame, so such a client may convert a frame
-						// or two around a switch with the previous mode.
-						let enabled = encoder.encodes_as_hdr(frame.color_space);
-						let state = HdrModeState {
-							enabled,
-							metadata: frame.hdr_metadata.filter(|_| enabled),
-						};
-						let _ = hdr_metadata_tx.send_if_modified(|current| {
-							if *current != state {
-								if current.enabled != state.enabled {
-									tracing::info!(
-										"PyroWave content switched to {}",
-										if enabled { "HDR (BT.2020/PQ)" } else { "SDR (sRGB)" }
-									);
-								}
-								*current = state;
-								true
-							} else {
-								false
+					let _ = hdr_metadata_tx.send_if_modified(|current| {
+						if *current != state {
+							if current.enabled != state.enabled {
+								tracing::info!(
+									"PyroWave content switched to {}",
+									if enabled { "HDR (BT.2020/PQ)" } else { "SDR (sRGB)" }
+								);
 							}
-						});
-					}
-					last_frame_time = std::time::Instant::now();
-					// `frame` drops at the end of this branch, which ends its capture
-					// admission: the next tick may be captured while this frame is
-					// still being paced out, within the network credits.
-					(
+							*current = state;
+							true
+						} else {
+							false
+						}
+					});
+				}
+				last_frame_time = std::time::Instant::now();
+				let assigned_rate = if let Some((staged_gen, _)) = &pending_rate
+					&& !pending_rate_assigned
+				{
+					pending_rate_assigned = true;
+					Some(*staged_gen)
+				} else {
+					None
+				};
+				let credit_waits = std::mem::take(&mut pending_credit_waits);
+				let credit_wait = std::mem::take(&mut pending_credit_wait);
+				let vrr_capture = frame.vrr_capture;
+				let capture_origin = frame.origin;
+				if frame_ctx_tx
+					.blocking_send(PyroWaveConsumerMessage::Frame(PyroWaveFrameContext {
 						encoded,
+						encoded_at: last_frame_time,
 						created_at,
 						source_time,
 						pacing_origin,
 						buffer_index,
-						received_at.saturating_duration_since(created_at),
-						true,
-					)
-				} else if resend_last && credits.available() && self.demand.may_replay(2 * frame_interval) {
-					let Some(encoded) = last_encoded.take() else {
-						continue;
-					};
-					resend_last = false;
-					let now = std::time::Instant::now();
-					// A resend shows the last content again now.
-					admitted = credits.take();
-					(encoded, now, now, now, usize::MAX, std::time::Duration::ZERO, false)
-				} else {
-					if !self.demand.wanted() {
-						// No client: captures are not requested, so none arrive.
-						last_frame_time = std::time::Instant::now();
-					} else if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
-						tracing::warn!("No frames received for 5 seconds");
-						last_frame_time = std::time::Instant::now();
+						channel_wait: received_at.saturating_duration_since(created_at),
+						vrr_capture,
+						capture_origin,
+						credit,
+						outstanding,
+						epoch,
+						rate_generation: assigned_rate,
+						credit_waits,
+						credit_wait,
+						import_cache_len: encoder.import_cache_len(),
+					}))
+					.is_err()
+				{
+					if stop_session_manager.is_shutdown_triggered() {
+						break;
 					}
-					continue;
-				};
-
-			frame_number = frame_number.wrapping_add(1);
-			let before_packetize = std::time::Instant::now();
-			let latency = (before_packetize.duration_since(created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
-			let rtp_timestamp = rtp_clock.timestamp(source_time);
-			let source_interval = if new_content {
-				rtp_clock.content_interval(source_time)
-			} else {
-				std::time::Duration::ZERO
-			};
-			// Wire version 1 transports one complete encoded frame through the
-			// ordinary GameStream packetizer. The client reassembles the decode
-			// unit before passing it to PyroWave.
-			let mut shards = packetizer
-				.packetize(
-					&encoded.data[..encoded.data_size],
-					true,
-					ctx.packet_size,
-					fec_controller.minimum_packets(ctx.minimum_fec_packets),
-					fec_controller.percentage(),
-					frame_number,
-					&mut sequence_number,
-					rtp_timestamp,
-					latency,
-				)
-				.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
-			// Anchor transport pacing before composition, when present. GLES fence
-			// waiting and encoding consume this frame's pacing window instead of being added
-			// on top of it, preserving the negotiated frame cadence.
-			shards.set_pacing_origin(pacing_origin);
-
-			let (credit, outstanding) = admitted;
-			let packet_count = shards.shard_count();
-			let packetized = std::time::Instant::now();
-			// The batch owns this frame's credit until its transport completes,
-			// fails or is discarded with its epoch. Meanwhile this thread goes on
-			// to the next capture.
-			shards.hold_until_release(credit);
-			shards.track_queue(network_queue.clone());
-			let stats = FrameStats {
-				channel_wait,
-				import: encoded.import,
-				convert: std::time::Duration::ZERO,
-				slot_wait: std::time::Duration::ZERO,
-				outstanding: outstanding.min(u8::MAX as usize) as u8,
-				submit: encoded.submit,
-				consumer_queue: std::time::Duration::ZERO,
-				encode_wait: encoded.encode_wait,
-				packetize: packetized.duration_since(before_packetize),
-				enqueue: std::time::Duration::ZERO,
-				send: std::time::Duration::ZERO,
-				total: std::time::Duration::ZERO,
-				encoded_bytes: encoded.data_size,
-				wire_bytes: 0,
-				packet_count: 0,
-				attempted_packet_count: 0,
-				failed_packet_count: 0,
-				discarded_packet_count: 0,
-				data_shards: shards.data_shards(),
-				parity_shards: shards.parity_shards(),
-				fec_percentage: shards.fec_percentage(),
-				requested_fec_percentage: shards.requested_fec_percentage(),
-				stale_frames_dropped,
-				is_key_frame: true,
-				source_interval,
-				content_age: created_at.saturating_duration_since(source_time),
-				vrr_capture: last_vrr_capture,
-				capture_origin: last_capture_origin,
-			};
-			let completion_stats = stats.clone();
-			let completion_stats_tx = stats_tx.clone();
-			let completion_tx = completion_tx.clone();
-			let completion_epoch = epoch;
-			shards.observe_completion(move |completion| {
-				let mut stats = completion_stats;
-				let started = completion.send_started_at.unwrap_or(completion.finished_at);
-				stats.enqueue = started.saturating_duration_since(packetized);
-				stats.send = completion.finished_at.saturating_duration_since(started);
-				stats.total = completion.finished_at.saturating_duration_since(created_at);
-				stats.wire_bytes = completion.outcome.submitted_payload_bytes;
-				stats.packet_count = completion.outcome.submitted_datagrams;
-				stats.attempted_packet_count = completion.outcome.attempted_datagrams;
-				stats.failed_packet_count = completion.outcome.failed_datagrams;
-				stats.discarded_packet_count =
-					packet_count.saturating_sub(stats.packet_count + stats.failed_packet_count);
-				let _ = completion_tx.try_send(PyroWaveCompletion {
-					epoch: completion_epoch,
-					frame_number,
-					send: stats.send,
-				});
-				let _ = completion_stats_tx.send(stats);
-			});
-			if new_content && pending_rate.is_some() && pending_rate_frame.is_none() {
-				pending_rate_frame = Some(frame_number);
-			}
-			if packet_tx.blocking_send(VideoPacketMessage::Batch(shards)).is_err() {
-				if stop_session_manager.is_shutdown_triggered() {
-					return Ok(LoopExit::Stop);
+					return Err("video consumer stopped".to_string());
 				}
-				return Err("video packet channel closed".to_string());
+			} else if resend_last && credits.available() && self.demand.may_replay(2 * frame_interval) {
+				resend_last = false;
+				let now = std::time::Instant::now();
+				let (credit, outstanding) = credits.take();
+				let credit_waits = std::mem::take(&mut pending_credit_waits);
+				let credit_wait = std::mem::take(&mut pending_credit_wait);
+				if frame_ctx_tx
+					.blocking_send(PyroWaveConsumerMessage::ReplayLast(PyroWaveReplayContext {
+						created_at: now,
+						credit,
+						outstanding,
+						epoch,
+						import_cache_len: encoder.import_cache_len(),
+						credit_waits,
+						credit_wait,
+					}))
+					.is_err()
+				{
+					if stop_session_manager.is_shutdown_triggered() {
+						break;
+					}
+					return Err("video consumer stopped".to_string());
+				}
+			} else {
+				if !self.demand.wanted() {
+					// No client: captures are not requested, so none arrive.
+					last_frame_time = std::time::Instant::now();
+				} else if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+					tracing::warn!("No frames received for 5 seconds");
+					last_frame_time = std::time::Instant::now();
+				}
+				continue;
 			}
-			let queued = std::time::Instant::now();
-			tracing::trace!(
-				frame_number,
-				buffer_index,
-				encoded_bytes = encoded.data_size,
-				outstanding,
-				encode_wait_us = duration_micros_u64(encoded.encode_wait),
-				packet_channel_wait_us = duration_micros_u64(queued.duration_since(packetized)),
-				"PyroWave frame handed to the sender"
-			);
-			// Transport time is reported at completion (FrameStats, the sender's
-			// transport summary); this window ends at the handoff.
-			diagnostics.record(
-				&FrameStats {
-					send: queued.duration_since(packetized),
-					total: queued.saturating_duration_since(created_at),
-					..stats
-				},
-				credits.outstanding(),
-				packet_tx.max_capacity() - packet_tx.capacity(),
-				Some(encoder.import_cache_len()),
-			);
+
 			gpu_window_frames += 1;
 			if self.config.log_stats && gpu_report_started.elapsed() >= std::time::Duration::from_secs(5) {
 				let seconds = gpu_report_started.elapsed().as_secs_f64();
@@ -2051,8 +2298,9 @@ impl VideoPipelineInner {
 				gpu_window_encodes = 0;
 				gpu_report_started = std::time::Instant::now();
 			}
-			last_encoded = Some(encoded);
 		}
+		drop(frame_ctx_tx);
+		consumer.join()?;
 		Ok(LoopExit::Stop)
 	}
 
