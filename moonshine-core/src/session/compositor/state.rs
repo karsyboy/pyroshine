@@ -283,7 +283,7 @@ enum SceneRenderList {
 }
 
 impl SceneRenderList {
-	fn for_each_element_mut(&mut self, mut f: impl FnMut(&mut OutputRenderElements)) {
+	fn for_each_element_mut(&mut self, f: impl FnMut(&mut OutputRenderElements)) {
 		match self {
 			Self::Unscaled(list) => list.iter_mut().for_each(f),
 			Self::Scaled(list) => list.iter_mut().map(|(e, _)| e).for_each(f),
@@ -2905,13 +2905,11 @@ impl MoonshineCompositor {
 	) -> Result<(), DirectReject> {
 		// Scene eligibility has proved that this opaque top window covers all
 		// other windows, except a notification composited as a layer.
-		let Some(window) = self.direct_source_window(true) else {
-			return Err(DirectReject::NoSurface);
-		};
+		let window = self.direct_source_window(true).ok_or(DirectReject::NoSurface)?.clone();
 		// Retain the origin safeguard inside the technical export path too.
 		if self
 			.space
-			.element_geometry(window)
+			.element_geometry(&window)
 			.is_none_or(|geo| geo.loc != Point::from((0, 0)))
 		{
 			return Err(DirectReject::OutputOrigin);
