@@ -277,6 +277,27 @@ type SceneTransform = (
 	smithay::utils::Point<i32, smithay::utils::Physical>,
 );
 
+enum SceneRenderList {
+	Unscaled(Vec<OutputRenderElements>),
+	Scaled(Vec<(OutputRenderElements, Option<SceneTransform>)>),
+}
+
+impl SceneRenderList {
+	fn for_each_element_mut(&mut self, mut f: impl FnMut(&mut OutputRenderElements)) {
+		match self {
+			Self::Unscaled(list) => list.iter_mut().for_each(f),
+			Self::Scaled(list) => list.iter_mut().map(|(e, _)| e).for_each(f),
+		}
+	}
+
+	fn len(&self) -> usize {
+		match self {
+			Self::Unscaled(list) => list.len(),
+			Self::Scaled(list) => list.len(),
+		}
+	}
+}
+
 /// Central compositor state for Moonshine's headless compositor.
 ///
 /// Runs on a dedicated calloop thread. All Smithay delegate_*! macros
@@ -1112,8 +1133,10 @@ impl MoonshineCompositor {
 		output: &Output,
 		layers: SceneLayers<'_>,
 		opacity: impl Fn(&smithay::desktop::Window) -> f32,
-		transform: impl Fn(&smithay::desktop::Window) -> Option<SceneTransform>,
-		elements: &mut Vec<(OutputRenderElements, Option<SceneTransform>)>,
+		mut render_element: impl FnMut(
+			SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+			&smithay::desktop::Window,
+		),
 	) {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
@@ -1121,27 +1144,31 @@ impl MoonshineCompositor {
 			return;
 		};
 
-		let mut render_window = |elements: &mut Vec<(OutputRenderElements, Option<SceneTransform>)>,
-		                         window: &smithay::desktop::Window| {
+		let mut render_window = |window: &smithay::desktop::Window| {
 			let alpha = opacity(window);
 			if alpha == 0.0 {
 				return;
 			}
 			let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
-			let transform = transform(window);
 
-			elements.extend(
-				window
-					.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
-						renderer, location, scale, alpha,
-					)
-					.into_iter()
-					.map(|e| (OutputRenderElements::Space(e, None), transform)),
-			);
+			for e in window
+				.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
+					renderer, location, scale, alpha,
+				) {
+				render_element(e, window);
+			}
 		};
 
 		// Preserve space order for ordinary windows, then paint classified
 		// layers. Dropdowns and Steam surfaces must remain above decorations.
+		let has_classified = !layers.decorations.is_empty() || layers.upper.iter().any(|w| w.is_some());
+		if !has_classified {
+			for window in space.elements().rev() {
+				render_window(window);
+			}
+			return;
+		}
+
 		let mut paint_order: Vec<&smithay::desktop::Window> = space.elements().collect();
 		let mut ordinary_len = paint_order.len();
 		for window in layers.decorations.iter().chain(layers.upper.into_iter().flatten()) {
@@ -1165,7 +1192,7 @@ impl MoonshineCompositor {
 
 		// Render elements are front to back (the topmost comes first).
 		for window in paint_order.into_iter().rev() {
-			render_window(elements, window);
+			render_window(window);
 		}
 	}
 
@@ -1593,15 +1620,15 @@ impl MoonshineCompositor {
 	/// cropped, multi-surface, multi-plane or unsupported formats). A DMA-BUF
 	/// layer also returns the client buffer to hold until the encoder read it.
 	fn notification_overlay(&mut self) -> Result<Option<(super::frame::FrameOverlay, Option<HeldBuffer>)>, ()> {
-		let Some(window) = self.notification_window.clone() else {
+		let Some(window) = self.notification_window.as_ref() else {
 			return Ok(None);
 		};
 		let opacity = self
 			.window_metadata
-			.get(&window)
+			.get(window)
 			.map(|m| m.opacity as f32 / 255.0)
 			.unwrap_or(1.0);
-		if opacity == 0.0 || !self.space.elements().any(|w| w == &window) {
+		if opacity == 0.0 || !self.space.elements().any(|w| w == window) {
 			return Ok(None);
 		}
 		let Some(output_geo) = self.space.output_geometry(&self.output) else {
@@ -2365,11 +2392,14 @@ impl MoonshineCompositor {
 		// mutable borrow from renderer.bind(). This avoids a borrow
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
-		let source_surface = self
-			.focused_window
-			.as_ref()
-			.filter(|window| self.space.elements().any(|w| w == *window))
-			.and_then(|window| window.wl_surface().map(|s| s.into_owned()));
+		let source_surface = if self.hdr {
+			self.focused_window
+				.as_ref()
+				.filter(|window| self.space.elements().any(|w| w == *window))
+				.and_then(|window| window.wl_surface().map(|s| s.into_owned()))
+		} else {
+			None
+		};
 		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&self.buffer_pool[idx].as_ref().expect("acquired capture slot").dmabuf,
 			idx,
@@ -2391,15 +2421,18 @@ impl MoonshineCompositor {
 		// their own transforms; every other window shares the focus window's.
 		let base_transform = self.compute_output_scale();
 		let layer_transforms = [
-			self.overlay_window.clone(),
-			self.notification_window.clone(),
-			self.external_overlay_window.clone(),
+			self.overlay_window.as_ref(),
+			self.notification_window.as_ref(),
+			self.external_overlay_window.as_ref(),
 		]
 		.map(|window| {
-			let transform = window.as_ref().and_then(|w| self.layer_output_scale(w));
+			let transform = window.and_then(|w| self.layer_output_scale(w));
 			(window, transform)
 		});
 		let cursor_transform = self.input_output_scale();
+		let has_transforms = base_transform.is_some()
+			|| cursor_transform.is_some()
+			|| layer_transforms.iter().any(|(_, transform)| transform.is_some());
 
 		// Select the sampler filter for this frame (linear by default).
 		let filter = self.upscale_filter;
@@ -2434,8 +2467,6 @@ impl MoonshineCompositor {
 			},
 		};
 
-		let num_space_elements = self.space.elements().count();
-
 		self.pointer_element.set_status(cursor_status.clone());
 
 		let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = cursor_status {
@@ -2462,62 +2493,106 @@ impl MoonshineCompositor {
 
 		// Combine elements in front-to-back order: cursor first (on top), then space.
 		// The cursor follows the transform of the window it points into.
-		let mut elements: Vec<(OutputRenderElements, Option<SceneTransform>)> = Vec::new();
-		elements.extend(cursor_elements.into_iter().map(|e| (e, cursor_transform)));
+		let layers = SceneLayers {
+			decorations: &self.decoration_windows,
+			upper: [
+				self.override_underlay_window.as_ref(),
+				self.override_window.as_ref(),
+				self.overlay_window.as_ref(),
+				self.notification_window.as_ref(),
+				self.external_overlay_window.as_ref(),
+			],
+		};
+		let opacity = |window: &smithay::desktop::Window| {
+			self.window_metadata
+				.get(window)
+				.map(|m| m.opacity as f32 / 255.0)
+				.unwrap_or(1.0)
+		};
 
-		Self::scene_render_elements(
-			&mut self.renderer,
-			&self.space,
-			&self.output,
-			SceneLayers {
-				decorations: &self.decoration_windows,
-				upper: [
-					self.override_underlay_window.as_ref(),
-					self.override_window.as_ref(),
-					self.overlay_window.as_ref(),
-					self.notification_window.as_ref(),
-					self.external_overlay_window.as_ref(),
-				],
-			},
-			|window| {
-				self.window_metadata
-					.get(window)
-					.map(|m| m.opacity as f32 / 255.0)
-					.unwrap_or(1.0)
-			},
-			|window| {
-				layer_transforms
-					.iter()
-					.find(|(layer, _)| layer.as_ref() == Some(window))
-					.map_or(base_transform, |(_, transform)| *transform)
-			},
-			&mut elements,
-		);
+		let mut elements = if has_transforms {
+			let mut elements: Vec<(OutputRenderElements, Option<SceneTransform>)> =
+				cursor_elements.into_iter().map(|e| (e, cursor_transform)).collect();
+			Self::scene_render_elements(
+				&mut self.renderer,
+				&self.space,
+				&self.output,
+				layers,
+				opacity,
+				|e, window| {
+					let transform = layer_transforms
+						.iter()
+						.find(|(layer, _)| *layer == Some(window))
+						.map_or(base_transform, |(_, transform)| *transform);
+					elements.push((OutputRenderElements::Space(e, None), transform));
+				},
+			);
+			SceneRenderList::Scaled(elements)
+		} else {
+			let mut elements: Vec<OutputRenderElements> = cursor_elements;
+			Self::scene_render_elements(
+				&mut self.renderer,
+				&self.space,
+				&self.output,
+				layers,
+				opacity,
+				|e, _| elements.push(OutputRenderElements::Space(e, None)),
+			);
+			SceneRenderList::Unscaled(elements)
+		};
+
 		// Resolve the composed frame from the real render list, not merely
 		// the shell root: native Vulkan content can live on a subsurface.
 		// Stop at a fullscreen opaque foreground element so a covered HDR
 		// window cannot supply metadata for the visible SDR scene.
 		let bounds: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
 			smithay::utils::Rectangle::from_size((self.width as i32, self.height as i32).into());
-		let hdr_source = source_surface.as_ref().and_then(|root| {
-			let cm = self.color_management.as_ref()?;
-			for (element, _) in &elements {
-				let geometry = element.geometry(scale);
-				if element.alpha() == 0.0 || !geometry.overlaps(bounds) {
-					continue;
+		let hdr_source = if self.hdr {
+			source_surface.as_ref().and_then(|root| {
+				let cm = self.color_management.as_ref()?;
+				let check = |element: &OutputRenderElements| {
+					let geometry = element.geometry(scale);
+					if element.alpha() == 0.0 || !geometry.overlaps(bounds) {
+						return (None, false);
+					}
+					if let Some(surface) = cm.hdr_element_surface(element.id(), root) {
+						return (Some(surface), true);
+					}
+					let opaque = element.opaque_regions(scale).iter().any(|region| {
+						let region = smithay::utils::Rectangle::new(region.loc + geometry.loc, region.size);
+						region.contains_rect(bounds)
+					});
+					(None, opaque)
+				};
+				match &elements {
+					SceneRenderList::Unscaled(list) => {
+						for element in list {
+							let (found, stop) = check(element);
+							if found.is_some() {
+								return found;
+							}
+							if stop {
+								break;
+							}
+						}
+					},
+					SceneRenderList::Scaled(list) => {
+						for (element, _) in list {
+							let (found, stop) = check(element);
+							if found.is_some() {
+								return found;
+							}
+							if stop {
+								break;
+							}
+						}
+					},
 				}
-				if let Some(surface) = cm.hdr_element_surface(element.id(), root) {
-					return Some(surface);
-				}
-				if element.opaque_regions(scale).iter().any(|region| {
-					let region = smithay::utils::Rectangle::new(region.loc + geometry.loc, region.size);
-					region.contains_rect(bounds)
-				}) {
-					break;
-				}
-			}
+				None
+			})
+		} else {
 			None
-		});
+		};
 		exported_frame.color_space = if self.hdr && hdr_source.is_some() {
 			FrameColorSpace::Bt2020Pq
 		} else {
@@ -2527,7 +2602,7 @@ impl MoonshineCompositor {
 			.as_ref()
 			.filter(|_| self.hdr)
 			.and_then(|s| self.color_management.as_ref()?.surface_hdr_metadata(s));
-		for (element, _) in &mut elements {
+		elements.for_each_element_mut(|element| {
 			let source = self
 				.color_management
 				.as_ref()
@@ -2537,13 +2612,16 @@ impl MoonshineCompositor {
 			match element {
 				OutputRenderElements::Space(_, p) | OutputRenderElements::Pointer(_, p) => *p = program,
 			}
-		}
+		});
 
-		tracing::trace!(
-			num_space_elements,
-			num_render_elements = elements.len(),
-			"Rendering frame"
-		);
+		if tracing::enabled!(tracing::Level::TRACE) {
+			let num_space_elements = self.space.elements().count();
+			tracing::trace!(
+				num_space_elements,
+				num_render_elements = elements.len(),
+				"Rendering frame"
+			);
+		}
 
 		// Compute the buffer age for partial damage tracking.
 		// Age = number of render_output calls since this buffer was last rendered to.
@@ -2552,43 +2630,45 @@ impl MoonshineCompositor {
 			.map(|last| self.render_count - last)
 			.unwrap_or(0);
 
-		let render_result = if elements.iter().any(|(_, transform)| transform.is_some()) {
-			let output_scale = self.output.current_scale().fractional_scale();
-			let scaled: Vec<ScaledOutputElement> = elements
-				.into_iter()
-				.map(|(e, transform)| {
-					let Some((scale, origin)) = transform else {
-						// Unscaled layers (external overlays, or a Steam overlay
-						// that fills the output) keep their own placement.
-						let rescaled = RescaleRenderElement::from_element(e, (0, 0).into(), 1.0);
-						return RelocateRenderElement::from_element(rescaled, (0, 0), Relocate::Relative);
-					};
-					let center = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-						(scale.offset_x * output_scale).round() as i32,
-						(scale.offset_y * output_scale).round() as i32,
-					));
-					let rescaled = RescaleRenderElement::from_element(e, origin, (scale.scale_x, scale.scale_y));
-					RelocateRenderElement::from_element(rescaled, center - origin, Relocate::Relative)
-				})
-				.collect();
-			// The relocation wrapper does not offset damage regions, so redraw
-			// the whole output while a scale/offset transform is active.
-			self.damage_tracker.render_output(
-				&mut self.renderer,
-				&mut framebuffer,
-				0,
-				&scaled,
-				[0.0, 0.0, 0.0, 1.0], // black clear color
-			)
-		} else {
-			let elements: Vec<OutputRenderElements> = elements.into_iter().map(|(e, _)| e).collect();
-			self.damage_tracker.render_output(
-				&mut self.renderer,
-				&mut framebuffer,
-				buffer_age,
-				&elements,
-				[0.0, 0.0, 0.0, 1.0], // black clear color
-			)
+		let render_result = match elements {
+			SceneRenderList::Scaled(elements) => {
+				let output_scale = self.output.current_scale().fractional_scale();
+				let scaled: Vec<ScaledOutputElement> = elements
+					.into_iter()
+					.map(|(e, transform)| {
+						let Some((scale, origin)) = transform else {
+							// Unscaled layers (external overlays, or a Steam overlay
+							// that fills the output) keep their own placement.
+							let rescaled = RescaleRenderElement::from_element(e, (0, 0).into(), 1.0);
+							return RelocateRenderElement::from_element(rescaled, (0, 0), Relocate::Relative);
+						};
+						let center = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
+							(scale.offset_x * output_scale).round() as i32,
+							(scale.offset_y * output_scale).round() as i32,
+						));
+						let rescaled = RescaleRenderElement::from_element(e, origin, (scale.scale_x, scale.scale_y));
+						RelocateRenderElement::from_element(rescaled, center - origin, Relocate::Relative)
+					})
+					.collect();
+				// The relocation wrapper does not offset damage regions, so redraw
+				// the whole output while a scale/offset transform is active.
+				self.damage_tracker.render_output(
+					&mut self.renderer,
+					&mut framebuffer,
+					0,
+					&scaled,
+					[0.0, 0.0, 0.0, 1.0], // black clear color
+				)
+			},
+			SceneRenderList::Unscaled(elements) => {
+				self.damage_tracker.render_output(
+					&mut self.renderer,
+					&mut framebuffer,
+					buffer_age,
+					&elements,
+					[0.0, 0.0, 0.0, 1.0], // black clear color
+				)
+			},
 		};
 
 		// Update the buffer's render count for future age calculations.
@@ -2824,15 +2904,14 @@ impl MoonshineCompositor {
 		overlay_hold: Option<HeldBuffer>,
 	) -> Result<(), DirectReject> {
 		// Scene eligibility has proved that this opaque top window covers all
-		// other windows, except a notification composited as a layer. Clone
-		// just the candidate, without a per-frame Vec.
-		let Some(window) = self.direct_source_window(true).cloned() else {
+		// other windows, except a notification composited as a layer.
+		let Some(window) = self.direct_source_window(true) else {
 			return Err(DirectReject::NoSurface);
 		};
 		// Retain the origin safeguard inside the technical export path too.
 		if self
 			.space
-			.element_geometry(&window)
+			.element_geometry(window)
 			.is_none_or(|geo| geo.loc != Point::from((0, 0)))
 		{
 			return Err(DirectReject::OutputOrigin);
