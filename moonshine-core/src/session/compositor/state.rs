@@ -1113,11 +1113,12 @@ impl MoonshineCompositor {
 		layers: SceneLayers<'_>,
 		opacity: impl Fn(&smithay::desktop::Window) -> f32,
 		transform: impl Fn(&smithay::desktop::Window) -> Option<SceneTransform>,
-	) -> Vec<(OutputRenderElements, Option<SceneTransform>)> {
+		elements: &mut Vec<(OutputRenderElements, Option<SceneTransform>)>,
+	) {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
 		let Some(output_geo) = space.output_geometry(output) else {
-			return Vec::new();
+			return;
 		};
 
 		let mut render_window = |elements: &mut Vec<(OutputRenderElements, Option<SceneTransform>)>,
@@ -1141,23 +1142,31 @@ impl MoonshineCompositor {
 
 		// Preserve space order for ordinary windows, then paint classified
 		// layers. Dropdowns and Steam surfaces must remain above decorations.
-		let mut paint_order: Vec<&smithay::desktop::Window> = space
-			.elements()
-			.filter(|window| !layers.decorations.contains(window) && !layers.upper.contains(&Some(*window)))
-			.collect();
+		let mut paint_order: Vec<&smithay::desktop::Window> = space.elements().collect();
+		let mut ordinary_len = paint_order.len();
 		for window in layers.decorations.iter().chain(layers.upper.into_iter().flatten()) {
-			if space.elements().any(|w| w == window) && !paint_order.contains(&window) {
+			if let Some(index) = paint_order[..ordinary_len]
+				.iter()
+				.position(|candidate| *candidate == window)
+			{
+				// Keep one copy of a classified window at the end of the space order.
+				let window = paint_order.remove(index);
+				ordinary_len -= 1;
+				while let Some(index) = paint_order[..ordinary_len]
+					.iter()
+					.position(|candidate| *candidate == window)
+				{
+					paint_order.remove(index);
+					ordinary_len -= 1;
+				}
 				paint_order.push(window);
 			}
 		}
 
 		// Render elements are front to back (the topmost comes first).
-		let mut elements = Vec::new();
 		for window in paint_order.into_iter().rev() {
-			render_window(&mut elements, window);
+			render_window(elements, window);
 		}
-
-		elements
 	}
 
 	/// Compute the scaling transform that fits the main window to the output.
@@ -2456,7 +2465,7 @@ impl MoonshineCompositor {
 		let mut elements: Vec<(OutputRenderElements, Option<SceneTransform>)> = Vec::new();
 		elements.extend(cursor_elements.into_iter().map(|e| (e, cursor_transform)));
 
-		let space_elements = Self::scene_render_elements(
+		Self::scene_render_elements(
 			&mut self.renderer,
 			&self.space,
 			&self.output,
@@ -2482,8 +2491,8 @@ impl MoonshineCompositor {
 					.find(|(layer, _)| layer.as_ref() == Some(window))
 					.map_or(base_transform, |(_, transform)| *transform)
 			},
+			&mut elements,
 		);
-		elements.extend(space_elements);
 		// Resolve the composed frame from the real render list, not merely
 		// the shell root: native Vulkan content can live on a subsurface.
 		// Stop at a fullscreen opaque foreground element so a covered HDR
