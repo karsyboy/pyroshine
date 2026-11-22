@@ -127,11 +127,23 @@ fn pacing_schedule(
 	started: Instant,
 ) -> (Instant, Duration, bool, Duration) {
 	let lateness = started.saturating_duration_since(requested);
-	if pacing_duration.is_zero() || requested >= started {
-		return (requested, pacing_duration, false, lateness);
+	// Cap the target transmit window within the capture slot (at least 1 /
+	// LATE_FRAME_MAX_SPEEDUP of bitrate duration) so oversized intra frames
+	// do not overrun the next capture tick and stall the following frame on
+	// network credit.
+	let target_duration = if frame_interval.is_zero() {
+		pacing_duration
+	} else {
+		let slot_cap = frame_interval * LATE_FRAME_SLOT_TENTHS / 10;
+		pacing_duration
+			.min(slot_cap)
+			.max(pacing_duration / LATE_FRAME_MAX_SPEEDUP)
+	};
+	if target_duration.is_zero() || requested >= started {
+		return (requested, target_duration, false, lateness);
 	}
 
-	match requested.checked_add(pacing_duration) {
+	match requested.checked_add(target_duration) {
 		Some(deadline) if deadline > started => {
 			// Encoding, or the previous frame's send, used part of this frame's
 			// transmit window. Start now and distribute every chunk across the
@@ -227,13 +239,20 @@ impl ChunkPacer {
 			return false;
 		}
 		let next_preceding = preceding.saturating_add(chunk_wire);
+		let remaining_wire = self.planned_wire_bytes.saturating_sub(next_preceding);
+		if remaining_wire == 0 {
+			return false;
+		}
 		let next_deadline = self.deadline_for(next_preceding);
 		if !waited && completed < next_deadline {
 			return false;
 		}
 
-		let remaining_wire = self.planned_wire_bytes.saturating_sub(next_preceding);
-		if !waited && remaining_wire > 0 && completed < self.frame_deadline {
+		// Absorb wake jitter inside the frame window and minor deadline slips
+		// without counting them as socket backpressure or resetting to 1x spacing.
+		// Actual WouldBlock stalls or multi-window stalls (>= base_duration past
+		// frame_deadline) rebase at 1x to prevent a catch-up microburst.
+		if !waited && completed < self.frame_deadline + self.base_duration {
 			let natural_remaining = scaled_duration(self.base_duration, remaining_wire, self.planned_wire_bytes);
 			let window_remaining = self.frame_deadline.saturating_duration_since(completed);
 			self.segment_origin = completed;
@@ -1126,7 +1145,7 @@ mod tests {
 		assert_eq!(pacer.deadline_for(200), origin + Duration::from_millis(21));
 		assert_eq!(pacer.frame_deadline, origin + duration);
 
-		// A full overrun past frame_deadline or a readiness wait rebases at 1x.
+		// A full overrun past frame_deadline + base_duration or a readiness wait rebases at 1x.
 		let mut stalled = ChunkPacer::new(origin, duration, duration, 300);
 		let stall_at = origin + Duration::from_millis(100);
 		assert!(stalled.on_chunk_sent(100, 100, stall_at, false));
@@ -1134,5 +1153,27 @@ mod tests {
 			stalled.deadline_for(200).duration_since(stall_at),
 			Duration::from_millis(10)
 		);
+
+		// Final chunk finishing past frame_deadline has no remaining chunks to rebase.
+		let mut final_chunk = ChunkPacer::new(origin, duration, duration, 300);
+		assert!(!final_chunk.on_chunk_sent(200, 100, origin + Duration::from_millis(31), false));
+
+		// A small overrun past frame_deadline without WouldBlock compresses remaining
+		// chunks smoothly rather than counting as socket backpressure.
+		let mut slight_overrun = ChunkPacer::new(origin, duration, duration, 300);
+		let overrun_at = origin + Duration::from_millis(31);
+		assert!(!slight_overrun.on_chunk_sent(100, 100, overrun_at, false));
+		assert_eq!(
+			slight_overrun.frame_deadline.duration_since(overrun_at),
+			Duration::from_millis(10) / LATE_FRAME_MAX_SPEEDUP
+		);
+
+		// Oversized pacing durations are bounded within the frame slot (up to 4x rate).
+		let now = Instant::now();
+		let (sched_origin, sched_duration, rebased, _) =
+			pacing_schedule(now, Duration::from_millis(20), Duration::from_millis(10), now);
+		assert_eq!(sched_origin, now);
+		assert_eq!(sched_duration, Duration::from_millis(9));
+		assert!(!rebased);
 	}
 }

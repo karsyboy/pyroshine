@@ -14,6 +14,12 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Changed
+
+- **PyroWave requests `HIGH` global Vulkan queue priority (`VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR`).** With `CAP_SYS_NICE` granted on `services.moonshine`, `[stream.video] pyrowave_queue = "auto"` keeps the high-priority async compute queue so PyroWave encodes do not stall behind a full game graphics queue, falling back to normal-priority graphics when unprivileged.
+- **Video packetizer and transmit pacing overhead reduced.** `Packetizer` now reuses pooled shard buffers without re-zeroing the entire allocation every frame, and `ChunkPacer` bounds oversized frame pacing within the capture slot without misclassifying minor timer jitter or final chunks as socket backpressure.
+- **NixOS `services.moonshine` priority defaults.** Configured `Nice = -10`, `IOSchedulingClass = "best-effort"`, `IOSchedulingPriority = 0`, `MemoryLow = "512M"`, and `AmbientCapabilities = [ "CAP_SYS_NICE" ]`.
+
 ## [v0.18.7] - 2026-11-17
 
 ### Added

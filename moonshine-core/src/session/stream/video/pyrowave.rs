@@ -200,8 +200,10 @@ impl PyroWaveQueueMode {
 		}
 	}
 }
-// Compatibility creation starts on graphics. Failure of an optional queue
-// preference leaves that safe default usable, including fallback API failure.
+// Compatibility creation starts on graphics unless high global priority is
+// granted (Granite's HIGH global priority only applies to async compute and
+// switches the device to compute). Failure of an optional queue preference
+// leaves graphics usable, including fallback API failure.
 fn select_queue(
 	mode: PyroWaveQueueMode,
 	mut select: impl FnMut(vk::QueueFlags) -> ResultCode,
@@ -214,6 +216,18 @@ fn select_queue(
 		let _ = select(vk::QueueFlags::GRAPHICS);
 		(vk::QueueFlags::GRAPHICS, result)
 	}
+}
+
+fn select_queue_for_priority(
+	mode: PyroWaveQueueMode,
+	actual_priority: vk::QueueGlobalPriorityKHR,
+	select: impl FnMut(vk::QueueFlags) -> ResultCode,
+) -> (vk::QueueFlags, ResultCode) {
+	let effective = match mode {
+		PyroWaveQueueMode::Auto if actual_priority >= vk::QueueGlobalPriorityKHR::HIGH => PyroWaveQueueMode::Compute,
+		other => other,
+	};
+	select_queue(effective, select)
 }
 type SetQueueType = unsafe extern "C" fn(DeviceHandle, vk::QueueFlags) -> ResultCode;
 type ReportPerformance =
@@ -279,6 +293,7 @@ type CreateDeviceByCompat = unsafe extern "C" fn(
 	*mut DeviceHandle,
 ) -> ResultCode;
 type ConfirmInterop = unsafe extern "C" fn(DeviceHandle) -> bool;
+type GetGlobalPriority = unsafe extern "C" fn(DeviceHandle) -> vk::QueueGlobalPriorityKHR;
 type DestroyDevice = unsafe extern "C" fn(DeviceHandle);
 type CreateEncoder = unsafe extern "C" fn(*const EncoderCreateInfo, *mut EncoderHandle) -> ResultCode;
 type DestroyEncoder = unsafe extern "C" fn(EncoderHandle);
@@ -311,6 +326,7 @@ struct Api {
 	_library: Library,
 	create_device_by_compat: CreateDeviceByCompat,
 	confirm_interop: ConfirmInterop,
+	get_global_priority: GetGlobalPriority,
 	set_queue_type: SetQueueType,
 	report_performance: ReportPerformance,
 	destroy_device: DestroyDevice,
@@ -373,6 +389,7 @@ impl Api {
 				let api = Self {
 					create_device_by_compat: symbol!("pyrowave_create_device_by_compat", CreateDeviceByCompat),
 					confirm_interop: symbol!("pyrowave_device_confirm_interop_support", ConfirmInterop),
+					get_global_priority: symbol!("pyrowave_device_get_global_priority", GetGlobalPriority),
 					set_queue_type: symbol!("pyrowave_device_set_queue_type", SetQueueType),
 					report_performance: symbol!("pyrowave_device_report_performance_stats", ReportPerformance),
 					destroy_device: symbol!("pyrowave_device_destroy", DestroyDevice),
@@ -484,23 +501,44 @@ impl Device {
 		}
 		let device_uuid = Uuid { uuid: ids.device_uuid };
 		let driver_uuid = Uuid { uuid: ids.driver_uuid };
+		let requested_priority = if mode == PyroWaveQueueMode::Graphics {
+			vk::QueueGlobalPriorityKHR::MEDIUM
+		} else {
+			vk::QueueGlobalPriorityKHR::HIGH
+		};
 		let mut handle = ptr::null_mut();
 		// SAFETY: all pointers reference initialized values for the call, and the
 		// returned owned handle is destroyed by Drop.
-		check(
-			unsafe {
-				(api.create_device_by_compat)(
-					properties.properties.vendor_id,
-					properties.properties.device_id,
-					&device_uuid,
-					&driver_uuid,
-					ptr::null(),
-					vk::QueueGlobalPriorityKHR::MEDIUM,
-					&mut handle,
-				)
-			},
-			"matching the PyroWave Vulkan device",
-		)?;
+		let create_result = unsafe {
+			(api.create_device_by_compat)(
+				properties.properties.vendor_id,
+				properties.properties.device_id,
+				&device_uuid,
+				&driver_uuid,
+				ptr::null(),
+				requested_priority,
+				&mut handle,
+			)
+		};
+		if create_result != SUCCESS && requested_priority != vk::QueueGlobalPriorityKHR::MEDIUM {
+			handle = ptr::null_mut();
+			check(
+				unsafe {
+					(api.create_device_by_compat)(
+						properties.properties.vendor_id,
+						properties.properties.device_id,
+						&device_uuid,
+						&driver_uuid,
+						ptr::null(),
+						vk::QueueGlobalPriorityKHR::MEDIUM,
+						&mut handle,
+					)
+				},
+				"matching the PyroWave Vulkan device",
+			)?;
+		} else {
+			check(create_result, "matching the PyroWave Vulkan device")?;
+		}
 		if handle.is_null() {
 			return Err("PyroWave returned a null device".to_string());
 		}
@@ -510,11 +548,15 @@ impl Device {
 			unsafe { (api.destroy_device)(handle) };
 			return Err("PyroWave device does not support DMA-BUF interoperability".to_string());
 		}
-		// Keep automatic selection on graphics to avoid observed compute-queue
-		// overhead and instability under game load. Explicit compute requests let
-		// Granite select a compute family, with library fallback to graphics.
-		// The entire PyroWave pipeline uses one queue.
-		let (selected, result) = select_queue(mode, |flags| unsafe { (api.set_queue_type)(handle, flags) });
+		// SAFETY: `handle` is a valid live PyroWave device.
+		let actual_priority = unsafe { (api.get_global_priority)(handle) };
+		// Requesting HIGH global priority activates async compute in Granite so
+		// PyroWave does not stall behind a full game graphics queue. Only drop back
+		// to graphics in Auto when HIGH priority was not granted or Graphics was
+		// explicitly configured.
+		let (selected, result) = select_queue_for_priority(mode, actual_priority, |flags| unsafe {
+			(api.set_queue_type)(handle, flags)
+		});
 		if log_selection {
 			let families = unsafe {
 				context
@@ -526,7 +568,7 @@ impl Device {
 					&& q.queue_flags.contains(vk::QueueFlags::COMPUTE)
 					&& !q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
 			});
-			tracing::info!(requested_mode = ?mode, queue_preference = ?selected, dedicated_compute_available = dedicated, selection_result = result, global_priority = "medium", "PyroWave queue selection (library falls back to graphics when compute is unavailable)");
+			tracing::info!(requested_mode = ?mode, queue_preference = ?selected, dedicated_compute_available = dedicated, selection_result = result, requested_priority = ?requested_priority, global_priority = ?actual_priority, "PyroWave queue selection (library falls back to graphics when compute is unavailable)");
 		}
 		Ok(Rc::new(Self {
 			api,
@@ -1775,6 +1817,29 @@ mod queue_fallback_tests {
 			assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 			SUCCESS
 		});
+		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+	}
+	#[test]
+	fn auto_keeps_compute_when_high_priority_granted_and_falls_back_otherwise() {
+		let (flags, _) =
+			select_queue_for_priority(PyroWaveQueueMode::Auto, vk::QueueGlobalPriorityKHR::HIGH, |flags| {
+				assert_eq!(flags, vk::QueueFlags::COMPUTE);
+				SUCCESS
+			});
+		assert_eq!(flags, vk::QueueFlags::COMPUTE);
+
+		let (flags, _) =
+			select_queue_for_priority(PyroWaveQueueMode::Auto, vk::QueueGlobalPriorityKHR::MEDIUM, |flags| {
+				assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+				SUCCESS
+			});
+		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+
+		let (flags, _) =
+			select_queue_for_priority(PyroWaveQueueMode::Graphics, vk::QueueGlobalPriorityKHR::HIGH, |flags| {
+				assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+				SUCCESS
+			});
 		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 	}
 }

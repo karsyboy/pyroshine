@@ -457,12 +457,42 @@ impl ShardBuf {
 
 	/// Reuse a zeroed backing buffer from `pool` when available, avoiding
 	/// repeated large `mmap`/zero-fault cycles across frames.
+	#[cfg(test)]
 	pub fn from_pool(shard_count: usize, data_size: usize, prefix_size: usize, pool: &ShardBufferPool) -> Self {
 		let stride = prefix_size + data_size;
 		let needed = shard_count * stride;
 		let mut data = pool.lock().ok().and_then(|mut guard| guard.pop()).unwrap_or_default();
 		data.clear();
 		data.resize(needed, 0);
+		Self {
+			data,
+			block_start: 0,
+			stride,
+			prefix_size,
+			data_size,
+			shard_count,
+		}
+	}
+
+	/// Reuse a pooled backing buffer without re-zeroing every byte.
+	///
+	/// The caller must overwrite every byte of every shard and prefix before
+	/// exposing the resulting [`ShardBatch`], including header padding and
+	/// trailing bytes on undersized shards.
+	pub fn from_pool_unzeroed(
+		shard_count: usize,
+		data_size: usize,
+		prefix_size: usize,
+		pool: &ShardBufferPool,
+	) -> Self {
+		let stride = prefix_size + data_size;
+		let needed = shard_count * stride;
+		let mut data = pool.lock().ok().and_then(|mut guard| guard.pop()).unwrap_or_default();
+		if data.len() < needed {
+			data.resize(needed, 0);
+		} else {
+			data.truncate(needed);
+		}
 		Self {
 			data,
 			block_start: 0,

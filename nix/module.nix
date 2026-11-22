@@ -185,6 +185,14 @@ in
         SupplementaryGroups = [
           "video"
         ];
+        Nice = -10;
+        IOSchedulingClass = "best-effort";
+        IOSchedulingPriority = 0;
+        MemoryLow = "512M";
+        # CAP_SYS_NICE allows PyroWave to request high global Vulkan queue priority
+        # so encoding does not stall behind a full game graphics queue.
+        AmbientCapabilities = [ "CAP_SYS_NICE" ];
+        CapabilityBoundingSet = [ "CAP_SYS_NICE" ];
         ExecStart = "${lib.getExe cfg.package} ${configFile}";
         Restart = "on-failure";
         RestartSec = 5;
