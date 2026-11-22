@@ -260,6 +260,27 @@ fn pop_missing(missing: &mut i64, requested: &mut i64, min_req: usize, in_prebuf
 }
 
 impl PlaybackStream {
+	/// A prebuffering stream is not consumed, so demand stops growing. SDL
+	/// writes only when its credit covers one minimum request (its mix
+	/// buffer). Top the outstanding credit up to that, and to whatever the
+	/// prebuffer still needs, or the callback waits forever.
+	fn ensure_writable_quantum(&mut self) {
+		let min_req = i64::from(self.buffer_attr.minimum_request_length).max(1);
+		let buffered = self.buffer.len_bytes() as i64;
+		let fill = i64::from(self.buffer_attr.pre_buffering).saturating_sub(buffered);
+		// A write past max_length is dropped, and libpulse still spends the
+		// credit, so the next top-up would ask for even more.
+		let room = i64::from(self.buffer_attr.max_length).saturating_sub(buffered);
+		if room <= 0 {
+			return;
+		}
+		let want = fill.max(min_req).min(room);
+		let granted = self.requested.saturating_add(self.missing);
+		if granted < want {
+			self.missing = self.missing.saturating_add(want - granted);
+		}
+	}
+
 	/// Mirrors `pa_memblockq_prebuf_force`: hold playback until the buffer
 	/// holds `pre_buffering` bytes. Request accounting is unchanged.
 	fn prebuf_force(&mut self) {
@@ -917,6 +938,12 @@ impl PulseServer {
 					}
 				}
 
+				// A stream waiting to fill does not consume, so the drain above
+				// will not create more demand. Ask for a full mix buffer anyway.
+				if stream.drains.is_empty() && matches!(stream.state, StreamState::Prebuffering(_)) {
+					stream.ensure_writable_quantum();
+				}
+
 				// ── Request phase ────────────────────────────────────────────────────
 				// Issue a REQUEST if enough demand has accumulated.
 				// Draining streams are excluded — they are emptying, not refilling.
@@ -1529,6 +1556,107 @@ mod receive_tests {
 		stop.store(true, Ordering::Relaxed);
 		player.join().unwrap();
 		assert!(silent.is_empty(), "silent after resumes {silent:?}");
+		assert!(server.stop().await);
+	}
+
+	/// SDL writes a whole mix buffer or nothing. A prebuffer that is still short
+	/// by less than that must be asked for another full mix buffer, or the
+	/// device callback never runs.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn sdl_prebuffer_shortfall_is_refilled_to_a_mix_buffer() {
+		const MIXLEN: usize = 4096;
+		let server = Server::spawn();
+		let path = server.path.clone();
+		let client = tokio::task::spawn_blocking(move || {
+			let mut client = UnixStream::connect(&path).unwrap();
+			client.set_read_timeout(Some(time::Duration::from_millis(500))).unwrap();
+			let auth = pulse::Command::Auth(pulse::AuthParams {
+				version: pulse::MAX_VERSION,
+				..Default::default()
+			});
+			let mut name = pulse::Props::new();
+			name.set(pulse::Prop::ApplicationName, c"sdl");
+			let create = pulse::Command::CreatePlaybackStream(pulse::PlaybackStreamParams {
+				sample_spec: pulse::SampleSpec {
+					format: pulse::SampleFormat::Float32Le,
+					sample_rate: 48_000,
+					channels: 2,
+				},
+				channel_map: pulse::ChannelMap::stereo(),
+				buffer_attr: pulse::stream::BufferAttr {
+					max_length: u32::MAX,
+					target_length: (MIXLEN * 4) as u32,
+					pre_buffering: u32::MAX,
+					minimum_request_length: MIXLEN as u32,
+					fragment_size: u32::MAX,
+				},
+				..Default::default()
+			});
+			client
+				.write_all(
+					&[
+						command(0, &auth),
+						command(1, &pulse::Command::SetClientName(name)),
+						command(2, &create),
+					]
+					.concat(),
+				)
+				.unwrap();
+
+			let reply = loop {
+				let mut message = vec![0u8; pulse::DESCRIPTOR_SIZE];
+				client.read_exact(&mut message).expect("create reply");
+				let desc = pulse::read_descriptor(&mut std::io::Cursor::new(&message)).unwrap();
+				let start = message.len();
+				message.resize(start + desc.length as usize, 0);
+				client.read_exact(&mut message[start..]).unwrap();
+				let (seq, _) =
+					pulse::read_command_message(&mut std::io::Cursor::new(&message), pulse::MAX_VERSION).unwrap();
+				if seq == 2 {
+					let (_, reply) = pulse::read_reply_message::<pulse::CreatePlaybackStreamReply>(
+						&mut std::io::Cursor::new(&message),
+						pulse::MAX_VERSION,
+					)
+					.unwrap();
+					break reply;
+				}
+			};
+			assert!(reply.requested_bytes as usize >= MIXLEN, "{reply:?}");
+			let pre = reply.buffer_attr.pre_buffering as usize;
+			let credit = reply.requested_bytes as usize;
+			let leave = MIXLEN - 8;
+			let write_len = credit - leave;
+			assert!(
+				write_len < pre,
+				"credit {credit} pre {pre} would already start playback"
+			);
+			let payload = [
+				descriptor(write_len as u32, reply.channel),
+				0.5f32.to_le_bytes().repeat(write_len / 4),
+			]
+			.concat();
+			client.write_all(&payload).unwrap();
+
+			let mut credit = leave;
+			let deadline = time::Instant::now() + time::Duration::from_secs(1);
+			while credit < MIXLEN {
+				assert!(time::Instant::now() < deadline, "no mix-sized request; credit {credit}");
+				let mut message = vec![0u8; pulse::DESCRIPTOR_SIZE];
+				client.read_exact(&mut message).expect("a further request");
+				let desc = pulse::read_descriptor(&mut std::io::Cursor::new(&message)).unwrap();
+				let start = message.len();
+				message.resize(start + desc.length as usize, 0);
+				client.read_exact(&mut message[start..]).unwrap();
+				let (_, command) =
+					pulse::read_command_message(&mut std::io::Cursor::new(&message), pulse::MAX_VERSION).unwrap();
+				if let pulse::Command::Request(request) = command {
+					credit += request.length as usize;
+				}
+			}
+			credit
+		});
+		let credit = client.await.unwrap();
+		assert!(credit >= MIXLEN);
 		assert!(server.stop().await);
 	}
 

@@ -976,18 +976,28 @@ fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSp
 	let half_10ms = align_up(len_10ms / 2, frame).max(frame);
 	let cap = len_10ms * 100;
 
-	let max_length = match attr.max_length {
+	let mut max_length = match attr.max_length {
 		u32::MAX => len_10ms * 20,
 		requested => align_up(u64::from(requested), frame),
 	}
 	// Room for at least two minimum requests.
 	.clamp(2 * half_10ms, cap);
 
-	let minimum_request_length = match attr.minimum_request_length {
+	let mut minimum_request_length = match attr.minimum_request_length {
 		u32::MAX => half_10ms,
 		requested => align_up(u64::from(requested), frame).max(half_10ms),
+	};
+	// SDL sets minreq to one mix buffer and writes only when at least that
+	// much is writable. A 200 ms default would shrink a longer mix buffer and
+	// the initial credit would never reach it, so the callback would not run.
+	// Grow the buffer (up to one second) to hold two of those requests.
+	if attr.minimum_request_length != u32::MAX {
+		let room = minimum_request_length.saturating_mul(2).min(cap);
+		if room > max_length {
+			max_length = room;
+		}
 	}
-	.min(align_down(max_length / 2));
+	minimum_request_length = minimum_request_length.min(align_down(max_length / 2).max(frame));
 
 	let target_length = match attr.target_length {
 		u32::MAX => align_up(len_10ms * 6, minimum_request_length),
@@ -1189,6 +1199,25 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn sdl_mix_buffer_stays_large_enough_to_write() {
+		// 16384 frames of f32 stereo at 48 kHz is about 341 ms, past the
+		// 200 ms default buffer. SDL waits until a whole mix buffer is writable.
+		let spec = spec(pulse::SampleFormat::Float32Le, 2, 48_000);
+		let mixlen = 16_384 * 8;
+		let mut attr = pulse::stream::BufferAttr {
+			max_length: u32::MAX,
+			target_length: mixlen * 4,
+			pre_buffering: u32::MAX,
+			minimum_request_length: mixlen,
+			fragment_size: u32::MAX,
+		};
+		configure_buffer(&mut attr, &spec);
+		assert!(attr.minimum_request_length >= mixlen, "{attr:?}");
+		assert!(attr.target_length >= mixlen, "{attr:?}");
+		assert_invariants(&attr, &spec);
 	}
 
 	#[test]
