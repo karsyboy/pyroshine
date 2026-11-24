@@ -58,7 +58,7 @@ const FALLBACK_LAYOUT: &str = "us";
 /// Keyboard configuration for the compositor's XKB state.
 ///
 /// An empty `layout` (the default) uses the host's X11 keymap, as `localectl`
-/// shows it, for each stream (see [`Self::resolve`]).
+/// shows it, for each stream.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct KeyboardConfig {
