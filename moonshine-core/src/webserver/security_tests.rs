@@ -1147,12 +1147,17 @@ async fn catalog_refresh_during_an_active_stream_leaves_it_untouched() {
 
 	// Clients are still told the game they launched is running.
 	let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
-	let info = body_text(server.server_info(HashMap::new(), None, peer, None, false, None).await).await;
+	let info = body_text(server.server_info(None, peer, None, false, None).await).await;
 	assert!(
 		info.contains(&format!("<currentgame>{}</currentgame>", entry.id)),
 		"{info}"
 	);
 	assert!(info.contains("MOONSHINE_SERVER_BUSY"), "{info}");
+	// Pair status comes from a paired client certificate, never from the
+	// shared `uniqueid` Moonlight clients send.
+	assert!(info.contains("<PairStatus>0</PairStatus>"), "{info}");
+	let https_info = body_text(server.server_info(None, peer, None, true, None).await).await;
+	assert!(https_info.contains("<PairStatus>0</PairStatus>"), "{https_info}");
 
 	server.session_manager.stop_session().await.unwrap();
 }

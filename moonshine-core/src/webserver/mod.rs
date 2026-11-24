@@ -404,7 +404,6 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => {
 					self.server_info(
-						params,
 						local_address,
 						peer_address,
 						mac_address,
@@ -553,7 +552,6 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => {
 					self.server_info(
-						params,
 						local_address,
 						peer_address,
 						mac_address,
@@ -665,7 +663,6 @@ impl Webserver {
 
 	async fn server_info(
 		&self,
-		params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
 		mac_address: Option<String>,
@@ -682,14 +679,6 @@ impl Webserver {
 		};
 
 		// Seems we should only say we paired when using HTTPS.
-		let paired = if https {
-			match params.get("uniqueid") {
-				Some(unique_id) if self.client_manager.is_paired(unique_id.clone()).unwrap_or(false) => "1",
-				Some(_) | None => "0",
-			}
-		} else {
-			"0"
-		};
 
 		let local_ip = local_address.map(|addr| addr.ip().to_string()).unwrap_or_default();
 
@@ -698,6 +687,16 @@ impl Webserver {
 		response += &format!("<hostname>{}</hostname>", escape_xml(&self.name));
 		response += &format!("<appversion>{}</appversion>", SERVERINFO_APP_VERSION);
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
+		// Only HTTPS carries the client certificate, which is what pairing
+		// registers. The `uniqueid` parameter is not unique: Moonlight clients
+		// all send the same one, so it cannot say whether this client is paired
+		// (upstream Moonshine 060b074).
+		let paired_peer = https
+			&& peer_cert_fingerprint.is_some_and(|fp| {
+				self.verify_paired_client(&Some(fp.clone()), peer_address.ip())
+					.is_none()
+			});
+		let paired = if paired_peer { "1" } else { "0" };
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
 		response += &format!("<HttpsPort>{}</HttpsPort>", self.webserver_config.port_https);
 		response += &format!("<ExternalPort>{}</ExternalPort>", self.webserver_config.port);
@@ -712,11 +711,6 @@ impl Webserver {
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
 		);
-		let paired_peer = https
-			&& peer_cert_fingerprint.is_some_and(|fp| {
-				self.verify_paired_client(&Some(fp.clone()), peer_address.ip())
-					.is_none()
-			});
 		if paired_peer {
 			// UDP calibration works for every codec; clients without it ignore these.
 			response += &format!(

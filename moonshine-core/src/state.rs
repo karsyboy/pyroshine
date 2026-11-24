@@ -210,6 +210,7 @@ impl PersistentState {
 		Ok(changed)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn has_client(&self, client: String) -> Result<bool, ()> {
 		let data = self.data.read().map_err(|_| ())?;
 		if !self.available.load(Ordering::Acquire) {

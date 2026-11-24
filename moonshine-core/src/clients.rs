@@ -337,6 +337,7 @@ impl ClientManager {
 		&self.state
 	}
 
+	#[cfg(test)]
 	pub(crate) fn is_paired(&self, id: String) -> Result<bool, ()> {
 		self.state.has_client(id)
 	}

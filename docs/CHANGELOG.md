@@ -29,6 +29,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 ### Fixed
 
 - **Reference frame invalidation recovers without an IDR.** The first frame after an invalidation is sent as a recovery frame (frame type 5), which Moonlight waits for; before, every invalidation ended in an IDR. Repeated loss reports for a loss already answered are ignored, a static screen re-sends the recovery frame, and when the client leaves the count to the host, Vulkan Video holds 150 ms of reference frames (4 to 16) and predicts from one. Applies to Vulkan Video, VA-API and NVENC (from upstream Moonshine, by Ryan Bateman).
+- **`/serverinfo` reports `PairStatus` from the client certificate.** It used the `uniqueid` parameter, which all Moonlight clients send with the same value, so an unpaired client could be told it was paired once any client had paired (from upstream Moonshine, by Hans Gaiser).
 - **Colour conversion submits through Pixelforge's queue locks**, so it cannot race the encoder's own submissions to a shared queue.
 
 ## [v0.18.7] - 2026-11-17
