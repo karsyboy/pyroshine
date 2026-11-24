@@ -2031,6 +2031,178 @@ mod xwayland_tests {
 		shut_down(stop);
 	}
 
+	/// A native toplevel that keeps its own size (a windowed app under Wine's
+	/// Wayland driver, which ignores a configure size without
+	/// maximized/fullscreen/tiled/resizing state) must not be answered with a
+	/// configure on every commit, while one that ignored only the initial size
+	/// (wlroots' wayland backend) still adopts the output size.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn toplevel_ignoring_the_configure_size_gets_bounded_configures() {
+		use std::os::fd::AsFd;
+		use wayland_client::protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface};
+		use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+
+		#[derive(Default)]
+		struct Client {
+			compositor: Option<wl_compositor::WlCompositor>,
+			shm: Option<wl_shm::WlShm>,
+			wm_base: Option<xdg_wm_base::XdgWmBase>,
+			configures: usize,
+			proposed: (i32, i32),
+			unacked: Option<u32>,
+		}
+		impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for Client {
+			fn event(
+				state: &mut Self,
+				registry: &wl_registry::WlRegistry,
+				event: wl_registry::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				qh: &wayland_client::QueueHandle<Self>,
+			) {
+				if let wl_registry::Event::Global { name, interface, .. } = event {
+					match interface.as_str() {
+						"wl_compositor" => state.compositor = Some(registry.bind(name, 4, qh, ())),
+						"wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
+						"xdg_wm_base" => state.wm_base = Some(registry.bind(name, 1, qh, ())),
+						_ => {},
+					}
+				}
+			}
+		}
+		impl wayland_client::Dispatch<xdg_wm_base::XdgWmBase, ()> for Client {
+			fn event(
+				_: &mut Self,
+				wm_base: &xdg_wm_base::XdgWmBase,
+				event: xdg_wm_base::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let xdg_wm_base::Event::Ping { serial } = event {
+					wm_base.pong(serial);
+				}
+			}
+		}
+		impl wayland_client::Dispatch<xdg_surface::XdgSurface, ()> for Client {
+			fn event(
+				state: &mut Self,
+				_: &xdg_surface::XdgSurface,
+				event: xdg_surface::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let xdg_surface::Event::Configure { serial } = event {
+					state.configures += 1;
+					state.unacked = Some(serial);
+				}
+			}
+		}
+		impl wayland_client::Dispatch<xdg_toplevel::XdgToplevel, ()> for Client {
+			fn event(
+				state: &mut Self,
+				_: &xdg_toplevel::XdgToplevel,
+				event: xdg_toplevel::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let xdg_toplevel::Event::Configure { width, height, .. } = event
+					&& width > 0
+					&& height > 0
+				{
+					state.proposed = (width, height);
+				}
+			}
+		}
+		wayland_client::delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+		wayland_client::delegate_noop!(Client: ignore wl_surface::WlSurface);
+		wayland_client::delegate_noop!(Client: ignore wl_shm::WlShm);
+		wayland_client::delegate_noop!(Client: ignore wl_shm_pool::WlShmPool);
+		wayland_client::delegate_noop!(Client: ignore wl_buffer::WlBuffer);
+
+		const OWN: (i32, i32) = (1000, 600);
+		const COMMITS: usize = 100;
+		// Initial configure, the one answer to a mismatch, and a few
+		// focus/activation changes; the old storm sent one per commit.
+		const MAX_CONFIGURES: usize = 6;
+
+		let (stop, _handles, launched) = launch();
+		let socket = std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap())
+			.join(&launched.ready().display.wayland_display);
+		// Returns the configures received and the size of the last commit.
+		let run = |adopt_after_first: bool| -> (usize, (i32, i32)) {
+			let wayland =
+				wayland_client::Connection::from_socket(std::os::unix::net::UnixStream::connect(&socket).unwrap())
+					.unwrap();
+			let mut queue = wayland.new_event_queue();
+			let qh = queue.handle();
+			wayland.display().get_registry(&qh, ());
+			let mut client = Client::default();
+			queue.roundtrip(&mut client).unwrap();
+			let surface = client
+				.compositor
+				.as_ref()
+				.expect("wl_compositor")
+				.create_surface(&qh, ());
+			let xdg = client
+				.wm_base
+				.as_ref()
+				.expect("xdg_wm_base")
+				.get_xdg_surface(&surface, &qh, ());
+			let _toplevel = xdg.get_toplevel(&qh, ());
+			surface.commit();
+			queue.roundtrip(&mut client).unwrap();
+
+			let bytes = i32::from(WIDTH).max(OWN.0) * i32::from(HEIGHT).max(OWN.1) * 4;
+			let file = tempfile::tempfile().unwrap();
+			file.set_len(bytes as u64).unwrap();
+			let pool = client
+				.shm
+				.as_ref()
+				.expect("wl_shm")
+				.create_pool(file.as_fd(), bytes, &qh, ());
+			let mut buffer: Option<(wl_buffer::WlBuffer, (i32, i32))> = None;
+			let mut drawn = OWN;
+			for _ in 0..COMMITS {
+				if let Some(serial) = client.unacked.take() {
+					xdg.ack_configure(serial);
+				}
+				drawn = if adopt_after_first && client.configures > 1 {
+					client.proposed
+				} else {
+					OWN
+				};
+				if buffer.as_ref().is_none_or(|(_, size)| *size != drawn) {
+					let next = pool.create_buffer(0, drawn.0, drawn.1, drawn.0 * 4, wl_shm::Format::Argb8888, &qh, ());
+					buffer = Some((next, drawn));
+				}
+				surface.attach(buffer.as_ref().map(|(b, _)| b), 0, 0);
+				surface.damage(0, 0, drawn.0, drawn.1);
+				surface.commit();
+				queue.roundtrip(&mut client).unwrap();
+			}
+			(client.configures, drawn)
+		};
+
+		let (configures, drawn) = run(false);
+		assert_eq!(drawn, OWN);
+		assert!(
+			configures <= MAX_CONFIGURES,
+			"{configures} configures over {COMMITS} commits for a client that keeps its own size"
+		);
+		let (configures, drawn) = run(true);
+		assert_eq!(
+			drawn,
+			(i32::from(WIDTH), i32::from(HEIGHT)),
+			"a client that dropped the initial size adopts the output size"
+		);
+		assert!(configures <= MAX_CONFIGURES, "{configures} configures");
+		shut_down(stop);
+	}
+
 	#[allow(dead_code, unused_imports, non_upper_case_globals, clippy::all)]
 	mod input_method_client {
 		use wayland_client;

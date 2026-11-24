@@ -21,7 +21,7 @@ use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, is_sync_subsurface};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
@@ -29,7 +29,9 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
-use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
+use smithay::wayland::shell::xdg::{
+	PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
+};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::xdg_activation::{
 	XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -43,6 +45,63 @@ use smithay::xwayland::XWaylandClientData;
 
 use crate::session::compositor::focus::{KeyboardFocusTarget, WindowFlags, WindowMetadata, get_window_priority_key};
 use crate::session::compositor::state::{ClientState, MoonshineCompositor};
+
+// ---------------------------------------------------------------------------
+// Output-size re-send for native toplevels
+// ---------------------------------------------------------------------------
+
+/// The mismatched size a toplevel was last answered with an output-size
+/// configure for, kept in the surface's data map.
+///
+/// Answering each (client size, output size) pair once lets a client that
+/// dropped the size (wlroots' wayland backend) adopt it, while a client that
+/// keeps its own size (a windowed Wine app) gets a bounded number of
+/// configures instead of one per commit.
+#[derive(Debug, Default)]
+struct OutputSizeNudge {
+	answered: Option<(Size<i32, Logical>, Size<i32, Logical>)>,
+}
+
+impl OutputSizeNudge {
+	/// Whether a commit at `committed` should get a configure proposing
+	/// `output`. `settled` is whether the client acked every configure sent,
+	/// so `committed` is its answer to the latest one rather than a stale size.
+	fn due(&mut self, committed: Size<i32, Logical>, output: Size<i32, Logical>, settled: bool) -> bool {
+		if committed == output {
+			// A later mismatch (after leaving fullscreen, say) gets one answer again.
+			self.answered = None;
+			return false;
+		}
+		if !settled || self.answered == Some((committed, output)) {
+			return false;
+		}
+		self.answered = Some((committed, output));
+		true
+	}
+}
+
+fn output_size_nudge_due(
+	toplevel: &ToplevelSurface,
+	committed: Size<i32, Logical>,
+	output: Size<i32, Logical>,
+) -> bool {
+	smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+		let settled = states
+			.data_map
+			.get::<XdgToplevelSurfaceData>()
+			.is_some_and(|data| data.lock().unwrap().pending_configures().is_empty());
+		states
+			.data_map
+			.insert_if_missing_threadsafe(std::sync::Mutex::<OutputSizeNudge>::default);
+		states
+			.data_map
+			.get::<std::sync::Mutex<OutputSizeNudge>>()
+			.unwrap()
+			.lock()
+			.unwrap()
+			.due(committed, output, settled)
+	})
+}
 
 // ---------------------------------------------------------------------------
 // Process-tree app_id detection (mirrors gamescope's get_appid_from_pid)
@@ -510,11 +569,14 @@ impl CompositorHandler for MoonshineCompositor {
 			window.on_commit();
 
 			// wlroots' wayland backend drops the size from the initial
-			// configure (output not enabled yet); re-send it on each
-			// mismatched commit so nested compositors adopt the session size.
+			// configure (output not enabled yet); re-send it once the client
+			// has settled on another size so nested compositors adopt the
+			// session size. Only once per mismatched size: Wine's Wayland
+			// driver ignores a size without maximized/fullscreen/tiled/resizing
+			// state but acks and commits, so re-sending on every commit loops.
 			let output_size = self.output_rect().size;
 			if let Some(toplevel) = window.toplevel()
-				&& window.geometry().size != output_size
+				&& output_size_nudge_due(toplevel, window.geometry().size, output_size)
 			{
 				toplevel.with_pending_state(|state| {
 					state.size = Some(output_size);
@@ -3013,7 +3075,71 @@ impl XwmHandler for MoonshineCompositor {
 
 #[cfg(test)]
 mod tests {
+	use super::OutputSizeNudge;
 	use super::scan_cmdline_for_app_id;
+	use smithay::utils::{Logical, Size};
+
+	const OUTPUT: (i32, i32) = (1920, 1080);
+
+	/// Drives the commit → configure → ack + commit loop with a client that
+	/// draws at `draw(configures_seen)`; returns configures sent over `commits`.
+	fn run_client(commits: usize, mut draw: impl FnMut(usize) -> (i32, i32)) -> (usize, Size<i32, Logical>) {
+		let output = Size::from(OUTPUT);
+		let mut nudge = OutputSizeNudge::default();
+		// `new_toplevel` sends the initial configure.
+		let mut configures = 1;
+		let mut size = Size::from(draw(configures));
+		for _ in 0..commits {
+			// The client acked everything before committing again.
+			if nudge.due(size, output, true) {
+				configures += 1;
+			}
+			size = Size::from(draw(configures));
+		}
+		(configures, size)
+	}
+
+	#[test]
+	fn client_that_ignores_the_size_gets_bounded_configures() {
+		// Wine's Wayland driver keeps a windowed app at its own size.
+		let (configures, size) = run_client(10_000, |_| (1706, 938));
+		assert_eq!(configures, 2, "initial configure plus one answer");
+		assert_eq!(size, Size::from((1706, 938)));
+	}
+
+	#[test]
+	fn client_that_dropped_the_initial_size_adopts_the_output() {
+		// wlroots' wayland backend ignores the initial configure's size only.
+		let (configures, size) = run_client(100, |seen| if seen < 2 { (1280, 720) } else { OUTPUT });
+		assert_eq!(configures, 2);
+		assert_eq!(size, Size::from(OUTPUT));
+	}
+
+	#[test]
+	fn unacked_configure_defers_the_answer() {
+		let output = Size::from(OUTPUT);
+		let mut nudge = OutputSizeNudge::default();
+		let stale = Size::from((1280, 720));
+		assert!(!nudge.due(stale, output, false));
+		assert!(nudge.due(stale, output, true));
+		assert!(!nudge.due(stale, output, true));
+	}
+
+	#[test]
+	fn new_mismatch_or_output_size_is_answered_again() {
+		let output = Size::from(OUTPUT);
+		let window = Size::from((1706, 938));
+		let mut nudge = OutputSizeNudge::default();
+		assert!(nudge.due(window, output, true));
+		assert!(!nudge.due(window, output, true));
+		// The client changed size by itself.
+		assert!(nudge.due(Size::from((800, 600)), output, true));
+		// The session resolution changed.
+		assert!(nudge.due(Size::from((800, 600)), Size::from((2560, 1440)), true));
+		// Matching, then leaving fullscreen back to the earlier size.
+		assert!(!nudge.due(output, output, true));
+		assert!(nudge.due(window, output, true));
+	}
 
 	// ---- cmdline scanning tests (T1) ----
 

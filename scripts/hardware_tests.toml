@@ -134,6 +134,11 @@ requires = ["render-node", "xwayland"]
 timeout = 120
 
 [[test]]
+name = "session::compositor::xwayland_tests::toplevel_ignoring_the_configure_size_gets_bounded_configures"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
 name = "session::compositor::xwayland_tests::x11_errors_on_destroyed_focus_windows_are_not_fatal"
 requires = ["render-node", "xwayland"]
 timeout = 120

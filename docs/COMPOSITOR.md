@@ -265,6 +265,15 @@ when Steam put itself first for its controller settings. Without Steam's
 control (for example a desktop session) activation still chooses the focus.
 Activation state changes are delivered to native toplevels with a configure.
 
+A new native toplevel is proposed the output size without a Maximized state;
+Wine's Wayland driver draws its own window frame for a maximized window. A
+toplevel that has acknowledged every configure but commits at another size is
+proposed the output size again, once for that size and output size, so a
+nested wlroots compositor (whose wayland backend drops the first size) adopts
+it. Wine ignores a size sent without maximized, fullscreen, tiled or resizing
+state, so a windowed Wine app keeps its own size; proposing it on every commit
+looped configure, acknowledge and commit.
+
 Steam closes its overlay by making it transparent; a transparent Steam surface
 holds no role. A window that is unmapped or destroyed (with or without a prior
 unmap) is retired by one idempotent path: it leaves the space, its metadata and

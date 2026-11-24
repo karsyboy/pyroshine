@@ -19,6 +19,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 ### Fixed
 
 - **Wine and Proton games on Wayland are exported without composition.** Wine's Wayland driver presents a game on a subsurface above a transparent placeholder window, which Pyroshine always composited (reported as `transparent` or `subsurfaces`), including HDR games such as World of Warcraft under GE-Proton with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`. A subsurface that fills the stream and is opaque is now exported directly with its own HDR description. When a game window is scaled to the stream, the sizes behind it are logged once per change. Hardware-tested on an AMD RX 9070 XT, with the compositor GPU tests and a real HDR stream; not yet tested on NVIDIA or Intel.
+- **Windowed Wine apps no longer flood the compositor with configures.** The compositor re-proposed the output size on every commit of a native Wayland window drawn at another size. Wine's Wayland driver ignores that size for a window that is not maximized or fullscreen, but acknowledges it and commits again, so a windowed app such as the Battle.net launcher under `PROTON_ENABLE_WAYLAND=1` kept the client and compositor in a configure loop. The output size is now re-proposed once per size the window settles on, which still lets nested wlroots compositors adopt it. Covered by the compositor GPU tests on an AMD RX 9070 XT; not yet checked with a live Battle.net session or a real nested wlroots compositor.
 
 ## [v0.18.8] - 2026-11-24
 
