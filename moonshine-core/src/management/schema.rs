@@ -1162,8 +1162,8 @@ pub(crate) fn config_schema() -> ConfigSchema {
 			"compositor.keyboard.layout",
 			"keyboard",
 			"Layout",
-			"XKB layout, for example us or de.",
-			text(false, Some("us"), &["us", "gb", "de", "fr", "es", "it", "jp"]),
+			"XKB layout, for example us or de; empty uses the host's keyboard layout (localectl).",
+			text(false, Some("host layout"), &["us", "gb", "de", "fr", "es", "it", "jp"]),
 		),
 		Field::new(
 			"compositor.keyboard.variant",

@@ -49,25 +49,123 @@ pub(crate) use self::capture::DirectReject;
 use self::state::MoonshineCompositor;
 use crate::session::capture::input::CaptureInputEvent;
 
+/// How long [`KeyboardConfig::resolve`] waits for systemd-localed.
+const LOCALED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The layout when none is configured and the host's cannot be read.
+const FALLBACK_LAYOUT: &str = "us";
+
 /// Keyboard configuration for the compositor's XKB state.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// An empty `layout` (the default) uses the host's X11 keymap, as `localectl`
+/// shows it, for each stream (see [`Self::resolve`]).
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct KeyboardConfig {
+	/// XKB layout, for example `us` or `de`; empty for the host's.
 	pub layout: String,
+	/// XKB variant; empty for the host's when `layout` is empty.
 	pub variant: String,
+	/// XKB model; empty for the host's when `layout` is empty.
 	pub model: String,
+	/// XKB options; unset for the host's when `layout` is empty.
 	pub options: Option<String>,
 }
 
-impl Default for KeyboardConfig {
-	fn default() -> Self {
+/// The host's X11 keymap, from `org.freedesktop.locale1`.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct HostKeymap {
+	layout: String,
+	variant: String,
+	model: String,
+	options: String,
+}
+
+impl KeyboardConfig {
+	/// The keymap for a stream.
+	///
+	/// A configured `layout` is used as it is. Without one, the host's X11
+	/// keymap is read from systemd-localed (the service behind `localectl`),
+	/// because a systemd service has no desktop environment to ask. Its
+	/// variant, model and options fill in the fields the configuration leaves
+	/// empty. When it cannot be read, or has no layout, the layout is `us`.
+	pub(crate) fn resolve(&self) -> Self {
+		if !self.layout.is_empty() {
+			return self.clone();
+		}
+		// The compositor thread is synchronous; a stuck bus must not hold the
+		// stream's start beyond the timeout.
+		let (tx, rx) = std::sync::mpsc::channel();
+		let spawned = std::thread::Builder::new()
+			.name("localed-keymap".into())
+			.spawn(move || {
+				let _ = tx.send(host_keymap());
+			});
+		let host = match spawned
+			.map_err(zbus::Error::from)
+			.map(|_| rx.recv_timeout(LOCALED_TIMEOUT))
+		{
+			Ok(Ok(Ok(host))) => Some(host),
+			Ok(Ok(Err(e))) | Err(e) => {
+				tracing::warn!("Failed to read the host's keyboard layout from systemd-localed: {e}");
+				None
+			},
+			Ok(Err(_)) => {
+				tracing::warn!("Timed out reading the host's keyboard layout from systemd-localed.");
+				None
+			},
+		};
+		let resolved = self.with_host_keymap(host.as_ref());
+		tracing::info!(
+			layout = resolved.layout,
+			variant = resolved.variant,
+			model = resolved.model,
+			options = resolved.options.as_deref().unwrap_or_default(),
+			"Using the host's keyboard layout (no layout configured)."
+		);
+		resolved
+	}
+
+	/// This configuration with its empty fields filled in from `host`, or as
+	/// it is when it configures a layout.
+	fn with_host_keymap(&self, host: Option<&HostKeymap>) -> Self {
+		if !self.layout.is_empty() {
+			return self.clone();
+		}
+		let Some(host) = host.filter(|host| !host.layout.is_empty()) else {
+			return Self {
+				layout: FALLBACK_LAYOUT.to_string(),
+				..self.clone()
+			};
+		};
+		let or_host = |configured: &str, host: &str| if configured.is_empty() { host } else { configured }.to_string();
 		Self {
-			layout: "us".to_string(),
-			variant: String::new(),
-			model: String::new(),
-			options: None,
+			layout: host.layout.clone(),
+			variant: or_host(&self.variant, &host.variant),
+			model: or_host(&self.model, &host.model),
+			options: self
+				.options
+				.clone()
+				.or_else(|| (!host.options.is_empty()).then(|| host.options.clone())),
 		}
 	}
+}
+
+/// Read the host's X11 keymap from systemd-localed.
+fn host_keymap() -> zbus::Result<HostKeymap> {
+	let connection = zbus::blocking::Connection::system()?;
+	let proxy = zbus::blocking::Proxy::new(
+		&connection,
+		"org.freedesktop.locale1",
+		"/org/freedesktop/locale1",
+		"org.freedesktop.locale1",
+	)?;
+	Ok(HostKeymap {
+		layout: proxy.get_property("X11Layout")?,
+		variant: proxy.get_property("X11Variant")?,
+		model: proxy.get_property("X11Model")?,
+		options: proxy.get_property("X11Options")?,
+	})
 }
 
 /// How focus is split between windows. Mirrors gamescope's
@@ -581,7 +679,7 @@ fn run_compositor(
 		capabilities,
 		config.steam_mode,
 		config.virtual_connector_strategy,
-		config.keyboard.clone(),
+		config.keyboard.resolve(),
 		config.capture_mode,
 		context.log_stats,
 	)?;
@@ -1865,5 +1963,62 @@ mod xwayland_tests {
 		drop(input_method);
 		drop(conn);
 		shut_down(stop);
+	}
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+	use super::{HostKeymap, KeyboardConfig};
+
+	fn host() -> HostKeymap {
+		HostKeymap {
+			layout: "de".to_string(),
+			variant: "nodeadkeys".to_string(),
+			model: "pc105".to_string(),
+			options: "caps:escape".to_string(),
+		}
+	}
+
+	#[test]
+	fn a_configured_layout_ignores_the_host() {
+		let config = KeyboardConfig {
+			layout: "fr".to_string(),
+			..KeyboardConfig::default()
+		};
+		assert_eq!(config.with_host_keymap(Some(&host())), config);
+	}
+
+	#[test]
+	fn an_empty_layout_takes_the_host_keymap() {
+		let resolved = KeyboardConfig::default().with_host_keymap(Some(&host()));
+		assert_eq!(
+			resolved,
+			KeyboardConfig {
+				layout: "de".to_string(),
+				variant: "nodeadkeys".to_string(),
+				model: "pc105".to_string(),
+				options: Some("caps:escape".to_string()),
+			}
+		);
+	}
+
+	#[test]
+	fn configured_fields_win_over_the_host() {
+		let config = KeyboardConfig {
+			variant: "neo".to_string(),
+			options: Some(String::new()),
+			..KeyboardConfig::default()
+		};
+		let resolved = config.with_host_keymap(Some(&host()));
+		assert_eq!(resolved.layout, "de");
+		assert_eq!(resolved.variant, "neo");
+		assert_eq!(resolved.options, Some(String::new()));
+	}
+
+	#[test]
+	fn no_host_layout_falls_back_to_us() {
+		assert_eq!(KeyboardConfig::default().with_host_keymap(None).layout, "us");
+		let empty = HostKeymap::default();
+		assert_eq!(KeyboardConfig::default().with_host_keymap(Some(&empty)).layout, "us");
 	}
 }

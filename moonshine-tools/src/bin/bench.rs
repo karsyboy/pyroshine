@@ -832,6 +832,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.init();
 
 	let args = Args::parse();
+	// A unit and PulseAudio socket of its own, so a benchmark does not stop the
+	// session of a server on the same account (MOONSHINE_APPLICATION_UNIT
+	// still overrides it).
+	moonshine_core::session::use_default_application_unit("moonshine-bench.service");
 	if args.rate_change.len() > 64 || args.rate_change.windows(2).any(|pair| pair[0].0 > pair[1].0) {
 		return Err(boxed_error("at most 64 rate changes, ordered by time"));
 	}

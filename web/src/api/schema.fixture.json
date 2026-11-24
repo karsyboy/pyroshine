@@ -30,7 +30,7 @@
       "gpu": null,
       "hdr": true,
       "keyboard": {
-        "layout": "us",
+        "layout": "",
         "model": "",
         "options": null,
         "variant": ""
@@ -1156,10 +1156,10 @@
       {
         "advanced": false,
         "caution": null,
-        "help": "XKB layout, for example us or de.",
+        "help": "XKB layout, for example us or de; empty uses the host's keyboard layout (localectl).",
         "kind": {
           "optional": false,
-          "placeholder": "us",
+          "placeholder": "host layout",
           "suggestions": [
             "us",
             "gb",

@@ -60,20 +60,52 @@ pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
 /// session's teardown has stopped this unit.
 const APPLICATION_UNIT_NAME: &str = "moonshine-session.service";
 
-/// The application unit name: `moonshine-session.service`, or
+/// The unit name a process uses when `MOONSHINE_APPLICATION_UNIT` is unset;
+/// see [`use_default_application_unit`].
+static DEFAULT_UNIT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Make `name` this process's application unit when `MOONSHINE_APPLICATION_UNIT`
+/// does not name one. A second session manager on the account (the benchmark)
+/// calls this before its first session: starting a session stops a leftover
+/// unit of the same name and replaces the PulseAudio socket, which would end a
+/// live server's session. Returns false (and changes nothing) for an invalid
+/// name, or once the name is in use.
+pub fn use_default_application_unit(name: &'static str) -> bool {
+	valid_application_unit_name(name) && DEFAULT_UNIT.set(name).is_ok()
+}
+
+/// The application unit name: `moonshine-session.service`, the process's
+/// default (see [`use_default_application_unit`]), or
 /// `MOONSHINE_APPLICATION_UNIT` for a benchmark or test instance that must not
 /// replace a live service's session on the same account. An invalid override
 /// is ignored with a warning.
 pub fn application_unit_name() -> &'static str {
 	static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-	NAME.get_or_init(|| match std::env::var("MOONSHINE_APPLICATION_UNIT") {
-		Ok(name) if valid_application_unit_name(&name) => Box::leak(name.into_boxed_str()),
-		Ok(name) => {
-			tracing::warn!(name, "Ignoring invalid MOONSHINE_APPLICATION_UNIT");
-			APPLICATION_UNIT_NAME
-		},
-		Err(_) => APPLICATION_UNIT_NAME,
+	NAME.get_or_init(|| {
+		let default = *DEFAULT_UNIT.get_or_init(|| APPLICATION_UNIT_NAME);
+		match std::env::var("MOONSHINE_APPLICATION_UNIT") {
+			Ok(name) if valid_application_unit_name(&name) => Box::leak(name.into_boxed_str()),
+			Ok(name) => {
+				tracing::warn!(name, "Ignoring invalid MOONSHINE_APPLICATION_UNIT");
+				default
+			},
+			Err(_) => default,
+		}
 	})
+}
+
+/// The `$XDG_RUNTIME_DIR` subdirectory of the sessions' PulseAudio socket:
+/// `moonshine` for the server's unit, else the application unit's stem, so a
+/// benchmark or test instance does not replace the server's socket.
+pub(crate) fn pulse_runtime_subdir() -> &'static str {
+	pulse_subdir_for(application_unit_name())
+}
+
+fn pulse_subdir_for(unit: &str) -> &str {
+	if unit == APPLICATION_UNIT_NAME {
+		return "moonshine";
+	}
+	unit.strip_suffix(".service").unwrap_or(unit)
 }
 
 fn valid_application_unit_name(name: &str) -> bool {
@@ -754,5 +786,10 @@ mod unit_name_tests {
 		] {
 			assert!(!super::valid_application_unit_name(name), "{name}");
 		}
+	}
+	#[test]
+	fn other_units_get_their_own_pulse_directory() {
+		assert_eq!(super::pulse_subdir_for("moonshine-session.service"), "moonshine");
+		assert_eq!(super::pulse_subdir_for("moonshine-bench.service"), "moonshine-bench");
 	}
 }

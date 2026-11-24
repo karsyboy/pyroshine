@@ -365,10 +365,10 @@ retains the NVIDIA/AMD/other preference and stable node sorting.
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `layout` | string, `"us"` | XKB layout name, for example `us` or `de`. |
-| `variant` | string, `""` | XKB layout variant; empty uses the layout default. |
-| `model` | string, `""` | XKB keyboard model; empty uses XKB's default. |
-| `options` | optional string, unset | XKB options such as `caps:escape`. Omit to use no explicit options. |
+| `layout` | string, `""` | XKB layout name, for example `us` or `de`. Empty uses the host's X11 keymap from systemd-localed (what `localectl` shows), read for each stream, and `us` when it cannot be read. |
+| `variant` | string, `""` | XKB layout variant; empty uses the layout default, or the host's when `layout` is empty. |
+| `model` | string, `""` | XKB keyboard model; empty uses XKB's default, or the host's when `layout` is empty. |
+| `options` | optional string, unset | XKB options such as `caps:escape`. Omit to use no explicit options, or the host's when `layout` is empty. |
 
 ## `[[application]]`
 

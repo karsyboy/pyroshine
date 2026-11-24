@@ -457,7 +457,10 @@ impl AudioStream {
 		}
 		let pulse_socket_dir = dirs::runtime_dir()
 			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
-			.join("moonshine/pulse");
+			// Its own per application unit: a benchmark beside the server must
+			// not replace the server's socket.
+			.join(crate::session::pulse_runtime_subdir())
+			.join("pulse");
 		Self::new_in(config, address, stop, &pulse_socket_dir).await
 	}
 

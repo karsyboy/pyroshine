@@ -185,18 +185,20 @@ python3 scripts/record_baseline.py --bench-binary ./moonshine-bench \
   --checkout-from provenance/manifest.json --netns --set phase0 --out ~/baselines/nvidia
 ```
 
-To benchmark beside a live service on the same account, give the benchmark its
-own application unit and network namespace, for example:
+The benchmark starts its application as `moonshine-bench.service` with its
+PulseAudio socket in `$XDG_RUNTIME_DIR/moonshine-bench/pulse`, so it does not
+stop a live service's session on the same account; `MOONSHINE_APPLICATION_UNIT`
+overrides the unit (and the socket directory follows it). To benchmark beside a
+live service, also give it a network namespace, for example:
 
 ```sh
-MOONSHINE_APPLICATION_UNIT=moonshine-bench.service \
-  unshare --user --map-root-user --net sh -c \
+unshare --user --map-root-user --net sh -c \
   'ip link set lo up && exec unshare --user --map-user=1000 --map-group=1000 "$@"' sh \
   target/release/moonshine-bench --codec hevc --fps 120 --duration 20 /usr/bin/vkcube
 ```
 
 `MOONSHINE_APPLICATION_UNIT` must be a plain `*.service` name; an invalid value
-is ignored with a warning.
+is ignored with a warning, keeping the default.
 
 A server test instance beside a live service also cannot own the management
 name on the shared session bus. `MOONSHINE_MANAGEMENT_BUS` (a D-Bus address,

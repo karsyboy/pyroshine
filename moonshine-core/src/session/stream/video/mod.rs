@@ -143,6 +143,34 @@ impl VideoStreamConfig {
 	}
 }
 
+impl VideoStreamConfig {
+	/// The parity percentage a stream may reach: none when FEC is off, the
+	/// configured one when fixed, the upper bound when automatic.
+	pub fn worst_case_fec_percentage(&self) -> u8 {
+		match self.fec_mode {
+			FecMode::Off => 0,
+			FecMode::Fixed => self.fec_percentage,
+			FecMode::Auto => self.fec_max_percentage.max(self.fec_percentage),
+		}
+	}
+}
+
+/// The video bitrate that keeps a stream within `configured` bits per second,
+/// as Sunshine computes it from `x-ml-video.configuredBitrateKbps` in
+/// `cmd_announce()` (src/rtsp.cpp): take off the FEC parity (unless over
+/// 80%), then the audio bitrate (at most a fifth of what's left), then
+/// 500 kb/s for packet headers and control traffic (at most a tenth). The caps
+/// stop a low bitrate from leaving almost nothing for video.
+pub fn video_bitrate_within(configured: usize, fec_percentage: u8, audio_bitrate: usize) -> usize {
+	let mut bitrate = configured as u64;
+	if fec_percentage <= 80 {
+		bitrate = bitrate * (100 - u64::from(fec_percentage)) / 100;
+	}
+	bitrate -= (audio_bitrate as u64).min(bitrate / 5);
+	bitrate -= 500_000.min(bitrate / 10);
+	bitrate as usize
+}
+
 impl Default for VideoStreamConfig {
 	fn default() -> Self {
 		Self {
@@ -1014,6 +1042,17 @@ fn deliverable(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn video_bitrate_leaves_room_for_fec_audio_and_overhead() {
+		// 20 Mb/s with 20% FEC and 512 kb/s audio: 16 Mb/s, then 15.488, then 14.988.
+		assert_eq!(super::video_bitrate_within(20_000_000, 20, 512_000), 14_988_000);
+		// FEC above 80% is not taken off.
+		assert_eq!(super::video_bitrate_within(10_000_000, 90, 0), 9_500_000);
+		// Low bitrates keep most of it: audio at most a fifth, overhead a tenth.
+		assert_eq!(super::video_bitrate_within(1_000_000, 0, 512_000), 720_000);
+		assert_eq!(super::video_bitrate_within(0, 20, 512_000), 0);
+	}
+
 	use super::*;
 	use crate::session::capture::CapturePacing;
 	use crate::session::stream::test_support::SocketId;

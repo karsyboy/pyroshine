@@ -14,6 +14,21 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Added
+
+- **Host keyboard layout.** With no `[compositor.keyboard] layout` configured, each stream uses the host's keyboard layout from systemd-localed (what `localectl` shows), with its variant, model and options; `us` when it cannot be read. A configured layout is used as before (from upstream Moonshine, by Hans Gaiser).
+
+### Changed
+
+- **Vulkan Video encoding uses Pixelforge v0.14.0.** Streams share one Vulkan instance for the whole process, so the driver is no longer unloaded and reloaded for every stream; NVIDIA's driver failed to create an instance after about 26 reloads (upstream Moonshine #265). Pyroshine's own changes to Pixelforge are carried forward. v0.14.0 is published on crates.io but not tagged upstream, so it is pinned by commit.
+- **The video bitrate leaves room for the rest of the stream.** H.264, HEVC and AV1 are encoded below the client's bitrate, by the FEC share, the audio bitrate and 500 kb/s of packet overhead (as Sunshine does), so the whole stream stays within what the client asked for. PyroWave keeps the requested rate (from upstream Moonshine, by Ryan Bateman).
+- **`moonshine-bench` uses its own application unit and PulseAudio socket** (`moonshine-bench.service`, `$XDG_RUNTIME_DIR/moonshine-bench/pulse`) unless `MOONSHINE_APPLICATION_UNIT` names one, so a benchmark no longer ends a running server's session on the same account (from upstream Moonshine).
+
+### Fixed
+
+- **Reference frame invalidation recovers without an IDR.** The first frame after an invalidation is sent as a recovery frame (frame type 5), which Moonlight waits for; before, every invalidation ended in an IDR. Repeated loss reports for a loss already answered are ignored, a static screen re-sends the recovery frame, and when the client leaves the count to the host, Vulkan Video holds 150 ms of reference frames (4 to 16) and predicts from one. Applies to Vulkan Video, VA-API and NVENC (from upstream Moonshine, by Ryan Bateman).
+- **Colour conversion submits through Pixelforge's queue locks**, so it cannot race the encoder's own submissions to a shared queue.
+
 ## [v0.18.7] - 2026-11-17
 
 ### Added
