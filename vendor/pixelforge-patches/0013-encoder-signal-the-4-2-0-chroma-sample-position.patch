@@ -112,10 +112,10 @@ index d9a8806..b4ea316 100644
              reserved2: 0,
              def_disp_win_left_offset: 0,
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index 65357be..f6c5b64 100644
+index ae5d53a..9d5c296 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
-@@ -353,6 +353,51 @@ pub struct ColorDescription {
+@@ -375,6 +375,51 @@ pub struct ColorDescription {
      pub matrix_coefficients: u8,
      /// Full range (true) or limited/TV range (false).
      pub full_range: bool,
@@ -167,7 +167,7 @@ index 65357be..f6c5b64 100644
  }
  
  impl ColorDescription {
-@@ -372,6 +417,7 @@ impl ColorDescription {
+@@ -394,6 +439,7 @@ impl ColorDescription {
              transfer_characteristics: Self::TRANSFER_BT709,
              matrix_coefficients: Self::MATRIX_BT709,
              full_range: false,
@@ -175,7 +175,7 @@ index 65357be..f6c5b64 100644
          }
      }
  
-@@ -388,6 +434,7 @@ impl ColorDescription {
+@@ -410,6 +456,7 @@ impl ColorDescription {
              transfer_characteristics: Self::TRANSFER_SRGB,
              matrix_coefficients: Self::MATRIX_BT709,
              full_range: false,
@@ -183,7 +183,7 @@ index 65357be..f6c5b64 100644
          }
      }
  
-@@ -398,6 +445,7 @@ impl ColorDescription {
+@@ -420,6 +467,7 @@ impl ColorDescription {
              transfer_characteristics: Self::TRANSFER_ST2084_PQ,
              matrix_coefficients: Self::MATRIX_BT2020_NCL,
              full_range: false,
@@ -191,7 +191,7 @@ index 65357be..f6c5b64 100644
          }
      }
  
-@@ -407,6 +455,12 @@ impl ColorDescription {
+@@ -429,6 +477,12 @@ impl ColorDescription {
          self
      }
  
@@ -204,7 +204,7 @@ index 65357be..f6c5b64 100644
      /// Whether this description makes the stream HDR.
      ///
      /// The PQ (ST 2084) transfer function is what decides it; primaries and
-@@ -1045,6 +1099,26 @@ mod tests {
+@@ -1127,6 +1181,26 @@ mod tests {
              assert!(!cd.full_range);
          }
  
@@ -232,10 +232,10 @@ index 65357be..f6c5b64 100644
          fn test_srgb() {
              let cd = ColorDescription::srgb();
 diff --git a/src/lib.rs b/src/lib.rs
-index b7c931e..789a8c2 100644
+index 7c14554..0a44426 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -460,10 +460,10 @@ pub use decoder::{
+@@ -468,10 +468,10 @@ pub use decoder::{
  #[cfg(feature = "dmabuf")]
  pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, DmaBufPlane};
  pub use encoder::{
@@ -250,3 +250,6 @@ index b7c931e..789a8c2 100644
  };
  pub use encoder::{
      Conversion, ConversionPreference, Handoff, InputSlot, RgbSource, Source, SourceImage,
+-- 
+2.56.1
+

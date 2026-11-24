@@ -28,10 +28,10 @@ index 7ca8e2d..561256b 100644
              _ => ash::vk::native::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_BT_709,
          };
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index 0380bb8..65357be 100644
+index 351309b..ae5d53a 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
-@@ -347,7 +347,7 @@ impl StreamColor {
+@@ -369,7 +369,7 @@ impl StreamColor {
  pub struct ColorDescription {
      /// Color primaries (1=BT.709, 9=BT.2020).
      pub color_primaries: u8,
@@ -40,7 +40,7 @@ index 0380bb8..65357be 100644
      pub transfer_characteristics: u8,
      /// Matrix coefficients (1=BT.709, 9=BT.2020 NCL).
      pub matrix_coefficients: u8,
-@@ -360,6 +360,7 @@ impl ColorDescription {
+@@ -382,6 +382,7 @@ impl ColorDescription {
      const PRIMARIES_BT709: u8 = 1;
      const PRIMARIES_BT2020: u8 = 9;
      const TRANSFER_BT709: u8 = 1;
@@ -48,7 +48,7 @@ index 0380bb8..65357be 100644
      const TRANSFER_ST2084_PQ: u8 = 16;
      const MATRIX_BT709: u8 = 1;
      const MATRIX_BT2020_NCL: u8 = 9;
-@@ -374,6 +375,22 @@ impl ColorDescription {
+@@ -396,6 +397,22 @@ impl ColorDescription {
          }
      }
  
@@ -71,7 +71,7 @@ index 0380bb8..65357be 100644
      /// BT.2020 with PQ transfer function (HDR10).
      pub fn bt2020_pq() -> Self {
          Self {
-@@ -1028,6 +1045,16 @@ mod tests {
+@@ -1110,6 +1127,16 @@ mod tests {
              assert!(!cd.full_range);
          }
  
@@ -88,3 +88,6 @@ index 0380bb8..65357be 100644
          #[test]
          fn test_bt2020_pq() {
              let cd = ColorDescription::bt2020_pq();
+-- 
+2.56.1
+

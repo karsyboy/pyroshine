@@ -11,8 +11,8 @@ use super::ExternalSupport;
 use super::queues;
 use super::{
     DecodeQueueFamilies, DeviceExtensions, DeviceFeatures, DeviceQueue, DeviceRequirements,
-    QueueRoles, VideoContext, VideoContextBuilder, VideoContextInner, decode_extension_names,
-    find_decode_queue_families, query_decode_codecs, scan_queue_families,
+    QueueLocks, QueueRoles, VideoContext, VideoContextBuilder, VideoContextInner,
+    decode_extension_names, find_decode_queue_families, query_decode_codecs, scan_queue_families,
     supports_internally_synchronized_queues, supports_unified_image_layouts,
 };
 use crate::encoder::Codec;
@@ -407,7 +407,15 @@ impl VideoContextBuilder {
         let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let queue = |q: DeviceQueue| unsafe { device.get_device_queue(q.family, q.index) };
+        // `vkGetDeviceQueue2`, so a queue created with flags is found.
+        let queue = |q: DeviceQueue| unsafe {
+            device.get_device_queue2(
+                &vk::DeviceQueueInfo2::default()
+                    .flags(q.flags)
+                    .queue_family_index(q.family)
+                    .queue_index(q.index),
+            )
+        };
         let video_encode_queue = encode.map(queue);
         let video_decode_queue = decode.map(queue);
         let transfer_queue = queue(transfer);
@@ -431,6 +439,12 @@ impl VideoContextBuilder {
         let encode_plan = plan.encode.as_ref();
         Ok(VideoContext {
             inner: std::sync::Arc::new(VideoContextInner {
+                queue_locks: QueueLocks::new([
+                    video_encode_queue,
+                    video_decode_queue,
+                    Some(transfer_queue),
+                    Some(compute_queue),
+                ]),
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
                 entry,
@@ -463,7 +477,7 @@ impl VideoContextBuilder {
                 owns_device: false,
                 retired_semaphores: Default::default(),
                 // The caller owns the instance; reporting is theirs to set up.
-                debug_messenger: None,
+                _instance: None,
             }),
         })
     }

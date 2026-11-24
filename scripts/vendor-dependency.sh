@@ -94,6 +94,12 @@ git clone --quiet --no-hardlinks "${source}" "${work}/src"
 git -C "${work}/src" checkout --quiet --detach "${ref}"
 commit="$(git -C "${work}/src" rev-parse HEAD)"
 describe="$(git -C "${work}/src" describe --tags --always)"
+# A Pixelforge release published to crates.io without its Git tag is named by
+# its manifest version; Cargo then pins the commit instead of the tag.
+if [[ "${dependency}" == pixelforge ]] && ! git -C "${work}/src" describe --tags --exact-match >/dev/null 2>&1; then
+  version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "${work}/src/Cargo.toml" | head -n1)"
+  [[ -n "${version}" ]] && describe="v${version}"
+fi
 
 count=0
 for patch in "${patches}"/[0-9][0-9][0-9][0-9]-*.patch; do
@@ -125,9 +131,14 @@ if [[ "${mode}" == check ]]; then
   fi
   if [[ "${dependency}" == pixelforge ]]; then
     tag="$(sed -n 's/^describe //p' "${base_file}")"
-    [[ "$(git -C "${work}/src" rev-parse "${tag}^{commit}")" == "${commit}" ]] || {
-      echo "error: Pixelforge tag does not resolve to the pinned commit" >&2; exit 1;
-    }
+    # An untagged release (see above) is checked by its manifest version.
+    if git -C "${work}/src" rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+      [[ "$(git -C "${work}/src" rev-parse "${tag}^{commit}")" == "${commit}" ]] || {
+        echo "error: Pixelforge tag does not resolve to the pinned commit" >&2; exit 1;
+      }
+    elif [[ "${tag}" != "${describe}" ]]; then
+      echo "error: untagged Pixelforge ${commit} is ${describe}, not ${tag}" >&2; exit 1
+    fi
   fi
   python3 "${root}/scripts/check-vendor-pins.py" "${dependency}"
   echo "vendor/${dependency} matches ${commit} plus ${count} patch(es); pins agree."

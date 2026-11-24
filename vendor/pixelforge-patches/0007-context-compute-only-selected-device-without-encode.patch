@@ -19,7 +19,7 @@ extension is enabled only with an encode queue.
  2 files changed, 160 insertions(+), 26 deletions(-)
 
 diff --git a/src/vulkan.rs b/src/vulkan.rs
-index cd37f40..e0cac34 100644
+index 1a1e8d2..65c248d 100644
 --- a/src/vulkan.rs
 +++ b/src/vulkan.rs
 @@ -114,6 +114,22 @@ impl DeviceSelector {
@@ -42,7 +42,7 @@ index cd37f40..e0cac34 100644
 +    }
 +}
 +
- /// Destroy the instance, and its validation messenger, if context
+ /// Destroy the instance, and its validation messenger, if `VideoInstance`
  /// initialization fails before ownership transfers.
  struct InstanceGuard<'a> {
 @@ -151,6 +167,7 @@ pub struct VideoContextBuilder {
@@ -61,7 +61,7 @@ index cd37f40..e0cac34 100644
          }
      }
  
-@@ -259,6 +277,20 @@ impl VideoContextBuilder {
+@@ -261,6 +279,20 @@ impl VideoContextBuilder {
          self
      }
  
@@ -79,10 +79,10 @@ index cd37f40..e0cac34 100644
 +        self
 +    }
 +
-     /// Build the VideoContext.
-     pub fn build(self) -> Result<VideoContext> {
-         VideoContext::new(self)
-@@ -784,6 +816,8 @@ struct VideoContextInner {
+     /// Build the VideoContext, on a Vulkan instance of its own.
+     ///
+     /// The same as [`Self::build_on`] with a new instance from
+@@ -857,6 +889,8 @@ struct VideoContextInner {
      memory_properties: vk::PhysicalDeviceMemoryProperties,
      device_properties: vk::PhysicalDeviceProperties,
      supported_encode_codecs: Vec<Codec>,
@@ -91,7 +91,7 @@ index cd37f40..e0cac34 100644
      supported_decode_codecs: Vec<Codec>,
      has_push_descriptor: bool,
      has_video_encode_rgb_conversion: bool,
-@@ -1109,6 +1143,7 @@ impl VideoContext {
+@@ -1295,6 +1329,7 @@ impl VideoContext {
          let mut transfer_queue_family = u32::MAX;
          let mut compute_queue_family = u32::MAX;
          let mut supported_encode_codecs = Vec::new();
@@ -99,7 +99,7 @@ index cd37f40..e0cac34 100644
          let mut supported_decode_codecs = Vec::new();
  
          let has_extension =
-@@ -1210,27 +1245,66 @@ impl VideoContext {
+@@ -1396,27 +1431,66 @@ impl VideoContext {
                  continue;
              }
  
@@ -186,7 +186,7 @@ index cd37f40..e0cac34 100644
                  }
              }
  
-@@ -1254,11 +1328,26 @@ impl VideoContext {
+@@ -1440,11 +1514,26 @@ impl VideoContext {
                  .iter()
                  .all(|codec| decode_codecs.contains(codec));
  
@@ -216,7 +216,7 @@ index cd37f40..e0cac34 100644
                  selected_device = Some(physical_device);
                  selected_device_exts = Some(available_extensions);
                  video_encode_queue_family = encode_queue;
-@@ -1271,6 +1360,7 @@ impl VideoContext {
+@@ -1457,6 +1546,7 @@ impl VideoContext {
                  };
                  compute_queue_family = compute_q;
                  supported_encode_codecs = encode_codecs;
@@ -224,7 +224,7 @@ index cd37f40..e0cac34 100644
                  supported_decode_codecs = decode_codecs;
                  info!("Selected device: {}", device_name);
                  break;
-@@ -1284,7 +1374,10 @@ impl VideoContext {
+@@ -1470,7 +1560,10 @@ impl VideoContext {
                      has_compute_support
                  );
                  if !has_video_support {
@@ -236,7 +236,7 @@ index cd37f40..e0cac34 100644
                  }
                  if !encode_supported {
                      warn!(
-@@ -1348,12 +1441,15 @@ impl VideoContext {
+@@ -1534,12 +1627,15 @@ impl VideoContext {
              })
              .collect();
  
@@ -254,7 +254,7 @@ index cd37f40..e0cac34 100644
  
          // DMA-BUF and sync_file input, with the `dmabuf` feature, wherever the
          // device offers them.
-@@ -1587,6 +1683,7 @@ impl VideoContext {
+@@ -1777,6 +1873,7 @@ impl VideoContext {
                  memory_properties,
                  device_properties,
                  supported_encode_codecs,
@@ -262,7 +262,7 @@ index cd37f40..e0cac34 100644
                  supported_decode_codecs,
                  has_push_descriptor,
                  has_video_encode_rgb_conversion: has_rgb_conversion,
-@@ -1783,6 +1880,27 @@ impl VideoContext {
+@@ -1973,6 +2070,27 @@ impl VideoContext {
          self.inner.supported_encode_codecs.contains(&codec)
      }
  
@@ -290,7 +290,7 @@ index cd37f40..e0cac34 100644
      /// Check if the selected device supports decoding the given codec.
      pub fn supports_decode(&self, codec: Codec) -> bool {
          self.inner.supported_decode_codecs.contains(&codec)
-@@ -1864,6 +1982,21 @@ mod selection_tests {
+@@ -2054,6 +2172,21 @@ mod selection_tests {
          );
      }
  
@@ -313,10 +313,10 @@ index cd37f40..e0cac34 100644
      fn codec_support_on_another_gpu_never_satisfies_selection() {
          let selector = DeviceSelector {
 diff --git a/src/vulkan/adopt.rs b/src/vulkan/adopt.rs
-index 72683e5..bd384a8 100644
+index 4009280..2eed77d 100644
 --- a/src/vulkan/adopt.rs
 +++ b/src/vulkan/adopt.rs
-@@ -450,6 +450,7 @@ impl VideoContextBuilder {
+@@ -464,6 +464,7 @@ impl VideoContextBuilder {
                  memory_properties,
                  device_properties,
                  supported_encode_codecs: encode_plan.map(|e| e.codecs.clone()).unwrap_or_default(),
@@ -324,3 +324,6 @@ index 72683e5..bd384a8 100644
                  supported_decode_codecs,
                  has_push_descriptor: encode_plan.is_some_and(|e| e.push_descriptor),
                  has_video_encode_rgb_conversion: encode_plan.is_some_and(|e| e.rgb_conversion),
+-- 
+2.56.1
+

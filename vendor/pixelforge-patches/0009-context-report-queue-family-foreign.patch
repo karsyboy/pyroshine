@@ -15,10 +15,10 @@ transfers can choose the family.
  1 file changed, 11 insertions(+)
 
 diff --git a/src/vulkan.rs b/src/vulkan.rs
-index e0cac34..11f5b5a 100644
+index 65c248d..0423b45 100644
 --- a/src/vulkan.rs
 +++ b/src/vulkan.rs
-@@ -892,6 +892,17 @@ impl VideoContext {
+@@ -1011,6 +1011,17 @@ impl VideoContext {
          self.inner.external
      }
  
@@ -36,3 +36,6 @@ index e0cac34..11f5b5a 100644
      /// Wait on the CPU until `point` is reached.
      pub(crate) fn wait_point(&self, point: crate::sync::TimelinePoint) -> crate::error::Result<()> {
          let semaphores = [point.semaphore];
+-- 
+2.56.1
+

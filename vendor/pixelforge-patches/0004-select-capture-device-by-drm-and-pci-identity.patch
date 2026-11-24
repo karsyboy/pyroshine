@@ -6,24 +6,24 @@ Subject: [PATCH 04/13] Select the capture device by DRM identity with PCI
 
 ---
  src/lib.rs    |   2 +-
- src/vulkan.rs | 160 ++++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 161 insertions(+), 1 deletion(-)
+ src/vulkan.rs | 161 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 162 insertions(+), 1 deletion(-)
 
 diff --git a/src/lib.rs b/src/lib.rs
-index e9a15de..b7c931e 100644
+index 6f2cd49..7c14554 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -472,7 +472,7 @@ pub use encoder::{
+@@ -480,7 +480,7 @@ pub use encoder::{
  pub use error::PixelForgeError;
  pub use image::{DownloadedFrame, YuvDownloader, YuvLayout, YuvUploader};
  pub use sync::TimelinePoint;
--pub use vulkan::VideoContextBuilder;
-+pub use vulkan::{DeviceSelector, VideoContextBuilder};
+-pub use vulkan::{VideoContextBuilder, VideoInstance};
++pub use vulkan::{DeviceSelector, VideoContextBuilder, VideoInstance};
  
  /// Re-export VideoContext for convenience.
  pub use vulkan::VideoContext;
 diff --git a/src/vulkan.rs b/src/vulkan.rs
-index f97d385..cd37f40 100644
+index 07a8849..1a1e8d2 100644
 --- a/src/vulkan.rs
 +++ b/src/vulkan.rs
 @@ -54,6 +54,89 @@ unsafe extern "system" fn debug_utils_callback(
@@ -90,7 +90,7 @@ index f97d385..cd37f40 100644
 +    }
 +}
 +
-+/// Destroy the instance, and its validation messenger, if context
++/// Destroy the instance, and its validation messenger, if `VideoInstance`
 +/// initialization fails before ownership transfers.
 +struct InstanceGuard<'a> {
 +    instance: &'a ash::Instance,
@@ -100,8 +100,8 @@ index f97d385..cd37f40 100644
 +impl Drop for InstanceGuard<'_> {
 +    fn drop(&mut self) {
 +        if self.armed {
-+            // SAFETY: initialization owns this instance and messenger; no logical
-+            // device was created on failure, and the guard is disarmed on success.
++            // SAFETY: initialization owns this instance and messenger; no context
++            // was made on it yet, and the guard is disarmed on success.
 +            // A messenger must be destroyed before its instance.
 +            unsafe {
 +                if let Some((debug_utils, messenger)) = self.debug_messenger.take() {
@@ -132,7 +132,7 @@ index f97d385..cd37f40 100644
          }
      }
  
-@@ -165,6 +250,15 @@ impl VideoContextBuilder {
+@@ -167,6 +252,15 @@ impl VideoContextBuilder {
          self
      }
  
@@ -145,10 +145,10 @@ index f97d385..cd37f40 100644
 +        self
 +    }
 +
-     /// Build the VideoContext.
-     pub fn build(self) -> Result<VideoContext> {
-         VideoContext::new(self)
-@@ -972,6 +1066,12 @@ impl VideoContext {
+     /// Build the VideoContext, on a Vulkan instance of its own.
+     ///
+     /// The same as [`Self::build_on`] with a new instance from
+@@ -1130,6 +1224,12 @@ impl VideoInstance {
          let instance = unsafe { entry.create_instance(&create_info, None) }
              .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
  
@@ -161,7 +161,7 @@ index f97d385..cd37f40 100644
          info!("Created Vulkan instance");
  
          let debug_messenger = if has_debug_utils {
-@@ -991,6 +1091,7 @@ impl VideoContext {
+@@ -1149,11 +1249,15 @@ impl VideoInstance {
              let messenger = unsafe { debug_utils.create_debug_utils_messenger(&create_info, None) }
                  .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
              info!("Validation layer messages are routed to tracing");
@@ -169,7 +169,15 @@ index f97d385..cd37f40 100644
              Some((debug_utils, messenger))
          } else {
              None
-@@ -1102,6 +1203,13 @@ impl VideoContext {
+         };
+ 
++        // The instance now belongs to `VideoInstanceInner`, which destroys it.
++        instance_guard.armed = false;
++        drop(instance_guard);
+         Ok(Self {
+             inner: std::sync::Arc::new(VideoInstanceInner {
+                 entry,
+@@ -1285,6 +1389,13 @@ impl VideoContext {
                  }
              };
  
@@ -183,7 +191,7 @@ index f97d385..cd37f40 100644
              // Check codec support for encoding.
              let mut encode_codecs = Vec::new();
              if let Some(eq) = encode_queue {
-@@ -1196,6 +1304,11 @@ impl VideoContext {
+@@ -1379,6 +1490,11 @@ impl VideoContext {
          }
  
          let physical_device = selected_device.ok_or_else(|| {
@@ -195,16 +203,7 @@ index f97d385..cd37f40 100644
              PixelForgeError::NoSuitableDevice(
                  "No device with required video support found. Ensure your GPU drivers support Vulkan Video extensions (VK_KHR_video_queue, VK_KHR_video_encode_queue, etc.).".to_string(),
              )
-@@ -1452,6 +1565,8 @@ impl VideoContext {
-         info!("Compute queue family: {}", compute_queue_family);
-         info!("Created Vulkan device with video support");
- 
-+        instance_guard.armed = false;
-+        drop(instance_guard);
-         Ok(Self {
-             inner: std::sync::Arc::new(VideoContextInner {
-                 entry,
-@@ -1724,3 +1839,48 @@ mod tests {
+@@ -1913,3 +2029,48 @@ mod tests {
          }
      }
  }
@@ -253,3 +252,6 @@ index f97d385..cd37f40 100644
 +        );
 +    }
 +}
+-- 
+2.56.1
+

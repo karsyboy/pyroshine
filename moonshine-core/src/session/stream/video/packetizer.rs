@@ -77,6 +77,18 @@ enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
+/// The frame types of the video frame header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameType {
+	Predicted = 1,
+	Key = 2,
+	/// The first frame after a reference frame invalidation: the client drops
+	/// frames until it receives one (moonlight-common-c's
+	/// `waitingForRefInvalFrame`).
+	Recovery = 5,
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct VideoFrameHeader {
@@ -301,7 +313,7 @@ impl Packetizer {
 	pub fn packetize(
 		&mut self,
 		encoded_data: &[u8],
-		is_key_frame: bool,
+		frame_type: FrameType,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
@@ -320,10 +332,10 @@ impl Packetizer {
 		}
 
 		tracing::trace!(
-			"Packetizing frame {}, size={}, keyframe={}",
+			"Packetizing frame {}, size={}, type={:?}",
 			frame_number,
 			encoded_data.len(),
-			is_key_frame
+			frame_type
 		);
 
 		let requested_shard_payload_size =
@@ -348,7 +360,7 @@ impl Packetizer {
 		let video_frame_header = VideoFrameHeader {
 			header_type: 0x01,
 			frame_processing_latency,
-			frame_type: if is_key_frame { 2 } else { 1 },
+			frame_type: frame_type as u8,
 			last_payload_len: last_shard_size as u32,
 		};
 
@@ -783,12 +795,20 @@ mod tests {
 				let mut ordinary = packetizer_with(encrypt);
 				let mut native = packetizer_with(encrypt);
 				native.set_pyrowave_dialect(Some(PyroWaveDialect::NativeWireV1));
-				let a = ordinary.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).unwrap();
-				let b = native.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).unwrap();
+				let a = ordinary
+					.packetize(&data, FrameType::Key, 1392, 0, fec, 1, &mut 0, 42, 3)
+					.unwrap();
+				let b = native
+					.packetize(&data, FrameType::Key, 1392, 0, fec, 1, &mut 0, 42, 3)
+					.unwrap();
 				assert_eq!(a.as_bytes(), b.as_bytes());
 				let mut records = packetizer();
 				records.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
-				assert!(records.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).is_err());
+				assert!(
+					records
+						.packetize(&data, FrameType::Key, 1392, 0, fec, 1, &mut 0, 42, 3)
+						.is_err()
+				);
 			}
 		}
 	}
@@ -805,7 +825,7 @@ mod tests {
 		for encrypt in [false, true] {
 			let mut p = packetizer_with(encrypt);
 			p.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
-			let batch = p.packetize(&frame, true, 80, 0, 20, 1, &mut 0, 0, 0).unwrap();
+			let batch = p.packetize(&frame, FrameType::Key, 80, 0, 20, 1, &mut 0, 0, 0).unwrap();
 			let prefix = if encrypt { ENC_PREFIX_SIZE } else { 0 };
 			let cipher = Aes128Gcm::new(&Key::<Aes128Gcm>::from([0; 16]));
 			let mut plain: Vec<Vec<u8>> = batch
@@ -909,7 +929,7 @@ mod tests {
 			let (_tx, rx) = tokio::sync::watch::channel(ActiveKeys::for_test([0x11; 16], 7));
 			let mut packetizer = Packetizer::new(encrypted, rx);
 			let first = packetizer
-				.packetize(&data, true, 1024, 0, fec, 1, &mut 0, 123, 5)
+				.packetize(&data, FrameType::Key, 1024, 0, fec, 1, &mut 0, 123, 5)
 				.unwrap();
 			if encrypted {
 				// The recorded baseline fixture is sample 20, after twenty nonce
@@ -924,7 +944,7 @@ mod tests {
 					.unwrap();
 			}
 			let batch = packetizer
-				.packetize(&data, true, 1024, 0, fec, 1, &mut 0, 123, 5)
+				.packetize(&data, FrameType::Key, 1024, 0, fec, 1, &mut 0, 123, 5)
 				.unwrap();
 			assert_eq!(hex::encode(Sha256::digest(batch.as_bytes())), expected);
 		}
@@ -945,7 +965,7 @@ mod tests {
 						measurement_allocator::reset();
 						let started = Instant::now();
 						let batch = packetizer
-							.packetize(&data, true, 1024, 0, fec, 1, &mut 0, 123, 5)
+							.packetize(&data, FrameType::Key, 1024, 0, fec, 1, &mut 0, 123, 5)
 							.unwrap();
 						let ns = started.elapsed().as_nanos();
 						let counts = measurement_allocator::counts();
@@ -991,7 +1011,7 @@ mod tests {
 						measurement_allocator::reset();
 						let started = Instant::now();
 						let batch = packetizer
-							.packetize(&data, true, 1392, 0, 20, sample, &mut 0, 0, 0)
+							.packetize(&data, FrameType::Key, 1392, 0, 20, sample, &mut 0, 0, 0)
 							.unwrap();
 						let elapsed = started.elapsed().as_micros() as u64;
 						if sample >= 20 {
@@ -1052,8 +1072,12 @@ mod tests {
 		let mut encrypted = Packetizer::new(true, rx.clone());
 		let mut plain = Packetizer::new(false, rx);
 		let data = frame(0xab, 5000);
-		let batch = encrypted.packetize(&data, true, 1024, 0, 20, 1, &mut 0, 0, 0).unwrap();
-		let reference = plain.packetize(&data, true, 1024, 0, 20, 1, &mut 0, 0, 0).unwrap();
+		let batch = encrypted
+			.packetize(&data, FrameType::Key, 1024, 0, 20, 1, &mut 0, 0, 0)
+			.unwrap();
+		let reference = plain
+			.packetize(&data, FrameType::Key, 1024, 0, 20, 1, &mut 0, 0, 0)
+			.unwrap();
 		assert_eq!(batch.shard_size(), reference.shard_size() + ENC_PREFIX_SIZE);
 		assert_eq!(batch.shard_count(), reference.shard_count());
 		assert!(
@@ -1101,7 +1125,7 @@ mod tests {
 			packetizer
 				.packetize(
 					&frame(frame_number as u8, 3000),
-					true,
+					FrameType::Key,
 					512,
 					1,
 					20,
@@ -1155,7 +1179,7 @@ mod tests {
 		let (tx, rx) = tokio::sync::watch::channel(ActiveKeys::with_nonces([0x66; 16], 1, nonces.clone()));
 		let mut packetizer = Packetizer::new(true, rx.clone());
 		let batch = packetizer
-			.packetize(&frame(1, 16), true, 1024, 0, 0, 1, &mut 0, 0, 0)
+			.packetize(&frame(1, 16), FrameType::Key, 1024, 0, 0, 1, &mut 0, 0, 0)
 			.unwrap();
 		let (iv, _) = decrypt_shards(&batch, &[0x66; 16]).unwrap()[0];
 		assert_eq!(u64::from_le_bytes(iv[..8].try_into().unwrap()), VIDEO_NONCE_END - 10);
@@ -1164,25 +1188,25 @@ mod tests {
 		let mut sequence = 0;
 		assert!(
 			packetizer
-				.packetize(&frame(2, 20 * 1008), true, 1024, 0, 0, 2, &mut sequence, 0, 0)
+				.packetize(&frame(2, 20 * 1008), FrameType::Key, 1024, 0, 0, 2, &mut sequence, 0, 0)
 				.is_err()
 		);
 		assert_eq!(nonces.video.high_water(), VIDEO_NONCE_END - 9);
 		// The key is retired for this epoch, even for frames that would fit.
 		assert!(
 			packetizer
-				.packetize(&frame(3, 16), true, 1024, 0, 0, 3, &mut 0, 0, 0)
+				.packetize(&frame(3, 16), FrameType::Key, 1024, 0, 0, 3, &mut 0, 0, 0)
 				.is_err()
 		);
 		// Another packetizer may use the remaining counters, but never past the end.
 		let mut other = Packetizer::new(true, rx);
 		let batch = other
-			.packetize(&frame(4, 8 * 1008), true, 1024, 0, 0, 4, &mut 0, 0, 0)
+			.packetize(&frame(4, 8 * 1008), FrameType::Key, 1024, 0, 0, 4, &mut 0, 0, 0)
 			.unwrap();
 		assert_eq!(batch.shard_count(), 9);
 		assert!(
 			other
-				.packetize(&frame(5, 16), true, 1024, 0, 0, 5, &mut 0, 0, 0)
+				.packetize(&frame(5, 16), FrameType::Key, 1024, 0, 0, 5, &mut 0, 0, 0)
 				.is_err()
 		);
 		assert_eq!(nonces.video.high_water(), VIDEO_NONCE_END);
@@ -1190,7 +1214,7 @@ mod tests {
 		// A newly published key restores service.
 		tx.send_replace(ActiveKeys::for_test([0x77; 16], 1));
 		let batch = packetizer
-			.packetize(&frame(6, 16), true, 1024, 0, 0, 6, &mut 0, 0, 0)
+			.packetize(&frame(6, 16), FrameType::Key, 1024, 0, 0, 6, &mut 0, 0, 0)
 			.unwrap();
 		assert!(decrypt_shards(&batch, &[0x77; 16]).is_ok());
 	}
@@ -1249,8 +1273,12 @@ mod tests {
 			let mut extended = packetizer_with(encrypt);
 			extended.set_fec_layout(FecBlockLayout::Extended);
 			// Each test packetizer has its own key, so nonces match too.
-			let a = gamestream.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 7, 1).unwrap();
-			let b = extended.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 7, 1).unwrap();
+			let a = gamestream
+				.packetize(&data, FrameType::Key, 1392, 0, 20, 1, &mut 0, 7, 1)
+				.unwrap();
+			let b = extended
+				.packetize(&data, FrameType::Key, 1392, 0, 20, 1, &mut 0, 7, 1)
+				.unwrap();
 			assert_eq!(a.fec_blocks(), 4);
 			assert_eq!(a.as_bytes(), b.as_bytes());
 		}
@@ -1302,7 +1330,9 @@ mod tests {
 		let data: Vec<u8> = (0..985 * 1376 - 8).map(|i| (i * 131 + i / 7) as u8).collect();
 		let mut p = packetizer();
 		p.set_fec_layout(FecBlockLayout::Extended);
-		let batch = p.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 0, 0).unwrap();
+		let batch = p
+			.packetize(&data, FrameType::Key, 1392, 0, 20, 1, &mut 0, 0, 0)
+			.unwrap();
 		assert_eq!((batch.fec_blocks(), batch.fec_percentage()), (5, 20));
 		assert_eq!(batch.data_shards(), 985);
 		assert_eq!(batch.parity_shards(), 5 * 40);
@@ -1327,7 +1357,9 @@ mod tests {
 		let data: Vec<u8> = (0..849 * 8 - 8).map(|i| (i * 131 + i / 7) as u8).collect();
 		let mut p = packetizer();
 		p.set_fec_layout(FecBlockLayout::Extended);
-		let batch = p.packetize(&data, true, 24, 0, 20, 1, &mut 0, 9000, 3).unwrap();
+		let batch = p
+			.packetize(&data, FrameType::Key, 24, 0, 20, 1, &mut 0, 9000, 3)
+			.unwrap();
 		assert_eq!((batch.fec_blocks(), batch.fec_percentage()), (5, 20));
 		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/protocol/pyrowave-extended-fec.bin");
 		if std::env::var_os("MOONSHINE_UPDATE_FEC_FIXTURE").is_some() {
@@ -1362,7 +1394,17 @@ mod tests {
 			let mut packetizer = packetizer();
 			let mut sequence = 0;
 			let batch = packetizer
-				.packetize(&vec![0x55; 992], true, 116, 0, percentage, 1, &mut sequence, 0, 0)
+				.packetize(
+					&vec![0x55; 992],
+					FrameType::Key,
+					116,
+					0,
+					percentage,
+					1,
+					&mut sequence,
+					0,
+					0,
+				)
 				.unwrap();
 			let first = &batch.as_bytes()[..batch.shard_size()];
 			let fec_info = u32::from_le_bytes(first[NV_PACKET_OFFSET + 12..NV_PACKET_OFFSET + 16].try_into().unwrap());
@@ -1384,7 +1426,7 @@ mod tests {
 		let mut packetizer = packetizer();
 		let mut sequence = 0;
 		let batch = packetizer
-			.packetize(&[0x55; 16], true, 116, 2, 20, 1, &mut sequence, 0, 0)
+			.packetize(&[0x55; 16], FrameType::Key, 116, 2, 20, 1, &mut sequence, 0, 0)
 			.unwrap();
 		let first = &batch.as_bytes()[..batch.shard_size()];
 		let fec_info = u32::from_le_bytes(first[NV_PACKET_OFFSET + 12..NV_PACKET_OFFSET + 16].try_into().unwrap());
@@ -1402,7 +1444,17 @@ mod tests {
 			let mut packetizer = packetizer();
 			let mut sequence = 0;
 			let batch = packetizer
-				.packetize(&vec![0x55; encoded_size], true, 1392, 0, 0, 1, &mut sequence, 0, 0)
+				.packetize(
+					&vec![0x55; encoded_size],
+					FrameType::Key,
+					1392,
+					0,
+					0,
+					1,
+					&mut sequence,
+					0,
+					0,
+				)
 				.unwrap();
 			assert_eq!(batch.shard_size(), 1408);
 			assert_eq!(batch.data_shards(), data_shards);
@@ -1490,9 +1542,11 @@ mod tests {
 
 		let data: Vec<u8> = (0..200_000).map(|i| (i * 7) as u8).collect();
 		let lazy = interrupted
-			.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 9, 1)
+			.packetize(&data, FrameType::Key, 1392, 0, 20, 1, &mut 0, 9, 1)
 			.unwrap();
-		let eager = warmed.packetize(&data, true, 1392, 0, 20, 1, &mut 0, 9, 1).unwrap();
+		let eager = warmed
+			.packetize(&data, FrameType::Key, 1392, 0, 20, 1, &mut 0, 9, 1)
+			.unwrap();
 		assert_eq!(lazy.as_bytes(), eager.as_bytes());
 	}
 }

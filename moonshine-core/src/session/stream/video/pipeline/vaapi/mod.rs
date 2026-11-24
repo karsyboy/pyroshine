@@ -958,15 +958,19 @@ impl VaapiEncoder {
 		self.dpb.clear();
 	}
 
-	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) {
+	/// Whether the next frame recovers from the loss by predicting from a
+	/// surviving reference; `false` when an IDR follows instead.
+	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) -> bool {
 		if matches!(self.codec, Codec::Av1(_)) || display_order >= self.submitted {
 			self.request_idr();
-			return;
+			return false;
 		}
 		self.dpb.invalidate(display_order);
 		if self.dpb.anchor().is_none() {
 			self.request_idr();
+			return false;
 		}
+		true
 	}
 
 	pub(crate) fn set_color_description(&mut self, description: ColorDescription) -> Result<(), EncodeError> {

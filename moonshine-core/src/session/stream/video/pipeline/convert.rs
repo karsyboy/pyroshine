@@ -2247,7 +2247,9 @@ impl InputConverter {
 		// SAFETY: guaranteed by the caller; the fence is unsignaled (it is reset
 		// after every completed wait).
 		unsafe {
-			device.queue_submit(
+			// Through the context: Pixelforge locks each queue, and its encoder
+			// may submit to this one from another thread.
+			self.context.submit(
 				self.queue,
 				&[vk::SubmitInfo::default().command_buffers(&command_buffers)],
 				self.fence,
@@ -2295,7 +2297,7 @@ impl InputConverter {
 				// queue before the command buffer is reused. A stalled GPU would
 				// never go idle, and stops the stream instead.
 				if e != vk::Result::TIMEOUT {
-					let _ = device.queue_wait_idle(self.queue);
+					let _ = self.context.wait_queue_idle(self.queue);
 				}
 				return Err(e);
 			}
@@ -2651,7 +2653,7 @@ impl SelfCheckSource {
 					);
 					device.end_command_buffer(cmd).map_err(err("end"))?;
 					if let Err(e) = converter.submit_and_wait(cmd) {
-						let _ = device.queue_wait_idle(converter.queue);
+						let _ = converter.context.wait_queue_idle(converter.queue);
 						return Err(format!("self-check upload: {e}"));
 					}
 					Ok(())
@@ -2699,7 +2701,7 @@ impl Drop for InputConverter {
 		// references these objects can still be pending. A failed wait leaves
 		// the queue in an unknown state; idle the queue before destroying.
 		unsafe {
-			let _ = device.queue_wait_idle(self.queue);
+			let _ = self.context.wait_queue_idle(self.queue);
 			for view in self.transient_views.drain(..) {
 				device.destroy_image_view(view, None);
 			}

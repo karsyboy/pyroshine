@@ -1047,37 +1047,41 @@ impl NvencEncoder {
 		self.recovery.reset(self.submitted);
 	}
 
-	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) {
+	/// Whether the next frame recovers from the loss by predicting from a
+	/// surviving reference; `false` when an IDR follows instead.
+	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) -> bool {
 		if self.idr_pending || !self.reference_invalidation {
 			self.request_idr();
-			return;
+			return false;
 		}
 		let (first, end) = match self.recovery.plan(display_order, self.submitted) {
 			recovery::Plan::Idr => {
 				self.request_idr();
-				return;
+				return false;
 			},
-			recovery::Plan::Covered => return,
+			// Already invalidated: the next frame still recovers.
+			recovery::Plan::Covered => return true,
 			recovery::Plan::Invalidate { first, end } => (first, end),
 		};
 		let shared = &self.shared;
 		let Some(invalidate) = shared.api.nvEncInvalidateRefFrames else {
 			self.idr_pending = true;
-			return;
+			return false;
 		};
 		let Ok(_current) = shared.cuda.push() else {
 			self.idr_pending = true;
-			return;
+			return false;
 		};
 		let _session = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
 		for timestamp in first..end {
 			// SAFETY: valid session; timestamps are the frames' inputTimeStamp.
 			if unsafe { invalidate(shared.session, timestamp) } != NV_ENC_SUCCESS {
 				self.idr_pending = true;
-				return;
+				return false;
 			}
 		}
 		self.recovery.accepted(first, end);
+		true
 	}
 
 	pub(crate) fn set_color_description(&mut self, description: ColorDescription) -> Result<(), EncodeError> {

@@ -1,7 +1,7 @@
 # Local Pixelforge patches
 
 Base: https://github.com/hgaiser/pixelforge, the revision recorded in
-`../pixelforge-patches/UPSTREAM` (v0.12.1, `e4ac68b73e49d7d7199fd91ad392cd6767a847b8`).
+`../pixelforge-patches/UPSTREAM` (v0.14.0, `49e869d5118ad770a0fc82c299d4cb589130ba11`; published to crates.io without a Git tag, so Cargo pins the commit).
 The crate files Pyroshine builds (`Cargo.toml`, `src/`, `shader/`, license, README,
 changelog) are copied with their BSD-2-Clause license, with `benches/` and `tests/`
 so the crate builds and tests on its own: the manifest names a bench target and
@@ -27,8 +27,8 @@ uses `pixelforge-ash` (a crates.io release of the ash revision it used before), 
 | `0007-context-compute-only-selected-device-without-encode.patch` | Encode support requires `VK_KHR_video_queue` and `VK_KHR_video_encode_queue` as well as a video encode queue family; each unsupported codec keeps a reason (`encode_unsupported_reason`); `allow_without_encode()` builds a compute/transfer-only context on the selected device; the video queue extension is enabled only with an encode or decode queue. | Intel Xe2/Xe3 (verified: Arc B390, Mesa 26.2.4) expose no Vulkan Video encode, so Pyroshine could not start there even for PyroWave, which encodes with compute. With `ANV_DEBUG=video-encode` ANV reports an encode queue family without the extensions, and device creation failed with `ERROR_EXTENSION_NOT_PRESENT`. |
 | `0008-encoder-validate-rate-control-capabilities.patch` | `EncoderCapabilities` carries the profile's `rateControlModes` and `maxBitrate`; `check_rate_control()` rejects an unsupported `RateControl` mode or a bitrate above the maximum, and encoder creation applies it. | Both are valid-usage requirements drivers do not report. ANV's Gen12 encoder (UHD 730, `ANV_DEBUG=video-encode`) offers only disabled rate control, yet a CBR encoder was created; an RTX 3080 limits H.264 and HEVC to 120 Mbps, and higher client bitrates were passed through. |
 | `0009-context-report-queue-family-foreign.patch` | Report through `has_queue_family_foreign()` whether `VK_EXT_queue_family_foreign` is enabled. | VA-API surfaces come from another driver than the Vulkan device that writes them. Their ownership transfers must use `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` only covers the same device and driver identity. Upstream enables the extension with the `dmabuf` feature. |
-| `0010-live-cbr-controls-preserve-session-and-dpb.patch` | `Encoder::set_bitrate` stages a bounded CBR change; the shared encode recording begins coding with the installed rate and issues ENCODE_RATE_CONTROL without RESET; `Encoder::next_display_order` exposes the next actual display order. A rebuild for a new conversion keeps the startup ceiling. | Live rate changes preserve the profile/session/DPB and remain within startup storage/level and `maxBitrate`; failed attempts can consume display order. Continuous decoded Vulkan fixtures exercise decreases/restores/clamps without extra keyframes on AMD and NVIDIA. |
-| `0011-context-keep-a-graphics-queue-beside-compute.patch` | A context that creates its own device also creates a queue on the first graphics-and-compute family, exposes it as `graphics_queue_family()`/`graphics_queue()`, and shares encoder input images with it. Adopted devices report their compute family. | Upstream selects a compute family without graphics when the device has one (RADV, NVIDIA), which left no graphics queue. Pyroshine's `conversion_queue = "graphics"` converts there to avoid compute-queue starvation under a GPU-bound game. |
+| `0010-encoder-clamp-live-CBR-bitrate-changes.patch` | `Encoder::set_bitrate` clamps a requested CBR target to the startup bitrate and the profile's `maxBitrate`, rejects CQP/VBR and zero, and applies it through upstream's `set_rate_control`; `Encoder::next_display_order` exposes the next actual display order. | Upstream v0.13 changes a running encoder's rate control without RESET (keeping the session and DPB), but refuses a peak above the startup one; Pyroshine's rate adaptation asks for any target and takes the accepted one. Failed attempts can consume display order. |
+| `0011-context-keep-a-graphics-queue-beside-compute.patch` | A context that creates its own device also creates a queue on the first graphics-and-compute family, exposes it as `graphics_queue_family()`/`graphics_queue()`, and shares encoder input images with it; the graphics queue gets its own lock in upstream's per-queue `QueueLocks`. Adopted devices report their compute family. | Upstream selects a compute family without graphics when the device has one (RADV, NVIDIA), which left no graphics queue. Pyroshine's `conversion_queue = "graphics"` converts there to avoid compute-queue starvation under a GPU-bound game. |
 | `0012-encoder-signal-the-sRGB-transfer-for-sRGB-encoded-in.patch` | Add `ColorDescription::srgb()` (H.273 transfer 13) and map it to the AV1 sRGB transfer; H.264/H.265 VUI carry the code point as is. | Pyroshine converts sRGB framebuffers to YCbCr without a transfer change. Signaled as BT.709 transfer, decoders apply BT.1886 and show SDR darker and with more contrast than the host (and than PyroWave, which signals sRGB). |
 | `0013-encoder-signal-the-4-2-0-chroma-sample-position.patch` | Add `ColorDescription::chroma_location` (`ChromaLocation`, default `Left`), written as H.264/H.265 VUI `chroma_loc_info` and AV1 `chroma_sample_position`, for 4:2:0 only. | Upstream always signals left-sited 4:2:0 chroma, which its own RGB conversion produces. Pyroshine's converter centers H.264/HEVC chroma (2x2 mean) and left-sites AV1 chroma, which has no centered code. |
 
@@ -44,8 +44,20 @@ Upstream v0.12 adds B-frames (off by default; Pyroshine never enables them, sinc
 they add a frame of latency), turns H.264 deblocking on, drops the H.264 CBR QP
 bounds and enables AV1 CDEF and loop restoration. Its 8x8 minimum H.265 coding
 block made NVIDIA encode about ten times slower and was reverted to 16x16 in
-v0.12.1. Patch 0010 records the installed CBR bitrate after each encode in
-upstream's new encode-order flow (`encode_planned`).
+v0.12.1.
+
+Upstream v0.13.0 provides the former live-CBR patch's session-preserving rate
+control change (`Encoder::set_rate_control`, ENCODE_RATE_CONTROL without RESET),
+so patch 0010 is now only the clamping `set_bitrate` wrapper. It also locks each
+queue: callers that submit to a context queue themselves must use
+`VideoContext::submit`/`submit2`/`wait_queue_idle`. `invalidate_reference_frames`
+returns whether references were invalidated, and the next frame after an
+invalidation reports `is_recovery_frame`.
+
+Upstream v0.14.0 splits instance creation out (`VideoInstance`,
+`VideoContextBuilder::build_on`), so contexts made one after another can share
+one Vulkan instance and the driver is not unloaded between streams. Patch 0004's
+instance clean-up on failure now covers only `VideoInstance` creation.
 
 Pyroshine converts frames itself and submits them with
 `Encoder::submit(Frame::input(slot))` from a YUV `Source`, so none of upstream's

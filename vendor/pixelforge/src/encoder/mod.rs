@@ -182,6 +182,28 @@ impl RateControl {
         }
         Ok(())
     }
+
+    /// Why an encoder made with `initial` cannot change to this, if it
+    /// cannot: the mode has to stay, and the peak cannot go above the one it
+    /// was made with.
+    pub(crate) fn check_change_from(&self, initial: RateControl) -> crate::error::Result<()> {
+        let invalid = |reason: String| Err(crate::error::PixelForgeError::InvalidInput(reason));
+        match (initial, *self) {
+            (Self::Cqp { .. }, Self::Cqp { .. }) => Ok(()),
+            (Self::Cbr { bitrate: limit }, Self::Cbr { bitrate: peak })
+            | (Self::Vbr { max: limit, .. }, Self::Vbr { max: peak, .. }) => {
+                if peak > limit {
+                    return invalid(format!(
+                        "a peak bitrate of {peak} is above the {limit} the encoder was made with"
+                    ));
+                }
+                Ok(())
+            }
+            _ => invalid(format!(
+                "the rate control mode cannot change, from {initial:?} to {self:?}"
+            )),
+        }
+    }
 }
 
 /// Encode usage hints.
@@ -494,6 +516,11 @@ pub struct EncodeConfig {
     /// as the device allows, which can be fewer. The device's DPB size can
     /// also lower it.
     pub max_reference_frames: u32,
+    /// The most references one frame predicts from, capped at the device's limit;
+    /// `None` predicts from as many as the device allows. Fewer cost less to
+    /// encode, and the rest of the window stays for invalidation. B-frames
+    /// still predict from one reference on each side.
+    pub active_reference_frames: Option<u32>,
     /// How many B-frames go between two reference frames; see
     /// [`Self::with_b_frames`].
     pub b_frames: u32,
@@ -550,6 +577,7 @@ impl EncodeConfig {
             },
             gop_size: DEFAULT_GOP_SIZE,
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            active_reference_frames: None,
             b_frames: 0,
             b_frame_references: BFrameReferences::Flat,
             virtual_buffer_size_ms: 1000,
@@ -616,6 +644,13 @@ impl EncodeConfig {
     /// [`max_reference_frames`](Self::max_reference_frames)).
     pub fn with_max_reference_frames(mut self, count: u32) -> Self {
         self.max_reference_frames = count;
+        self
+    }
+
+    /// Set the most references a frame predicts from (see
+    /// [`active_reference_frames`](Self::active_reference_frames)).
+    pub fn with_active_reference_frames(mut self, count: u32) -> Self {
+        self.active_reference_frames = Some(count);
         self
     }
 
@@ -755,6 +790,12 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     /// Frame type.
     pub frame_type: FrameType,
+    /// Whether this is the first frame shown after
+    /// [`Encoder::invalidate_reference_frames`](crate::Encoder::invalidate_reference_frames)
+    /// returned `true`: it predicts only from frames before the loss, so a
+    /// client that stopped decoding at the loss can start again here.
+    /// Moonlight's protocol marks it as frame type 5. Never set on a key frame.
+    pub is_recovery_frame: bool,
     /// Presentation timestamp: the number of the frame in the order it was
     /// submitted.
     pub pts: u64,
@@ -862,6 +903,46 @@ mod tests {
     // RateControl tests.
     mod rate_control_tests {
         use super::*;
+
+        #[test]
+        fn a_change_keeps_the_mode_and_stays_below_the_peak() {
+            let cbr = RateControl::Cbr { bitrate: 8_000_000 };
+            let vbr = RateControl::Vbr {
+                target: 6_000_000,
+                max: 8_000_000,
+            };
+            let cqp = RateControl::Cqp { qp: 26 };
+
+            assert!(
+                RateControl::Cbr { bitrate: 2_000_000 }
+                    .check_change_from(cbr)
+                    .is_ok()
+            );
+            assert!(cbr.check_change_from(cbr).is_ok());
+            assert!(
+                RateControl::Cbr { bitrate: 8_000_001 }
+                    .check_change_from(cbr)
+                    .is_err()
+            );
+
+            let lower = RateControl::Vbr {
+                target: 1_000_000,
+                max: 2_000_000,
+            };
+            assert!(lower.check_change_from(vbr).is_ok());
+            let above = RateControl::Vbr {
+                target: 6_000_000,
+                max: 9_000_000,
+            };
+            assert!(above.check_change_from(vbr).is_err());
+
+            assert!(RateControl::Cqp { qp: 40 }.check_change_from(cqp).is_ok());
+
+            assert!(cbr.check_change_from(vbr).is_err());
+            assert!(vbr.check_change_from(cbr).is_err());
+            assert!(cqp.check_change_from(cbr).is_err());
+            assert!(cbr.check_change_from(cqp).is_err());
+        }
 
         #[test]
         fn defaults_are_a_constant_quantizer() {
@@ -1059,6 +1140,7 @@ mod tests {
             let packet = EncodedPacket {
                 data: vec![0x00, 0x00, 0x00, 0x01, 0x67],
                 frame_type: FrameType::Idr,
+                is_recovery_frame: false,
                 pts: 0,
                 dts: 0,
                 stats: EncodedPacketStats::default(),

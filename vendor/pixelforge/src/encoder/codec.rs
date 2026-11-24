@@ -51,11 +51,6 @@ pub(crate) const MAX_DPB_SLOTS: usize = 16;
 pub(crate) struct EncoderCommon {
     pub context: VideoContext,
     pub config: EncodeConfig,
-    /// The startup CBR target, which bounds live changes without changing the
-    /// sequence level or storage; 0 without CBR.
-    pub bitrate_ceiling: u32,
-    /// The CBR target installed by the most recent submitted coding scope.
-    pub installed_bitrate: u32,
 
     pub video_queue_fn: ash::khr::video_queue::Device,
     pub video_encode_fn: ash::khr::video_encode_queue::Device,
@@ -82,6 +77,9 @@ pub(crate) struct EncoderCommon {
     pub input_frame_num: u64,
     /// Monotonic encode-order counter (decode order / DTS; `0` => first frame).
     pub encode_frame_num: u64,
+    /// Set when an invalidation left a reference to predict from: the next
+    /// frame shown is the recovery frame, see [`crate::EncodedPacket::is_recovery_frame`].
+    pub recovery_pending: bool,
 
     pub dpb_images: Vec<vk::Image>,
     pub dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -125,22 +123,12 @@ pub(crate) struct EncoderCommon {
     pub profile: EncodeProfile,
     /// The RGB format the encoder converts from, when it takes RGB input.
     pub rgb_input: Option<RgbFormat>,
-}
-
-/// The CBR bitrate of `config`, or 0 for another rate control mode.
-fn cbr_bitrate(config: &EncodeConfig) -> u32 {
-    match config.rate_control {
-        RateControl::Cbr { bitrate } => bitrate,
-        _ => 0,
-    }
+    /// What the session's rate control was set to by the last encode
+    /// submitted. `None` before the first.
+    pub rate_control_state: Option<RateControlState>,
 }
 
 impl EncoderCommon {
-    /// Whether a live CBR change is staged for the next frame.
-    pub fn rate_changed(&self) -> bool {
-        matches!(self.config.rate_control, RateControl::Cbr { bitrate } if bitrate != self.installed_bitrate)
-    }
-
     /// Set up what a frame's encode reads, copying the source into the input
     /// image of `slot` first when it has to. Returns the frame, ready to wait
     /// for its encode, and the point where its source is free again if
@@ -341,8 +329,7 @@ impl EncoderCommon {
         let signals = std::mem::take(&mut self.pending_signals);
         let delivery = std::mem::replace(&mut self.delivery, Delivery::Packet);
         let point = self.pipeline.submit_current(
-            self.context.device(),
-            self.context.sync2(),
+            &self.context,
             encode_queue,
             &waits,
             &signals,
@@ -365,47 +352,35 @@ impl EncoderCommon {
             + TaggedStructure<'static>
             + Copy,
         L: for<'x> vk::Extends<vk::VideoEncodeRateControlLayerInfoKHR<'x>>
-            + TaggedStructure<'static>,
+            + TaggedStructure<'static>
+            + Copy,
     {
         let slot = self.pipeline.current();
         let command_buffer = slot.encode_command_buffer;
         let query_pool = slot.query_pool;
         let timestamp_query_pool = slot.timestamp_query_pool;
-        let rc = cmd.rate_control;
+        let state = cmd.rate_control.state();
+        // What the session's rate control is set to before this frame. Begin
+        // coding has to state it, and a control command then changes it to
+        // this frame's, without a reset, when the bitrate changed.
+        let current = self.rate_control_state.unwrap_or(state);
+        let change = !cmd.reset && current != state;
 
         let mut codec_layer = cmd.codec_layer;
-        let rc_layers = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(rc.average_bitrate as u64)
-            .max_bitrate(rc.max_bitrate as u64)
-            .frame_rate_numerator(self.config.frame_rate.numerator)
-            .frame_rate_denominator(self.config.frame_rate.denominator)
-            .push(&mut codec_layer)];
-        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc.mode);
-        if !rc.is_disabled() {
-            rc_info = rc_info
-                .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
-                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
-        }
+        let rc_layers = [self.rate_control_layer(state).push(&mut codec_layer)];
+        let mut rc_info = self.rate_control_info(state, &rc_layers);
 
         reset_start_timestamp(self.device(), command_buffer, timestamp_query_pool);
-
-        // Begin describes the state left by the previous submission; a live
-        // CBR change is installed by a control command inside this scope.
-        let rate_changed = self.rate_changed();
-        let begin_layers = [rc_layers[0]
-            .average_bitrate(u64::from(self.installed_bitrate))
-            .max_bitrate(u64::from(self.installed_bitrate))];
 
         // Ash links pNext chains in place, so each command needs its own
         // extension structs. The first frame sets rate control with the
         // control command below, after RESET, rather than here.
         let mut begin_codec_rc = cmd.codec_rate_control;
-        let mut begin_rc = if rate_changed {
-            rc_info.layers(&begin_layers)
-        } else {
-            rc_info
-        };
+        let mut begin_codec_layer = cmd.codec_layer;
+        let begin_layers = [self
+            .rate_control_layer(current)
+            .push(&mut begin_codec_layer)];
+        let mut begin_rc = self.rate_control_info(current, &begin_layers);
         let mut begin_info = vk::VideoBeginCodingInfoKHR::default()
             .video_session(self.session)
             .video_session_parameters(self.session_params)
@@ -420,32 +395,33 @@ impl EncoderCommon {
         }
 
         // RESET + RATE_CONTROL + QUALITY_LEVEL in one control command (matches
-        // FFmpeg; required for AMD RADV).
-        if cmd.reset {
+        // FFmpeg; required for AMD RADV). A new bitrate alone is RATE_CONTROL
+        // only: the coding state stays, so the stream needs no key frame.
+        if cmd.reset || change {
             let mut codec_rc = cmd.codec_rate_control;
             let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default()
                 .quality_level(self.config.quality_level);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-                )
-                .push(&mut rc_info)
-                .push(&mut codec_rc)
-                .push(&mut quality_level_info);
-            unsafe {
-                self.video_queue_fn
-                    .cmd_control_video_coding(command_buffer, &control_info);
-            }
-        } else if rate_changed {
-            // A live CBR change keeps the coding state, references and DPB:
-            // ENCODE_RATE_CONTROL without RESET.
-            let mut codec_rc = cmd.codec_rate_control;
-            let control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL)
+            let mut control_info = vk::VideoCodingControlInfoKHR::default()
                 .push(&mut rc_info)
                 .push(&mut codec_rc);
+            control_info = if cmd.reset {
+                control_info
+                    .flags(
+                        vk::VideoCodingControlFlagsKHR::RESET
+                            | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                            | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                    )
+                    .push(&mut quality_level_info)
+            } else {
+                tracing::debug!(
+                    "Rate control: {} to {} bits per second on average, peak {} to {}",
+                    current.average_bitrate,
+                    state.average_bitrate,
+                    current.max_bitrate,
+                    state.max_bitrate,
+                );
+                control_info.flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL)
+            };
             unsafe {
                 self.video_queue_fn
                     .cmd_control_video_coding(command_buffer, &control_info);
@@ -483,7 +459,36 @@ impl EncoderCommon {
                 .map_err(PixelForgeError::vk("vkEndCommandBuffer"))?;
         }
 
-        self.submit_frame()
+        self.submit_frame()?;
+        self.rate_control_state = Some(state);
+        Ok(())
+    }
+
+    /// The rate control layer for `state`, without the codec's layer info.
+    fn rate_control_layer(
+        &self,
+        state: RateControlState,
+    ) -> vk::VideoEncodeRateControlLayerInfoKHR<'static> {
+        vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(u64::from(state.average_bitrate))
+            .max_bitrate(u64::from(state.max_bitrate))
+            .frame_rate_numerator(self.config.frame_rate.numerator)
+            .frame_rate_denominator(self.config.frame_rate.denominator)
+    }
+
+    /// The rate control info for `state`, with its `layers`.
+    fn rate_control_info<'a>(
+        &self,
+        state: RateControlState,
+        layers: &'a [vk::VideoEncodeRateControlLayerInfoKHR<'a>],
+    ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
+        let info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(state.mode);
+        if state.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            return info;
+        }
+        info.layers(layers)
+            .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+            .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms)
     }
 
     /// The `ash` device handle.
@@ -681,6 +686,25 @@ impl RateControlPlan {
     pub fn is_disabled(&self) -> bool {
         self.mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
     }
+
+    /// What the session's rate control state holds of this decision.
+    pub fn state(&self) -> RateControlState {
+        RateControlState {
+            mode: self.mode,
+            average_bitrate: self.average_bitrate,
+            max_bitrate: self.max_bitrate,
+        }
+    }
+}
+
+/// What a video session's rate control is set to, of what changes between
+/// frames. The quantizer of a constant quantizer is not in it: it goes with
+/// each frame's picture info, not with the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateControlState {
+    pub mode: vk::VideoEncodeRateControlModeFlagsKHR,
+    pub average_bitrate: u32,
+    pub max_bitrate: u32,
 }
 
 /// What a constant quantizer is raised by for the B-frame `plan`.
@@ -696,33 +720,6 @@ fn b_frame_qp_offset(plan: &FramePlan, b_offset: u32) -> u32 {
     } else {
         by_level.max(b_offset)
     }
-}
-
-/// The CBR target a live change to `requested` gets: bounded by the startup
-/// `ceiling` and the profile's maximum. Never changes the rate control mode.
-fn live_cbr_target(
-    config: &EncodeConfig,
-    caps: &super::EncoderCapabilities,
-    ceiling: u32,
-    requested: u32,
-) -> Result<u32> {
-    if requested == 0 || !matches!(config.rate_control, RateControl::Cbr { .. }) {
-        return Err(PixelForgeError::InvalidInput(
-            "a live bitrate needs a non-zero target and CBR".into(),
-        ));
-    }
-    let accepted = u64::from(requested)
-        .min(u64::from(ceiling))
-        .min(caps.max_bitrate) as u32;
-    if accepted == 0 {
-        return Err(PixelForgeError::InvalidInput(
-            "zero live bitrate ceiling".into(),
-        ));
-    }
-    let mut candidate = config.clone();
-    candidate.rate_control = RateControl::Cbr { bitrate: accepted };
-    caps.check_rate_control(&candidate)?;
-    Ok(accepted)
 }
 
 /// A video codec plugged into the generic [`CodecEncoder`].
@@ -946,6 +943,7 @@ impl<C: VideoCodec> CodecEncoder<C> {
             self.common.pipeline.submit_synthetic(EncodedPacket {
                 data: hidden.show_packet,
                 frame_type: hidden.frame_type,
+                is_recovery_frame: false,
                 pts: hidden.display_order,
                 dts: hidden.display_order as i64,
                 stats: EncodedPacketStats {
@@ -971,8 +969,14 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.begin_encode(frame, delivery);
 
         let setup = self.codec.begin_picture(&mut self.common, plan)?;
+        // The first frame shown after an invalidation that kept a reference. An
+        // IDR requested in between recovers by itself and isn't marked.
+        let is_recovery_frame = !plan.hidden
+            && std::mem::take(&mut self.common.recovery_pending)
+            && plan.frame_type() != FrameType::Idr;
         self.common.set_pending_metadata(SlotPacketMetadata {
             frame_type: plan.frame_type(),
+            is_recovery_frame,
             pts: plan.display_order,
             // With hidden frames the packets are in display order.
             dts: if C::HIDDEN_FRAMES {
@@ -987,7 +991,6 @@ impl<C: VideoCodec> CodecEncoder<C> {
 
         let dpb_slot = self.common.current_dpb_slot;
         self.codec.record_picture(&mut self.common, plan)?;
-        self.common.installed_bitrate = cbr_bitrate(&self.common.config);
         self.common.encode_frame_num += 1;
         if plan.hidden {
             self.common.hidden_frames.push(HiddenFrame {
@@ -1003,19 +1006,6 @@ impl<C: VideoCodec> CodecEncoder<C> {
             .encode_point
             .take()
             .expect("record_picture submits the frame"))
-    }
-
-    /// Stage a CBR target for the next successfully submitted frame. The
-    /// negotiated startup ceiling keeps sequence levels and bitstream storage valid.
-    pub fn set_bitrate(&mut self, requested: u32) -> Result<u32> {
-        let accepted = live_cbr_target(
-            &self.common.config,
-            &self.common.capabilities,
-            self.common.bitrate_ceiling,
-            requested,
-        )?;
-        self.common.config.rate_control = RateControl::Cbr { bitrate: accepted };
-        Ok(accepted)
     }
 
     /// End-of-stream barrier: encode the frames that wait, then wait for all
@@ -1042,18 +1032,21 @@ impl<C: VideoCodec> CodecEncoder<C> {
     ///
     /// For the IDR, the oldest frame that waits for its group is encoded as
     /// one at once, so no frame is encoded from the lost references.
-    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) {
+    pub fn invalidate_reference_frames(&mut self, first_lost_display_order: u64) -> bool {
         if self
             .codec
             .invalidate_references(&mut self.common, first_lost_display_order)
         {
-            return;
+            self.common.recovery_pending = true;
+            return true;
         }
+        self.common.recovery_pending = false;
         let ready = self.common.gop.restart();
         if let Err(e) = self.encode_ready(ready) {
             // Its future resolves with the error, and the next frame is an IDR.
             tracing::warn!("Encoding the IDR after lost references failed: {e}");
         }
+        false
     }
 
     /// Rebuild session parameters with a new stream colour; the next frame is
@@ -1079,6 +1072,12 @@ impl<C: VideoCodec> CodecEncoder<C> {
         self.common.gop.request_idr();
         Ok(())
     }
+
+    /// Encode the frames from now on with `rate_control`, which the caller
+    /// checked. The frames that wait for their group are among them.
+    pub fn set_rate_control(&mut self, rate_control: RateControl) {
+        self.common.config.rate_control = rate_control;
+    }
 }
 
 impl<C: VideoCodec> Drop for CodecEncoder<C> {
@@ -1087,9 +1086,11 @@ impl<C: VideoCodec> Drop for CodecEncoder<C> {
             let common = &mut self.common;
             let device = common.context.device();
             // Wait on just the queues this encoder used, not the whole device.
-            let _ = device.queue_wait_idle(common.context.transfer_queue());
+            let _ = common
+                .context
+                .wait_queue_idle(common.context.transfer_queue());
             if let Some(q) = common.context.video_encode_queue() {
-                let _ = device.queue_wait_idle(q);
+                let _ = common.context.wait_queue_idle(q);
             }
 
             common.pipeline.destroy(device);
@@ -1437,7 +1438,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     }
     let mut max_active_reference_pictures = reference_window
         .min(max_active_supported)
-        .min(req.max_frame_references);
+        .min(req.max_frame_references)
+        .min(
+            config
+                .active_reference_frames
+                .map_or(usize::MAX, |n| n as usize),
+        );
     // `PIXELFORGE_MAX_ACTIVE_REFERENCES=1` predicts from fewer references than
     // the device allows, to reproduce a device with tighter limits.
     if let Some(cap) = std::env::var("PIXELFORGE_MAX_ACTIVE_REFERENCES")
@@ -1556,8 +1562,6 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
     let common = EncoderCommon {
         context: context.clone(),
         config: config.clone(),
-        bitrate_ceiling: cbr_bitrate(config),
-        installed_bitrate: cbr_bitrate(config),
         video_queue_fn,
         video_encode_fn,
         session,
@@ -1571,6 +1575,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         gop,
         input_frame_num: 0,
         encode_frame_num: 0,
+        recovery_pending: false,
         dpb_images,
         dpb_image_memories,
         dpb_image_views,
@@ -1591,6 +1596,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
         hidden_frames: Vec::new(),
         profile: req.profile,
         rgb_input: req.rgb_input,
+        rate_control_state: None,
     };
 
     Ok(CommonInit {
@@ -1631,62 +1637,5 @@ mod tests {
         assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 2), 3);
         // AV1 steps by 4.
         assert_eq!(b_frame_qp_offset(&b_frame(false, 3), 8), 12);
-    }
-}
-
-#[cfg(test)]
-mod live_bitrate_tests {
-    use super::*;
-
-    #[test]
-    fn live_cbr_changes_preserve_startup_and_profile_limits() {
-        let caps = super::super::EncoderCapabilities {
-            min_coded_extent: vk::Extent2D {
-                width: 1,
-                height: 1,
-            },
-            max_coded_extent: vk::Extent2D {
-                width: 4096,
-                height: 4096,
-            },
-            picture_access_granularity: vk::Extent2D {
-                width: 1,
-                height: 1,
-            },
-            av1_coded_picture_alignment: None,
-            rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
-            max_bitrate: 60_000_000,
-        };
-        let config = EncodeConfig::h264(1920, 1080).with_rate_control(RateControl::Cbr {
-            bitrate: 40_000_000,
-        });
-        for requested in [1, 5_000_000, 50_000_000, u32::MAX] {
-            assert_eq!(
-                live_cbr_target(&config, &caps, 40_000_000, requested).unwrap(),
-                requested.min(40_000_000)
-            );
-        }
-        assert_eq!(
-            live_cbr_target(&config, &caps, 100_000_000, u32::MAX).unwrap(),
-            60_000_000
-        );
-        assert!(live_cbr_target(&config, &caps, 40_000_000, 0).is_err());
-        for mode in [
-            RateControl::Cqp { qp: 26 },
-            RateControl::Vbr {
-                target: 10_000_000,
-                max: 20_000_000,
-            },
-        ] {
-            assert!(
-                live_cbr_target(
-                    &config.clone().with_rate_control(mode),
-                    &caps,
-                    40_000_000,
-                    5_000_000
-                )
-                .is_err()
-            );
-        }
     }
 }

@@ -48,8 +48,11 @@ def check(dependency):
         expected = f"git+{repository}?rev={base['commit']}#{base['commit']}"
         if core.get("rev") != base["commit"] or public.get("source") != expected:
             raise ValueError("inputtino: public Rust crate and native base must pin the same revision")
-    elif core.get("tag") != base["describe"] or base["describe"] != f"v{manifest['version']}":
-        raise ValueError("pixelforge: upstream tag and vendored version must agree with UPSTREAM")
+    elif base["describe"] != f"v{manifest['version']}" or (
+        # A release tag, or the commit of a release published without one.
+        core.get("tag") != base["describe"] and core.get("rev") != base["commit"]
+    ):
+        raise ValueError("pixelforge: upstream tag or revision and vendored version must agree with UPSTREAM")
 
 
 if __name__ == "__main__":

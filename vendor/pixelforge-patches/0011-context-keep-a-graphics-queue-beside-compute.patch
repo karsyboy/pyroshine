@@ -13,12 +13,12 @@ as graphics_queue_family()/graphics_queue(), and share encoder input
 images with it. Adopted devices report their compute family.
 ---
  src/encoder/resources.rs |  1 +
- src/vulkan.rs            | 75 ++++++++++++++++++++++++++++++++++++++++
+ src/vulkan.rs            | 76 ++++++++++++++++++++++++++++++++++++++++
  src/vulkan/adopt.rs      |  4 +++
- 3 files changed, 80 insertions(+)
+ 3 files changed, 81 insertions(+)
 
 diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
-index dee41ee..0103082 100644
+index 50b5ce7..eff9267 100644
 --- a/src/encoder/resources.rs
 +++ b/src/encoder/resources.rs
 @@ -65,6 +65,7 @@ pub(crate) fn create_image(
@@ -30,10 +30,10 @@ index dee41ee..0103082 100644
          (
              vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
 diff --git a/src/vulkan.rs b/src/vulkan.rs
-index 11f5b5a..e502b0c 100644
+index 0423b45..5ea3991 100644
 --- a/src/vulkan.rs
 +++ b/src/vulkan.rs
-@@ -436,6 +436,25 @@ fn find_compute_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Op
+@@ -465,6 +465,25 @@ fn find_compute_queue_family(queue_families: &[vk::QueueFamilyProperties]) -> Op
          .map(|(idx, _)| idx as u32)
  }
  
@@ -59,7 +59,7 @@ index 11f5b5a..e502b0c 100644
  /// The families [`scan_queue_families`] found.
  struct ScannedFamilies {
      /// The last family with the requested video flag, if any.
-@@ -813,6 +832,10 @@ struct VideoContextInner {
+@@ -886,6 +905,10 @@ struct VideoContextInner {
      transfer_queue: vk::Queue,
      compute_queue_family: u32,
      compute_queue: vk::Queue,
@@ -70,7 +70,7 @@ index 11f5b5a..e502b0c 100644
      memory_properties: vk::PhysicalDeviceMemoryProperties,
      device_properties: vk::PhysicalDeviceProperties,
      supported_encode_codecs: Vec<Codec>,
-@@ -979,6 +1002,21 @@ impl VideoContext {
+@@ -1098,6 +1121,21 @@ impl VideoContext {
          self.inner.compute_queue
      }
  
@@ -92,7 +92,7 @@ index 11f5b5a..e502b0c 100644
      pub(crate) fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
          &self.inner.memory_properties
      }
-@@ -1153,6 +1191,7 @@ impl VideoContext {
+@@ -1339,6 +1377,7 @@ impl VideoContext {
          let mut video_decode_queue_family = None;
          let mut transfer_queue_family = u32::MAX;
          let mut compute_queue_family = u32::MAX;
@@ -100,7 +100,7 @@ index 11f5b5a..e502b0c 100644
          let mut supported_encode_codecs = Vec::new();
          let mut encode_unsupported = Vec::new();
          let mut supported_decode_codecs = Vec::new();
-@@ -1370,6 +1409,8 @@ impl VideoContext {
+@@ -1556,6 +1595,8 @@ impl VideoContext {
                      encode_queue.unwrap_or(0)
                  };
                  compute_queue_family = compute_q;
@@ -109,7 +109,7 @@ index 11f5b5a..e502b0c 100644
                  supported_encode_codecs = encode_codecs;
                  encode_unsupported = device_unsupported;
                  supported_decode_codecs = decode_codecs;
-@@ -1442,6 +1483,9 @@ impl VideoContext {
+@@ -1628,6 +1669,9 @@ impl VideoContext {
          if !unique_families.contains(&compute_queue_family) {
              unique_families.push(compute_queue_family);
          }
@@ -119,7 +119,7 @@ index 11f5b5a..e502b0c 100644
  
          let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
              .iter()
-@@ -1661,6 +1705,7 @@ impl VideoContext {
+@@ -1847,6 +1891,7 @@ impl VideoContext {
              video_decode_queue_family.map(|family| unsafe { device.get_device_queue(family, 0) });
          let transfer_queue = unsafe { device.get_device_queue(transfer_queue_family, 0) };
          let compute_queue = unsafe { device.get_device_queue(compute_queue_family, 0) };
@@ -127,15 +127,23 @@ index 11f5b5a..e502b0c 100644
  
          if let Some(family) = video_encode_queue_family {
              info!("Video encode queue family: {}", family);
-@@ -1670,6 +1715,7 @@ impl VideoContext {
+@@ -1856,6 +1901,7 @@ impl VideoContext {
          }
          info!("Transfer queue family: {}", transfer_queue_family);
          info!("Compute queue family: {}", compute_queue_family);
 +        info!("Graphics queue family: {}", graphics_queue_family);
          info!("Created Vulkan device with video support");
  
-         instance_guard.armed = false;
-@@ -1691,6 +1737,8 @@ impl VideoContext {
+         Ok(Self {
+@@ -1865,6 +1911,7 @@ impl VideoContext {
+                     video_decode_queue,
+                     Some(transfer_queue),
+                     Some(compute_queue),
++                    Some(graphics_queue),
+                 ]),
+                 entry,
+                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
+@@ -1881,6 +1928,8 @@ impl VideoContext {
                  transfer_queue,
                  compute_queue_family,
                  compute_queue,
@@ -144,7 +152,7 @@ index 11f5b5a..e502b0c 100644
                  memory_properties,
                  device_properties,
                  supported_encode_codecs,
-@@ -1941,6 +1989,33 @@ impl VideoContext {
+@@ -2131,6 +2180,33 @@ impl VideoContext {
  mod tests {
      use super::*;
  
@@ -179,10 +187,10 @@ index 11f5b5a..e502b0c 100644
      fn compute_family_is_one_without_graphics_when_the_device_has_one() {
          let graphics =
 diff --git a/src/vulkan/adopt.rs b/src/vulkan/adopt.rs
-index bd384a8..ae660d9 100644
+index 2eed77d..38bd40a 100644
 --- a/src/vulkan/adopt.rs
 +++ b/src/vulkan/adopt.rs
-@@ -447,6 +447,10 @@ impl VideoContextBuilder {
+@@ -461,6 +461,10 @@ impl VideoContextBuilder {
                  transfer_queue,
                  compute_queue_family: compute.family,
                  compute_queue,
@@ -193,3 +201,6 @@ index bd384a8..ae660d9 100644
                  memory_properties,
                  device_properties,
                  supported_encode_codecs: encode_plan.map(|e| e.codecs.clone()).unwrap_or_default(),
+-- 
+2.56.1
+

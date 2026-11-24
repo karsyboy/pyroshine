@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Take what the GPU has finished with; `Pending` just means "not yet".
         while let FramePoll::Frame(frame) = decoder.try_next_frame()? {
             // `frame.image` is a decoder-owned GPU image, valid until dropped.
-            let _ = frame.image;
+            let _ = frame.image();
         }
     }
 
@@ -175,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // held back, and closes the source.
     decoder.finish()?;
     while let Some(frame) = pollster::block_on(decoder.next_frame())? {
-        let _ = frame.image;
+        let _ = frame.image();
     }
     Ok(())
 }
@@ -187,6 +187,14 @@ bounds how many can be outstanding before the decoder starts copying
 pictures out instead of handing over its own. To get a frame's samples on
 the CPU (for a file, a test or software processing), copy it with
 [`YuvDownloader`].
+
+To seek, call [`Decoder::reset`] and feed again from a keyframe. The
+decoder keeps the session for unchanged stream parameters and discards
+buffered input and pictures still waiting for reordering. Frames already
+sent to the source can still be read. Use the `pts` supplied with each
+call to distinguish frames from before and after the seek. At the end of
+a sequence, [`Decoder::flush`] delivers the remaining frames and keeps the
+decoder ready for another keyframe.
 
 ### RGB input
 

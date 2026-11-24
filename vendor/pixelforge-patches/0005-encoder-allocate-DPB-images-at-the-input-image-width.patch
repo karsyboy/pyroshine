@@ -19,10 +19,10 @@ extent through each picture resource's codedExtent.
  1 file changed, 11 insertions(+), 1 deletion(-)
 
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index f21f6d3..c4b077c 100644
+index f301778..db01acf 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -1174,6 +1174,13 @@ pub(crate) fn query_video_caps(
+@@ -1257,6 +1257,13 @@ pub(crate) fn query_video_caps(
  /// The two differ when `width % 64` is 1..=32 (e.g. 1360, 1440, 2400), and the
  /// decoded chroma comes out sheared. With a 64-aligned image width they are
  /// always equal; other formats and implementations ignore the extra columns.
@@ -36,7 +36,7 @@ index f21f6d3..c4b077c 100644
  pub(crate) fn input_image_width(coded_width: u32, max_coded_width: u32) -> u32 {
      const INPUT_IMAGE_WIDTH_ALIGNMENT: u32 = 64;
      coded_width
-@@ -1397,9 +1404,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1485,9 +1492,12 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
          tracing::info!("Using layered DPB (driver does not support separate reference images)");
      }
  
@@ -50,3 +50,6 @@ index f21f6d3..c4b077c 100644
          aligned_height,
          reference_picture_format,
          dpb_slot_count,
+-- 
+2.56.1
+

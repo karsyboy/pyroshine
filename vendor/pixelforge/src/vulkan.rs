@@ -130,7 +130,7 @@ fn encode_queue_unavailable(
     }
 }
 
-/// Destroy the instance, and its validation messenger, if context
+/// Destroy the instance, and its validation messenger, if `VideoInstance`
 /// initialization fails before ownership transfers.
 struct InstanceGuard<'a> {
     instance: &'a ash::Instance,
@@ -140,8 +140,8 @@ struct InstanceGuard<'a> {
 impl Drop for InstanceGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            // SAFETY: initialization owns this instance and messenger; no logical
-            // device was created on failure, and the guard is disarmed on success.
+            // SAFETY: initialization owns this instance and messenger; no context
+            // was made on it yet, and the guard is disarmed on success.
             // A messenger must be destroyed before its instance.
             unsafe {
                 if let Some((debug_utils, messenger)) = self.debug_messenger.take() {
@@ -225,8 +225,8 @@ impl VideoContextBuilder {
     /// Submit video encode work to `queue` on an adopted device.
     ///
     /// See [`Self::with_transfer_queue`] for why this matters. Ignored by
-    /// [`Self::build`], which creates its own device and owns every queue on
-    /// it.
+    /// [`Self::build`] and [`Self::build_on`], which create their own device
+    /// and own every queue on it.
     pub fn with_encode_queue(mut self, queue: DeviceQueue) -> Self {
         self.queues.encode = Some(queue);
         self
@@ -235,8 +235,8 @@ impl VideoContextBuilder {
     /// Submit video decode work to `queue` on an adopted device.
     ///
     /// See [`Self::with_transfer_queue`] for why this matters. Ignored by
-    /// [`Self::build`], which creates its own device and owns every queue on
-    /// it.
+    /// [`Self::build`] and [`Self::build_on`], which create their own device
+    /// and own every queue on it.
     pub fn with_decode_queue(mut self, queue: DeviceQueue) -> Self {
         self.queues.decode = Some(queue);
         self
@@ -255,14 +255,16 @@ impl VideoContextBuilder {
     ///
     /// The queue's family must support transfer, and `queue.index` must be
     /// below the number of queues the caller created in that family. The
-    /// second part cannot be checked. Ignored by [`Self::build`].
+    /// second part cannot be checked. Ignored by [`Self::build`] and
+    /// [`Self::build_on`].
     pub fn with_transfer_queue(mut self, queue: DeviceQueue) -> Self {
         self.queues.transfer = Some(queue);
         self
     }
 
     /// Submit the colour converter's dispatches to `queue` on an adopted
-    /// device. See [`Self::with_transfer_queue`]. Ignored by [`Self::build`].
+    /// device. See [`Self::with_transfer_queue`]. Ignored by [`Self::build`]
+    /// and [`Self::build_on`].
     pub fn with_compute_queue(mut self, queue: DeviceQueue) -> Self {
         self.queues.compute = Some(queue);
         self
@@ -291,9 +293,36 @@ impl VideoContextBuilder {
         self
     }
 
-    /// Build the VideoContext.
+    /// Build the VideoContext, on a Vulkan instance of its own.
+    ///
+    /// The same as [`Self::build_on`] with a new instance from
+    /// [`Self::build_instance`].
     pub fn build(self) -> Result<VideoContext> {
-        VideoContext::new(self)
+        let instance = self.build_instance()?;
+        self.build_on(&instance)
+    }
+
+    /// Create a Vulkan instance with this builder's application name, version
+    /// and validation setting, for [`Self::build_on`].
+    pub fn build_instance(&self) -> Result<VideoInstance> {
+        VideoInstance::new(self)
+    }
+
+    /// Build the VideoContext, with a device of its own, on `instance`.
+    ///
+    /// The context keeps a clone of `instance`, so the instance outlives it.
+    /// Dropping the context destroys its device, and with it everything the
+    /// device still holds (such as the semaphores encoders retire when they are
+    /// dropped), but not the instance.
+    ///
+    /// An application that creates contexts one after another, for example one
+    /// per stream, should give them one instance. When the last instance of a
+    /// process is destroyed, the Vulkan loader unloads the driver, and the next
+    /// instance loads it again. Each reload costs a driver initialisation, and
+    /// NVIDIA's driver fails `vkCreateInstance` after about 26 of them (its
+    /// `libnvidia-tls.so` uses static TLS, which glibc does not give back).
+    pub fn build_on(self, instance: &VideoInstance) -> Result<VideoContext> {
+        VideoContext::new(self, instance)
     }
 
     /// Declare that the adopted device was created with
@@ -806,8 +835,52 @@ fn check_decode_support(
     }
 }
 
+/// One lock for each distinct queue the context uses.
+///
+/// A `VkQueue` is externally synchronized: two threads may not submit to it at
+/// once. A context is `Clone` and `Sync`, so decoders, encoders and uploaders
+/// made from clones of it may run on different threads, and several of them
+/// can share a queue, whatever their roles. Every submission takes the lock of
+/// its queue's handle. Roles do not matter: the transfer and compute roles may
+/// well be one queue.
+struct QueueLocks {
+    locks: Vec<(vk::Queue, std::sync::Mutex<()>)>,
+    /// For a queue the context does not know. Not expected, but a lock that
+    /// is too wide is better than none.
+    other: std::sync::Mutex<()>,
+}
+
+impl QueueLocks {
+    fn new(queues: impl IntoIterator<Item = Option<vk::Queue>>) -> Self {
+        let mut locks: Vec<(vk::Queue, std::sync::Mutex<()>)> = Vec::new();
+        for queue in queues.into_iter().flatten() {
+            if !locks.iter().any(|(q, _)| *q == queue) {
+                locks.push((queue, std::sync::Mutex::new(())));
+            }
+        }
+        Self {
+            locks,
+            other: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn lock(&self, queue: vk::Queue) -> std::sync::MutexGuard<'_, ()> {
+        let mutex = self
+            .locks
+            .iter()
+            .find(|(q, _)| *q == queue)
+            .map_or(&self.other, |(_, m)| m);
+        // The guarded data is `()`, so a panic while holding it left nothing
+        // inconsistent.
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Inner struct holding the actual Vulkan resources.
 struct VideoContextInner {
+    queue_locks: QueueLocks,
     entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -855,9 +928,11 @@ struct VideoContextInner {
     /// waiting on, destroyed with the context. See
     /// [`VideoContext::retire_semaphore`].
     retired_semaphores: std::sync::Mutex<Vec<vk::Semaphore>>,
-    /// Validation message sink, present only when validation is enabled and the
-    /// instance is ours. Destroyed before the instance it belongs to.
-    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    /// The instance the device was created on, when pixelforge created it.
+    /// Dropped after the device: `Drop` destroys the device, and the fields are
+    /// dropped after `Drop` runs. `None` for an adopted device, whose instance
+    /// is the caller's.
+    _instance: Option<VideoInstance>,
 }
 
 impl Drop for VideoContextInner {
@@ -876,10 +951,6 @@ impl Drop for VideoContextInner {
         if self.owns_device {
             unsafe {
                 self.device.destroy_device(None);
-                if let Some((debug_utils, messenger)) = &self.debug_messenger {
-                    debug_utils.destroy_debug_utils_messenger(*messenger, None);
-                }
-                self.instance.destroy_instance(None);
             }
         }
     }
@@ -903,6 +974,54 @@ impl VideoContext {
     /// Get the Vulkan device.
     pub fn device(&self) -> &ash::Device {
         &self.inner.device
+    }
+
+    /// `vkQueueSubmit` on one of this context's queues, under the queue's lock.
+    ///
+    /// Use this, and not `device().queue_submit`, to submit to a queue got
+    /// from this context: the same queue may be used by other threads through
+    /// clones of the context, and Vulkan forbids two threads submitting to one
+    /// queue at once.
+    ///
+    /// # Safety
+    ///
+    /// As `vkQueueSubmit`, except for the queue's synchronization, which this
+    /// takes care of.
+    pub unsafe fn submit(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> std::result::Result<(), vk::Result> {
+        let _guard = self.inner.queue_locks.lock(queue);
+        unsafe { self.inner.device.queue_submit(queue, submits, fence) }
+    }
+
+    /// `vkQueueSubmit2` on one of this context's queues, under the queue's
+    /// lock. See [`submit`](Self::submit).
+    ///
+    /// # Safety
+    ///
+    /// As `vkQueueSubmit2`, except for the queue's synchronization.
+    pub unsafe fn submit2(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> std::result::Result<(), vk::Result> {
+        let _guard = self.inner.queue_locks.lock(queue);
+        unsafe { self.inner.sync2.queue_submit2(queue, submits, fence) }
+    }
+
+    /// `vkQueueWaitIdle` on one of this context's queues, under the queue's
+    /// lock. See [`submit`](Self::submit).
+    ///
+    /// # Safety
+    ///
+    /// As `vkQueueWaitIdle`, except for the queue's synchronization.
+    pub unsafe fn wait_queue_idle(&self, queue: vk::Queue) -> std::result::Result<(), vk::Result> {
+        let _guard = self.inner.queue_locks.lock(queue);
+        unsafe { self.inner.device.queue_wait_idle(queue) }
     }
 
     pub(crate) fn sync2(&self) -> &ash::khr::synchronization2::Device {
@@ -1059,29 +1178,68 @@ impl VideoContext {
     }
 }
 
-impl VideoContext {
-    fn new(builder: VideoContextBuilder) -> Result<Self> {
+/// A Vulkan instance that video contexts can share.
+///
+/// Create one with [`VideoContextBuilder::build_instance`], and build contexts
+/// on it with [`VideoContextBuilder::build_on`]. Each context gets a device of
+/// its own and keeps a clone of the instance, which is destroyed with its last
+/// clone. See [`VideoContextBuilder::build_on`] for why to share one.
+#[derive(Clone)]
+pub struct VideoInstance {
+    inner: std::sync::Arc<VideoInstanceInner>,
+}
+
+struct VideoInstanceInner {
+    entry: ash::Entry,
+    instance: ash::Instance,
+    /// Validation message sink, present only when validation is enabled.
+    /// Destroyed before the instance it belongs to.
+    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+}
+
+impl Drop for VideoInstanceInner {
+    fn drop(&mut self) {
+        // Every context holds a clone, so no device of ours is left.
+        unsafe {
+            if let Some((debug_utils, messenger)) = &self.debug_messenger {
+                debug_utils.destroy_debug_utils_messenger(*messenger, None);
+            }
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+impl std::fmt::Debug for VideoInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoInstance")
+            .field("instance", &self.inner.instance.handle())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VideoInstance {
+    fn new(settings: &VideoContextBuilder) -> Result<Self> {
         // Load Vulkan.
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
 
         // Create instance.
-        let app_name = CString::new(builder.app_name.clone()).expect("Invalid app name");
+        let app_name = CString::new(settings.app_name.clone()).expect("Invalid app name");
         let engine_name = CString::new("PixelForge").expect("Invalid engine name");
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .application_version(vk::make_api_version(
                 0,
-                builder.app_version.0,
-                builder.app_version.1,
-                builder.app_version.2,
+                settings.app_version.0,
+                settings.app_version.1,
+                settings.app_version.2,
             ))
             .engine_name(&engine_name)
             .engine_version(vk::make_api_version(0, 1, 0, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        let mut enable_validation = builder.enable_validation;
+        let mut enable_validation = settings.enable_validation;
         if enable_validation {
             let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
                 .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
@@ -1179,6 +1337,34 @@ impl VideoContext {
         } else {
             None
         };
+
+        // The instance now belongs to `VideoInstanceInner`, which destroys it.
+        instance_guard.armed = false;
+        drop(instance_guard);
+        Ok(Self {
+            inner: std::sync::Arc::new(VideoInstanceInner {
+                entry,
+                instance,
+                debug_messenger,
+            }),
+        })
+    }
+
+    /// The Vulkan entry points the instance was created with.
+    pub fn entry(&self) -> &ash::Entry {
+        &self.inner.entry
+    }
+
+    /// The Vulkan instance.
+    pub fn instance(&self) -> &ash::Instance {
+        &self.inner.instance
+    }
+}
+
+impl VideoContext {
+    fn new(builder: VideoContextBuilder, owner: &VideoInstance) -> Result<Self> {
+        let entry = owner.entry().clone();
+        let instance = owner.instance().clone();
 
         // Find physical device with video support.
         let physical_devices = unsafe { instance.enumerate_physical_devices() }
@@ -1718,10 +1904,15 @@ impl VideoContext {
         info!("Graphics queue family: {}", graphics_queue_family);
         info!("Created Vulkan device with video support");
 
-        instance_guard.armed = false;
-        drop(instance_guard);
         Ok(Self {
             inner: std::sync::Arc::new(VideoContextInner {
+                queue_locks: QueueLocks::new([
+                    video_encode_queue,
+                    video_decode_queue,
+                    Some(transfer_queue),
+                    Some(compute_queue),
+                    Some(graphics_queue),
+                ]),
                 entry,
                 sync2: ash::khr::synchronization2::Device::load(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::load(&instance, &device),
@@ -1750,7 +1941,7 @@ impl VideoContext {
                 external,
                 owns_device: true,
                 retired_semaphores: Default::default(),
-                debug_messenger,
+                _instance: Some(owner.clone()),
             }),
         })
     }

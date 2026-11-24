@@ -292,7 +292,8 @@ impl FramePool {
             return;
         }
         unsafe {
-            common.context.device().device_wait_idle().ok();
+            // The pool image may be a copy target of a submission in flight.
+            common.pipeline.wait_all_free();
             common.context.device().destroy_image(p.image, None);
             common.context.device().free_memory(p.memory, None);
         }
@@ -477,6 +478,15 @@ impl ReorderBuffer {
         common.submit_copy()?;
         self.pool.images[index].state = PoolState::Buffered;
         Ok(Retained::Pool { index })
+    }
+
+    /// Release buffered pictures once their GPU work has completed.
+    pub fn discard(&mut self) {
+        for entry in self.buffered.drain(..) {
+            if let Retained::Pool { index } = entry.retained {
+                self.pool.images[index].state = PoolState::Free;
+            }
+        }
     }
 
     /// Emit every buffered picture in display order. Call at end of stream.

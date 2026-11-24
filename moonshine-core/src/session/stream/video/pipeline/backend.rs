@@ -310,8 +310,10 @@ impl ConventionalEncoder {
 
 	/// Stop predicting from frames at or after `display_order`, the first
 	/// frame the client lost. Backends without reference invalidation encode
-	/// an IDR instead.
-	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) {
+	/// an IDR instead. Returns whether the next frame recovers by predicting
+	/// from a surviving reference (sent as a recovery frame); `false` when an
+	/// IDR follows.
+	pub(crate) fn invalidate_reference_frames(&mut self, display_order: u64) -> bool {
 		match self {
 			Self::Vulkan(encoder) => encoder.invalidate_reference_frames(display_order),
 			Self::Vaapi(encoder) => encoder.invalidate_reference_frames(display_order),

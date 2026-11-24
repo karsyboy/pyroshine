@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: karsyboy <karsyboy@k-ops.cloud>
+Date: Mon, 26 Oct 2026 10:06:50 -0400
+Subject: [PATCH 10/13] encoder: clamp live CBR bitrate changes
+
+Pyroshine adapts the bitrate to the link. Upstream v0.13.0 changes a running
+encoder's rate control with set_rate_control, but refuses a peak above the
+startup bitrate. set_bitrate clamps the requested CBR target to the startup
+bitrate and the profile limit instead, and next_display_order reports the
+display order of the next encode attempt.
+---
+ src/encoder/api.rs | 107 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
+
+diff --git a/src/encoder/api.rs b/src/encoder/api.rs
+index 9ff3b95..fe72679 100644
+--- a/src/encoder/api.rs
++++ b/src/encoder/api.rs
+@@ -198,6 +198,25 @@ impl Encoder {
+         Ok(())
+     }
+ 
++    /// Change a CBR encoder's bitrate from the next frame on, clamped rather
++    /// than refused: the target is bounded by the bitrate the encoder was made
++    /// with and this profile's device limit. Returns the accepted target.
++    /// CQP/VBR encoders and a zero target are rejected. The change goes
++    /// through [`Self::set_rate_control`], so the session and its references
++    /// stay and no IDR is coded.
++    pub fn set_bitrate(&mut self, requested: u32) -> Result<u32> {
++        let accepted = live_cbr_target(&self.config, &self.inner.common().capabilities, requested)?;
++        self.set_rate_control(RateControl::Cbr { bitrate: accepted })?;
++        Ok(accepted)
++    }
++
++    /// Display order (the packet `pts`) of the next encode attempt. Failed
++    /// attempts can consume an order; callers must not infer this from
++    /// successful packets.
++    pub fn next_display_order(&self) -> u64 {
++        self.pts_offset + self.inner.common().input_frame_num
++    }
++
+     /// The encoder's input image for the next frame, to write it in place.
+     ///
+     /// Write the frame into [`InputSlot::image`] and submit it with
+@@ -624,3 +643,91 @@ fn create_codec_encoder(
+         Codec::AV1 => Box::new(super::av1::Av1::create(context, config, rgb_input)?),
+     })
+ }
++
++/// The CBR target a live change to `requested` gets: bounded by the bitrate
++/// `config` was made with and the profile's maximum. Never changes the rate
++/// control mode.
++fn live_cbr_target(
++    config: &EncodeConfig,
++    caps: &super::EncoderCapabilities,
++    requested: u32,
++) -> Result<u32> {
++    let RateControl::Cbr { bitrate: ceiling } = config.rate_control else {
++        return Err(PixelForgeError::InvalidInput(
++            "a live bitrate needs CBR".into(),
++        ));
++    };
++    if requested == 0 {
++        return Err(PixelForgeError::InvalidInput(
++            "a live bitrate needs a non-zero target".into(),
++        ));
++    }
++    let accepted = u64::from(requested)
++        .min(u64::from(ceiling))
++        .min(caps.max_bitrate) as u32;
++    if accepted == 0 {
++        return Err(PixelForgeError::InvalidInput(
++            "zero live bitrate ceiling".into(),
++        ));
++    }
++    let mut candidate = config.clone();
++    candidate.rate_control = RateControl::Cbr { bitrate: accepted };
++    caps.check_rate_control(&candidate)?;
++    Ok(accepted)
++}
++
++#[cfg(test)]
++mod live_bitrate_tests {
++    use super::*;
++
++    #[test]
++    fn live_cbr_changes_preserve_startup_and_profile_limits() {
++        let caps = super::super::EncoderCapabilities {
++            min_coded_extent: vk::Extent2D {
++                width: 1,
++                height: 1,
++            },
++            max_coded_extent: vk::Extent2D {
++                width: 4096,
++                height: 4096,
++            },
++            picture_access_granularity: vk::Extent2D {
++                width: 1,
++                height: 1,
++            },
++            av1_coded_picture_alignment: None,
++            rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
++            max_bitrate: 60_000_000,
++        };
++        let cbr = |bitrate| {
++            EncodeConfig::h264(1920, 1080).with_rate_control(RateControl::Cbr { bitrate })
++        };
++        for requested in [1, 5_000_000, 50_000_000, u32::MAX] {
++            assert_eq!(
++                live_cbr_target(&cbr(40_000_000), &caps, requested).unwrap(),
++                requested.min(40_000_000)
++            );
++        }
++        assert_eq!(
++            live_cbr_target(&cbr(100_000_000), &caps, u32::MAX).unwrap(),
++            60_000_000
++        );
++        assert!(live_cbr_target(&cbr(40_000_000), &caps, 0).is_err());
++        for mode in [
++            RateControl::Cqp { qp: 26 },
++            RateControl::Vbr {
++                target: 10_000_000,
++                max: 20_000_000,
++            },
++        ] {
++            assert!(
++                live_cbr_target(
++                    &EncodeConfig::h264(1920, 1080).with_rate_control(mode),
++                    &caps,
++                    5_000_000
++                )
++                .is_err()
++            );
++        }
++    }
++}
+-- 
+2.56.1
+

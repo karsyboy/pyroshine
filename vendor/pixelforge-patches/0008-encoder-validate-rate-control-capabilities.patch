@@ -137,10 +137,10 @@ index d0cecd6..6a4ed46 100644
      fn coded_and_allocated_extents_are_distinct() {
          let limits = caps((1, 1), (1, 1), 8192);
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index c4b077c..375e74e 100644
+index db01acf..354aa3e 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -1095,6 +1095,10 @@ pub(crate) struct DeviceVideoCaps {
+@@ -1178,6 +1178,10 @@ pub(crate) struct DeviceVideoCaps {
      /// AV1's coded picture grid; set by the AV1 encoder, which chains the
      /// AV1 capability struct.
      pub av1_coded_picture_alignment: Option<vk::Extent2D>,
@@ -151,7 +151,7 @@ index c4b077c..375e74e 100644
  }
  
  /// Check `config.quality_level` against the device's
-@@ -1151,6 +1155,7 @@ pub(crate) fn query_video_caps(
+@@ -1234,6 +1238,7 @@ pub(crate) fn query_video_caps(
              result
          )));
      }
@@ -159,7 +159,7 @@ index c4b077c..375e74e 100644
      Ok(DeviceVideoCaps {
          picture_access_granularity: capabilities.picture_access_granularity,
          min_coded_extent: capabilities.min_coded_extent,
-@@ -1160,9 +1165,32 @@ pub(crate) fn query_video_caps(
+@@ -1243,9 +1248,32 @@ pub(crate) fn query_video_caps(
          flags: capabilities.flags,
          std_header_version: capabilities.std_header_version,
          av1_coded_picture_alignment: None,
@@ -192,7 +192,7 @@ index c4b077c..375e74e 100644
  /// Width of the encoder input images for a coded width.
  ///
  /// Pyroshine local change: input images are 64 texels wide-aligned (within
-@@ -1212,6 +1240,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1295,6 +1323,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
      // Align the coded extent to lcm(codec block size, device granularity), then
      // clamp up to the device minimum and re-align.
      let public_caps = super::EncoderCapabilities::from_caps(capabilities);
@@ -200,3 +200,6 @@ index c4b077c..375e74e 100644
      let coded_extent = public_caps.coded_extent(config.codec, width, height)?;
      let input_image_extent = public_caps.input_image_extent(config.codec, width, height)?;
      let aligned_width = coded_extent.width;
+-- 
+2.56.1
+

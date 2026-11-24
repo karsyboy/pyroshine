@@ -39,7 +39,7 @@ network-interface = "2.0.5"
 notify-rust = "4.18.2"
 opus = "0.4.0"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.12.1", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "49e869d5118ad770a0fc82c299d4cb589130ba11", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.10"
 regex = "1.13.1"

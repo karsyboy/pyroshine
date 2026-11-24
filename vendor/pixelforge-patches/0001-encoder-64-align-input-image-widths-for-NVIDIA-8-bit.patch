@@ -19,10 +19,10 @@ columns.
  3 files changed, 39 insertions(+), 4 deletions(-)
 
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index 21e287c..8d16b45 100644
+index c33aa70..5c619b9 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
-@@ -1156,6 +1156,26 @@ pub(crate) fn query_video_caps(
+@@ -1239,6 +1239,26 @@ pub(crate) fn query_video_caps(
      })
  }
  
@@ -49,7 +49,7 @@ index 21e287c..8d16b45 100644
  /// Query capabilities, create the video session, DPB images, command resources,
  /// the encode pipeline and the GOP structure — the ~85% of encoder
  /// initialization that is identical across codecs.
-@@ -1405,8 +1425,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1493,8 +1513,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
  
      let pipeline = EncodePipeline::new(&PipelineConfig {
          context,
@@ -60,10 +60,10 @@ index 21e287c..8d16b45 100644
          rgb_input: req.rgb_input.is_some(),
          chroma_format: config.chroma_format,
 diff --git a/src/encoder/pipeline.rs b/src/encoder/pipeline.rs
-index b5d8a7e..9320abc 100644
+index 1db6c34..45f0a41 100644
 --- a/src/encoder/pipeline.rs
 +++ b/src/encoder/pipeline.rs
-@@ -278,8 +278,10 @@ pub(crate) struct EncodeSlot {
+@@ -279,8 +279,10 @@ pub(crate) struct EncodeSlot {
  /// Configuration for building an [`EncodePipeline`].
  pub(crate) struct PipelineConfig<'a> {
      pub context: &'a VideoContext,
@@ -75,7 +75,7 @@ index b5d8a7e..9320abc 100644
      pub picture_format: vk::Format,
      /// Whether the input image is RGB, for the encoder to convert.
      pub rgb_input: bool,
-@@ -350,7 +352,7 @@ impl EncodePipeline {
+@@ -351,7 +353,7 @@ impl EncodePipeline {
          for &encode_command_buffer in &command_buffers {
              let (input_image, input_image_memory, input_image_view) = create_image(
                  context,
@@ -84,7 +84,7 @@ index b5d8a7e..9320abc 100644
                  config.aligned_height,
                  config.picture_format,
                  false,
-@@ -378,7 +380,7 @@ impl EncodePipeline {
+@@ -379,7 +381,7 @@ impl EncodePipeline {
                      fence: config.upload_fence,
                      queue: context.transfer_queue(),
                      image: input_image,
@@ -94,10 +94,10 @@ index b5d8a7e..9320abc 100644
                      chroma_format: config.chroma_format,
                      bit_depth: config.bit_depth,
 diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
-index 1a5d4ed..012f8f0 100644
+index 57d410a..1c8fcb6 100644
 --- a/src/encoder/resources.rs
 +++ b/src/encoder/resources.rs
-@@ -1192,6 +1192,19 @@ mod tests {
+@@ -1188,6 +1188,19 @@ mod tests {
          assert_eq!(lcm(7, 7), 7);
      }
  
@@ -117,3 +117,6 @@ index 1a5d4ed..012f8f0 100644
      #[test]
      fn test_align_up() {
          assert_eq!(align_up(130, 64), 192);
+-- 
+2.56.1
+

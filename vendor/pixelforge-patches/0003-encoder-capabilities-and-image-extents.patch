@@ -19,10 +19,10 @@ Subject: [PATCH 03/13] Expose encoder capabilities and actual extents from
  create mode 100644 src/encoder/capabilities.rs
 
 diff --git a/src/encoder/api.rs b/src/encoder/api.rs
-index 73e281f..06aa31c 100644
+index 346ae4f..9ff3b95 100644
 --- a/src/encoder/api.rs
 +++ b/src/encoder/api.rs
-@@ -129,6 +129,25 @@ impl Encoder {
+@@ -133,6 +133,25 @@ impl Encoder {
          })
      }
  
@@ -321,7 +321,7 @@ index 0000000..7c7d666
 +    }
 +}
 diff --git a/src/encoder/codec.rs b/src/encoder/codec.rs
-index 8d16b45..f21f6d3 100644
+index 5c619b9..f301778 100644
 --- a/src/encoder/codec.rs
 +++ b/src/encoder/codec.rs
 @@ -24,8 +24,8 @@ use crate::encoder::pipeline::{
@@ -347,7 +347,7 @@ index 8d16b45..f21f6d3 100644
      /// Coded extent (display dimensions aligned to the codec block size and the
      /// device's picture-access granularity).
      pub aligned_width: u32,
-@@ -1046,8 +1051,6 @@ pub(crate) struct CommonInitRequest<'a> {
+@@ -1129,8 +1134,6 @@ pub(crate) struct CommonInitRequest<'a> {
      pub rgb_input: Option<RgbFormat>,
      /// Device capabilities for this profile, resolved by [`query_video_caps`].
      pub caps: &'a DeviceVideoCaps,
@@ -356,7 +356,7 @@ index 8d16b45..f21f6d3 100644
      /// Upper bound on the reference window the codec's syntax allows.
      pub max_reference_window: usize,
      /// How many references one frame may predict from, from the codec's own
-@@ -1089,6 +1092,9 @@ pub(crate) struct DeviceVideoCaps {
+@@ -1172,6 +1175,9 @@ pub(crate) struct DeviceVideoCaps {
      pub max_active_reference_pictures: u32,
      pub flags: vk::VideoCapabilityFlagsKHR,
      pub std_header_version: vk::ExtensionProperties,
@@ -366,7 +366,7 @@ index 8d16b45..f21f6d3 100644
  }
  
  /// Check `config.quality_level` against the device's
-@@ -1153,6 +1159,7 @@ pub(crate) fn query_video_caps(
+@@ -1236,6 +1242,7 @@ pub(crate) fn query_video_caps(
          max_active_reference_pictures: capabilities.max_active_reference_pictures,
          flags: capabilities.flags,
          std_header_version: capabilities.std_header_version,
@@ -374,7 +374,7 @@ index 8d16b45..f21f6d3 100644
      })
  }
  
-@@ -1197,33 +1204,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1280,33 +1287,13 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
  
      // Align the coded extent to lcm(codec block size, device granularity), then
      // clamp up to the device minimum and re-align.
@@ -413,7 +413,7 @@ index 8d16b45..f21f6d3 100644
      tracing::info!(
          "Using coded extent {}x{} (granularity {}x{}, min {}x{}, max {}x{})",
          aligned_width,
-@@ -1426,7 +1413,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1514,7 +1501,7 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
      let pipeline = EncodePipeline::new(&PipelineConfig {
          context,
          aligned_height,
@@ -422,7 +422,7 @@ index 8d16b45..f21f6d3 100644
          picture_format,
          rgb_input: req.rgb_input.is_some(),
          chroma_format: config.chroma_format,
-@@ -1453,6 +1440,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
+@@ -1541,6 +1528,8 @@ pub(crate) fn build_encoder_common(req: CommonInitRequest) -> Result<CommonInit>
          session,
          session_params: vk::VideoSessionParametersKHR::null(),
          session_memory,
@@ -468,7 +468,7 @@ index 1fe928f..f4008b3 100644
              max_frame_references: h265_caps.max_p_picture_l0_reference_count as usize,
              bitstream_buffer_size,
 diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
-index 6d667a5..0380bb8 100644
+index 16f80e6..351309b 100644
 --- a/src/encoder/mod.rs
 +++ b/src/encoder/mod.rs
 @@ -7,6 +7,8 @@
@@ -481,7 +481,7 @@ index 6d667a5..0380bb8 100644
  #[cfg(feature = "dmabuf")]
  pub mod external;
 diff --git a/src/encoder/resources.rs b/src/encoder/resources.rs
-index 012f8f0..dee41ee 100644
+index 1c8fcb6..50b5ce7 100644
 --- a/src/encoder/resources.rs
 +++ b/src/encoder/resources.rs
 @@ -11,10 +11,10 @@ use std::ptr;
@@ -499,7 +499,7 @@ index 012f8f0..dee41ee 100644
  };
  
  /// Create the encoder's DPB images.
-@@ -1182,16 +1182,6 @@ mod tests {
+@@ -1178,16 +1178,6 @@ mod tests {
          assert_eq!(gcd(5, 0), 5);
      }
  
@@ -516,7 +516,7 @@ index 012f8f0..dee41ee 100644
      #[test]
      fn input_images_are_64_aligned_within_the_device_maximum() {
          use crate::encoder::codec::input_image_width;
-@@ -1204,18 +1194,4 @@ mod tests {
+@@ -1200,18 +1190,4 @@ mod tests {
          // Never wider than the device allows, never narrower than coded.
          assert_eq!(input_image_width(4080, 4080), 4080);
      }
@@ -536,10 +536,10 @@ index 012f8f0..dee41ee 100644
 -    }
  }
 diff --git a/src/lib.rs b/src/lib.rs
-index 9648670..e9a15de 100644
+index ac423b2..6f2cd49 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -462,7 +462,8 @@ pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, D
+@@ -470,7 +470,8 @@ pub use encoder::external::{DmaBuf, DmaBufFormat, DmaBufImage, DmaBufModifier, D
  pub use encoder::{
      BFrameReferences, BFrameSupport, BitDepth, ChromaFormat, Codec, ColorDescription, Dimensions,
      EncodeConfig, EncodeContentHint, EncodeFuture, EncodeUsageHint, EncodedPacket, Encoder,
@@ -569,3 +569,6 @@ index be7ce1c..47efb3f 100644
  /// Align a value up to the next multiple of the given alignment.
  pub(crate) fn align_up(value: u32, alignment: u32) -> u32 {
      if alignment <= 1 {
+-- 
+2.56.1
+

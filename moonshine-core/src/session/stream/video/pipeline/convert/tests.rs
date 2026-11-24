@@ -2323,7 +2323,9 @@ mod gpu {
 							assert_eq!(encoder.set_bitrate(u32::MAX).unwrap(), format.bitrate);
 						},
 						4 => encoder.request_idr(),
-						8 => encoder.invalidate_reference_frames(6),
+						8 => {
+							encoder.invalidate_reference_frames(6);
+						},
 						_ => {},
 					}
 					if loss_injection && index == loss_start + 2 {

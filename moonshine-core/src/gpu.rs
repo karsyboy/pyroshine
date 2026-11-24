@@ -2,10 +2,11 @@
 //! never infer identity from enumeration order, vendor IDs, or device names.
 use ash::vk;
 use ash::vk::TaggedStructure;
-use pixelforge::{DeviceSelector, VideoContext, VideoContextBuilder};
+use pixelforge::{DeviceSelector, VideoContext, VideoContextBuilder, VideoInstance};
 use std::ffi::CStr;
 use std::fs::File;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::sync::{Mutex, PoisonError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureIdentity {
@@ -60,16 +61,44 @@ fn parse_pci(address: &str) -> Option<(u32, u32, u32, u32)> {
 /// the extensions) still captures, converts and runs PyroWave, which encodes
 /// with compute. Conventional profiles are then absent from the probe, so
 /// they are never advertised; [`encode_status`] says why.
+/// The settings every capture context, and the instance they share, use.
+fn video_builder() -> VideoContextBuilder {
+	VideoContextBuilder::new().app_name("Pyroshine")
+}
+
+/// The Vulkan instance every capture context is made on, for the whole process.
+///
+/// A context per stream with an instance of its own makes the Vulkan loader
+/// unload the driver after each stream and load it again for the next. Each
+/// reload costs a driver initialization, and NVIDIA's driver does not survive
+/// many: `libnvidia-tls.so` uses static TLS, which glibc does not give back,
+/// so after about 26 reloads `vkCreateInstance` fails with
+/// `VK_ERROR_INCOMPATIBLE_DRIVER` (upstream Moonshine #265). Each context still
+/// gets a device of its own, which dropping it destroys. A failed creation is
+/// not kept, so the next stream tries again.
+fn shared_video_instance() -> Result<VideoInstance, String> {
+	static INSTANCE: Mutex<Option<VideoInstance>> = Mutex::new(None);
+	let mut instance = INSTANCE.lock().unwrap_or_else(PoisonError::into_inner);
+	if let Some(instance) = instance.as_ref() {
+		return Ok(instance.clone());
+	}
+	let created = video_builder()
+		.build_instance()
+		.map_err(|e| format!("Failed to create the encoder's Vulkan instance: {e}"))?;
+	tracing::debug!("Created the encoder's Vulkan instance; streams share it.");
+	Ok(instance.insert(created).clone())
+}
+
 pub(crate) fn capture_context(file: &File) -> Result<VideoContext, String> {
 	let capture = CaptureIdentity::from_file(file)?;
-	let context = VideoContextBuilder::new()
-		.app_name("Pyroshine")
+	let instance = shared_video_instance()?;
+	let context = video_builder()
 		.device_selector(DeviceSelector {
 			drm_render_node: capture.render,
 			pci_bus: capture.pci,
 		})
 		.allow_without_encode(true)
-		.build()
+		.build_on(&instance)
 		.map_err(|e| {
 			format!(
 				"Failed to initialize Vulkan on capture DRM {:?} (PCI {:?}): {e}",
@@ -327,6 +356,10 @@ mod tests {
 		let file = File::open(path).unwrap();
 		// capture_context independently queries and verifies the selected GPU.
 		let context = capture_context(&file).unwrap();
+		// Streams one after another share the instance (the driver stays loaded).
+		let second = capture_context(&file).unwrap();
+		assert_eq!(context.instance().handle(), second.instance().handle());
+		drop(second);
 		assert!(
 			[pixelforge::Codec::H264, pixelforge::Codec::H265, pixelforge::Codec::AV1]
 				.into_iter()

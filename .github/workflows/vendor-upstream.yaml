@@ -154,6 +154,8 @@ jobs:
                 moonshine-core/src/session/stream/video/pyrowave.rs nix/pyrowave.nix docs/PYROWAVE.md
             else
               sed -i "s/tag = \"${PINNED_DESCRIBE}\"/tag = \"${describe}\"/" moonshine-core/Cargo.toml
+              # A pin on the commit of an untagged release moves to the new tag.
+              sed -i "s/rev = \"${PINNED_COMMIT}\"/tag = \"${describe}\"/" moonshine-core/Cargo.toml
               sed -i "s/^# Pixelforge ${PINNED_DESCRIBE} /# Pixelforge ${describe} /" Cargo.toml
               sed -i "s/(${PINNED_DESCRIBE}, /(${describe}, /" vendor/pixelforge/LOCAL_CHANGES.md
             fi

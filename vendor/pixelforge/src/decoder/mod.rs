@@ -223,6 +223,30 @@ impl DecodeConfig {
 ///   destroyed immediately afterwards. Wait for your fence first.
 #[derive(Debug)]
 pub struct DecodedFrame {
+    pub(crate) image: vk::Image,
+    pub(crate) image_view: vk::ImageView,
+    pub(crate) layout: vk::ImageLayout,
+    pub(crate) array_layer: u32,
+    pub(crate) chroma_format: ChromaFormat,
+    pub(crate) bit_depth: BitDepth,
+    pub(crate) generation: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) coded_width: u32,
+    pub(crate) coded_height: u32,
+    pub(crate) pts: u64,
+    pub(crate) display_order: i32,
+    pub(crate) is_keyframe: bool,
+    pub(crate) sampleable: bool,
+    pub(crate) plane_views: bool,
+    /// Keeps this frame's storage reserved; releases it on drop. `None` for a
+    /// frame that borrows the decoder's DPB image (see the validity rules).
+    // Held purely for its `Drop`, which is what returns the storage.
+    #[allow(dead_code)]
+    pub(crate) pin: Option<frames::FramePin>,
+}
+
+impl DecodedFrame {
     /// The decoded picture on the GPU.
     ///
     /// The image format is the decoder's picture format (see
@@ -236,19 +260,37 @@ pub struct DecodedFrame {
     /// `SAMPLED` (see [`sampleable`](Self::sampleable)). Reading it from a
     /// queue family other than the decoder's own requires
     /// [`DecodeConfig::with_consumer_queue_family`].
-    pub image: vk::Image,
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
     /// An image view over the whole decoded picture.
-    pub image_view: vk::ImageView,
+    pub fn image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
+
     /// Current layout of `image`.
-    pub layout: vk::ImageLayout,
+    pub fn layout(&self) -> vk::ImageLayout {
+        self.layout
+    }
+
     /// Array layer within `image` holding this picture. Always 0 for a
     /// non-layered DPB or a distinct output image; the DPB slot's layer
     /// when the DPB is layered and the driver decoded straight into it.
-    pub array_layer: u32,
+    pub fn array_layer(&self) -> u32 {
+        self.array_layer
+    }
+
     /// The chroma format of this frame.
-    pub chroma_format: ChromaFormat,
+    pub fn chroma_format(&self) -> ChromaFormat {
+        self.chroma_format
+    }
+
     /// Bit depth of the samples: eight for NV12, ten for P010.
-    pub bit_depth: BitDepth,
+    pub fn bit_depth(&self) -> BitDepth {
+        self.bit_depth
+    }
+
     /// Which set of decoder images [`image`](Self::image) belongs to.
     ///
     /// The decoder rebuilds its session, and with it every picture image, when
@@ -266,25 +308,49 @@ pub struct DecodedFrame {
     ///
     /// Frames from the copying path carry a generation too, so a consumer never
     /// has to know which path a frame took.
-    pub generation: u64,
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Visible (cropped) width in pixels.
-    pub width: u32,
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
     /// Visible (cropped) height in pixels.
-    pub height: u32,
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
     /// Coded width in pixels (image width).
-    pub coded_width: u32,
+    pub fn coded_width(&self) -> u32 {
+        self.coded_width
+    }
+
     /// Coded height in pixels (image height).
-    pub coded_height: u32,
+    pub fn coded_height(&self) -> u32 {
+        self.coded_height
+    }
+
     /// Presentation timestamp, passed through from [`Decoder::decode`].
-    pub pts: u64,
+    pub fn pts(&self) -> u64 {
+        self.pts
+    }
+
     /// Position of this frame in presentation order within the current coded
     /// video sequence: the codec's own ordering value (H.26x picture order
     /// count, AV1 order hint). Only the relative ordering carries meaning, and
     /// it restarts at every keyframe. Frames are already emitted sorted by it.
-    pub display_order: i32,
+    pub fn display_order(&self) -> i32 {
+        self.display_order
+    }
+
     /// Whether this frame is a keyframe: a random-access point starting a new
     /// coded video sequence (H.264 IDR, H.265 IRAP, AV1 key frame).
-    pub is_keyframe: bool,
+    pub fn is_keyframe(&self) -> bool {
+        self.is_keyframe
+    }
+
     /// Whether [`image`](Self::image) was created with `SAMPLED` usage, so a
     /// shader can read it directly rather than copying from it first.
     ///
@@ -296,7 +362,10 @@ pub struct DecodedFrame {
     /// multi-planar YCbCr, so it takes a `VkSamplerYcbcrConversion`, and the
     /// image must be transitioned out of [`layout`](Self::layout) first, unless
     /// it is already in `GENERAL`.
-    pub sampleable: bool,
+    pub fn sampleable(&self) -> bool {
+        self.sampleable
+    }
+
     /// Whether views of [`image`](Self::image)'s individual planes are legal:
     /// a view with a `VK_IMAGE_ASPECT_PLANE_i_BIT` aspect and that plane's
     /// compatible single-plane format (`R8_UNORM` for luma and `R8G8_UNORM`
@@ -327,12 +396,9 @@ pub struct DecodedFrame {
     /// invalid view, and only on the drivers where the frame really is the
     /// decoder's DPB image, so it passes on hardware that copies. See
     /// `tests/sample_planes.rs`.
-    pub plane_views: bool,
-    /// Keeps this frame's storage reserved; releases it on drop. `None` for a
-    /// frame that borrows the decoder's DPB image (see the validity rules).
-    // Held purely for its `Drop`, which is what returns the storage.
-    #[allow(dead_code)]
-    pub(crate) pin: Option<frames::FramePin>,
+    pub fn plane_views(&self) -> bool {
+        self.plane_views
+    }
 }
 
 /// What a [`DecodeSink::decode`] call did with the data it was given.
@@ -366,6 +432,8 @@ pub(crate) type FrameReceiver = futures_channel::mpsc::UnboundedReceiver<Result<
 /// The codec-erased operations every codec decoder exposes.
 trait DecoderApi: Send {
     fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus>;
+    fn reset(&mut self) -> Result<()>;
+    fn flush(&mut self) -> Result<()>;
     fn finish(&mut self) -> Result<()>;
     fn take_frame_receiver(&mut self) -> Option<FrameReceiver>;
     fn picture_format(&self) -> Option<vk::Format>;
@@ -474,6 +542,16 @@ impl Decoder {
         self.sink.decode(data, pts)
     }
 
+    /// Declare a discontinuity. See [`DecodeSink::reset`].
+    pub fn reset(&mut self) -> Result<()> {
+        self.sink.reset()
+    }
+
+    /// Deliver remaining frames. See [`DecodeSink::flush`].
+    pub fn flush(&mut self) -> Result<()> {
+        self.sink.flush()
+    }
+
     /// End the stream. See [`DecodeSink::finish`].
     pub fn finish(&mut self) -> Result<()> {
         self.sink.finish()
@@ -521,6 +599,40 @@ impl DecodeSink {
     /// comes back as [`DecodeStatus::NeedsKeyframe`] instead.
     pub fn decode(&mut self, data: &[u8], pts: u64) -> Result<DecodeStatus> {
         self.inner.decode(data, pts)
+    }
+
+    /// Declare a discontinuity, as when seeking to a new position in a file.
+    ///
+    /// Discards buffered input and frames held back for reordering. Start
+    /// feeding again at a keyframe; earlier pictures yield
+    /// [`DecodeStatus::NeedsKeyframe`]. Parameter sets and sequence headers
+    /// already seen are kept, and unchanged parameters reuse the session.
+    ///
+    /// Waits for submitted GPU work to complete. Frames already handed to
+    /// the completion thread are on the source when this returns, unless
+    /// already taken. Use distinct `pts` values to tell old and new frames
+    /// apart. Frames already taken remain valid.
+    ///
+    /// Returns [`PixelForgeError::InvalidInput`] after a successful
+    /// [`finish`](Self::finish). Errors from GPU work already submitted are
+    /// reported by the source.
+    pub fn reset(&mut self) -> Result<()> {
+        self.inner.reset()
+    }
+
+    /// End the current sequence and keep the source open for another one.
+    ///
+    /// Decodes the remaining input as at [`finish`](Self::finish), then emits
+    /// the pictures still held for reordering in display order. On success,
+    /// all frames have been sent to the source, so
+    /// [`DecodeSource::try_next_frame`] can drain them until
+    /// [`FramePoll::Pending`].
+    ///
+    /// Feeding can resume at a keyframe, with the same retained parameters as
+    /// after [`reset`](Self::reset). Like that call, this fails after a
+    /// successful `finish`. It can also fail while decoding the buffered tail.
+    pub fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
     }
 
     /// End the stream: decode whatever is still buffered, emit the frames held
