@@ -1607,9 +1607,52 @@ mod tests {
 				if !encrypt {
 					assert_eq!(actual.as_bytes(), expected.as_bytes());
 				} else {
-					// With AES-GCM, verify headers match in non-zero size and every padding/tail byte was written deterministically.
-					assert_eq!(actual.as_bytes().len(), expected.as_bytes().len());
-					assert_eq!(actual.shard_count(), expected.shard_count());
+					// Every shard decrypts, and to the bytes a zeroed buffer gives:
+					// no stale pool byte reaches the wire under encryption either.
+					let fresh_plain = decrypt_shards(&expected, &[0; 16]).unwrap();
+					let dirty_plain = decrypt_shards(&actual, &[0; 16]).unwrap();
+					assert_eq!(fresh_plain.len(), dirty_plain.len());
+					for ((_, fresh), (_, dirty)) in fresh_plain.iter().zip(&dirty_plain) {
+						assert_eq!(fresh, dirty);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn unzeroed_pooled_buffers_match_fresh_output_for_records() {
+		// A record frame (Nightjar's dialect) with undersized final shards.
+		let mut frame = Vec::new();
+		frame.extend_from_slice(&(0x80000000u32 | 127 | (127 << 14)).to_le_bytes());
+		frame.extend_from_slice(&32u32.to_le_bytes());
+		for block in 0..32u32 {
+			frame.extend_from_slice(&(2u32 << 16).to_le_bytes());
+			frame.extend_from_slice(&(block << 8).to_le_bytes());
+		}
+		for encrypt in [false, true] {
+			for fec in [0u8, 20] {
+				let mut fresh = packetizer_with(encrypt);
+				let mut dirty = packetizer_with(encrypt);
+				for p in [&mut fresh, &mut dirty] {
+					p.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
+				}
+				dirty.shard_pool.lock().unwrap().push(vec![0xaa; 64 * 1024]);
+				let expected = fresh
+					.packetize(&frame, FrameType::Key, 80, 0, fec, 1, &mut 0, 0, 0)
+					.unwrap();
+				let actual = dirty
+					.packetize(&frame, FrameType::Key, 80, 0, fec, 1, &mut 0, 0, 0)
+					.unwrap();
+				if encrypt {
+					let fresh_plain = decrypt_shards(&expected, &[0; 16]).unwrap();
+					let dirty_plain = decrypt_shards(&actual, &[0; 16]).unwrap();
+					assert_eq!(
+						fresh_plain.iter().map(|(_, plain)| plain).collect::<Vec<_>>(),
+						dirty_plain.iter().map(|(_, plain)| plain).collect::<Vec<_>>()
+					);
+				} else {
+					assert_eq!(actual.as_bytes(), expected.as_bytes());
 				}
 			}
 		}
