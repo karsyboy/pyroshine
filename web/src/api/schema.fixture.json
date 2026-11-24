@@ -658,7 +658,7 @@
         "kind": {
           "options": [
             {
-              "description": "High-priority compute queue when permitted, otherwise graphics (recommended).",
+              "description": "Graphics queue (recommended).",
               "label": "Automatic",
               "value": "auto"
             },

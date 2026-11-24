@@ -200,10 +200,10 @@ impl PyroWaveQueueMode {
 		}
 	}
 }
-// Compatibility creation starts on graphics unless high global priority is
-// granted (Granite's HIGH global priority only applies to async compute and
-// switches the device to compute). Failure of an optional queue preference
-// leaves graphics usable, including fallback API failure.
+// Compatibility creation starts on graphics, or on compute when HIGH global
+// priority is requested and granted (Granite's HIGH priority only applies to
+// async compute). Failure of an optional queue preference leaves graphics
+// usable, including fallback API failure.
 fn select_queue(
 	mode: PyroWaveQueueMode,
 	mut select: impl FnMut(vk::QueueFlags) -> ResultCode,
@@ -218,16 +218,16 @@ fn select_queue(
 	}
 }
 
-fn select_queue_for_priority(
-	mode: PyroWaveQueueMode,
-	actual_priority: vk::QueueGlobalPriorityKHR,
-	select: impl FnMut(vk::QueueFlags) -> ResultCode,
-) -> (vk::QueueFlags, ResultCode) {
-	let effective = match mode {
-		PyroWaveQueueMode::Auto if actual_priority >= vk::QueueGlobalPriorityKHR::HIGH => PyroWaveQueueMode::Compute,
-		other => other,
-	};
-	select_queue(effective, select)
+/// The global queue priority to request. Granite grants HIGH only to async
+/// compute (creating the device with it selects compute), so only an explicit
+/// compute preference asks for it. Automatic stays on graphics at normal
+/// priority: on AMD a GPU-bound game starved normal-priority compute (36 vs
+/// 54 FPS, 2026-10-14), and HIGH-priority compute has not been measured yet.
+fn requested_global_priority(mode: PyroWaveQueueMode) -> vk::QueueGlobalPriorityKHR {
+	match mode {
+		PyroWaveQueueMode::Compute => vk::QueueGlobalPriorityKHR::HIGH,
+		PyroWaveQueueMode::Auto | PyroWaveQueueMode::Graphics => vk::QueueGlobalPriorityKHR::MEDIUM,
+	}
 }
 type SetQueueType = unsafe extern "C" fn(DeviceHandle, vk::QueueFlags) -> ResultCode;
 type ReportPerformance =
@@ -501,11 +501,7 @@ impl Device {
 		}
 		let device_uuid = Uuid { uuid: ids.device_uuid };
 		let driver_uuid = Uuid { uuid: ids.driver_uuid };
-		let requested_priority = if mode == PyroWaveQueueMode::Graphics {
-			vk::QueueGlobalPriorityKHR::MEDIUM
-		} else {
-			vk::QueueGlobalPriorityKHR::HIGH
-		};
+		let requested_priority = requested_global_priority(mode);
 		let mut handle = ptr::null_mut();
 		// SAFETY: all pointers reference initialized values for the call, and the
 		// returned owned handle is destroyed by Drop.
@@ -550,13 +546,9 @@ impl Device {
 		}
 		// SAFETY: `handle` is a valid live PyroWave device.
 		let actual_priority = unsafe { (api.get_global_priority)(handle) };
-		// Requesting HIGH global priority activates async compute in Granite so
-		// PyroWave does not stall behind a full game graphics queue. Only drop back
-		// to graphics in Auto when HIGH priority was not granted or Graphics was
-		// explicitly configured.
-		let (selected, result) = select_queue_for_priority(mode, actual_priority, |flags| unsafe {
-			(api.set_queue_type)(handle, flags)
-		});
+		// A compute preference holds HIGH priority when it was granted (without
+		// CAP_SYS_NICE, RADV refuses it and the device falls back to MEDIUM).
+		let (selected, result) = select_queue(mode, |flags| unsafe { (api.set_queue_type)(handle, flags) });
 		if log_selection {
 			let families = unsafe {
 				context
@@ -1820,26 +1812,20 @@ mod queue_fallback_tests {
 		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 	}
 	#[test]
-	fn auto_keeps_compute_when_high_priority_granted_and_falls_back_otherwise() {
-		let (flags, _) =
-			select_queue_for_priority(PyroWaveQueueMode::Auto, vk::QueueGlobalPriorityKHR::HIGH, |flags| {
-				assert_eq!(flags, vk::QueueFlags::COMPUTE);
-				SUCCESS
-			});
-		assert_eq!(flags, vk::QueueFlags::COMPUTE);
-
-		let (flags, _) =
-			select_queue_for_priority(PyroWaveQueueMode::Auto, vk::QueueGlobalPriorityKHR::MEDIUM, |flags| {
-				assert_eq!(flags, vk::QueueFlags::GRAPHICS);
-				SUCCESS
-			});
-		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
-
-		let (flags, _) =
-			select_queue_for_priority(PyroWaveQueueMode::Graphics, vk::QueueGlobalPriorityKHR::HIGH, |flags| {
-				assert_eq!(flags, vk::QueueFlags::GRAPHICS);
-				SUCCESS
-			});
-		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+	fn only_a_compute_preference_requests_high_priority() {
+		assert_eq!(
+			requested_global_priority(PyroWaveQueueMode::Compute),
+			vk::QueueGlobalPriorityKHR::HIGH
+		);
+		// Requesting HIGH would move the device to compute, so Auto keeps
+		// graphics at normal priority.
+		assert_eq!(
+			requested_global_priority(PyroWaveQueueMode::Auto),
+			vk::QueueGlobalPriorityKHR::MEDIUM
+		);
+		assert_eq!(
+			requested_global_priority(PyroWaveQueueMode::Graphics),
+			vk::QueueGlobalPriorityKHR::MEDIUM
+		);
 	}
 }

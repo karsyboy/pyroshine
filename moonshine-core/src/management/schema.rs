@@ -120,10 +120,7 @@ fn fec_mode(mode: FecMode) -> (&'static str, &'static str) {
 
 fn queue_mode(mode: PyroWaveQueueMode) -> (&'static str, &'static str) {
 	match mode {
-		PyroWaveQueueMode::Auto => (
-			"Automatic",
-			"High-priority compute queue when permitted, otherwise graphics (recommended).",
-		),
+		PyroWaveQueueMode::Auto => ("Automatic", "Graphics queue (recommended)."),
 		PyroWaveQueueMode::Graphics => ("Graphics", "Graphics queue at medium priority."),
 		PyroWaveQueueMode::Compute => (
 			"Compute",
