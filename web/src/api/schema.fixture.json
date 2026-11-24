@@ -658,17 +658,17 @@
         "kind": {
           "options": [
             {
-              "description": "Graphics queue (recommended).",
+              "description": "High-priority compute queue when permitted, otherwise graphics (recommended).",
               "label": "Automatic",
               "value": "auto"
             },
             {
-              "description": "Graphics queue.",
+              "description": "Graphics queue at medium priority.",
               "label": "Graphics",
               "value": "graphics"
             },
             {
-              "description": "Request a compute queue; the library falls back to graphics.",
+              "description": "Request a compute queue (high priority when permitted); the library falls back to graphics.",
               "label": "Compute",
               "value": "compute"
             }

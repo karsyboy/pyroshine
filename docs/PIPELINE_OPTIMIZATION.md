@@ -349,11 +349,7 @@ conversion's own GPU time is unchanged.
 PyroWave runs on the graphics queue, where its frames queue behind the game's
 work whether or not imports stay alive, so it keeps its cache.
 
-`[stream.video] pyrowave_queue = "auto"` prefers graphics, even when a
-compute-only family is available. Explicit `graphics`/`compute` modes support A/B
-measurement. Optional selection failure retains a graphics fallback. The logged
-value is a preference, not proof of the native library's final queue choice.
-Normal queue priority and external-memory synchronization remain in place.
+`[stream.video] pyrowave_queue = "auto"` requests `VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR` (which Granite activates on async compute when the process holds `CAP_SYS_NICE` or root) and drops back to the normal-priority graphics queue if `HIGH` priority is not granted. Explicit `graphics`/`compute` modes support A/B measurement. Optional selection failure retains a graphics fallback. The logged value records both the requested and achieved priority.
 Measure real-game contention before drawing conclusions from cube benchmarks.
 
 Capture follows client demand. A pause (client detached or reconnecting)

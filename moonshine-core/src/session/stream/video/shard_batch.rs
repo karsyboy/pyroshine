@@ -162,6 +162,14 @@ pub(crate) struct TransportCompletion {
 	pub discarded_payload_bytes: usize,
 }
 
+/// Maximum recycled frame shard allocations retained by a stream's packetizer.
+const MAX_POOLED_SHARD_BUFFERS: usize = 4;
+/// Skip retaining extreme outlier allocations across frames.
+const MAX_POOLED_SHARD_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Recycled backing buffers returned when a [`ShardBatch`] finishes or drops.
+pub(crate) type ShardBufferPool = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
 /// A batch of equal-sized network shards stored in a single contiguous buffer.
 ///
 /// Replaces `Vec<Vec<u8>>` to avoid one heap allocation per shard
@@ -170,6 +178,8 @@ pub(crate) struct TransportCompletion {
 pub(crate) struct ShardBatch {
 	/// Contiguous buffer holding `shard_count * shard_size` bytes.
 	data: Vec<u8>,
+	/// Optional pool to recycle `data` back into on drop.
+	buffer_pool: Option<ShardBufferPool>,
 	/// Size of each shard in bytes.
 	shard_size: usize,
 	/// Transport metadata used for pacing and low-overhead frame diagnostics.
@@ -200,6 +210,7 @@ impl ShardBatch {
 	pub fn empty() -> Self {
 		Self {
 			data: Vec::new(),
+			buffer_pool: None,
 			shard_size: 0,
 			frame_number: 0,
 			encoded_size: 0,
@@ -279,6 +290,10 @@ impl ShardBatch {
 
 	pub fn set_pacing_origin(&mut self, origin: std::time::Instant) {
 		self.pacing_origin = Some(origin);
+	}
+
+	pub fn set_buffer_pool(&mut self, pool: ShardBufferPool) {
+		self.buffer_pool = Some(pool);
 	}
 
 	pub fn set_frame_metadata(
@@ -390,6 +405,16 @@ impl ShardBatch {
 impl Drop for ShardBatch {
 	fn drop(&mut self) {
 		self.finish(self.disposition);
+		if let Some(pool) = self.buffer_pool.take() {
+			let data = std::mem::take(&mut self.data);
+			if data.capacity() > 0
+				&& data.capacity() <= MAX_POOLED_SHARD_BUFFER_BYTES
+				&& let Ok(mut guard) = pool.lock()
+				&& guard.len() < MAX_POOLED_SHARD_BUFFERS
+			{
+				guard.push(data);
+			}
+		}
 	}
 }
 
@@ -422,6 +447,54 @@ impl ShardBuf {
 		let stride = prefix_size + data_size;
 		Self {
 			data: vec![0u8; shard_count * stride],
+			block_start: 0,
+			stride,
+			prefix_size,
+			data_size,
+			shard_count,
+		}
+	}
+
+	/// Reuse a zeroed backing buffer from `pool` when available, avoiding
+	/// repeated large `mmap`/zero-fault cycles across frames.
+	#[cfg(test)]
+	pub fn from_pool(shard_count: usize, data_size: usize, prefix_size: usize, pool: &ShardBufferPool) -> Self {
+		let stride = prefix_size + data_size;
+		let needed = shard_count * stride;
+		let mut data = pool.lock().ok().and_then(|mut guard| guard.pop()).unwrap_or_default();
+		data.clear();
+		data.resize(needed, 0);
+		Self {
+			data,
+			block_start: 0,
+			stride,
+			prefix_size,
+			data_size,
+			shard_count,
+		}
+	}
+
+	/// Reuse a pooled backing buffer without re-zeroing every byte.
+	///
+	/// The caller must overwrite every byte of every shard and prefix before
+	/// exposing the resulting [`ShardBatch`], including header padding and
+	/// trailing bytes on undersized shards.
+	pub fn from_pool_unzeroed(
+		shard_count: usize,
+		data_size: usize,
+		prefix_size: usize,
+		pool: &ShardBufferPool,
+	) -> Self {
+		let stride = prefix_size + data_size;
+		let needed = shard_count * stride;
+		let mut data = pool.lock().ok().and_then(|mut guard| guard.pop()).unwrap_or_default();
+		if data.len() < needed {
+			data.resize(needed, 0);
+		} else {
+			data.truncate(needed);
+		}
+		Self {
+			data,
 			block_start: 0,
 			stride,
 			prefix_size,
@@ -481,6 +554,7 @@ impl ShardBuf {
 	pub fn into_batch(self) -> ShardBatch {
 		ShardBatch {
 			data: self.data,
+			buffer_pool: None,
 			shard_size: self.stride,
 			frame_number: 0,
 			encoded_size: 0,
@@ -593,5 +667,22 @@ mod tests {
 		assert!(started.elapsed() < Duration::from_secs(5));
 		assert_eq!(counter.load(Ordering::Relaxed), 1);
 		sender.join().unwrap();
+	}
+
+	#[test]
+	fn shard_buffer_pool_recycles_dropped_allocations() {
+		let pool: ShardBufferPool = Arc::default();
+		let batch = ShardBuf::from_pool(8, 256, 32, &pool).into_batch();
+		let original_ptr = batch.as_bytes().as_ptr();
+		let mut batch = batch;
+		batch.set_buffer_pool(pool.clone());
+		// Mutate payload bytes before drop to verify pooled reuse zeroes cleanly.
+		batch.as_bytes_mut().fill(0x5a);
+		drop(batch);
+		assert_eq!(pool.lock().unwrap().len(), 1);
+
+		let reused = ShardBuf::from_pool(8, 256, 32, &pool);
+		assert_eq!(reused.data.as_ptr(), original_ptr);
+		assert!(reused.data.iter().all(|&b| b == 0));
 	}
 }

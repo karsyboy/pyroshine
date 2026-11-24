@@ -12,6 +12,13 @@ use super::shard_batch::{ShardBatch, TransportCompletion, TransportOutcome};
 pub(super) const MAX_UDP_PAYLOAD: usize = 65507;
 /// Use the common 64-segment GSO cadence for pacing even when GSO is off.
 const MAX_PACING_SEGMENTS: usize = 64;
+/// Target kernel UDP socket send buffer size (`SO_SNDBUF`).
+///
+/// Linux defaults (`net.core.wmem_default` ~ 212 KiB) are smaller than a single
+/// 4K PyroWave frame (~650 KiB on wire), causing spurious `WouldBlock` events
+/// between paced chunks. The kernel clamps this to `net.core.wmem_max` when
+/// needed; permission/limit failures are ignored cleanly.
+const TARGET_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Keep the uncontended raw-send path, but let Tokio observe every failed
 /// retry. Quinn uses sendmsg directly and cannot clear Tokio's cached readiness.
@@ -120,11 +127,23 @@ fn pacing_schedule(
 	started: Instant,
 ) -> (Instant, Duration, bool, Duration) {
 	let lateness = started.saturating_duration_since(requested);
-	if pacing_duration.is_zero() || requested >= started {
-		return (requested, pacing_duration, false, lateness);
+	// Cap the target transmit window within the capture slot (at least 1 /
+	// LATE_FRAME_MAX_SPEEDUP of bitrate duration) so oversized intra frames
+	// do not overrun the next capture tick and stall the following frame on
+	// network credit.
+	let target_duration = if frame_interval.is_zero() {
+		pacing_duration
+	} else {
+		let slot_cap = frame_interval * LATE_FRAME_SLOT_TENTHS / 10;
+		pacing_duration
+			.min(slot_cap)
+			.max(pacing_duration / LATE_FRAME_MAX_SPEEDUP)
+	};
+	if target_duration.is_zero() || requested >= started {
+		return (requested, target_duration, false, lateness);
 	}
 
-	match requested.checked_add(pacing_duration) {
+	match requested.checked_add(target_duration) {
 		Some(deadline) if deadline > started => {
 			// Encoding, or the previous frame's send, used part of this frame's
 			// transmit window. Start now and distribute every chunk across the
@@ -156,6 +175,7 @@ fn pacing_schedule(
 
 /// Rebase after observed readiness waits or a chunk overrun that consumed the
 /// next slot. Ordinary healthy send cost does not extend every pacing interval.
+#[cfg_attr(not(test), allow(dead_code))]
 fn rebase_after_chunk(
 	origin: Instant,
 	duration: Duration,
@@ -174,6 +194,85 @@ fn rebase_after_chunk(
 		Some(completed.checked_sub(offset).unwrap_or(completed))
 	} else {
 		None
+	}
+}
+
+/// Chunk-level transmit schedule within one frame's pacing window.
+///
+/// Minor timer wakeup jitter while the frame deadline still has headroom is
+/// absorbed across the remaining chunks (up to [`LATE_FRAME_MAX_SPEEDUP`]) so
+/// one slipped wakeup cannot stretch every remaining chunk past the next
+/// capture slot. Actual kernel `WouldBlock` backpressure or stalls past the
+/// frame deadline rebase at 1x so overdue chunks never dump in a microburst.
+struct ChunkPacer {
+	base_duration: Duration,
+	planned_wire_bytes: u64,
+	segment_origin: Instant,
+	segment_duration: Duration,
+	segment_start_wire: u64,
+	frame_deadline: Instant,
+}
+
+impl ChunkPacer {
+	fn new(origin: Instant, scheduled_duration: Duration, base_duration: Duration, planned_wire_bytes: u64) -> Self {
+		Self {
+			base_duration,
+			planned_wire_bytes,
+			segment_origin: origin,
+			segment_duration: scheduled_duration,
+			segment_start_wire: 0,
+			frame_deadline: origin + scheduled_duration,
+		}
+	}
+
+	fn deadline_for(&self, preceding_wire_bytes: u64) -> Instant {
+		let segment_total = self.planned_wire_bytes.saturating_sub(self.segment_start_wire);
+		let segment_done = preceding_wire_bytes.saturating_sub(self.segment_start_wire);
+		self.segment_origin + scaled_duration(self.segment_duration, segment_done, segment_total)
+	}
+
+	/// Update the schedule after sending `chunk_wire` starting at `preceding`.
+	/// Returns `true` when socket backpressure or a full-window overrun forced
+	/// a rebase past the current frame deadline.
+	fn on_chunk_sent(&mut self, preceding: u64, chunk_wire: u64, completed: Instant, waited: bool) -> bool {
+		if self.segment_duration.is_zero() || self.planned_wire_bytes == 0 {
+			return false;
+		}
+		let next_preceding = preceding.saturating_add(chunk_wire);
+		let remaining_wire = self.planned_wire_bytes.saturating_sub(next_preceding);
+		if remaining_wire == 0 {
+			return false;
+		}
+		let next_deadline = self.deadline_for(next_preceding);
+		if !waited && completed < next_deadline {
+			return false;
+		}
+
+		// Absorb wake jitter inside the frame window and minor deadline slips
+		// without counting them as socket backpressure or resetting to 1x spacing.
+		// Actual WouldBlock stalls or multi-window stalls (>= base_duration past
+		// frame_deadline) rebase at 1x to prevent a catch-up microburst.
+		if !waited && completed < self.frame_deadline + self.base_duration {
+			let natural_remaining = scaled_duration(self.base_duration, remaining_wire, self.planned_wire_bytes);
+			let window_remaining = self.frame_deadline.saturating_duration_since(completed);
+			self.segment_origin = completed;
+			self.segment_duration = window_remaining.max(natural_remaining / LATE_FRAME_MAX_SPEEDUP);
+			self.segment_start_wire = next_preceding;
+			// Keep frame_deadline anchored unless LATE_FRAME_MAX_SPEEDUP caps compression.
+			self.frame_deadline = self.segment_origin + self.segment_duration;
+			return false;
+		}
+
+		// Preserve 1x inter-chunk spacing on kernel backpressure or multi-slot stalls.
+		let segment_total = self.planned_wire_bytes.saturating_sub(self.segment_start_wire);
+		let offset = scaled_duration(
+			self.segment_duration,
+			preceding.saturating_sub(self.segment_start_wire),
+			segment_total,
+		);
+		self.segment_origin = completed.checked_sub(offset).unwrap_or(completed);
+		self.frame_deadline = self.segment_origin + self.segment_duration;
+		true
 	}
 }
 
@@ -255,6 +354,20 @@ impl UdpGsoSocket {
 		let socket = UdpSocket::bind((address, port))
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
+		let sock_ref = socket2::SockRef::from(&socket);
+		match sock_ref.set_send_buffer_size(TARGET_SEND_BUFFER_BYTES) {
+			Ok(()) => {
+				let actual = sock_ref.send_buffer_size().unwrap_or(0);
+				tracing::debug!(
+					requested = TARGET_SEND_BUFFER_BYTES,
+					actual,
+					"Configured video UDP SO_SNDBUF"
+				);
+			},
+			Err(error) => {
+				tracing::debug!(%error, requested = TARGET_SEND_BUFFER_BYTES, "Unable to raise video UDP SO_SNDBUF");
+			},
+		}
 		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
 			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
 		// Diagnostic-only bypass; intentionally not a user-facing tuning knob.
@@ -355,7 +468,7 @@ impl UdpGsoSocket {
 		// behind the previous frame, is already late. Rebase it instead of
 		// releasing every overdue GSO chunk as one catch-up burst. The
 		// pipeline's frame credits bound how many frames can wait here.
-		let (mut pacing_origin, scheduled_pacing_duration, pacing_rebased, initial_lateness) = pacing_schedule(
+		let (pacing_origin, scheduled_pacing_duration, pacing_rebased, initial_lateness) = pacing_schedule(
 			requested_pacing_origin,
 			pacing_duration,
 			pacing.map(|pacing| pacing.frame_interval).unwrap_or_default(),
@@ -364,18 +477,19 @@ impl UdpGsoSocket {
 		stats.pacing_rebased = pacing_rebased;
 		stats.initial_pacing_lateness = initial_lateness;
 		stats.scheduled_pacing_duration = scheduled_pacing_duration;
+		let mut pacer = ChunkPacer::new(
+			pacing_origin,
+			scheduled_pacing_duration,
+			pacing_duration,
+			stats.planned_wire_bytes,
+		);
 		let header_size = network_header_size(addr) as u64;
 		let mut preceding_wire_bytes = 0u64;
 
 		let (bytes, outcome) = batch.transport_parts();
 		for chunk in bytes.chunks(chunk_bytes) {
-			if !scheduled_pacing_duration.is_zero() {
-				let deadline = pacing_origin
-					+ scaled_duration(
-						scheduled_pacing_duration,
-						preceding_wire_bytes,
-						stats.planned_wire_bytes,
-					);
+			if !pacer.segment_duration.is_zero() {
+				let deadline = pacer.deadline_for(preceding_wire_bytes);
 				let now = Instant::now();
 				if now < deadline {
 					if let Some(timer) = &mut self.pacing_timer {
@@ -451,19 +565,15 @@ impl UdpGsoSocket {
 					.unwrap_or(u64::MAX)
 					.saturating_mul(header_size),
 			);
-			// Socket backpressure may consume multiple scheduled chunk slots. Move
-			// the remaining schedule forward from the completed chunk instead of
-			// releasing every now-overdue GSO send as a catch-up microburst.
-			if let Some(rebased) = rebase_after_chunk(
-				pacing_origin,
-				scheduled_pacing_duration,
+			// Socket backpressure or full-window stalls rebase remaining chunks at
+			// 1x; minor wakeup jitter inside the frame window is absorbed evenly
+			// across remaining chunks so frames stay within their capture slot.
+			if pacer.on_chunk_sent(
 				preceding_wire_bytes,
 				chunk_wire_bytes,
-				stats.planned_wire_bytes,
 				Instant::now(),
 				chunk_would_block || stats.would_block_events > before_would_block,
 			) {
-				pacing_origin = rebased;
 				stats.backpressure_rebases = stats.backpressure_rebases.saturating_add(1);
 			}
 			preceding_wire_bytes = preceding_wire_bytes.saturating_add(chunk_wire_bytes);
@@ -1019,5 +1129,51 @@ mod tests {
 		// Dropping the paced future leaves the socket usable for shutdown or a
 		// subsequent frame; no lock or partially-owned buffer survives it.
 		socket.socket.send_to(&[1], destination).await.unwrap();
+	}
+
+	#[test]
+	fn chunk_pacer_absorbs_within_window_jitter_without_stretching_deadline() {
+		let origin = Instant::now();
+		let duration = Duration::from_millis(30);
+		let mut pacer = ChunkPacer::new(origin, duration, duration, 300);
+
+		// Chunk 0 (100/300) slips slightly past its 10 ms slot to 12 ms with no
+		// kernel backpressure: absorb the 2 ms overrun across the remaining
+		// 200 bytes rather than pushing the frame deadline to 32 ms.
+		assert!(!pacer.on_chunk_sent(0, 100, origin + Duration::from_millis(12), false));
+		assert_eq!(pacer.deadline_for(100), origin + Duration::from_millis(12));
+		assert_eq!(pacer.deadline_for(200), origin + Duration::from_millis(21));
+		assert_eq!(pacer.frame_deadline, origin + duration);
+
+		// A full overrun past frame_deadline + base_duration or a readiness wait rebases at 1x.
+		let mut stalled = ChunkPacer::new(origin, duration, duration, 300);
+		let stall_at = origin + Duration::from_millis(100);
+		assert!(stalled.on_chunk_sent(100, 100, stall_at, false));
+		assert_eq!(
+			stalled.deadline_for(200).duration_since(stall_at),
+			Duration::from_millis(10)
+		);
+
+		// Final chunk finishing past frame_deadline has no remaining chunks to rebase.
+		let mut final_chunk = ChunkPacer::new(origin, duration, duration, 300);
+		assert!(!final_chunk.on_chunk_sent(200, 100, origin + Duration::from_millis(31), false));
+
+		// A small overrun past frame_deadline without WouldBlock compresses remaining
+		// chunks smoothly rather than counting as socket backpressure.
+		let mut slight_overrun = ChunkPacer::new(origin, duration, duration, 300);
+		let overrun_at = origin + Duration::from_millis(31);
+		assert!(!slight_overrun.on_chunk_sent(100, 100, overrun_at, false));
+		assert_eq!(
+			slight_overrun.frame_deadline.duration_since(overrun_at),
+			Duration::from_millis(10) / LATE_FRAME_MAX_SPEEDUP
+		);
+
+		// Oversized pacing durations are bounded within the frame slot (up to 4x rate).
+		let now = Instant::now();
+		let (sched_origin, sched_duration, rebased, _) =
+			pacing_schedule(now, Duration::from_millis(20), Duration::from_millis(10), now);
+		assert_eq!(sched_origin, now);
+		assert_eq!(sched_duration, Duration::from_millis(9));
+		assert!(!rebased);
 	}
 }

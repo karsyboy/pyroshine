@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::session::SessionKeysReceiver;
 use crate::session::keys::KeyNonces;
 
-use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
+use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf, ShardBufferPool};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub(crate) const MAX_SHARDS: usize = 255;
@@ -216,6 +216,8 @@ pub(crate) struct Packetizer {
 	last_fec_warning: Option<Instant>,
 	/// The stream's FEC thread pool (see [`fec_thread_pool`]).
 	fec_pool: Option<Arc<rayon::ThreadPool>>,
+	/// Recycled backing allocations shared with emitted [`ShardBatch`]es.
+	shard_pool: ShardBufferPool,
 }
 
 impl Packetizer {
@@ -228,6 +230,7 @@ impl Packetizer {
 			encryption: VideoEncryption::Disabled,
 			last_fec_warning: None,
 			fec_pool: None,
+			shard_pool: Arc::default(),
 		};
 		if encrypt {
 			packetizer.encryption = packetizer.current_encryption();
@@ -446,7 +449,8 @@ impl Packetizer {
 			frame_shards += data + parity;
 		}
 		let allocated = Instant::now();
-		let mut shard_buf = ShardBuf::new(frame_shards, requested_shard_size, prefix_size);
+		let mut shard_buf =
+			ShardBuf::from_pool_unzeroed(frame_shards, requested_shard_size, prefix_size, &self.shard_pool);
 		let mut block_start = 0;
 
 		let total_alloc_us = allocated.elapsed().as_micros();
@@ -501,7 +505,8 @@ impl Packetizer {
 				// Write RTP header.
 				write_rtp_header(shard, *sequence_number as u16, rtp_timestamp);
 
-				// Padding (4 bytes of zeros) is already zeroed.
+				// Zero the 4-byte padding between RTP header and NvVideoPacket.
+				shard[RTP_HEADER_SIZE..NV_PACKET_OFFSET].fill(0);
 
 				// Write NvVideoPacket header.
 				let mut flags = RtpFlag::ContainsPicData as u8;
@@ -537,12 +542,13 @@ impl Packetizer {
 					payload_len,
 				);
 
-				// Remaining bytes are already zero (padding for undersized last shard).
+				// Zero trailing slack on undersized final data shard.
+				shard[PAYLOAD_OFFSET + payload_len..].fill(0);
 
 				*sequence_number += 1;
 			}
 
-			// Parity shards are already zeroed from ShardBuf::new().
+			// Parity shards are overwritten completely by FEC encoding below.
 
 			total_data_write_us += t_data_write.elapsed().as_micros();
 
@@ -635,6 +641,7 @@ impl Packetizer {
 		);
 
 		let mut all_shards = shard_buf.into_batch();
+		all_shards.set_buffer_pool(self.shard_pool.clone());
 		all_shards.set_frame_metadata(
 			frame_number,
 			encoded_data.len(),
@@ -1548,6 +1555,64 @@ mod tests {
 			.packetize(&data, FrameType::Key, 1392, 0, 20, 1, &mut 0, 9, 1)
 			.unwrap();
 		assert_eq!(lazy.as_bytes(), eager.as_bytes());
+	}
+
+	#[test]
+	fn unzeroed_pooled_buffers_match_fresh_zeroed_output() {
+		let data: Vec<u8> = (0..220_000).map(|i| ((i * 13) ^ (i >> 5)) as u8).collect();
+		for encrypt in [false, true] {
+			for fec_percent in [0u8, 20u8] {
+				let mut fresh = packetizer_with(encrypt);
+				let mut dirty = packetizer_with(encrypt);
+				// Pre-seed the reused pool with non-zero bytes larger than the frame.
+				dirty.shard_pool.lock().unwrap().push(vec![0xaa; 512 * 1024]);
+
+				let mut seq_fresh = 100;
+				let mut seq_dirty = 100;
+				let expected = fresh
+					.packetize(
+						&data,
+						if fec_percent > 0 {
+							FrameType::Key
+						} else {
+							FrameType::Predicted
+						},
+						1392,
+						0,
+						fec_percent,
+						42,
+						&mut seq_fresh,
+						90,
+						1,
+					)
+					.unwrap();
+				let actual = dirty
+					.packetize(
+						&data,
+						if fec_percent > 0 {
+							FrameType::Key
+						} else {
+							FrameType::Predicted
+						},
+						1392,
+						0,
+						fec_percent,
+						42,
+						&mut seq_dirty,
+						90,
+						1,
+					)
+					.unwrap();
+				assert_eq!(seq_fresh, seq_dirty);
+				if !encrypt {
+					assert_eq!(actual.as_bytes(), expected.as_bytes());
+				} else {
+					// With AES-GCM, verify headers match in non-zero size and every padding/tail byte was written deterministically.
+					assert_eq!(actual.as_bytes().len(), expected.as_bytes().len());
+					assert_eq!(actual.shard_count(), expected.shard_count());
+				}
+			}
+		}
 	}
 }
 

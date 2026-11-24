@@ -31,6 +31,11 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - **Reference frame invalidation recovers without an IDR.** The first frame after an invalidation is sent as a recovery frame (frame type 5), which Moonlight waits for; before, every invalidation ended in an IDR. Repeated loss reports for a loss already answered are ignored, a static screen re-sends the recovery frame, and when the client leaves the count to the host, Vulkan Video holds 150 ms of reference frames (4 to 16) and predicts from one. Applies to Vulkan Video, VA-API and NVENC (from upstream Moonshine, by Ryan Bateman).
 - **`/serverinfo` reports `PairStatus` from the client certificate.** It used the `uniqueid` parameter, which all Moonlight clients send with the same value, so an unpaired client could be told it was paired once any client had paired (from upstream Moonshine, by Hans Gaiser).
 - **Colour conversion submits through Pixelforge's queue locks**, so it cannot race the encoder's own submissions to a shared queue.
+### Changed
+
+- **PyroWave requests `HIGH` global Vulkan queue priority (`VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR`).** With `CAP_SYS_NICE` granted on `services.moonshine`, `[stream.video] pyrowave_queue = "auto"` keeps the high-priority async compute queue so PyroWave encodes do not stall behind a full game graphics queue, falling back to normal-priority graphics when unprivileged.
+- **Video packetizer and transmit pacing overhead reduced.** `Packetizer` now reuses pooled shard buffers without re-zeroing the entire allocation every frame, and `ChunkPacer` bounds oversized frame pacing within the capture slot without misclassifying minor timer jitter or final chunks as socket backpressure.
+- **NixOS `services.moonshine` priority defaults.** Configured `Nice = -10`, `IOSchedulingClass = "best-effort"`, `IOSchedulingPriority = 0`, `MemoryLow = "512M"`, and `AmbientCapabilities = [ "CAP_SYS_NICE" ]`.
 
 ## [v0.18.7] - 2026-11-17
 
