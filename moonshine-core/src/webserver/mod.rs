@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
+use crate::healthcheck::{CODEC_PYROWAVE, CODEC_PYROWAVE_444};
 use crate::{
 	ShutdownReason,
 	app_scanner::Library,
@@ -416,7 +417,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint, peer_address.ip()) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					if self.supported_codecs & 0x01800000 == 0 {
+					if self.supported_codecs & (CODEC_PYROWAVE | CODEC_PYROWAVE_444) == 0 {
 						return Ok(not_found().map(BodyExt::boxed_unsync));
 					}
 					// Explicit calibration is unavailable during a session so a
@@ -703,13 +704,10 @@ impl Webserver {
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += &format!("<LocalIP>{}</LocalIP>", escape_xml(local_ip));
-		// HDR444 alias for record clients; native orthogonal HDR bit remains.
-		let server_codec_mode_support = self.supported_codecs
-			| if self.supported_codecs & 0x03000000 == 0x03000000 {
-				0x04000000
-			} else {
-				0
-			};
+		// PyroWave's current bits, plus its legacy bits (and the record HDR444
+		// alias) for clients from before the 2026-11 move.
+		let server_codec_mode_support =
+			self.supported_codecs | crate::healthcheck::legacy_pyrowave_modes(self.supported_codecs);
 		response += &format!(
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
@@ -727,7 +725,7 @@ impl Webserver {
 				crate::calibration::plan::MAX_RATE_KBPS
 			);
 		}
-		if paired_peer && self.supported_codecs & 0x01800000 != 0 {
+		if paired_peer && self.supported_codecs & (CODEC_PYROWAVE | CODEC_PYROWAVE_444) != 0 {
 			let speed = local_address
 				.map(|a| bandwidth::routed_link_mbps(a.ip(), peer_address.ip()))
 				.unwrap_or(0);

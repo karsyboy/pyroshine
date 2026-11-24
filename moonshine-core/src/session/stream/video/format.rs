@@ -15,6 +15,11 @@ pub enum VideoCodec {
 	PyroWave,
 }
 
+/// `x-nv-vqos[0].bitStreamFormat` of PyroWave.
+pub const PYROWAVE_BITSTREAM_FORMAT: u32 = 16;
+/// The value PyroWave used before 2026-11, still accepted from older clients.
+pub const LEGACY_PYROWAVE_BITSTREAM_FORMAT: u32 = 3;
+
 impl TryFrom<u32> for VideoCodec {
 	type Error = ();
 
@@ -23,9 +28,12 @@ impl TryFrom<u32> for VideoCodec {
 			0 => Ok(Self::H264),
 			1 => Ok(Self::Hevc),
 			2 => Ok(Self::Av1),
-			// Pyroshine extension. This value is only sent by a client which
-			// advertised the PyroWave extension; it never impersonates AV1/HEVC.
-			3 => Ok(Self::PyroWave),
+			// Pyroshine extension, only sent by a client which advertised it; it
+			// never impersonates AV1/HEVC. 16 since 2026-11; 3 is the legacy
+			// value, which upstream moonlight-common-c now uses for MPEG-2.
+			// Pyroshine never offers MPEG-2 (no MPV rtpmap in DESCRIBE), so a 3
+			// reaching it is a PyroWave client from before the move.
+			PYROWAVE_BITSTREAM_FORMAT | LEGACY_PYROWAVE_BITSTREAM_FORMAT => Ok(Self::PyroWave),
 			_ => Err(()),
 		}
 	}
@@ -232,6 +240,14 @@ impl Default for NegotiatedVideoFormat {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn pyrowave_has_a_bitstream_format_of_its_own_and_its_legacy_one() {
+		assert_eq!(VideoCodec::try_from(16), Ok(VideoCodec::PyroWave));
+		assert_eq!(VideoCodec::try_from(3), Ok(VideoCodec::PyroWave));
+		// H.263+ (Sunshine's 4) is not offered.
+		assert_eq!(VideoCodec::try_from(4), Err(()));
+	}
 
 	#[test]
 	fn codec_and_format_are_independent() {

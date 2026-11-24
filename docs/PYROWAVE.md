@@ -61,11 +61,21 @@ rejected.
 The normal `ServerCodecModeSupport` bits retain their existing meanings. The
 PyroWave-aware wire-v1 extension uses orthogonal chroma and HDR bits:
 
-| Bit | Mode |
-| ---: | --- |
-| `0x00800000` | PyroWave 4:2:0 |
-| `0x01000000` | PyroWave 4:4:4 |
-| `0x02000000` | PyroWave HDR10 (with either advertised chroma mode) |
+| Bit | Legacy bit | Mode |
+| ---: | ---: | --- |
+| `0x10000000` | `0x00800000` | PyroWave 4:2:0 |
+| `0x20000000` | `0x01000000` | PyroWave 4:4:4 |
+| `0x40000000` | `0x02000000` | PyroWave HDR10 (with either advertised chroma mode) |
+
+PyroWave moved to the high bits in 2026-11, when upstream moonlight-common-c
+gave `0x00800000` to MPEG-2 and `0x02000000` to H.263+ (and `bitStreamFormat`
+`3` to MPEG-2). Pyroshine also advertises the legacy bits, plus the record
+HDR 4:4:4 alias `0x04000000`, for Nightjar, Nonary-derived clients and older
+Pyrolight/PyroDeck releases. A client takes legacy bits as PyroWave only when
+DESCRIBE also carries the `x-ss-pyrowave.*` attributes and `PYROWAVE/90000`
+rtpmap; MPEG-2 and H.263+ need an `MPV`/`H263` rtpmap, which Pyroshine never
+sends. Current Pyrolight announces `bitStreamFormat` `16` to a host that
+advertises the high bits and `3` to one that advertises only the legacy bits.
 
 The server advertises a chroma bit only after loading API 1.1.0, matching
 PyroWave to the capture-verified Vulkan adapter, confirming external-memory
@@ -89,7 +99,7 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 
 | Attribute | Values |
 | --- | --- |
-| `x-nv-vqos[0].bitStreamFormat` | `0` H.264, `1` HEVC, `2` AV1, `3` PyroWave |
+| `x-nv-vqos[0].bitStreamFormat` | `0` H.264, `1` HEVC, `2` AV1, `16` PyroWave (`3` from clients before 2026-11, still accepted) |
 | `x-ss-video[0].chromaSamplingType` | `0` 4:2:0, `1` 4:4:4 |
 | `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 (also after `hdrMode=0`: PyroWave has no 10-bit SDR) |
 | `x-nv-video[0].encoderCscMode` bit 0 | `0` limited, `1` full range |

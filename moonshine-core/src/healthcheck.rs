@@ -107,10 +107,42 @@ pub const CODEC_AV1_HIGH_8444: u32 = 0x00200000;
 pub const CODEC_AV1_HIGH_10444: u32 = 0x00400000;
 /// Private Sunshine/Moonlight wire-v1 extension bits. Chroma and HDR are
 /// orthogonal capabilities; SDR uses the 8-bit intermediate and HDR10 uses 10-bit.
-pub const CODEC_PYROWAVE: u32 = 0x00800000;
-pub const CODEC_PYROWAVE_444: u32 = 0x01000000;
-pub const CODEC_PYROWAVE_HDR: u32 = 0x02000000;
+///
+/// High bits since 2026-11: upstream moonlight-common-c took the former
+/// PyroWave bits for MPEG-2 (0x00800000) and H.263+ (0x02000000). `/serverinfo`
+/// still advertises the [legacy bits](legacy_pyrowave_modes) for older clients.
+pub const CODEC_PYROWAVE: u32 = 0x10000000;
+pub const CODEC_PYROWAVE_444: u32 = 0x20000000;
+pub const CODEC_PYROWAVE_HDR: u32 = 0x40000000;
 pub const CODEC_PYROWAVE_MASK: u32 = CODEC_PYROWAVE | CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
+
+/// The PyroWave bits before 2026-11, which Nightjar, Nonary-derived clients
+/// and older Pyrolight/PyroDeck read. Clients only take them as PyroWave when
+/// DESCRIBE also carries PyroWave's attributes, so they never offer MPEG-2 or
+/// H.263+ (which also needs an `MPV`/`H263` rtpmap Pyroshine never sends).
+pub const LEGACY_CODEC_PYROWAVE: u32 = 0x00800000;
+pub const LEGACY_CODEC_PYROWAVE_444: u32 = 0x01000000;
+pub const LEGACY_CODEC_PYROWAVE_HDR: u32 = 0x02000000;
+/// Record clients' HDR 4:4:4 alias, advertised with native HDR 4:4:4.
+pub const LEGACY_CODEC_PYROWAVE_RECORD_HDR444: u32 = 0x04000000;
+
+/// The legacy PyroWave bits matching the PyroWave profiles in `capabilities`.
+pub fn legacy_pyrowave_modes(capabilities: u32) -> u32 {
+	let mut legacy = 0;
+	for (current, old) in [
+		(CODEC_PYROWAVE, LEGACY_CODEC_PYROWAVE),
+		(CODEC_PYROWAVE_444, LEGACY_CODEC_PYROWAVE_444),
+		(CODEC_PYROWAVE_HDR, LEGACY_CODEC_PYROWAVE_HDR),
+	] {
+		if capabilities & current != 0 {
+			legacy |= old;
+		}
+	}
+	if capabilities & (CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR) == CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR {
+		legacy |= LEGACY_CODEC_PYROWAVE_RECORD_HDR444;
+	}
+	legacy
+}
 
 /// Test a negotiated mode against the exact combinations successfully probed
 /// at startup.  This intentionally has no codec-name-only shortcut.
@@ -1960,10 +1992,36 @@ mod tests {
 	}
 
 	#[test]
+	fn legacy_pyrowave_bits_mirror_the_current_ones() {
+		assert_eq!(legacy_pyrowave_modes(CODEC_H264 | CODEC_AV1_MAIN8), 0);
+		assert_eq!(legacy_pyrowave_modes(CODEC_PYROWAVE), LEGACY_CODEC_PYROWAVE);
+		assert_eq!(
+			legacy_pyrowave_modes(CODEC_PYROWAVE | CODEC_PYROWAVE_HDR),
+			LEGACY_CODEC_PYROWAVE | LEGACY_CODEC_PYROWAVE_HDR
+		);
+		assert_eq!(
+			legacy_pyrowave_modes(CODEC_PYROWAVE_MASK),
+			LEGACY_CODEC_PYROWAVE
+				| LEGACY_CODEC_PYROWAVE_444
+				| LEGACY_CODEC_PYROWAVE_HDR
+				| LEGACY_CODEC_PYROWAVE_RECORD_HDR444
+		);
+		// The current bits overlap no Sunshine codec bit, the legacy ones no
+		// current PyroWave bit.
+		let sunshine = CODEC_PROFILES
+			.iter()
+			.map(|(bit, ..)| *bit)
+			.filter(|bit| bit & CODEC_PYROWAVE_MASK == 0)
+			.fold(0, |all, bit| all | bit);
+		assert_eq!(sunshine & CODEC_PYROWAVE_MASK, 0);
+		assert_eq!(legacy_pyrowave_modes(CODEC_PYROWAVE_MASK) & CODEC_PYROWAVE_MASK, 0);
+	}
+
+	#[test]
 	fn pyrowave_profiles_require_chroma_and_hdr_bits_in_either_range() {
-		assert_eq!(CODEC_PYROWAVE, 0x00800000);
-		assert_eq!(CODEC_PYROWAVE_444, 0x01000000);
-		assert_eq!(CODEC_PYROWAVE_HDR, 0x02000000);
+		assert_eq!(CODEC_PYROWAVE, 0x10000000);
+		assert_eq!(CODEC_PYROWAVE_444, 0x20000000);
+		assert_eq!(CODEC_PYROWAVE_HDR, 0x40000000);
 		let caps = CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
 		for range in [ColorRange::Full, ColorRange::Limited] {
 			assert!(supports_video_format(

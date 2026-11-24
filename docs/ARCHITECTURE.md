@@ -542,7 +542,7 @@ forces an IDR. An NVENC color change stays pending until NVENC accepts the
 reconfiguration, so no frame converted for a new color description is encoded
 under the previous one.
 
-PyroWave is a separate codec (`bitStreamFormat` 3); it never impersonates a
+PyroWave is a separate codec (`bitStreamFormat` 16, legacy 3); it never impersonates a
 conventional codec and has no CPU or alternate-codec fallback. `pyrowave.rs`
 owns the C API's unsafe boundary: exact ABI checks, handle ownership, and
 destroying child resources before the device and library. See

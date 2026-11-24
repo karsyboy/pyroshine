@@ -14,7 +14,10 @@ length prefix, padding, second encoder, or framing inference enters this path.
 
 ## Setup negotiation
 
-PyroWave uses `bitStreamFormat:3`. DESCRIBE adds these attributes:
+PyroWave uses `bitStreamFormat:16`; Pyroshine also accepts the legacy `3`,
+which record clients and older Pyrolight send (see
+[capability bits](PYROWAVE.md#capability-and-negotiation-extension)).
+DESCRIBE adds these attributes:
 
 ```sdp
 a=x-ss-pyrowave.version:1
@@ -70,14 +73,15 @@ No legacy length-prefixed transport is implemented or inferred.
 
 ## Color capability translation
 
-| Profile | Native HTTP requirement | Record HTTP requirement |
+| Profile | Native HTTP requirement | Legacy native / record HTTP requirement |
 | --- | --- | --- |
-| SDR 8-bit 420 | `0x00800000` | `0x00800000` |
-| SDR 8-bit 444 | `0x01000000` | `0x01000000` |
-| HDR10 10-bit 420 | 420 plus `0x02000000` | 420 plus `0x02000000` |
-| HDR10 10-bit 444 | 444 plus `0x02000000` | 444 plus `0x04000000` |
+| SDR 8-bit 420 | `0x10000000` | `0x00800000` |
+| SDR 8-bit 444 | `0x20000000` | `0x01000000` |
+| HDR10 10-bit 420 | 420 plus `0x40000000` | 420 plus `0x02000000` |
+| HDR10 10-bit 444 | 444 plus `0x40000000` | 444 plus `0x02000000` (native) or `0x04000000` (record) |
 
-Pyroshine adds the HDR444 record alias only when native HDR444 is supported.
+Pyroshine advertises both columns. It adds the HDR444 record alias only when
+native HDR444 is supported.
 Internal formats remain typed independent axes. Only 8-bit SDR and 10-bit
 HDR10 are supported by the current scaled encoder, in full or limited range as
 the client asks; contradictory depth or chroma requests are rejected. SDR uses
