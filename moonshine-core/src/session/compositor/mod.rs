@@ -1806,6 +1806,231 @@ mod xwayland_tests {
 		shut_down(stop);
 	}
 
+	/// Wine's Wayland driver presents a game as a toplevel holding a
+	/// transparent ARGB placeholder (no opaque region) with the swapchain on a
+	/// desynchronized subsurface above it. The swapchain fills the output and
+	/// has no alpha channel, so it is the frame: exported directly rather than
+	/// composited for `transparent`/`subsurfaces`.
+	#[test]
+	#[ignore = "needs a GPU render node and Xwayland"]
+	fn wine_wayland_swapchain_subsurface_is_exported_directly() {
+		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+		use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier, dmabuf::AsDmabuf};
+		use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+		use wayland_client::protocol::{
+			wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+		};
+		use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+			zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+			zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+		};
+		use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+
+		#[derive(Default)]
+		struct Client {
+			globals: Vec<(u32, String, u32)>,
+			configure: Option<u32>,
+		}
+		impl wayland_client::Dispatch<wl_registry::WlRegistry, ()> for Client {
+			fn event(
+				state: &mut Self,
+				_: &wl_registry::WlRegistry,
+				event: wl_registry::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let wl_registry::Event::Global {
+					name,
+					interface,
+					version,
+				} = event
+				{
+					state.globals.push((name, interface, version));
+				}
+			}
+		}
+		impl wayland_client::Dispatch<xdg_wm_base::XdgWmBase, ()> for Client {
+			fn event(
+				_: &mut Self,
+				base: &xdg_wm_base::XdgWmBase,
+				event: xdg_wm_base::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let xdg_wm_base::Event::Ping { serial } = event {
+					base.pong(serial);
+				}
+			}
+		}
+		impl wayland_client::Dispatch<xdg_surface::XdgSurface, ()> for Client {
+			fn event(
+				state: &mut Self,
+				_: &xdg_surface::XdgSurface,
+				event: xdg_surface::Event,
+				_: &(),
+				_: &wayland_client::Connection,
+				_: &wayland_client::QueueHandle<Self>,
+			) {
+				if let xdg_surface::Event::Configure { serial } = event {
+					state.configure = Some(serial);
+				}
+			}
+		}
+		wayland_client::delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+		wayland_client::delegate_noop!(Client: ignore wl_subcompositor::WlSubcompositor);
+		wayland_client::delegate_noop!(Client: ignore wl_subsurface::WlSubsurface);
+		wayland_client::delegate_noop!(Client: ignore wl_surface::WlSurface);
+		wayland_client::delegate_noop!(Client: ignore wl_shm::WlShm);
+		wayland_client::delegate_noop!(Client: ignore wl_shm_pool::WlShmPool);
+		wayland_client::delegate_noop!(Client: ignore wl_buffer::WlBuffer);
+		wayland_client::delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
+		wayland_client::delegate_noop!(Client: ignore ZwpLinuxDmabufV1);
+		wayland_client::delegate_noop!(Client: ignore ZwpLinuxBufferParamsV1);
+
+		let stop = async_shutdown::ShutdownManager::new();
+		let (foreground, _) = tokio::sync::watch::channel(None);
+		let (compositor, handles) = Compositor::new(
+			CompositorConfig::default(),
+			CompositorContext {
+				width: WIDTH.into(),
+				height: HEIGHT.into(),
+				refresh_rate: 60,
+				hdr: false,
+				output_scale: 1.0,
+				log_stats: false,
+			},
+			stop.clone(),
+			foreground,
+		);
+		let launched = compositor.launch().expect("compositor launch");
+		let socket = std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap())
+			.join(&launched.ready().display.wayland_display);
+		let wayland =
+			wayland_client::Connection::from_socket(std::os::unix::net::UnixStream::connect(socket).unwrap()).unwrap();
+		let mut queue = wayland.new_event_queue();
+		let qh = queue.handle();
+		let registry = wayland.display().get_registry(&qh, ());
+		let mut client = Client::default();
+		queue.roundtrip(&mut client).unwrap();
+		let bind = |interface: &str, max: u32| {
+			let (name, _, version) = client
+				.globals
+				.iter()
+				.find(|(_, name, _)| name == interface)
+				.unwrap_or_else(|| panic!("{interface} is advertised"));
+			(*name, (*version).min(max))
+		};
+		let (name, version) = bind("wl_compositor", 4);
+		let wl_compositor: wl_compositor::WlCompositor = registry.bind(name, version, &qh, ());
+		let (name, version) = bind("wl_subcompositor", 1);
+		let subcompositor: wl_subcompositor::WlSubcompositor = registry.bind(name, version, &qh, ());
+		let (name, version) = bind("wl_shm", 1);
+		let shm: wl_shm::WlShm = registry.bind(name, version, &qh, ());
+		let (name, version) = bind("xdg_wm_base", 1);
+		let wm_base: xdg_wm_base::XdgWmBase = registry.bind(name, version, &qh, ());
+		let (name, version) = bind("zwp_linux_dmabuf_v1", 3);
+		let linux_dmabuf: ZwpLinuxDmabufV1 = registry.bind(name, version, &qh, ());
+
+		let (width, height) = (i32::from(WIDTH), i32::from(HEIGHT));
+		let toplevel_surface = wl_compositor.create_surface(&qh, ());
+		let xdg_surface = wm_base.get_xdg_surface(&toplevel_surface, &qh, ());
+		let toplevel = xdg_surface.get_toplevel(&qh, ());
+		toplevel_surface.commit();
+		while client.configure.is_none() {
+			queue.blocking_dispatch(&mut client).unwrap();
+		}
+		xdg_surface.ack_configure(client.configure.take().unwrap());
+		xdg_surface.set_window_geometry(0, 0, width, height);
+
+		// The placeholder: zero-filled (transparent) ARGB8888 shared memory.
+		let size = width * height * 4;
+		// SAFETY: memfd_create takes a NUL-terminated name and returns a new
+		// descriptor that the OwnedFd takes over.
+		let memfd = unsafe {
+			let fd = libc::memfd_create(c"placeholder".as_ptr(), libc::MFD_CLOEXEC);
+			assert!(fd >= 0);
+			OwnedFd::from_raw_fd(fd)
+		};
+		std::fs::File::from(memfd.try_clone().unwrap())
+			.set_len(size as u64)
+			.unwrap();
+		let pool = shm.create_pool(memfd.as_fd(), size, &qh, ());
+		let placeholder = pool.create_buffer(0, width, height, width * 4, wl_shm::Format::Argb8888, &qh, ());
+		toplevel_surface.attach(Some(&placeholder), 0, 0);
+		toplevel_surface.damage_buffer(0, 0, width, height);
+		toplevel_surface.commit();
+
+		// The swapchain: an opaque-format DMA-BUF on a desynchronized subsurface.
+		let node = super::find_render_node(&None).unwrap();
+		let file = std::fs::OpenOptions::new().read(true).write(true).open(node).unwrap();
+		let mut allocator = GbmAllocator::new(GbmDevice::new(file).unwrap(), GbmBufferFlags::RENDERING);
+		let buffer = allocator
+			.create_buffer(WIDTH.into(), HEIGHT.into(), Fourcc::Xrgb8888, &[Modifier::Linear])
+			.unwrap();
+		let dmabuf = buffer.export().unwrap();
+		let params = linux_dmabuf.create_params(&qh, ());
+		let modifier: u64 = dmabuf.format().modifier.into();
+		for (index, ((handle, offset), stride)) in
+			dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides()).enumerate()
+		{
+			params.add(
+				handle,
+				index as u32,
+				offset,
+				stride,
+				(modifier >> 32) as u32,
+				modifier as u32,
+			);
+		}
+		let swapchain = params.create_immed(
+			width,
+			height,
+			Fourcc::Xrgb8888 as u32,
+			zwp_linux_buffer_params_v1::Flags::empty(),
+			&qh,
+			(),
+		);
+		let game_surface = wl_compositor.create_surface(&qh, ());
+		let subsurface = subcompositor.get_subsurface(&game_surface, &toplevel_surface, &qh, ());
+		subsurface.set_desync();
+		subsurface.set_position(0, 0);
+		subsurface.place_above(&toplevel_surface);
+		toplevel_surface.commit();
+
+		let mut origins = Vec::new();
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while std::time::Instant::now() < deadline {
+			// Fresh swapchain content each round, like a running game.
+			game_surface.attach(Some(&swapchain), 0, 0);
+			game_surface.damage_buffer(0, 0, width, height);
+			game_surface.commit();
+			queue.roundtrip(&mut client).unwrap();
+			if let Ok(frame) = handles.frames.recv_timeout(std::time::Duration::from_millis(100)) {
+				frame.consumed.store(true, std::sync::atomic::Ordering::Release);
+				let origin = frame.origin;
+				drop(frame);
+				origins.push(origin);
+				if origin.path == crate::session::capture::frame::CapturePath::Direct {
+					break;
+				}
+			}
+		}
+		assert_eq!(
+			origins.last().map(|origin| origin.path),
+			Some(crate::session::capture::frame::CapturePath::Direct),
+			"the swapchain subsurface was not exported directly: {origins:?}"
+		);
+
+		drop((toplevel, subsurface, placeholder, pool, swapchain, params));
+		drop(wayland);
+		drop(dmabuf);
+		drop(buffer);
+		drop(allocator);
+		shut_down(stop);
+	}
+
 	#[allow(dead_code, unused_imports, non_upper_case_globals, clippy::all)]
 	mod input_method_client {
 		use wayland_client;

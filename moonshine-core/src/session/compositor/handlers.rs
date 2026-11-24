@@ -456,12 +456,17 @@ impl CompositorHandler for MoonshineCompositor {
 		if !is_sync_subsurface(surface) && surface_tree_buffer_changed(surface) {
 			self.note_content_change(std::time::Instant::now());
 		}
-		if self
-			.focused_window
-			.as_ref()
-			.and_then(|window| window.wl_surface())
-			.is_some_and(|s| &*s == surface)
-		{
+		// The application's frames may arrive on a desynchronized subsurface
+		// (Wine's swapchain) rather than on the shell surface itself.
+		if let Some(focus) = self.focused_window.as_ref().and_then(|window| window.wl_surface())
+			&& (&*focus == surface
+				|| (!is_sync_subsurface(surface) && smithay::wayland::compositor::get_parent(surface).is_some() && {
+					let mut root = surface.clone();
+					while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+						root = parent;
+					}
+					root == *focus
+				})) {
 			self.note_source_commit();
 		}
 

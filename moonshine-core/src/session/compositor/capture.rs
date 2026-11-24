@@ -226,6 +226,46 @@ pub(super) fn surface_view_rejection(
 		None
 	}
 }
+/// The topmost buffered surface of a window's tree, as direct export sees it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TreeLayer {
+	/// The surface view, with `offset` replaced by the surface's location
+	/// relative to the tree root (the sum of its subsurface positions).
+	pub view: smithay::backend::renderer::utils::SurfaceView,
+	pub buffer_scale: i32,
+	pub transform: smithay::utils::Transform,
+	/// Nothing below shows through anywhere on the output: an opaque region
+	/// covers it, or its buffer format has no alpha channel.
+	pub opaque: bool,
+	/// The layer is the tree root (the shell surface) itself.
+	pub root: bool,
+}
+
+/// Whether the topmost buffered surface of a window's tree can be exported
+/// as the whole frame.
+///
+/// That surface need not be the root: Wine's Wayland driver gives the
+/// toplevel a transparent placeholder buffer and presents the game's
+/// swapchain (with its HDR color description) on a desynchronized
+/// subsurface above it. A topmost layer that fills the output 1:1 and is
+/// opaque hides everything below, so it is the frame. Content above a root
+/// that is not such a layer (a client-drawn overlay, for example) needs
+/// composition.
+pub(super) fn direct_layer_rejection(
+	top: Option<TreeLayer>,
+	output: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> Option<DirectReject> {
+	let Some(top) = top else {
+		return Some(DirectReject::NoSurface);
+	};
+	let reason = surface_view_rejection(top.view, top.buffer_scale, top.transform, output)
+		.or((!top.opaque).then_some(DirectReject::NotOpaque));
+	match reason {
+		Some(_) if !top.root => Some(DirectReject::SurfaceTree),
+		reason => reason,
+	}
+}
+
 #[cfg(test)]
 fn surface_view_is_direct(
 	view: smithay::backend::renderer::utils::SurfaceView,
@@ -480,6 +520,72 @@ mod tests {
 			),
 			Some(DirectReject::Crop)
 		);
+	}
+
+	/// Wine's Wayland driver: a transparent toplevel placeholder with the
+	/// game's swapchain on a subsurface above it.
+	#[test]
+	fn a_full_opaque_subsurface_above_the_root_is_the_direct_source() {
+		use super::{TreeLayer, direct_layer_rejection};
+		use smithay::backend::renderer::utils::SurfaceView;
+		use smithay::utils::{Rectangle, Transform};
+		let output = (2560, 1440).into();
+		let game = TreeLayer {
+			view: SurfaceView {
+				src: Rectangle::from_size((2560.0, 1440.0).into()),
+				dst: output,
+				offset: (0, 0).into(),
+			},
+			buffer_scale: 1,
+			transform: Transform::Normal,
+			opaque: true,
+			root: false,
+		};
+		assert_eq!(direct_layer_rejection(Some(game), output), None);
+		// A root alone keeps its own reasons.
+		assert_eq!(
+			direct_layer_rejection(
+				Some(TreeLayer {
+					opaque: false,
+					root: true,
+					..game
+				}),
+				output
+			),
+			Some(DirectReject::NotOpaque)
+		);
+		assert_eq!(direct_layer_rejection(None, output), Some(DirectReject::NoSurface));
+		// Anything short of a complete opaque layer above the root is a
+		// multi-surface scene: a translucent, offset, smaller or scaled layer.
+		for layer in [
+			TreeLayer { opaque: false, ..game },
+			TreeLayer {
+				view: SurfaceView {
+					offset: (0, 32).into(),
+					..game.view
+				},
+				..game
+			},
+			TreeLayer {
+				view: SurfaceView {
+					dst: (1920, 1080).into(),
+					..game.view
+				},
+				..game
+			},
+			TreeLayer {
+				view: SurfaceView {
+					src: Rectangle::from_size((1920.0, 1080.0).into()),
+					..game.view
+				},
+				..game
+			},
+		] {
+			assert_eq!(
+				direct_layer_rejection(Some(layer), output),
+				Some(DirectReject::SurfaceTree)
+			);
+		}
 	}
 }
 

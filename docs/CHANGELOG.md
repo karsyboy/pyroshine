@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- **Wine and Proton games on Wayland are exported without composition.** Wine's Wayland driver presents a game on a subsurface above a transparent placeholder window, which Pyroshine always composited (reported as `transparent` or `subsurfaces`), including HDR games such as World of Warcraft under GE-Proton with `PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`. A subsurface that fills the stream and is opaque is now exported directly with its own HDR description. When a game window is scaled to the stream, the sizes behind it are logged once per change.
+
 ## [v0.18.8] - 2026-11-24
 
 ### Added

@@ -136,7 +136,21 @@ visibility, then checks the actual top visible source. Cursor, Steam overlays,
 notifications, external overlays, dropdowns, decorations, scaling, popup trees,
 and independently visible subsurfaces require composition. An opaque fullscreen
 source can cover mapped background windows without making them independently
-visible. Buffer dimensions, lifetime, crop, scale, rotation, position, and the
+visible.
+
+The exported surface is the topmost buffered surface of the top window's tree,
+which need not be the shell surface. Wine's Wayland driver gives each toplevel a
+transparent ARGB placeholder buffer, without an opaque region, and presents the
+game's swapchain, with its color description, on a desynchronized subsurface
+above it. A topmost subsurface whose location, view and buffer fill the output 1:1
+and that is opaque hides everything below, so its buffer is exported, and its
+color description and HDR metadata describe the frame. A surface is opaque when
+an opaque region covers the output or its buffer format has no alpha channel;
+Mesa's Vulkan WSI chooses such formats for opaque swapchains without declaring a
+region. Any other content above the shell surface is reported as `subsurfaces`.
+Frame callbacks and presentation feedback still cover the whole tree, and
+commits on such a subsurface count as the application's commits in the cadence
+diagnostics. Buffer dimensions, lifetime, crop, scale, rotation, position, and the
 existing DMA-BUF checks still apply. Eligibility performs no X11 queries and
 allocates no window list. Current color management passes through pixel data and
 metadata; no new color conversion or SDR intermediate is introduced.

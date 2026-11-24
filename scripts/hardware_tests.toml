@@ -119,6 +119,11 @@ requires = ["render-node", "xwayland"]
 timeout = 120
 
 [[test]]
+name = "session::compositor::xwayland_tests::wine_wayland_swapchain_subsurface_is_exported_directly"
+requires = ["render-node", "xwayland"]
+timeout = 120
+
+[[test]]
 name = "session::compositor::xwayland_tests::steam_browser_subwindow_keeps_focus_when_overlay_closes"
 requires = ["render-node", "xwayland"]
 timeout = 120

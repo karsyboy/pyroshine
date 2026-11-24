@@ -556,6 +556,9 @@ pub(crate) struct MoonshineCompositor {
 	/// Overscan × magnification scale (`STEAM_SCREEN_SCALE` ×
 	/// `STEAM_SCREEN_MAGNIFICATION`), normally 1.0.
 	pub global_scale: f64,
+	/// The last focus-window size mismatch logged as output scaling
+	/// (source, window geometry, output), so each change is logged once.
+	scaling_report: std::cell::Cell<Option<[(i32, i32); 3]>>,
 
 	/// Currently active override window (dropdown, menu, tooltip).
 	/// Override windows are visually raised and may receive keyboard input
@@ -1097,6 +1100,7 @@ impl MoonshineCompositor {
 				upscale_scaler: super::scaling::UpscaleScaler::from_env(),
 				upscale_filter: smithay::backend::renderer::TextureFilter::Linear,
 				global_scale: 1.0,
+				scaling_report: std::cell::Cell::new(None),
 				override_window: None,
 				override_underlay_window: None,
 				decoration_windows: Vec::new(),
@@ -1272,8 +1276,25 @@ impl MoonshineCompositor {
 			f64::MAX,
 			self.global_scale,
 		);
+		let is_focus = self.focused_window.as_ref() == Some(window);
 		if scale.is_identity() {
+			if is_focus {
+				self.scaling_report.set(None);
+			}
 			return None;
+		}
+		// A scaled focus window keeps every frame composited (`scaling`);
+		// record the sizes behind it once per change, without debug logging.
+		let report = [(source_w, source_h), (geo.size.w, geo.size.h), (out.size.w, out.size.h)];
+		if is_focus && self.scaling_report.replace(Some(report)) != Some(report) {
+			tracing::info!(
+				source = ?report[0],
+				geometry = ?report[1],
+				output = ?report[2],
+				dropdown = fit.is_some(),
+				x11 = window.x11_surface().is_some(),
+				"Scaling the focus window to the output"
+			);
 		}
 
 		let output_scale = smithay::utils::Scale::from(self.output.current_scale().fractional_scale());
@@ -1453,64 +1474,71 @@ impl MoonshineCompositor {
 		{
 			return Err(DirectReject::SurfaceTree);
 		}
+		let source = self.direct_source_surface(&source)?;
 		// Composition converts what the stream cannot carry as is: HDR into
 		// an SDR output, and gamma 2.2 into the sRGB every SDR stream signals
 		// (PyroWave's scaler has no gamma 2.2 input, and the conversion is
-		// the compositor's shader either way).
+		// the compositor's shader either way). The exported surface's own
+		// description counts: Wine declares it on the swapchain subsurface.
 		if self.color_management.as_ref().is_some_and(|cm| {
 			let color_space = cm.surface_color_space(&source);
 			color_space == FrameColorSpace::Gamma22 || (!self.hdr && color_space.is_hdr())
 		}) {
 			return Err(DirectReject::ForcedComposition);
 		}
-		self.surface_is_complete_output(&source)
+		Ok(())
 	}
 
-	/// A transformed/cropped tree cannot be represented by its root DMA-BUF.
-	fn surface_is_complete_output(&self, surface: &WlSurface) -> Result<(), DirectReject> {
-		let output = self.output_rect();
-		with_renderer_surface_state(surface, |state| {
-			let view = state.view().ok_or(DirectReject::NoSurface)?;
-			if let Some(reason) = super::capture::surface_view_rejection(
-				view,
-				state.buffer_scale(),
-				state.buffer_transform(),
-				output.size,
-			) {
-				return Err(reason);
-			}
-			if !state
-				.opaque_regions()
-				.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(output)))
-			{
-				return Err(DirectReject::NotOpaque);
-			}
-			Ok(())
-		})
-		.unwrap_or(Err(DirectReject::NoSurface))?;
-		let mut extra_content = false;
-		compositor::with_surface_tree_downward(
-			surface,
-			(),
-			|_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
-			|child, states, &()| {
+	/// The surface of `root`'s tree whose buffer is the whole output frame
+	/// (see [`super::capture::direct_layer_rejection`]).
+	fn direct_source_surface(&self, root: &WlSurface) -> Result<WlSurface, DirectReject> {
+		let output = self.output_rect().size;
+		let mut top: Option<(WlSurface, super::capture::TreeLayer)> = None;
+		// Upward traversal visits surfaces in drawing order, so the last
+		// buffered surface is the topmost. Locations accumulate subsurface
+		// positions like Smithay's own render-element traversal.
+		compositor::with_surface_tree_upward(
+			root,
+			Point::<i32, Logical>::from((0, 0)),
+			|_, states, location| match renderer_view(states) {
+				Some(view) => compositor::TraversalAction::DoChildren(*location + view.offset),
+				None => compositor::TraversalAction::SkipChildren,
+			},
+			|surface, states, location| {
 				// Tree callbacks already hold the surface-state lock. Read
 				// renderer data directly instead of re-entering with_states.
-				if child != surface
-					&& states
-						.data_map
-						.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
-						.is_some_and(|state| state.lock().unwrap().buffer().is_some())
-				{
-					extra_content = true;
-				}
+				let Some(data) = states
+					.data_map
+					.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+				else {
+					return;
+				};
+				let data = data.lock().unwrap();
+				let (Some(_), Some(mut view)) = (data.buffer(), data.view()) else {
+					return;
+				};
+				view.offset += *location;
+				// Smithay counts a buffer without alpha as fully opaque.
+				let covered = smithay::utils::Rectangle::new((-view.offset.x, -view.offset.y).into(), output);
+				let opaque = data
+					.opaque_regions()
+					.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(covered)));
+				top = Some((
+					surface.clone(),
+					super::capture::TreeLayer {
+						view,
+						buffer_scale: data.buffer_scale(),
+						transform: data.buffer_transform(),
+						opaque,
+						root: surface == root,
+					},
+				));
 			},
-			|_, _, &()| true,
+			|_, _, _| true,
 		);
-		if extra_content {
-			Err(DirectReject::SurfaceTree)
-		} else {
-			Ok(())
+		match super::capture::direct_layer_rejection(top.as_ref().map(|(_, layer)| *layer), output) {
+			Some(reason) => Err(reason),
+			None => Ok(top.expect("an accepted layer exists").0),
 		}
 	}
 
@@ -2917,9 +2945,12 @@ impl MoonshineCompositor {
 		let Some(wl_surface) = window.wl_surface().map(|s| s.into_owned()) else {
 			return Err(DirectReject::NoSurface);
 		};
+		// The exported surface may be a subsurface (Wine's swapchain); frame
+		// callbacks and presentation feedback still cover the whole tree.
+		let source = self.direct_source_surface(&wl_surface)?;
 
 		// Get the committed buffer and check if it's a DMA-BUF.
-		let scanout_buffer = with_renderer_surface_state(&wl_surface, |state| {
+		let scanout_buffer = with_renderer_surface_state(&source, |state| {
 			let buffer = state.buffer()?;
 			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
 				return None;
@@ -2976,12 +3007,12 @@ impl MoonshineCompositor {
 		let color_space = self
 			.color_management
 			.as_ref()
-			.map(|cm| cm.surface_color_space(&wl_surface))
+			.map(|cm| cm.surface_color_space(&source))
 			.unwrap_or(FrameColorSpace::Srgb);
 		let hdr_metadata = self
 			.color_management
 			.as_ref()
-			.and_then(|cm| cm.surface_hdr_metadata(&wl_surface));
+			.and_then(|cm| cm.surface_hdr_metadata(&source));
 
 		// The frame takes its own reference to the client's DMA-BUF; the held
 		// wl_buffer below only defers the client's content reuse.
@@ -3494,6 +3525,16 @@ fn refresh_interval_for(mode: Option<Mode>) -> std::time::Duration {
 
 fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
 	surface_size.or(buffer_size)
+}
+
+/// The renderer's view of a surface, read inside a surface-tree traversal.
+fn renderer_view(states: &compositor::SurfaceData) -> Option<smithay::backend::renderer::utils::SurfaceView> {
+	states
+		.data_map
+		.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()?
+		.lock()
+		.unwrap()
+		.view()
 }
 
 #[cfg(test)]

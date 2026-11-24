@@ -135,6 +135,14 @@ release. Choose a build documenting native Wayland support and check its
 [current options](https://github.com/GloriousEggroll/proton-ge-custom#options).
 Pyroshine does not force these variables or change the installed runtime.
 
+Wine's Wayland driver presents the game on a subsurface above a transparent
+placeholder toplevel. The compositor exports that subsurface directly when it
+fills the stream resolution, so a fullscreen Wine/Proton Wayland game with HDR
+reaches the encoder without composition. A window smaller or larger than the
+stream is still scaled by composition. The composition reason appears in the
+web interface and `GetStats` (`capture.path`), and each new scaling mismatch is
+logged once as `Scaling the focus window to the output`.
+
 Check Steam Input with the Wayland driver. Some Proton builds (for example
 proton-cachyos 11.0-20261005) set `PROTON_NO_STEAMINPUT=1` whenever
 `PROTON_ENABLE_WAYLAND=1`, so a game whose Steam controller configuration
